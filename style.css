@@ -1,0 +1,33 @@
+/* ST-Agentic host container integration rules (UI styling is isolated inside Shadow DOM) */
+
+agentic-capsule {
+    display: block;
+    width: 100%;
+    margin: 6px 0;
+    box-sizing: border-box;
+}
+
+#agentic-settings-root,
+#agentic-settings-host,
+[data-agentic-settings-mount="true"] {
+    display: block;
+    width: 100%;
+    margin: 6px 0;
+    box-sizing: border-box;
+}
+
+[data-agentic-shell-root="true"] {
+    display: contents;
+}
+
+.agentic-menu-item,
+[data-agentic-menu-item] {
+    cursor: pointer;
+}
+
+.agentic-menu-item .extensionsMenuExtensionButton,
+[data-agentic-menu-item] .extensionsMenuExtensionButton {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}

@@ -1,12 +1,1727 @@
+import { AgentRunner } from '@/core/agents';
+import {
+    createDefaultSettings,
+    exportPreset,
+    importConnections,
+    importPreset,
+    importSettings,
+    normalizeSettings,
+    resolveActivePreset,
+    validateConnectionsImport,
+    validatePresetImport,
+    validateSettingsImport,
+} from '@/core/config';
+import {
+    ContextAssembler,
+    TrajectoryStore,
+    WatermarkCompactor,
+} from '@/core/context';
+import { FetchLLMTransport } from '@/core/llm';
+import { TraceLogger } from '@/core/logger';
+import {
+    buildLoreVfsPath,
+    LoreReadEvaluator,
+    TailRadar,
+    WIClassifier,
+} from '@/core/lore';
+import {
+    importSillyTavernOpenAIPreset,
+    isLegacyCustomGenerationData,
+    isSillyTavernOpenAIPreset,
+    migrateFromCustomGeneration,
+} from '@/core/migration';
+import { RegexPipeline } from '@/core/regex';
+import {
+    ChatDataStore,
+    DATA_NAMESPACES,
+    DataCompactor,
+    invalidateHeadIndex,
+    MESSAGE_OVERRIDE_KEY,
+    VARIABLES_DOC_KEY,
+    worldInfoKey,
+} from '@/core/store';
+import {
+    BUILTIN_TOOL_NAMES,
+    compileCustomToolConfig,
+    compileLoreToolEntry,
+    compileSlashBridgeTool,
+    createBuiltinToolRegistry,
+    createToolExecutionContext,
+    registerCustomTools,
+    type ToolRegistry,
+} from '@/core/tools';
+import {
+    BarrierCoordinator,
+    DecoratorCompiler,
+    PipelineOrchestrator,
+} from '@/core/triggers';
+import type {
+    AgentProfile,
+    AgentRunTrace,
+    ApiConnection,
+    ClassifiedLoreEntry,
+    CompactionReport,
+    CustomToolConfig,
+    DataNamespace,
+    MessageTarget,
+    MigrationReport,
+    Preset,
+    RawLoreEntry,
+    Settings,
+    WICategory,
+} from '@/core/types';
+import { canonicalClone, canonicalStringify, initXxHash } from '@/core/utils';
+import { VirtualFileSystem } from '@/core/vfs';
+import type { AgenticPublicApi } from '@/globals';
+import { setupCompanionHooks } from '@/host/companion-hooks';
+import { evaluateOptionalEjs } from '@/host/ejs-adapter';
+import {
+    embedFilesToCard,
+    embedPresetToCard,
+    getEmbeddedCardStatus,
+    importEmbeddedFromCard,
+    setupEmbedCard,
+} from '@/host/embed-card';
+import {
+    createAgenticInterceptor,
+    type STGenerateInterceptor,
+} from '@/host/interceptor';
+import { executeStSlashCommand } from '@/host/slash-bridge';
+import {
+    DEFAULT_EXTENSION_SETTINGS_KEY,
+    STHostBridge,
+} from '@/host/st-bridge';
+import { IframeJsSandbox, SandboxLifecycleManager } from '@/sandbox';
+import {
+    mountExtensionsMenuItems,
+    mountExtensionsSettingsCard,
+    registerAgenticCapsuleElement,
+} from '@/ui/capsule';
+import { registerSessionViews } from '@/ui/session';
+import { mountAgenticAppShell } from '@/ui/shell';
+import {
+    AppStore,
+    type AgenticUIServices,
+    type AgentWatermarkStatus,
+    type ConnectionTestResult,
+    type EmbeddedCardStatus,
+    type FileOverrideItem,
+    type ImportPresetResult,
+    type StorageOverview,
+    type ToolTestResult,
+    setDefaultAppStore,
+} from '@/ui/store';
+import { registerStudioViews } from '@/ui/studio';
+import { chat, saveMetadata, saveSettingsDebounced } from '@st/script.js';
+import { event_types, eventSource } from '@st/scripts/events.js';
+import { extension_settings } from '@st/scripts/extensions.js';
 
-// jQuery
-$(async () => {
-    // Initialize here
-    
-    // @ts-expect-error: Expose global APIs
-    globalThis.agentic = {
-        
-    };
-    
-    console.log('Agentic initialized');
+const AGENTIC_VERSION = '0.1.0';
+const LEGACY_EXTENSION_SETTINGS_KEY = 'CustomGeneration';
+const BUILTIN_TOOL_NAME_SET = new Set<string>(BUILTIN_TOOL_NAMES);
+
+let resolveBootReady: (() => void) | null = null;
+const bootReadyPromise = new Promise<void>((resolve) => {
+    resolveBootReady = resolve;
 });
+let bootFailed = false;
+let activeRealInterceptor: STGenerateInterceptor | null = null;
+
+/**
+ * Register a safe early interceptor placeholder until async initialization completes,
+ * matching `manifest.json` `generate_interceptor: "Agentic_interceptor"`.
+ */
+function ensureEarlyInterceptorPlaceholder(): void {
+    const holder = globalThis as { Agentic_interceptor?: STGenerateInterceptor };
+    if (typeof holder.Agentic_interceptor === 'function') {
+        return;
+    }
+
+    const earlyPlaceholder: STGenerateInterceptor = async (
+        chatMessages: Parameters<STGenerateInterceptor>[0],
+        contextSize: Parameters<STGenerateInterceptor>[1],
+        abort: Parameters<STGenerateInterceptor>[2],
+        type: Parameters<STGenerateInterceptor>[3],
+    ) => {
+        if (!activeRealInterceptor && !bootFailed) {
+            await bootReadyPromise;
+        }
+        if (activeRealInterceptor) {
+            await activeRealInterceptor(chatMessages, contextSize, abort, type);
+        }
+    };
+    holder.Agentic_interceptor = earlyPlaceholder;
+}
+
+ensureEarlyInterceptorPlaceholder();
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasStoredAgenticSettings(raw: unknown): raw is Record<string, unknown> {
+    if (!isPlainObject(raw)) {
+        return false;
+    }
+    return (
+        'presets' in raw
+        || 'connections' in raw
+        || 'currentPresetId' in raw
+        || 'currentConnectionId' in raw
+        || 'runMode' in raw
+    );
+}
+
+function ensureAgenticBucket(): Record<string, unknown> {
+    const root = extension_settings as Record<string, unknown>;
+    if (!isPlainObject(root[DEFAULT_EXTENSION_SETTINGS_KEY])) {
+        root[DEFAULT_EXTENSION_SETTINGS_KEY] = {};
+    }
+    return root[DEFAULT_EXTENSION_SETTINGS_KEY] as Record<string, unknown>;
+}
+
+function persistAgenticSettings(next: Settings, persistDebounced = true): Settings {
+    const normalized = normalizeSettings(next);
+    const bucket = ensureAgenticBucket();
+    // Merge normalized settings fields while preserving auxiliary extension data keys (e.g. global VFS files).
+    Object.assign(bucket, canonicalClone(normalized));
+    if (persistDebounced) {
+        saveSettingsDebounced();
+    }
+    return normalized;
+}
+
+function loadOrMigrateSettings(): {
+    settings: Settings;
+    migrationReport?: MigrationReport;
+} {
+    const root = extension_settings as Record<string, unknown>;
+    const existingAgentic = root[DEFAULT_EXTENSION_SETTINGS_KEY];
+
+    if (hasStoredAgenticSettings(existingAgentic)) {
+        return {
+            settings: normalizeSettings(existingAgentic),
+        };
+    }
+
+    // Strictly read-only detection of legacy CustomGeneration config on first boot.
+    const rawLegacy = root[LEGACY_EXTENSION_SETTINGS_KEY];
+    if (rawLegacy && isLegacyCustomGenerationData(rawLegacy)) {
+        const migrated = migrateFromCustomGeneration(rawLegacy);
+        const persisted = persistAgenticSettings(migrated.settings, true);
+        return {
+            settings: persisted,
+            migrationReport: migrated.report,
+        };
+    }
+
+    return {
+        settings: persistAgenticSettings(createDefaultSettings(), true),
+    };
+}
+
+function resolveValidTarget(candidate?: MessageTarget | null): MessageTarget {
+    if (
+        candidate
+        && Number.isInteger(candidate.messageId)
+        && candidate.messageId >= 0
+        && Number.isInteger(candidate.swipeId)
+        && candidate.swipeId >= 0
+    ) {
+        return { messageId: candidate.messageId, swipeId: candidate.swipeId };
+    }
+    if (!Array.isArray(chat) || chat.length === 0) {
+        return { messageId: 0, swipeId: 0 };
+    }
+    const lastIndex = chat.length - 1;
+    const lastMessage = chat[lastIndex] as { swipe_id?: unknown } | undefined;
+    const swipeId =
+        typeof lastMessage?.swipe_id === 'number'
+        && Number.isInteger(lastMessage.swipe_id)
+        && lastMessage.swipe_id >= 0
+            ? lastMessage.swipe_id
+            : 0;
+    return { messageId: lastIndex, swipeId };
+}
+
+function formatLayerLabel(messageId: number, swipeId: number, isBase = false): string {
+    if (isBase || messageId < 0) {
+        return 'Base 层 (全局默认)';
+    }
+    return `L${messageId}#${swipeId}`;
+}
+
+function readNestedValue(obj: Record<string, unknown>, path: string): unknown {
+    const segments = path
+        .split('.')
+        .map((segment) => segment.trim())
+        .filter(Boolean);
+    let cursor: unknown = obj;
+    for (const seg of segments) {
+        if (!isPlainObject(cursor) || !(seg in cursor)) {
+            return undefined;
+        }
+        cursor = cursor[seg];
+    }
+    return cursor;
+}
+
+function parseJsonObjectSafe(rawText: string): Record<string, unknown> {
+    if (!rawText.trim()) {
+        return {};
+    }
+    try {
+        const parsed: unknown = JSON.parse(rawText);
+        return isPlainObject(parsed) ? parsed : {};
+    } catch {
+        return {};
+    }
+}
+
+function hydrateTrajectoryStore(targetStore: TrajectoryStore, sourceStore: TrajectoryStore): void {
+    for (const id of targetStore.listAgentIds()) {
+        targetStore.clearThread(id);
+    }
+    for (const agentId of sourceStore.listAgentIds()) {
+        const frozenPrefix = sourceStore.getFrozenPrefix(agentId);
+        if (frozenPrefix) {
+            targetStore.setFrozenPrefix(frozenPrefix, agentId);
+        }
+        targetStore.applyCompaction(
+            {
+                compactedMessages: sourceStore.getMessages(agentId),
+                archivedUpToChunk: sourceStore.getArchivedUpToChunk(agentId),
+                compactionHeaderCount: sourceStore.getCompactionHeaderCount(agentId),
+                turnEndCounts: sourceStore.getTurnEndCounts(agentId),
+            },
+            agentId,
+        );
+        targetStore.setReadSet(sourceStore.getReadSet(agentId), agentId);
+    }
+}
+
+function createEjsVfsHelpers(
+    getVfs: () => VirtualFileSystem | undefined,
+    getStore: () => ChatDataStore | undefined,
+    getTarget: () => MessageTarget,
+): Record<string, unknown> {
+    const readVarsObject = async (): Promise<Record<string, unknown>> => {
+        const store = getStore();
+        const vfs = getVfs();
+        const target = getTarget();
+        if (vfs) {
+            try {
+                const raw = await vfs.readFile('/state/variables.json', { target });
+                return parseJsonObjectSafe(raw);
+            } catch {
+                // Fall back to ChatDataStore lookup below.
+            }
+        }
+        const entry = store?.get(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, {
+            target,
+            includeStaged: true,
+        });
+        return parseJsonObjectSafe(entry?.content ?? '');
+    };
+
+    const readVfsFile = async (path: string): Promise<string> => {
+        const vfs = getVfs();
+        if (!vfs || !path.trim()) {
+            return '';
+        }
+        try {
+            return await vfs.readFile(path, { target: getTarget() });
+        } catch {
+            return '';
+        }
+    };
+
+    const fileExists = async (path: string): Promise<boolean> => {
+        const vfs = getVfs();
+        if (!vfs || !path.trim()) {
+            return false;
+        }
+        try {
+            return await vfs.exists(path, { target: getTarget() });
+        } catch {
+            return false;
+        }
+    };
+
+    const listFiles = async (dirPath = '/'): Promise<string[]> => {
+        const vfs = getVfs();
+        if (!vfs) {
+            return [];
+        }
+        try {
+            const entries = await vfs.listDir(dirPath, { target: getTarget() });
+            return entries.map((entry) => entry.path);
+        } catch {
+            return [];
+        }
+    };
+
+    return {
+        readFile: readVfsFile,
+        fileExists,
+        listFiles,
+        getVars: readVarsObject,
+        getVar: async (keyPath?: string, fallback?: unknown): Promise<unknown> => {
+            const vars = await readVarsObject();
+            if (!keyPath || !keyPath.trim()) {
+                return vars;
+            }
+            const value = readNestedValue(vars, keyPath);
+            return value !== undefined ? value : fallback;
+        },
+        vfs: {
+            read: readVfsFile,
+            exists: fileExists,
+            list: listFiles,
+        },
+        vars: {
+            all: readVarsObject,
+            get: async (keyPath: string, fallback?: unknown): Promise<unknown> => {
+                const vars = await readVarsObject();
+                const value = readNestedValue(vars, keyPath);
+                return value !== undefined ? value : fallback;
+            },
+        },
+    };
+}
+
+interface RuntimeServicesDeps {
+    bridge: STHostBridge;
+    store: ChatDataStore;
+    dataCompactor: DataCompactor;
+    vfs: VirtualFileSystem;
+    traceLogger: TraceLogger;
+    sandbox: IframeJsSandbox;
+    toolRegistry: ToolRegistry;
+    trajectoryStore: TrajectoryStore;
+    watermarkCompactor: WatermarkCompactor;
+    transport: FetchLLMTransport;
+    barrierCoordinator: BarrierCoordinator;
+    orchestrator: PipelineOrchestrator;
+    classifier: WIClassifier;
+    getSettings: () => Settings;
+    setSettings: (next: Settings, persistDebounced?: boolean) => Settings;
+    syncTools: () => Promise<void>;
+    getAppStore: () => AppStore | undefined;
+    isSuppressingSave: () => boolean;
+}
+
+function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
+    const {
+        bridge,
+        store,
+        dataCompactor,
+        vfs,
+        traceLogger,
+        sandbox,
+        toolRegistry,
+        trajectoryStore,
+        watermarkCompactor,
+        transport,
+        barrierCoordinator,
+        orchestrator,
+        classifier,
+        getSettings,
+        setSettings,
+        syncTools,
+        getAppStore,
+        isSuppressingSave,
+    } = deps;
+
+    const resolveTarget = (target?: MessageTarget): MessageTarget =>
+        resolveValidTarget(target ?? getAppStore()?.getSnapshot().activeTarget);
+
+    const hasSummaryTriggersInContext = (
+        preset: Preset,
+        loreEntries: readonly RawLoreEntry[],
+    ): boolean => {
+        const compiled = orchestrator.decoratorCompiler.compile(loreEntries, { preset });
+        const triggers = [...preset.triggers, ...compiled.triggers];
+        return triggers.some(
+            (trigger) =>
+                trigger.enabled
+                && /summary|outline|记忆|摘要|大纲/i.test(
+                    `${trigger.label} ${trigger.id} ${trigger.targetPath ?? ''}`,
+                ),
+        );
+    };
+
+    const buildWatermarkStatusForAgent = (
+        agent: AgentProfile,
+        summaryMode: 'bridge' | 'fallback',
+    ): AgentWatermarkStatus => ({
+        agentId: agent.id,
+        agentName: agent.name,
+        currentTokens: watermarkCompactor.estimateCurrentTokens(trajectoryStore, {
+            agentId: agent.id,
+        }),
+        lowWatermark: agent.watermark?.low ?? 24_000,
+        highWatermark: agent.watermark?.high ?? 48_000,
+        archivedChunks: trajectoryStore.getArchivedUpToChunk(agent.id),
+        summaryMode,
+    });
+
+    const listFilesAndOverrides = async (targetInput?: MessageTarget): Promise<FileOverrideItem[]> => {
+        const target = resolveTarget(targetInput);
+        const settings = getSettings();
+        const activePreset = resolveActivePreset(settings);
+        const items: FileOverrideItem[] = [];
+
+        // 1. Variables (/state/variables.json)
+        let varsContent = '{}';
+        try {
+            varsContent = await vfs.readFile('/state/variables.json', { target });
+        } catch {
+            const fallbackVars = store.getLegacyMetadataVariables();
+            varsContent = fallbackVars ? JSON.stringify(fallbackVars, null, 2) : '{}';
+        }
+        const varsEntry = store.get(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, {
+            target,
+            includeStaged: true,
+        });
+        const varsRows = store.lookup(DATA_NAMESPACES.VARIABLES, {
+            target,
+            includeStaged: true,
+        });
+        const varsRow = varsRows.find((row) => row.key === VARIABLES_DOC_KEY);
+        const legacyVars = store.getLegacyMetadataVariables();
+        const baseVarsContent = legacyVars ? JSON.stringify(legacyVars, null, 2) : '{}';
+
+        items.push({
+            id: `variables:${VARIABLES_DOC_KEY}`,
+            category: 'variables',
+            namespace: DATA_NAMESPACES.VARIABLES,
+            path: '/state/variables.json',
+            key: VARIABLES_DOC_KEY,
+            target:
+                varsRow && varsRow.messageId >= 0
+                    ? { messageId: varsRow.messageId, swipeId: varsRow.swipeId }
+                    : target,
+            layerLabel: formatLayerLabel(
+                varsRow?.messageId ?? target.messageId,
+                varsRow?.swipeId ?? target.swipeId,
+                !varsRow || varsRow.messageId < 0,
+            ),
+            source: varsEntry?.source ?? 'initvar',
+            content: varsContent,
+            baseContent: baseVarsContent,
+            overridden: Boolean(varsRow && varsRow.messageId >= 0),
+            writable: true,
+        });
+
+        // 2. Workspace files (chat DataStore `files` + active preset embedded files)
+        const presetFileMap = new Map<string, string>();
+        for (const [rawKey, content] of Object.entries(activePreset.files)) {
+            presetFileMap.set(rawKey.replace(/^\/+/, ''), content);
+        }
+
+        const fileRows = store.lookup(DATA_NAMESPACES.FILES, {
+            target,
+            includeStaged: true,
+        });
+        const seenFileKeys = new Set<string>();
+        for (const row of fileRows) {
+            const cleanKey = row.key.replace(/^\/+/, '');
+            seenFileKeys.add(cleanKey);
+            const presetBase = presetFileMap.get(cleanKey);
+            items.push({
+                id: `files:${cleanKey}`,
+                category: 'workspace',
+                namespace: DATA_NAMESPACES.FILES,
+                path: `/${cleanKey}`,
+                key: cleanKey,
+                target:
+                    row.messageId >= 0
+                        ? { messageId: row.messageId, swipeId: row.swipeId }
+                        : target,
+                layerLabel: formatLayerLabel(row.messageId, row.swipeId, row.messageId < 0),
+                source: row.entry.source,
+                content: row.entry.content,
+                baseContent: presetBase,
+                overridden: row.messageId >= 0,
+                writable: true,
+            });
+        }
+
+        for (const [cleanKey, content] of presetFileMap.entries()) {
+            if (seenFileKeys.has(cleanKey)) {
+                continue;
+            }
+            items.push({
+                id: `files:preset:${cleanKey}`,
+                category: 'workspace',
+                namespace: DATA_NAMESPACES.FILES,
+                path: `/${cleanKey}`,
+                key: cleanKey,
+                target,
+                layerLabel: 'Preset 预设默认层',
+                source: 'preset',
+                content,
+                baseContent: content,
+                overridden: false,
+                writable: true,
+            });
+        }
+
+        // 3. World Info entries & branch overrides
+        const lorebooks = await bridge.listEnabledLorebooks();
+        const wiRows = store.lookup(DATA_NAMESPACES.WORLDINFO, {
+            target,
+            includeStaged: true,
+        });
+        const wiRowMap = new Map(wiRows.map((row) => [row.key, row]));
+        const seenWiKeys = new Set<string>();
+
+        for (const [worldName, entries] of lorebooks.entries()) {
+            for (const entry of entries) {
+                const rawEntry = entry.world ? entry : { ...entry, world: worldName };
+                const wiKey = worldInfoKey(rawEntry.world, rawEntry.uid);
+                seenWiKeys.add(wiKey);
+                const wiPath = buildLoreVfsPath(rawEntry);
+                const overrideRow = wiRowMap.get(wiKey);
+                const baseContent = rawEntry.content ?? '';
+
+                items.push({
+                    id: `worldinfo:${wiKey}`,
+                    category: 'worldinfo',
+                    namespace: DATA_NAMESPACES.WORLDINFO,
+                    path: wiPath,
+                    key: wiKey,
+                    target:
+                        overrideRow && overrideRow.messageId >= 0
+                            ? { messageId: overrideRow.messageId, swipeId: overrideRow.swipeId }
+                            : target,
+                    layerLabel: overrideRow
+                        ? formatLayerLabel(overrideRow.messageId, overrideRow.swipeId, overrideRow.messageId < 0)
+                        : `原书 (${rawEntry.world})`,
+                    source: overrideRow?.entry.source ?? 'lorebook',
+                    content: overrideRow ? overrideRow.entry.content : baseContent,
+                    baseContent,
+                    overridden: Boolean(overrideRow),
+                    writable: true,
+                });
+            }
+        }
+
+        for (const [wiKey, row] of wiRowMap.entries()) {
+            if (seenWiKeys.has(wiKey)) {
+                continue;
+            }
+            items.push({
+                id: `worldinfo:${wiKey}`,
+                category: 'worldinfo',
+                namespace: DATA_NAMESPACES.WORLDINFO,
+                path: `/lorebooks/${wiKey}`,
+                key: wiKey,
+                target:
+                    row.messageId >= 0
+                        ? { messageId: row.messageId, swipeId: row.swipeId }
+                        : target,
+                layerLabel: formatLayerLabel(row.messageId, row.swipeId, row.messageId < 0),
+                source: row.entry.source,
+                content: row.entry.content,
+                overridden: true,
+                writable: true,
+            });
+        }
+
+        // 4. Message display overrides
+        const chatMessages = bridge.getChat();
+        const msgRows = store.scan(DATA_NAMESPACES.MESSAGE, {
+            depth: 50,
+            includeHidden: true,
+            includeStaged: true,
+        });
+        const seenMsgKeys = new Set<string>();
+        for (const row of msgRows) {
+            const branchKey = `${row.messageId}:${row.swipeId}`;
+            seenMsgKeys.add(branchKey);
+            const rawMsg = chatMessages[row.messageId];
+            items.push({
+                id: `message:${branchKey}`,
+                category: 'message',
+                namespace: DATA_NAMESPACES.MESSAGE,
+                path: `message://${row.messageId}#${row.swipeId} (展示层覆写)`,
+                key: MESSAGE_OVERRIDE_KEY,
+                target: { messageId: row.messageId, swipeId: row.swipeId },
+                layerLabel: formatLayerLabel(row.messageId, row.swipeId),
+                source: row.entry.source,
+                content: row.entry.content,
+                baseContent: rawMsg?.mes ?? '',
+                overridden: true,
+                writable: true,
+            });
+        }
+
+        const activeBranchKey = `${target.messageId}:${target.swipeId}`;
+        if (chatMessages[target.messageId] && !seenMsgKeys.has(activeBranchKey)) {
+            const rawMsg = chatMessages[target.messageId];
+            const originalText = rawMsg?.mes ?? '';
+            items.push({
+                id: `message:${activeBranchKey}`,
+                category: 'message',
+                namespace: DATA_NAMESPACES.MESSAGE,
+                path: `message://${target.messageId}#${target.swipeId} (展示层覆写)`,
+                key: MESSAGE_OVERRIDE_KEY,
+                target,
+                layerLabel: formatLayerLabel(target.messageId, target.swipeId),
+                source: 'chat',
+                content: originalText,
+                baseContent: originalText,
+                overridden: false,
+                writable: true,
+            });
+        }
+
+        return items;
+    };
+
+    const normalizeKeyForNamespace = (
+        namespace: DataNamespace,
+        key: string,
+        path: string,
+    ): string => {
+        if (namespace === DATA_NAMESPACES.FILES) {
+            return (key || path).replace(/^\/+/, '');
+        }
+        if (namespace === DATA_NAMESPACES.VARIABLES) {
+            return VARIABLES_DOC_KEY;
+        }
+        if (namespace === DATA_NAMESPACES.MESSAGE) {
+            return MESSAGE_OVERRIDE_KEY;
+        }
+        return key;
+    };
+
+    return {
+        listFilesAndOverrides,
+
+        async saveFileOrOverride(input): Promise<FileOverrideItem> {
+            const target = resolveTarget(input.target);
+            const cleanKey = normalizeKeyForNamespace(input.namespace, input.key, input.path);
+
+            store.set(input.namespace, cleanKey, 'ui-edit', input.content, { target });
+            if (input.namespace === DATA_NAMESPACES.MESSAGE) {
+                await bridge.refreshMessageView(target);
+            }
+            await saveMetadata();
+
+            const refreshed = await listFilesAndOverrides(target);
+            const matched = refreshed.find(
+                (item) =>
+                    item.namespace === input.namespace
+                    && item.key === cleanKey
+                    && item.target.messageId === target.messageId
+                    && item.target.swipeId === target.swipeId,
+            );
+            if (matched) {
+                return matched;
+            }
+            return {
+                id: `${input.namespace}:${cleanKey}`,
+                category:
+                    input.namespace === DATA_NAMESPACES.VARIABLES
+                        ? 'variables'
+                        : input.namespace === DATA_NAMESPACES.WORLDINFO
+                            ? 'worldinfo'
+                            : input.namespace === DATA_NAMESPACES.MESSAGE
+                                ? 'message'
+                                : 'workspace',
+                namespace: input.namespace,
+                path: input.path,
+                key: cleanKey,
+                target,
+                layerLabel: formatLayerLabel(target.messageId, target.swipeId),
+                source: 'ui-edit',
+                content: input.content,
+                overridden: true,
+                writable: true,
+            };
+        },
+
+        async deleteFileOrOverride(input): Promise<void> {
+            const target = resolveTarget(input.target);
+            const cleanKey = normalizeKeyForNamespace(input.namespace, input.key, input.path);
+
+            const removed = store.remove(input.namespace, cleanKey, target);
+            if (
+                input.namespace === DATA_NAMESPACES.FILES
+                && (!removed || store.get(DATA_NAMESPACES.FILES, cleanKey, { target }) !== null)
+            ) {
+                store.erase(DATA_NAMESPACES.FILES, cleanKey, 'ui-delete', { target });
+            }
+
+            if (input.namespace === DATA_NAMESPACES.MESSAGE) {
+                await bridge.refreshMessageView(target);
+            }
+            await saveMetadata();
+        },
+
+        async getWatermarkStatuses(): Promise<AgentWatermarkStatus[]> {
+            const activePreset = resolveActivePreset(getSettings());
+            const lorebooks = await bridge.listEnabledLorebooks();
+            const loreEntries = Array.from(lorebooks.values()).flat();
+            const summaryMode = hasSummaryTriggersInContext(activePreset, loreEntries)
+                ? 'bridge'
+                : 'fallback';
+
+            const agentMap = new Map<string, AgentProfile>();
+            for (const agent of Object.values(activePreset.agents)) {
+                if (agent.sessionMode === 'persistent') {
+                    agentMap.set(agent.id, agent);
+                }
+            }
+            for (const threadId of trajectoryStore.listAgentIds()) {
+                if (!agentMap.has(threadId)) {
+                    const fromPreset = activePreset.agents[threadId];
+                    if (fromPreset) {
+                        agentMap.set(threadId, fromPreset);
+                    }
+                }
+            }
+
+            return Array.from(agentMap.values()).map((agent) =>
+                buildWatermarkStatusForAgent(agent, summaryMode),
+            );
+        },
+
+        async compactAgentContext(agentId: string): Promise<AgentWatermarkStatus> {
+            const activePreset = resolveActivePreset(getSettings());
+            const lorebooks = await bridge.listEnabledLorebooks();
+            const loreEntries = Array.from(lorebooks.values()).flat();
+            const agent = activePreset.agents[agentId] ?? Object.values(activePreset.agents)[0];
+            const summaryMode = hasSummaryTriggersInContext(activePreset, loreEntries)
+                ? 'bridge'
+                : 'fallback';
+
+            await watermarkCompactor.compact(trajectoryStore, {
+                agentId,
+                watermark: agent?.watermark,
+                triggers: activePreset.triggers,
+                loreEntries,
+                force: true,
+            });
+            trajectoryStore.saveToHost(bridge);
+
+            if (agent) {
+                return buildWatermarkStatusForAgent(agent, summaryMode);
+            }
+            return {
+                agentId,
+                agentName: agentId,
+                currentTokens: watermarkCompactor.estimateCurrentTokens(trajectoryStore, { agentId }),
+                lowWatermark: 24_000,
+                highWatermark: 48_000,
+                archivedChunks: trajectoryStore.getArchivedUpToChunk(agentId),
+                summaryMode,
+            };
+        },
+
+        async getStorageOverview(): Promise<StorageOverview> {
+            const settings = getSettings();
+            return {
+                estimatedBytes: dataCompactor.estimateBytes(),
+                activeLayers: dataCompactor.countLayers(),
+                compactedWatermark: dataCompactor.getWatermark(),
+                keepDepth: settings.storage.keepDepth,
+                autoCompact: settings.storage.autoCompact,
+                sizeThreshold: settings.storage.sizeThreshold,
+            };
+        },
+
+        async previewColdCompaction(keepDepth?: number): Promise<CompactionReport> {
+            const settings = getSettings();
+            return dataCompactor.compactColdLayers({
+                dryRun: true,
+                keepDepth: keepDepth ?? settings.storage.keepDepth,
+                includeLegacy: settings.storage.pruneLegacy,
+            });
+        },
+
+        async runColdCompaction(keepDepth?: number): Promise<CompactionReport> {
+            const settings = getSettings();
+            const report = dataCompactor.compactColdLayers({
+                dryRun: false,
+                keepDepth: keepDepth ?? settings.storage.keepDepth,
+                includeLegacy: settings.storage.pruneLegacy,
+            });
+            if (report.removedLayers > 0 || report.compactedMessages > 0) {
+                await saveMetadata();
+            }
+            return report;
+        },
+
+        async listTraces(filter?: { messageId?: number; swipeId?: number }): Promise<AgentRunTrace[]> {
+            return traceLogger.listTraces(filter);
+        },
+
+        async clearTraces(): Promise<void> {
+            traceLogger.clear();
+            getAppStore()?.setTraces([]);
+        },
+
+        async rerunAfterTurn(targetInput?: MessageTarget): Promise<void> {
+            const target = resolveTarget(targetInput);
+            const handles = await orchestrator.rerunAfterTurn(target);
+            const storeUi = getAppStore();
+            storeUi?.setBackgroundTasks(barrierCoordinator.listTasks());
+            await Promise.allSettled(handles.map((handle) => handle.promise));
+            trajectoryStore.saveToHost(bridge);
+            storeUi?.setBackgroundTasks(barrierCoordinator.listTasks());
+            if (storeUi) {
+                await storeUi.refreshTraces();
+            }
+        },
+
+        async cancelBackgroundTask(taskId: string): Promise<void> {
+            orchestrator.cancelBackgroundTask(taskId, 'Cancelled from Agentic console');
+            getAppStore()?.setBackgroundTasks(barrierCoordinator.listTasks());
+        },
+
+        async saveSettings(nextSettings: Settings): Promise<void> {
+            setSettings(nextSettings, !isSuppressingSave());
+            await syncTools();
+        },
+
+        async importPresetOrConfig(
+            rawJson: unknown,
+            options?: { presetName?: string },
+        ): Promise<ImportPresetResult> {
+            const prevSettings = getSettings();
+
+            if (isSillyTavernOpenAIPreset(rawJson)) {
+                const imported = importSillyTavernOpenAIPreset(rawJson, {
+                    presetName: options?.presetName,
+                });
+                const nextSettings = setSettings({
+                    ...prevSettings,
+                    presets: {
+                        ...prevSettings.presets,
+                        [imported.preset.id]: imported.preset,
+                    },
+                    currentPresetId: imported.preset.id,
+                });
+                await syncTools();
+                return {
+                    settings: nextSettings,
+                    preset: imported.preset,
+                    report: imported.report,
+                    message: `已导入 SillyTavern OpenAI 预设：${imported.preset.name}`,
+                };
+            }
+
+            if (isLegacyCustomGenerationData(rawJson)) {
+                const migrated = migrateFromCustomGeneration(rawJson);
+                const mergedPresets = {
+                    ...prevSettings.presets,
+                    ...migrated.settings.presets,
+                };
+                const mergedConnections = {
+                    ...prevSettings.connections,
+                    ...migrated.settings.connections,
+                };
+                const importedPreset = resolveActivePreset(migrated.settings);
+                const nextSettings = setSettings({
+                    ...prevSettings,
+                    presets: mergedPresets,
+                    connections: mergedConnections,
+                    currentPresetId: importedPreset.id,
+                });
+                await syncTools();
+                return {
+                    settings: nextSettings,
+                    preset: importedPreset,
+                    report: migrated.report,
+                    message: `已迁移导入 CustomGeneration 配置（预设 ${Object.keys(migrated.settings.presets).length} 个）`,
+                };
+            }
+
+            if (validateSettingsImport(rawJson).ok) {
+                const full = importSettings(rawJson);
+                const nextSettings = setSettings(full);
+                await syncTools();
+                return {
+                    settings: nextSettings,
+                    preset: resolveActivePreset(nextSettings),
+                    message: '已导入完整 Agentic 配置。',
+                };
+            }
+
+            if (validatePresetImport(rawJson).ok) {
+                const imported = importPreset(rawJson);
+                const nextPresets = { ...prevSettings.presets };
+                let primaryPreset = imported.presets[0];
+                for (let index = 0; index < imported.presets.length; index++) {
+                    const item = imported.presets[index];
+                    const resolvedName =
+                        index === 0 && options?.presetName?.trim()
+                            ? options.presetName.trim()
+                            : item.name;
+                    const presetCopy: Preset = { ...item, name: resolvedName };
+                    nextPresets[presetCopy.id] = presetCopy;
+                    if (index === 0) {
+                        primaryPreset = presetCopy;
+                    }
+                }
+                const nextConnections = { ...prevSettings.connections };
+                if (imported.connection && !(imported.connection.id in nextConnections)) {
+                    nextConnections[imported.connection.id] = imported.connection;
+                }
+                const nextSettings = setSettings({
+                    ...prevSettings,
+                    presets: nextPresets,
+                    connections: nextConnections,
+                    currentPresetId: primaryPreset?.id ?? prevSettings.currentPresetId,
+                });
+                await syncTools();
+                return {
+                    settings: nextSettings,
+                    preset: primaryPreset,
+                    connection: imported.connection,
+                    message: `已导入预设：${primaryPreset?.name ?? 'Preset'}`,
+                };
+            }
+
+            if (validateConnectionsImport(rawJson).ok) {
+                const imported = importConnections(rawJson);
+                const nextConnections = { ...prevSettings.connections };
+                for (const [connId, conn] of Object.entries(imported.connections)) {
+                    const existingKey = nextConnections[connId]?.apiKey;
+                    nextConnections[connId] = {
+                        ...conn,
+                        apiKey: conn.apiKey || existingKey || '',
+                    };
+                }
+                const nextSettings = setSettings({
+                    ...prevSettings,
+                    connections: nextConnections,
+                    currentConnectionId:
+                        imported.currentConnectionId in nextConnections
+                            ? imported.currentConnectionId
+                            : prevSettings.currentConnectionId,
+                });
+                return {
+                    settings: nextSettings,
+                    message: `已导入 ${Object.keys(imported.connections).length} 条 API 连接配置。`,
+                };
+            }
+
+            throw new Error('无法识别的 JSON 格式：请提供 Agentic 预设/设置、Connections 或 SillyTavern OpenAI 预设。');
+        },
+
+        async exportPresetJson(presetId: string, includeConnection = false): Promise<string> {
+            const settings = getSettings();
+            const preset = settings.presets[presetId] ?? resolveActivePreset(settings);
+            const connId = preset.agents[preset.mainAgentId]?.connectionId ?? settings.currentConnectionId;
+            const connection = includeConnection ? settings.connections[connId] : undefined;
+            return JSON.stringify(
+                exportPreset(preset, { includeConnection: connection }),
+                null,
+                2,
+            );
+        },
+
+        async getEmbeddedCardStatus(): Promise<EmbeddedCardStatus> {
+            return await getEmbeddedCardStatus();
+        },
+
+        async embedPresetToCard(presetId: string): Promise<string> {
+            return await embedPresetToCard(presetId, undefined, { store: getAppStore() });
+        },
+
+        async embedFilesToCard(files: Record<string, string>): Promise<string> {
+            return await embedFilesToCard(files);
+        },
+
+        async importEmbeddedFromCard() {
+            const result = await importEmbeddedFromCard(undefined, {
+                store: getAppStore(),
+                bridge,
+                dataStore: store,
+            });
+            await syncTools();
+            return result;
+        },
+
+        async testConnection(connection: ApiConnection): Promise<ConnectionTestResult> {
+            const startedAt = performance.now();
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 15_000);
+            try {
+                const response = await transport.complete({
+                    connectionId: connection.id,
+                    connection,
+                    messages: [{ role: 'user', content: 'Reply with OK.' }],
+                    tools: [],
+                    stream: false,
+                    signal: controller.signal,
+                });
+                const latencyMs = Math.max(1, Math.round(performance.now() - startedAt));
+                const cacheSupport =
+                    response.usage?.cachedTokens
+                        ? `cachedTokens=${response.usage.cachedTokens}`
+                        : `${connection.providerFormat}:${connection.model}`;
+                return {
+                    ok: true,
+                    latencyMs,
+                    message: `连接成功 (${latencyMs}ms · ${connection.model})`,
+                    cacheSupport,
+                };
+            } catch (error) {
+                const latencyMs = Math.max(1, Math.round(performance.now() - startedAt));
+                const msg = error instanceof Error ? error.message : String(error);
+                return {
+                    ok: false,
+                    latencyMs,
+                    message: `连接失败 (${latencyMs}ms)：${msg}`,
+                };
+            } finally {
+                clearTimeout(timer);
+            }
+        },
+
+        async testToolInSandbox(
+            tool: CustomToolConfig | { name: string; code?: string; commandTemplate?: string },
+            argsJson: string,
+            targetInput?: MessageTarget,
+        ): Promise<ToolTestResult> {
+            const startedAt = performance.now();
+            const target = resolveTarget(targetInput);
+            try {
+                const parsedArgs: unknown = argsJson.trim() ? JSON.parse(argsJson) : {};
+                const argsRecord = isPlainObject(parsedArgs) ? parsedArgs : {};
+                const ctx = createToolExecutionContext({
+                    bridge,
+                    vfs,
+                    store,
+                    target,
+                    signal: AbortSignal.timeout(15_000),
+                    staged: false,
+                    source: 'sandbox-test',
+                });
+
+                let resultValue: unknown;
+                if ('kind' in tool && tool.kind === 'slash_bridge') {
+                    const def = compileSlashBridgeTool(tool);
+                    resultValue = await def.execute(argsRecord, ctx);
+                } else if ('kind' in tool && tool.kind === 'js') {
+                    const defs = await compileCustomToolConfig(tool, sandbox, { timeoutMs: 15_000 });
+                    const picked = defs.find((d) => d.name === tool.name) ?? defs[0];
+                    resultValue = await picked.execute(argsRecord, ctx);
+                } else if ('commandTemplate' in tool && tool.commandTemplate?.trim()) {
+                    const tempSlash: CustomToolConfig = {
+                        id: `test_slash_${tool.name}`,
+                        name: tool.name,
+                        kind: 'slash_bridge',
+                        description: tool.name,
+                        enabled: true,
+                        commandTemplate: tool.commandTemplate,
+                    };
+                    const def = compileSlashBridgeTool(tempSlash);
+                    resultValue = await def.execute(argsRecord, ctx);
+                } else if ('code' in tool && tool.code?.trim()) {
+                    if (/defineTool\s*\(/.test(tool.code)) {
+                        const tempJs: CustomToolConfig = {
+                            id: `test_js_${tool.name}`,
+                            name: tool.name,
+                            kind: 'js',
+                            description: tool.name,
+                            enabled: true,
+                            code: tool.code,
+                            allowNetwork: true,
+                        };
+                        const defs = await compileCustomToolConfig(tempJs, sandbox, { timeoutMs: 15_000 });
+                        const picked = defs.find((d) => d.name === tool.name) ?? defs[0];
+                        resultValue = await picked.execute(argsRecord, ctx);
+                    } else {
+                        resultValue = await sandbox.evaluateScript(tool.code, ctx, {
+                            id: `test_script_${tool.name}`,
+                            allowNetwork: true,
+                            timeoutMs: 15_000,
+                        });
+                    }
+                } else {
+                    const outputText = await toolRegistry.executeToolCallText(tool.name, argsJson, ctx);
+                    return {
+                        ok: true,
+                        durationMs: Math.max(1, Math.round(performance.now() - startedAt)),
+                        output: outputText,
+                        target,
+                    };
+                }
+
+                const output =
+                    typeof resultValue === 'string'
+                        ? resultValue
+                        : JSON.stringify(resultValue ?? null, null, 2);
+                return {
+                    ok: true,
+                    durationMs: Math.max(1, Math.round(performance.now() - startedAt)),
+                    output,
+                    target,
+                };
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : String(error);
+                return {
+                    ok: false,
+                    durationMs: Math.max(1, Math.round(performance.now() - startedAt)),
+                    output: '',
+                    error: msg,
+                    target,
+                };
+            }
+        },
+
+        async listClassifiedLoreEntries(
+            overrides?: Record<string, WICategory>,
+        ): Promise<{ entries: ClassifiedLoreEntry[]; isHollowCard: boolean }> {
+            const lorebooks = await bridge.listEnabledLorebooks();
+            const activePreset = resolveActivePreset(getSettings());
+            const classified = classifier.classifyLorebooks(lorebooks, {
+                overrides: overrides ?? activePreset.wiRouterOverrides,
+            });
+            const isHollowCard = classifier.isHollowCharacterCard(bridge.getCharacterFields());
+            return {
+                entries: classified.all,
+                isHollowCard,
+            };
+        },
+
+        getHostLuminance() {
+            return bridge.getHostLuminance();
+        },
+
+        subscribeEvents(listener) {
+            return traceLogger.subscribe(listener);
+        },
+    };
+}
+
+interface HostMountController {
+    sync(): void;
+    dispose(): void;
+}
+
+function setupHostUiContainers(appStore: AppStore): HostMountController {
+    let unmountSettings: (() => void) | null = null;
+    let unmountMenu: (() => void) | null = null;
+    let disposed = false;
+
+    const ensureSettingsCardMounted = (): HTMLElement | null => {
+        if (disposed) {
+            return null;
+        }
+        const container =
+            document.getElementById('extensions_settings')
+            ?? document.getElementById('extensions_settings2');
+        if (!container) {
+            return null;
+        }
+        if (!container.querySelector('[data-agentic-settings-mount]')) {
+            unmountSettings?.();
+            unmountSettings = mountExtensionsSettingsCard(container, appStore);
+        }
+        return container;
+    };
+
+    const ensureMenuMounted = (): HTMLElement | null => {
+        if (disposed) {
+            return null;
+        }
+        const menu = document.getElementById('extensionsMenu');
+        if (!menu) {
+            return null;
+        }
+        if (!menu.querySelector('[data-agentic-menu-item]')) {
+            unmountMenu?.();
+            unmountMenu = mountExtensionsMenuItems(menu, appStore);
+        }
+        return menu;
+    };
+
+    const observedContainers = new WeakSet<Element>();
+    const containerObserver = new MutationObserver(() => {
+        syncMounts();
+    });
+
+    const attachObservers = (): void => {
+        const settingsEl = ensureSettingsCardMounted();
+        if (settingsEl && !observedContainers.has(settingsEl)) {
+            observedContainers.add(settingsEl);
+            containerObserver.observe(settingsEl, { childList: true });
+        }
+        const menuEl = ensureMenuMounted();
+        if (menuEl && !observedContainers.has(menuEl)) {
+            observedContainers.add(menuEl);
+            containerObserver.observe(menuEl, { childList: true });
+        }
+    };
+
+    const syncMounts = (): void => {
+        if (disposed) {
+            return;
+        }
+        attachObservers();
+    };
+
+    syncMounts();
+
+    let bodyObserver: MutationObserver | null = null;
+    if (
+        typeof document !== 'undefined'
+        && document.body
+        && (!document.getElementById('extensions_settings') || !document.getElementById('extensionsMenu'))
+    ) {
+        bodyObserver = new MutationObserver(() => {
+            attachObservers();
+            if (
+                document.getElementById('extensions_settings')
+                && document.getElementById('extensionsMenu')
+            ) {
+                bodyObserver?.disconnect();
+                bodyObserver = null;
+            }
+        });
+        bodyObserver.observe(document.body, { childList: true, subtree: true });
+    }
+
+    const onDocumentClick = (event: MouseEvent): void => {
+        const target = event.target as Element | null;
+        if (target?.closest?.('#extensionsMenuButton')) {
+            queueMicrotask(syncMounts);
+        }
+    };
+    document.addEventListener('click', onDocumentClick);
+
+    return {
+        sync: syncMounts,
+        dispose: () => {
+            disposed = true;
+            document.removeEventListener('click', onDocumentClick);
+            containerObserver.disconnect();
+            bodyObserver?.disconnect();
+            unmountSettings?.();
+            unmountMenu?.();
+        },
+    };
+}
+
+jQuery(async () => {
+    try {
+        await initXxHash();
+
+        const runtimeRefs: {
+            vfs?: VirtualFileSystem;
+            store?: ChatDataStore;
+            appStore?: AppStore;
+        } = {};
+
+        const bridge = new STHostBridge({
+            extensionKey: DEFAULT_EXTENSION_SETTINGS_KEY,
+            executeSlashCommand: executeStSlashCommand,
+            evaluateOptionalEjs: async (text: string, vars?: Record<string, unknown>) =>
+                await evaluateOptionalEjs(
+                    text,
+                    vars,
+                    createEjsVfsHelpers(
+                        () => runtimeRefs.vfs,
+                        () => runtimeRefs.store,
+                        () => resolveValidTarget(runtimeRefs.appStore?.getSnapshot().activeTarget),
+                    ),
+                ),
+        });
+
+        const initial = loadOrMigrateSettings();
+        let currentSettings = initial.settings;
+
+        const store = new ChatDataStore(bridge);
+        runtimeRefs.store = store;
+        bridge.setStore(store);
+        bridge.setSettingsGetter(() => currentSettings);
+
+        const dataCompactor = new DataCompactor(bridge);
+        const regexPipeline = new RegexPipeline(resolveActivePreset(currentSettings).regexRules);
+        const loreReadEvaluator = new LoreReadEvaluator(bridge, {
+            getOverride: (world, uid, target) =>
+                store.get(DATA_NAMESPACES.WORLDINFO, worldInfoKey(world, uid), {
+                    target,
+                    includeStaged: true,
+                })?.content ?? null,
+            applyLoreReadRegex: (text) =>
+                regexPipeline.run(text, { stage: 'lore_read', sender: 'lore' }),
+        });
+        const tailRadar = new TailRadar(loreReadEvaluator);
+        const classifier = new WIClassifier();
+        const decoratorCompiler = new DecoratorCompiler();
+        const vfs = new VirtualFileSystem({
+            bridge,
+            store,
+            loreReadHook: loreReadEvaluator.toLoreReadHook(),
+            getPresetFiles: () => resolveActivePreset(currentSettings).files,
+        });
+        runtimeRefs.vfs = vfs;
+
+        const traceLogger = new TraceLogger();
+        const sandboxLifecycle = new SandboxLifecycleManager();
+        const sandbox = new IframeJsSandbox({ lifecycle: sandboxLifecycle });
+        const toolRegistry = createBuiltinToolRegistry();
+
+        const registeredCustomToolNames = new Set<string>();
+        let toolSyncGeneration = 0;
+
+        const syncCustomAndLoreTools = async (): Promise<void> => {
+            const gen = ++toolSyncGeneration;
+            for (const name of registeredCustomToolNames) {
+                if (!BUILTIN_TOOL_NAME_SET.has(name)) {
+                    toolRegistry.unregister(name);
+                }
+            }
+            registeredCustomToolNames.clear();
+
+            const activePreset = resolveActivePreset(currentSettings);
+            const safeCustomConfigs = activePreset.customTools.filter(
+                (tool) => !BUILTIN_TOOL_NAME_SET.has(tool.name.trim()),
+            );
+
+            try {
+                const customRes = await registerCustomTools(toolRegistry, safeCustomConfigs, sandbox);
+                if (gen !== toolSyncGeneration) {
+                    return;
+                }
+                for (const name of customRes.registered) {
+                    registeredCustomToolNames.add(name);
+                }
+                for (const err of customRes.errors) {
+                    console.warn(`[Agentic] Failed to compile custom tool "${err.name}": ${err.error}`);
+                }
+            } catch (error) {
+                console.warn('[Agentic] Custom tool registration error:', error);
+            }
+
+            try {
+                const lorebooks = await bridge.listEnabledLorebooks();
+                if (gen !== toolSyncGeneration) {
+                    return;
+                }
+                const compiled = decoratorCompiler.compile(
+                    Array.from(lorebooks.values()).flat(),
+                    { preset: activePreset },
+                );
+                for (const loreTool of compiled.toolEntries) {
+                    if (gen !== toolSyncGeneration) {
+                        return;
+                    }
+                    if (loreTool.entry.disable) {
+                        continue;
+                    }
+                    try {
+                        const defs = await compileLoreToolEntry(loreTool.entry, sandbox);
+                        for (const def of defs) {
+                            if (BUILTIN_TOOL_NAME_SET.has(def.name)) {
+                                continue;
+                            }
+                            toolRegistry.register(def, { replace: true });
+                            registeredCustomToolNames.add(def.name);
+                        }
+                    } catch (error) {
+                        console.warn(
+                            `[Agentic] Failed to compile @@tool "${loreTool.name}":`,
+                            error,
+                        );
+                    }
+                }
+            } catch (error) {
+                console.warn('[Agentic] World Info @@tool scan error:', error);
+            }
+        };
+
+        const trajectoryStore = new TrajectoryStore();
+        hydrateTrajectoryStore(trajectoryStore, TrajectoryStore.loadFromHost(bridge));
+
+        const contextAssembler = new ContextAssembler();
+        const watermarkCompactor = new WatermarkCompactor({ vfs, bridge });
+        const transport = new FetchLLMTransport({
+            connections: currentSettings.connections,
+            resolveConnection: (connectionId) =>
+                currentSettings.connections[connectionId]
+                ?? currentSettings.connections[currentSettings.currentConnectionId],
+        });
+
+        const agentRunner = new AgentRunner({
+            bridge,
+            transport,
+            settings: () => currentSettings,
+            toolRegistry,
+            contextAssembler,
+            trajectoryStore,
+            vfs,
+            store,
+            regexPipeline,
+            loreReadEvaluator,
+            tailRadar,
+            traceLogger,
+            sandbox,
+        });
+
+        const barrierCoordinator = new BarrierCoordinator({ traceLogger });
+        const orchestrator = new PipelineOrchestrator({
+            bridge,
+            transport,
+            settings: () => currentSettings,
+            store,
+            vfs,
+            trajectoryStore,
+            contextAssembler,
+            watermarkCompactor,
+            toolRegistry,
+            traceLogger,
+            barrierCoordinator,
+            agentRunner,
+            decoratorCompiler,
+            classifier,
+            loreReadEvaluator,
+            tailRadar,
+            regexPipeline,
+            sandbox,
+        });
+
+        const updateSettingsState = (next: Settings, persistDebounced = true): Settings => {
+            currentSettings = persistAgenticSettings(next, persistDebounced);
+            regexPipeline.setRules(resolveActivePreset(currentSettings).regexRules);
+            transport.setConnections(currentSettings.connections);
+            return currentSettings;
+        };
+
+        let suppressNextSave = false;
+
+        const uiServices = createLiveUiServices({
+            bridge,
+            store,
+            dataCompactor,
+            vfs,
+            traceLogger,
+            sandbox,
+            toolRegistry,
+            trajectoryStore,
+            watermarkCompactor,
+            transport,
+            barrierCoordinator,
+            orchestrator,
+            classifier,
+            getSettings: () => currentSettings,
+            setSettings: updateSettingsState,
+            syncTools: syncCustomAndLoreTools,
+            getAppStore: () => runtimeRefs.appStore,
+            isSuppressingSave: () => suppressNextSave,
+        });
+
+        await syncCustomAndLoreTools();
+
+        const appStore = new AppStore({
+            initialSettings: currentSettings,
+            initialTraces: traceLogger.listTraces(),
+            initialBackgroundTasks: barrierCoordinator.listTasks(),
+            initialTarget: resolveValidTarget(),
+            services: uiServices,
+            getHostLuminance: () => bridge.getHostLuminance(),
+        });
+        runtimeRefs.appStore = appStore;
+        setDefaultAppStore(appStore);
+
+        // Register all Studio/Session views and Shadow DOM custom element before mounting UI shells.
+        registerSessionViews();
+        registerStudioViews();
+        registerAgenticCapsuleElement();
+
+        mountAgenticAppShell({ store: appStore });
+        const hostMounts = setupHostUiContainers(appStore);
+
+        if (initial.migrationReport) {
+            appStore.pushToast(
+                `已自动从 CustomGeneration 迁移配置（预设 ${Object.keys(currentSettings.presets).length} 个）。`,
+                'primary',
+                4200,
+            );
+        }
+
+        const interceptorHandle = createAgenticInterceptor({
+            bridge,
+            orchestrator,
+            getSettings: () => currentSettings,
+            getAppStore: () => appStore,
+            registerGlobal: true,
+        });
+        activeRealInterceptor = interceptorHandle.interceptor;
+
+        setupCompanionHooks({
+            bridge,
+            orchestrator,
+            getSettings: () => currentSettings,
+            getAppStore: () => appStore,
+            isTakeoverActive: () => interceptorHandle.isTakeoverActive(),
+        });
+
+        setupEmbedCard({
+            store: appStore,
+            bridge,
+            dataStore: store,
+        });
+
+        // Persist persistent agent trajectories whenever a turn trace completes.
+        traceLogger.subscribe((event) => {
+            if (event.kind === 'trace_recorded' && trajectoryStore.listAgentIds().length > 0) {
+                trajectoryStore.saveToHost(bridge);
+            }
+        });
+
+        const runAutoStorageCompactionIfNeeded = async (): Promise<void> => {
+            if (!currentSettings.storage.autoCompact) {
+                return;
+            }
+            if (dataCompactor.estimateBytes() <= currentSettings.storage.sizeThreshold) {
+                return;
+            }
+            const report = dataCompactor.compactColdLayers({
+                dryRun: false,
+                keepDepth: currentSettings.storage.keepDepth,
+                includeLegacy: currentSettings.storage.pruneLegacy,
+            });
+            if (report.removedLayers > 0 || report.compactedMessages > 0) {
+                await saveMetadata();
+            }
+        };
+
+        const syncActiveTargetFromChat = (explicitMessageId?: number): void => {
+            if (
+                typeof explicitMessageId === 'number'
+                && Number.isInteger(explicitMessageId)
+                && explicitMessageId >= 0
+                && chat[explicitMessageId]
+            ) {
+                const msg = chat[explicitMessageId] as { swipe_id?: unknown };
+                const swipeId =
+                    typeof msg?.swipe_id === 'number'
+                    && Number.isInteger(msg.swipe_id)
+                    && msg.swipe_id >= 0
+                        ? msg.swipe_id
+                        : 0;
+                appStore?.setActiveTarget({ messageId: explicitMessageId, swipeId });
+                return;
+            }
+            appStore?.setActiveTarget(resolveValidTarget());
+        };
+
+        const handleChatChanged = async (): Promise<void> => {
+            sandboxLifecycle.disposeAll();
+            invalidateHeadIndex();
+            hydrateTrajectoryStore(trajectoryStore, TrajectoryStore.loadFromHost(bridge));
+            syncActiveTargetFromChat();
+            appStore?.setTraces(traceLogger.listTraces());
+            appStore?.setBackgroundTasks(barrierCoordinator.listTasks());
+            await syncCustomAndLoreTools();
+            await runAutoStorageCompactionIfNeeded();
+        };
+
+        const handleSettingsReloaded = async (): Promise<void> => {
+            const reloaded = (extension_settings as Record<string, unknown>)[
+                DEFAULT_EXTENSION_SETTINGS_KEY
+            ];
+            if (!hasStoredAgenticSettings(reloaded)) {
+                return;
+            }
+            const normalized = normalizeSettings(reloaded);
+            if (canonicalStringify(normalized) === canonicalStringify(currentSettings)) {
+                return;
+            }
+            updateSettingsState(normalized, false);
+            if (appStore) {
+                suppressNextSave = true;
+                try {
+                    await appStore.updateSettings(() => normalized);
+                } finally {
+                    suppressNextSave = false;
+                }
+            }
+            await syncCustomAndLoreTools();
+        };
+
+        eventSource.on(event_types.CHAT_CHANGED, () => {
+            void handleChatChanged();
+        });
+        eventSource.on(event_types.SETTINGS_LOADED, () => {
+            void handleSettingsReloaded();
+        });
+        eventSource.on(event_types.EXTENSION_SETTINGS_LOADED, () => {
+            void handleSettingsReloaded();
+        });
+        eventSource.on(event_types.WORLDINFO_UPDATED, () => {
+            void syncCustomAndLoreTools();
+        });
+        eventSource.on(event_types.WORLDINFO_SETTINGS_UPDATED, () => {
+            void syncCustomAndLoreTools();
+        });
+        eventSource.on(event_types.MESSAGE_DELETED, () => {
+            syncActiveTargetFromChat();
+            appStore?.setTraces(traceLogger.listTraces());
+        });
+        eventSource.on(event_types.MESSAGE_SWIPED, (messageId: unknown) => {
+            syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
+            appStore?.setTraces(traceLogger.listTraces());
+        });
+        eventSource.on(event_types.MESSAGE_RECEIVED, (messageId: unknown) => {
+            syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
+        });
+        eventSource.on(event_types.MESSAGE_UPDATED, (messageId: unknown) => {
+            syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
+        });
+        eventSource.on(event_types.APP_READY, () => {
+            hostMounts.sync();
+            syncActiveTargetFromChat();
+        });
+        eventSource.on(event_types.EXTENSIONS_FIRST_LOAD, () => {
+            hostMounts.sync();
+        });
+
+        await runAutoStorageCompactionIfNeeded();
+
+        const publicApi: AgenticPublicApi = {
+            version: AGENTIC_VERSION,
+            getSettings: () => canonicalClone(currentSettings),
+            openConsole: (tab, deepLink) => {
+                appStore?.openConsole(tab, deepLink);
+            },
+            closeConsole: () => {
+                appStore?.closeConsole();
+            },
+            runTurn: (input) => orchestrator.runTurn(input),
+            rerunAfterTurn: async (target) => {
+                await uiServices.rerunAfterTurn(target);
+            },
+            vfs,
+            store,
+            traces: traceLogger,
+            orchestrator,
+            sandbox,
+            uiStore: appStore,
+            bridge,
+        };
+
+        globalThis.Agentic = publicApi;
+        resolveBootReady?.();
+    } catch (error) {
+        bootFailed = true;
+        resolveBootReady?.();
+        console.error('[Agentic] Initialization failed:', error);
+    }
+});
+
+export type { AgenticPublicApi };
+export default {
+    version: AGENTIC_VERSION,
+    getApi: (): AgenticPublicApi | undefined => globalThis.Agentic,
+};
