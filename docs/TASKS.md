@@ -43,10 +43,10 @@
 | **T0.1** | 工具链校准与防腐层 Lint 守卫 | Wave 0 | Serial | 无 | `package.json`, `tsconfig.json`, `vitest.config.ts`, `.eslintrc.cjs`, `manifest.json` | `[x]` |
 | **T0.2** | 核心领域类型、防腐接口与基础原语 | Wave 0 | Serial | T0.1 | `src/core/types/**`, `src/core/bridge/**`, `src/core/utils/**`, `tests/unit/utils/**` | `[x]` |
 | **T0.3** | 测试基座桩模块与标准测试语料 | Wave 0 | Serial | T0.2 | `tests/mocks/**`, `tests/fixtures/**` | `[x]` |
-| **T1.1** | 分层数据存储、冷层压平与 VFS 引擎 | Wave 1 | Track A | T0.3 | `src/core/store/**`, `src/core/vfs/**`, `tests/unit/store/**`, `tests/unit/vfs/**` | `[ ]` |
-| **T1.2** | 自研正则引擎、配置状态与自动迁移 | Wave 1 | Track B | T0.3 | `src/core/regex/**`, `src/core/migration/**`, `src/core/config/**`, `tests/unit/regex/**`, `tests/unit/migration/**` | `[ ]` |
-| **T1.3** | WI 装饰器解析、四类分流与尾部雷达 | Wave 1 | Track C | T0.3 | `src/core/lore/**`, `tests/unit/lore/**` | `[ ]` |
-| **T1.4** | LLM 传输、SSE 解析、缓存断点与限流 | Wave 1 | Track D | T0.3 | `src/core/llm/**`, `tests/unit/llm/**` | `[ ]` |
+| **T1.1** | 分层数据存储、冷层压平与 VFS 引擎 | Wave 1 | Track A | T0.3 | `src/core/store/**`, `src/core/vfs/**`, `tests/unit/store/**`, `tests/unit/vfs/**` | `[x]` |
+| **T1.2** | 自研正则引擎、配置状态与自动迁移 | Wave 1 | Track B | T0.3 | `src/core/regex/**`, `src/core/migration/**`, `src/core/config/**`, `tests/unit/regex/**`, `tests/unit/migration/**` | `[x]` |
+| **T1.3** | WI 装饰器解析、四类分流与尾部雷达 | Wave 1 | Track C | T0.3 | `src/core/lore/**`, `tests/unit/lore/**` | `[x]` |
+| **T1.4** | LLM 传输、SSE 解析、缓存断点与限流 | Wave 1 | Track D | T0.3 | `src/core/llm/**`, `tests/unit/llm/**` | `[x]` |
 | **T2.1** | 三层上下文组装、持久轨与高低水位压缩 | Wave 2 | Track A | T1.1, T1.2, T1.3 | `src/core/context/**`, `tests/unit/context/**` | `[ ]` |
 | **T2.2** | 内置工具集、斜杠包装模型与 JS 沙箱 | Wave 2 | Track B | T1.1, T1.3 | `src/core/tools/**`, `src/sandbox/**`, `tests/unit/tools/**`, `tests/browser/sandbox/**` | `[ ]` |
 | **T2.3** | Shadow DOM 独立 `<dialog>` 壳与双主题 | Wave 2 | Track C | T1.2 | `src/ui/shell/**`, `src/ui/components/**`, `src/ui/store/**`, `src/ui/dev-preview.tsx` | `[ ]` |
