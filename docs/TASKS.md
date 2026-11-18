@@ -47,9 +47,9 @@
 | **T1.2** | 自研正则引擎、配置状态与自动迁移 | Wave 1 | Track B | T0.3 | `src/core/regex/**`, `src/core/migration/**`, `src/core/config/**`, `tests/unit/regex/**`, `tests/unit/migration/**` | `[x]` |
 | **T1.3** | WI 装饰器解析、四类分流与尾部雷达 | Wave 1 | Track C | T0.3 | `src/core/lore/**`, `tests/unit/lore/**` | `[x]` |
 | **T1.4** | LLM 传输、SSE 解析、缓存断点与限流 | Wave 1 | Track D | T0.3 | `src/core/llm/**`, `tests/unit/llm/**` | `[x]` |
-| **T2.1** | 三层上下文组装、持久轨与高低水位压缩 | Wave 2 | Track A | T1.1, T1.2, T1.3 | `src/core/context/**`, `tests/unit/context/**` | `[ ]` |
-| **T2.2** | 内置工具集、斜杠包装模型与 JS 沙箱 | Wave 2 | Track B | T1.1, T1.3 | `src/core/tools/**`, `src/sandbox/**`, `tests/unit/tools/**`, `tests/browser/sandbox/**` | `[ ]` |
-| **T2.3** | Shadow DOM 独立 `<dialog>` 壳与双主题 | Wave 2 | Track C | T1.2 | `src/ui/shell/**`, `src/ui/components/**`, `src/ui/store/**`, `src/ui/dev-preview.tsx` | `[ ]` |
+| **T2.1** | 三层上下文组装、持久轨与高低水位压缩 | Wave 2 | Track A | T1.1, T1.2, T1.3 | `src/core/context/**`, `tests/unit/context/**` | `[x]` |
+| **T2.2** | 内置工具集、斜杠包装模型与 JS 沙箱 | Wave 2 | Track B | T1.1, T1.3 | `src/core/tools/**`, `src/sandbox/**`, `tests/unit/tools/**`, `tests/browser/sandbox/**` | `[x]` |
+| **T2.3** | Shadow DOM 独立 `<dialog>` 壳与双主题 | Wave 2 | Track C | T1.2 | `src/ui/shell/**`, `src/ui/components/**`, `src/ui/store/**`, `src/ui/dev-preview.tsx` | `[x]` |
 | **T3.1** | AgentRunner、四阶段管线与三级屏障 | Wave 3 | Track A | T1.4, T2.1, T2.2 | `src/core/agents/**`, `src/core/triggers/**`, `src/core/logger/**`, `tests/unit/agents/**`, `tests/unit/triggers/**` | `[ ]` |
 | **T3.2** | 「当前会话」3 视图与 `<agentic-capsule>` | Wave 3 | Track B | T2.1, T2.3 | `src/ui/session/**`, `src/ui/capsule/**` | `[ ]` |
 | **T3.3** | 「预设与系统」6 视图与迁移/嵌卡弹窗 | Wave 3 | Track C | T2.2, T2.3 | `src/ui/studio/**` | `[ ]` |

@@ -16,8 +16,8 @@
   },
   "scripts": {
     "build": "webpack --mode production",
-    "dev:ui": "webpack --entry ./src/ui/dev-preview.tsx --output-filename dev-preview.js --mode development --watch",
-    "build:dev-ui": "webpack --entry ./src/ui/dev-preview.tsx --output-filename dev-preview.js --mode development",
+    "dev:ui": "webpack --entry-reset --entry ./src/ui/dev-preview.tsx --output-filename dev-preview.js --mode development --watch",
+    "build:dev-ui": "webpack --entry-reset --entry ./src/ui/dev-preview.tsx --output-filename dev-preview.js --mode development",
     "lint": "eslint src tests --ext .ts,.tsx --no-error-on-unmatched-pattern",
     "lint:fix": "eslint src tests --ext .ts,.tsx --fix --no-error-on-unmatched-pattern",
     "test": "vitest run --project unit",

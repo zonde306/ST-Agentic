@@ -1,0 +1,833 @@
+import type { HostBridge, LLMRequest } from '@/core/bridge';
+import { DEFAULT_MAIN_AGENT_ID, createDefaultPromptBlocks } from '@/core/config';
+import {
+    buildCoreManifest,
+    classifyEntry,
+    type CoreManifestResult,
+    type TailRadar,
+} from '@/core/lore';
+import {
+    RegexPipeline,
+    applyRegexRules,
+    type RegexSender,
+} from '@/core/regex';
+import type {
+    AgentProfile,
+    CanonicalContentPart,
+    CanonicalMessage,
+    CanonicalToolSchema,
+    ChatMessageSnapshot,
+    ClassifiedLoreEntry,
+    MessageTarget,
+    PromptBlock,
+    RadarScanResult,
+    RawLoreEntry,
+    RegexRule,
+    WICategory,
+} from '@/core/types';
+import { canonicalClone, stripJsonSchemaMeta } from '@/core/utils';
+import { TrajectoryStore } from './trajectory-store';
+import { estimateRequestTokens, groupLayer1Turns } from './watermark-compactor';
+
+export interface StaticPrefixResult {
+    tools: CanonicalToolSchema[];
+    messages: CanonicalMessage[];
+    layer0EndIndex: number;
+    coreManifest: CoreManifestResult;
+    systemRuleCount: number;
+}
+
+export interface ContextLayerStats {
+    layer0MessageCount: number;
+    layer1MessageCount: number;
+    layer2MessageCount: number;
+    totalMessageCount: number;
+    layer0EndIndex: number;
+    layer1EndIndex: number;
+    estimatedTokens: number;
+}
+
+export interface AssembledContext {
+    request: LLMRequest;
+    layer0Messages: CanonicalMessage[];
+    layer1Messages: CanonicalMessage[];
+    layer2Messages: CanonicalMessage[];
+    cacheBreakpoints: number[];
+    coreManifest: CoreManifestResult;
+    systemRuleCount: number;
+    stats: ContextLayerStats;
+}
+
+export type RegexSource = RegexPipeline | readonly RegexRule[];
+
+export interface ContextAssembleInput {
+    agent: AgentProfile;
+    connectionId?: string;
+    tools?: readonly CanonicalToolSchema[];
+
+    // Layer 0 inputs
+    characterFields?: Record<string, string>;
+    personaDescription?: string;
+    loreEntries?: readonly (RawLoreEntry | ClassifiedLoreEntry)[];
+    wiRouterOverrides?: Record<string, WICategory>;
+    presetFiles?: Record<string, string>;
+    hollowThreshold?: number;
+    systemBasePrompt?: string;
+    forceRecompilePrefix?: boolean;
+
+    // Layer 1 inputs
+    trajectoryStore?: TrajectoryStore;
+    /** Recent chat turns/messages used when `agent.sessionMode === 'ephemeral'`. */
+    recentChatMessages?: readonly (CanonicalMessage | ChatMessageSnapshot)[];
+
+    // Layer 2 inputs (new turn vs active in-flight continuation)
+    userInput?: string | CanonicalContentPart[];
+    userName?: string;
+    turnBrief?: string;
+    dynamicReminders?: readonly string[];
+    /** Automatically evaluate Category ④ `dynamic_at_depth` lore entries into Layer 2 (default `true`). */
+    includeCategory4DynamicEntries?: boolean;
+    loreHint?: string | RadarScanResult;
+    /** Active turn messages during multi-step tool loop (bypasses regenerating Layer 2). */
+    inFlightMessages?: readonly CanonicalMessage[];
+
+    // Shared runtime services
+    hostBridge?: HostBridge;
+    regex?: RegexSource;
+    vars?: Record<string, unknown>;
+    macroOverrides?: Record<string, string>;
+    signal?: AbortSignal;
+}
+
+export interface AssembleWithHostInput extends Omit<ContextAssembleInput, 'hostBridge'> {
+    hostBridge: HostBridge;
+    tailRadar?: TailRadar;
+    /** Target coordinates passed to `TailRadar.scan` for `worldinfo` override checking. */
+    target?: MessageTarget;
+    /** Whether to automatically run `TailRadar` when `tailRadar` is provided and `loreHint` is omitted (default `true`). */
+    runTailRadar?: boolean;
+}
+
+export interface FinalizeTurnInput {
+    trajectoryStore: TrajectoryStore;
+    agentId?: string;
+    target: MessageTarget;
+    /** Messages produced during the turn before the final assistant reply (Layer 2 + tool call/result chain). */
+    turnMessages: readonly CanonicalMessage[];
+    /** Final assistant reply for the turn (will run `ingest` regex once before freezing). */
+    finalAssistantMessage?: CanonicalMessage;
+    regex?: RegexSource;
+}
+
+function compareCodeUnits(a: string, b: string): number {
+    if (a < b) {
+        return -1;
+    }
+    if (a > b) {
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * Deterministically sort tool schemas by name and canonicalize parameter JSON Schemas
+ * (stripping `$schema`/`$id` and sorting keys recursively) for KV Cache invariance.
+ */
+export function canonicalizeTools(
+    tools: readonly CanonicalToolSchema[] = [],
+): CanonicalToolSchema[] {
+    const sorted = [...tools].sort((a, b) => compareCodeUnits(a.name, b.name));
+    return sorted.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        parameters: stripJsonSchemaMeta(canonicalClone(tool.parameters ?? {})),
+        ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
+    }));
+}
+
+/** Apply `ingest`-stage regex rules once (never runs `display` or `lore_read` rules). */
+export function applyIngestRegexText(
+    text: string,
+    sender: Extract<RegexSender, 'user' | 'assistant'>,
+    regex?: RegexSource,
+): string {
+    if (!regex || !text) {
+        return text;
+    }
+    if (regex instanceof RegexPipeline) {
+        return regex.run(text, { stage: 'ingest', sender });
+    }
+    if (regex.length === 0) {
+        return text;
+    }
+    return applyRegexRules(text, regex, { stage: 'ingest', sender });
+}
+
+/** Apply `ingest`-stage regex rules once to a `CanonicalMessage` before freezing into Layer 1. */
+export function ingestCanonicalMessage(
+    message: CanonicalMessage,
+    regex?: RegexSource,
+): CanonicalMessage {
+    const cloned = canonicalClone(message);
+    if (!regex || (cloned.role !== 'user' && cloned.role !== 'assistant')) {
+        return cloned;
+    }
+    const sender: Extract<RegexSender, 'user' | 'assistant'> = cloned.role;
+
+    if (typeof cloned.content === 'string') {
+        cloned.content = applyIngestRegexText(cloned.content, sender, regex);
+        return cloned;
+    }
+
+    cloned.content = cloned.content.map((part) => {
+        if (part.type === 'text') {
+            return {
+                ...part,
+                text: applyIngestRegexText(part.text, sender, regex),
+            };
+        }
+        return part;
+    });
+    return cloned;
+}
+
+function isClassifiedLoreEntry(
+    item: RawLoreEntry | ClassifiedLoreEntry,
+): item is ClassifiedLoreEntry {
+    return 'entry' in item && 'category' in item && 'vfsPath' in item;
+}
+
+function classifyAllEntries(
+    entries: readonly (RawLoreEntry | ClassifiedLoreEntry)[] | undefined,
+    overrides?: Record<string, WICategory>,
+): ClassifiedLoreEntry[] {
+    if (!entries || entries.length === 0) {
+        return [];
+    }
+    const result: ClassifiedLoreEntry[] = [];
+    for (const item of entries) {
+        if (isClassifiedLoreEntry(item)) {
+            if (overrides) {
+                result.push(classifyEntry(item.entry, { overrides }));
+            } else {
+                result.push(item);
+            }
+        } else {
+            result.push(classifyEntry(item, { overrides }));
+        }
+    }
+    return result;
+}
+
+function isChatMessageSnapshot(
+    msg: CanonicalMessage | ChatMessageSnapshot,
+): msg is ChatMessageSnapshot {
+    return 'mes' in msg && 'isUser' in msg;
+}
+
+function toCanonicalHistoryMessages(
+    rawMessages: readonly (CanonicalMessage | ChatMessageSnapshot)[],
+    regex?: RegexSource,
+): CanonicalMessage[] {
+    const out: CanonicalMessage[] = [];
+    for (const item of rawMessages) {
+        if (isChatMessageSnapshot(item)) {
+            if (item.isSystem) {
+                continue;
+            }
+            const role: 'user' | 'assistant' = item.isUser ? 'user' : 'assistant';
+            const content = applyIngestRegexText(item.mes ?? '', role, regex);
+            out.push({
+                role,
+                content,
+                ...(item.name ? { name: item.name } : {}),
+            });
+        } else {
+            out.push(canonicalClone(item));
+        }
+    }
+    return out;
+}
+
+function buildLayer2MacroOverrides(
+    vars?: Record<string, unknown>,
+    macroOverrides?: Record<string, string>,
+): Record<string, string> | undefined {
+    if (!vars && !macroOverrides) {
+        return undefined;
+    }
+    const merged: Record<string, string> = {};
+    if (vars) {
+        for (const [k, v] of Object.entries(vars)) {
+            if (v === undefined || v === null) {
+                merged[`var:${k}`] = '';
+            } else if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+                merged[`var:${k}`] = String(v);
+            } else {
+                merged[`var:${k}`] = JSON.stringify(v);
+            }
+        }
+    }
+    if (macroOverrides) {
+        Object.assign(merged, macroOverrides);
+    }
+    return merged;
+}
+
+function substituteText(
+    text: string,
+    hostBridge?: HostBridge,
+    overrides?: Record<string, string>,
+): string {
+    if (!text || !hostBridge) {
+        return text;
+    }
+    return hostBridge.substituteMacros(text, overrides);
+}
+
+function wrapXmlIfNeeded(tag: string, body: string): string {
+    const trimmed = body.trim();
+    if (!trimmed) {
+        return '';
+    }
+    if (trimmed.startsWith(`<${tag}>`) && trimmed.endsWith(`</${tag}>`)) {
+        return trimmed;
+    }
+    return `<${tag}>\n${trimmed}\n</${tag}>`;
+}
+
+/**
+ * Three-layer KV-cache-friendly Context Assembler:
+ * - **Layer 0 (Static Prefix)**: canonical sorted tools + decoupled multi-character/world-simulator
+ *   system base + Category ① `system_rule` compiled block + `Core Manifest` + `prefix` `PromptBlock`s.
+ * - **Layer 1 (Frozen Trajectory)**: immutable finalized turns (`persistent` via `TrajectoryStore`,
+ *   or sliding `ephemeralWindowSize` recent turns for `ephemeral` agents).
+ * - **Layer 2 (Tail-Only Dynamic Zone)**: current user input + `<turn-brief>` + Category ④ dynamic
+ *   reminders + `<lore-hint>` + `tail` `PromptBlock`s.
+ */
+export class ContextAssembler {
+    private readonly defaultSystemBase: string;
+
+    constructor(options: { defaultSystemBase?: string } = {}) {
+        this.defaultSystemBase = options.defaultSystemBase ?? createDefaultPromptBlocks()[0].content;
+    }
+
+    /**
+     * Compile the deterministic Layer 0 static prefix (`tools` + `messages` + `layer0EndIndex`).
+     */
+    compileStaticPrefix(input: {
+        agent: AgentProfile;
+        tools?: readonly CanonicalToolSchema[];
+        characterFields?: Record<string, string>;
+        personaDescription?: string;
+        classifiedLore?: readonly ClassifiedLoreEntry[];
+        presetFiles?: Record<string, string>;
+        hollowThreshold?: number;
+        systemBasePrompt?: string;
+        hostBridge?: HostBridge;
+    }): StaticPrefixResult {
+        const canonicalTools = canonicalizeTools(input.tools);
+        const promptBlocks = input.agent.promptBlocks ?? [];
+        const layer0Messages: CanonicalMessage[] = [];
+
+        // 1. Decoupled System Base (multi-character / world-simulator safe)
+        const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
+        let rawBaseText = '';
+        if (input.systemBasePrompt !== undefined) {
+            rawBaseText = input.systemBasePrompt;
+        } else if (systemBaseBlock) {
+            rawBaseText = systemBaseBlock.enabled ? systemBaseBlock.content : '';
+        } else {
+            rawBaseText = this.defaultSystemBase;
+        }
+        const resolvedBase = substituteText(rawBaseText, input.hostBridge).trim();
+        if (resolvedBase) {
+            layer0Messages.push({
+                role: systemBaseBlock?.role ?? 'system',
+                content: resolvedBase,
+            });
+        }
+
+        // 2. Category ① `system_rule` compiled block
+        const classified = input.classifiedLore ?? [];
+        const systemRules = classified
+            .filter((item) => item.category === 'system_rule' && !item.entry.disable)
+            .sort(
+                (a, b) =>
+                    b.entry.order - a.entry.order
+                    || a.entry.depth - b.entry.depth
+                    || compareCodeUnits(a.entry.world, b.entry.world)
+                    || a.entry.uid - b.entry.uid,
+            );
+
+        const renderedRules: string[] = [];
+        for (const item of systemRules) {
+            const text = substituteText(item.cleanContent, input.hostBridge).trim();
+            if (!text) {
+                continue;
+            }
+            const title = item.entry.comment?.trim();
+            renderedRules.push(title ? `### ${title}\n${text}` : text);
+        }
+
+        if (renderedRules.length > 0) {
+            layer0Messages.push({
+                role: 'system',
+                content: `<system-rules>\n${renderedRules.join('\n\n')}\n</system-rules>`,
+            });
+        }
+
+        // 3. Core Manifest (/character/* + Category ② core_manifest + hollow-card notice)
+        const coreEntries = classified.filter(
+            (item) => item.category === 'core_manifest' && !item.entry.disable,
+        );
+        const coreManifest = buildCoreManifest({
+            characterFields: input.characterFields ?? {},
+            coreEntries,
+            personaDescription: input.personaDescription,
+            hollowThreshold: input.hollowThreshold,
+        });
+
+        let manifestText = coreManifest.text;
+        const presetFileNames = Object.keys(input.presetFiles ?? {})
+            .map((name) => name.replace(/^\/+/, ''))
+            .filter(Boolean)
+            .sort(compareCodeUnits);
+        if (presetFileNames.length > 0) {
+            const presetLines = presetFileNames.map((name) => `- /preset/${name}`);
+            manifestText = manifestText.replace(
+                /<\/core-manifest>$/,
+                `预设参考文档（/preset/*，按需调用 read_file 阅读）：\n${presetLines.join('\n')}\n</core-manifest>`,
+            );
+        }
+
+        layer0Messages.push({
+            role: 'system',
+            content: manifestText,
+        });
+
+        // 4. Additional `prefix` PromptBlocks (preserving explicit order and role)
+        const prefixBlocks = promptBlocks.filter(
+            (b: PromptBlock) =>
+                b.enabled
+                && b.placement === 'prefix'
+                && b.id !== 'system_base'
+                && b.content.trim().length > 0,
+        );
+        for (const block of prefixBlocks) {
+            const rendered = substituteText(block.content, input.hostBridge).trim();
+            if (rendered) {
+                layer0Messages.push({
+                    role: block.role,
+                    content: rendered,
+                });
+            }
+        }
+
+        return {
+            tools: canonicalTools,
+            messages: layer0Messages,
+            layer0EndIndex: layer0Messages.length - 1,
+            coreManifest,
+            systemRuleCount: renderedRules.length,
+        };
+    }
+
+    /**
+     * Assemble a complete three-layer `LLMRequest` (and metadata) synchronously.
+     */
+    assemble(input: ContextAssembleInput): AssembledContext {
+        const hostBridge = input.hostBridge;
+        const characterFields = input.characterFields ?? hostBridge?.getCharacterFields() ?? {};
+        const personaDescription = input.personaDescription ?? hostBridge?.getPersonaDescription() ?? '';
+        const classified = classifyAllEntries(input.loreEntries, input.wiRouterOverrides);
+
+        let layer0Messages: CanonicalMessage[];
+        let tools: CanonicalToolSchema[];
+        let layer0EndIndex: number;
+        let coreManifest: CoreManifestResult;
+        let systemRuleCount: number;
+
+        const isPersistent = input.agent.sessionMode === 'persistent';
+        const existingFrozen = isPersistent && !input.forceRecompilePrefix
+            ? input.trajectoryStore?.getFrozenPrefix(input.agent.id) ?? null
+            : null;
+
+        if (existingFrozen) {
+            tools = canonicalClone(existingFrozen.tools) as CanonicalToolSchema[];
+            layer0Messages = canonicalClone(existingFrozen.messages) as CanonicalMessage[];
+            layer0EndIndex = existingFrozen.layer0EndIndex;
+            const coreEntries = classified.filter(
+                (item) => item.category === 'core_manifest' && !item.entry.disable,
+            );
+            coreManifest = buildCoreManifest({
+                characterFields,
+                coreEntries,
+                personaDescription,
+                hollowThreshold: input.hollowThreshold,
+            });
+            systemRuleCount = classified.filter(
+                (item) => item.category === 'system_rule' && !item.entry.disable,
+            ).length;
+        } else {
+            const prefix = this.compileStaticPrefix({
+                agent: input.agent,
+                tools: input.tools,
+                characterFields,
+                personaDescription,
+                classifiedLore: classified,
+                presetFiles: input.presetFiles,
+                hollowThreshold: input.hollowThreshold,
+                systemBasePrompt: input.systemBasePrompt,
+                hostBridge,
+            });
+            tools = prefix.tools;
+            layer0Messages = prefix.messages;
+            layer0EndIndex = prefix.layer0EndIndex;
+            coreManifest = prefix.coreManifest;
+            systemRuleCount = prefix.systemRuleCount;
+
+            if (isPersistent && input.trajectoryStore) {
+                input.trajectoryStore.setFrozenPrefix(
+                    {
+                        tools,
+                        messages: layer0Messages,
+                        layer0EndIndex,
+                    },
+                    input.agent.id,
+                );
+            }
+        }
+
+        // Layer 1: Frozen trajectory (persistent) or sliding recent turns (ephemeral)
+        let layer1Messages: CanonicalMessage[];
+        if (isPersistent) {
+            const stored = input.trajectoryStore?.getMessages(input.agent.id) ?? [];
+            layer1Messages = stored.map((m) => canonicalClone(m));
+        } else {
+            const windowSize = Math.max(0, input.agent.ephemeralWindowSize ?? 6);
+            if (windowSize === 0 || !input.recentChatMessages?.length) {
+                layer1Messages = [];
+            } else {
+                const canonicalHistory = toCanonicalHistoryMessages(input.recentChatMessages, input.regex);
+                const { turns } = groupLayer1Turns(canonicalHistory);
+                layer1Messages = turns
+                    .slice(-windowSize)
+                    .flatMap((t) => t.messages.map((m) => canonicalClone(m)));
+            }
+        }
+
+        // Layer 2: Tail-Only Dynamic Zone (or frozen in-flight messages during tool loop)
+        const layer2Messages = input.inFlightMessages !== undefined
+            ? input.inFlightMessages.map((m) => canonicalClone(m))
+            : this.buildLayer2Messages(input, classified);
+
+        const allMessages = [...layer0Messages, ...layer1Messages, ...layer2Messages];
+        const layer1EndIndex = layer0Messages.length + layer1Messages.length - 1;
+
+        const cacheBreakpoints = this.computeCacheBreakpoints({
+            layer0Count: layer0Messages.length,
+            layer0EndIndex,
+            layer1Count: layer1Messages.length,
+            layer1EndIndex,
+            isPersistent,
+            trajectoryStore: input.trajectoryStore,
+            agentId: input.agent.id,
+        });
+
+        const request: LLMRequest = {
+            connectionId: input.connectionId ?? input.agent.connectionId,
+            messages: allMessages,
+            tools,
+            ...(cacheBreakpoints.length > 0 ? { cacheBreakpoints } : {}),
+            ...(input.signal ? { signal: input.signal } : {}),
+        };
+
+        const estimatedTokens = estimateRequestTokens(allMessages, tools);
+
+        return {
+            request,
+            layer0Messages,
+            layer1Messages,
+            layer2Messages,
+            cacheBreakpoints,
+            coreManifest,
+            systemRuleCount,
+            stats: {
+                layer0MessageCount: layer0Messages.length,
+                layer1MessageCount: layer1Messages.length,
+                layer2MessageCount: layer2Messages.length,
+                totalMessageCount: allMessages.length,
+                layer0EndIndex,
+                layer1EndIndex,
+                estimatedTokens,
+            },
+        };
+    }
+
+    /**
+     * Async convenience wrapper pulling lorebooks/character/persona from `HostBridge`
+     * and optionally scanning Category ③ entries via `TailRadar` against `TrajectoryStore`'s `Read-Set`.
+     */
+    async assembleWithHost(input: AssembleWithHostInput): Promise<AssembledContext> {
+        const { hostBridge, tailRadar, target, runTailRadar = true, ...rest } = input;
+
+        let loreEntries = rest.loreEntries;
+        if (!loreEntries) {
+            const books = await hostBridge.listEnabledLorebooks();
+            const raw: RawLoreEntry[] = [];
+            for (const [world, entries] of books.entries()) {
+                for (const entry of entries) {
+                    raw.push(entry.world ? entry : { ...entry, world });
+                }
+            }
+            loreEntries = raw;
+        }
+
+        let loreHint = rest.loreHint;
+        const shouldScanRadar =
+            runTailRadar
+            && loreHint === undefined
+            && rest.inFlightMessages === undefined
+            && tailRadar !== undefined;
+
+        if (shouldScanRadar && tailRadar) {
+            const userText = extractUserTextForRadar(rest.userInput);
+            if (userText) {
+                const readSet = rest.agent.sessionMode === 'persistent'
+                    ? rest.trajectoryStore?.getReadSet(rest.agent.id)
+                    : undefined;
+                const recentTextHistory = extractRecentTexts(
+                    rest.agent.sessionMode === 'persistent'
+                        ? (rest.trajectoryStore?.getMessages(rest.agent.id) ?? [])
+                        : [],
+                );
+                const classified = classifyAllEntries(loreEntries, rest.wiRouterOverrides);
+                loreHint = await tailRadar.scan(classified, {
+                    input: userText,
+                    recentMessages: recentTextHistory,
+                    readSet,
+                    target,
+                    vars: rest.vars,
+                    macroOverrides: rest.macroOverrides,
+                });
+            }
+        }
+
+        return this.assemble({
+            ...rest,
+            loreEntries,
+            loreHint,
+            hostBridge,
+        });
+    }
+
+    /**
+     * Append a completed turn into `TrajectoryStore` (applying `ingest` regex ONCE to
+     * `finalAssistantMessage` before freezing) and record the `(messageId, swipeId)` checkpoint.
+     */
+    finalizeTurn(input: FinalizeTurnInput): void {
+        const agentId = input.agentId ?? DEFAULT_MAIN_AGENT_ID;
+        const messagesToAppend: CanonicalMessage[] = input.turnMessages.map((m) => canonicalClone(m));
+
+        if (input.finalAssistantMessage) {
+            messagesToAppend.push(
+                ingestCanonicalMessage(input.finalAssistantMessage, input.regex),
+            );
+        }
+
+        input.trajectoryStore.appendTurn(messagesToAppend, agentId);
+        input.trajectoryStore.recordCheckpoint(input.target, agentId);
+    }
+
+    private buildLayer2Messages(
+        input: ContextAssembleInput,
+        classified: readonly ClassifiedLoreEntry[],
+    ): CanonicalMessage[] {
+        const layer2Messages: CanonicalMessage[] = [];
+        const macroOverrides = buildLayer2MacroOverrides(input.vars, input.macroOverrides);
+
+        // 1. Dynamic reminders: Category ④ `dynamic_at_depth` + explicit `dynamicReminders`
+        const reminderLines: string[] = [];
+        if (input.includeCategory4DynamicEntries !== false) {
+            const dynamicEntries = classified
+                .filter(
+                    (item) =>
+                        item.category === 'dynamic_or_trigger'
+                        && !item.entry.disable
+                        && item.reason === 'dynamic_at_depth',
+                )
+                .sort(
+                    (a, b) =>
+                        b.entry.order - a.entry.order
+                        || a.entry.depth - b.entry.depth
+                        || compareCodeUnits(a.entry.world, b.entry.world)
+                        || a.entry.uid - b.entry.uid,
+                );
+            for (const item of dynamicEntries) {
+                const rendered = substituteText(item.cleanContent, input.hostBridge, macroOverrides).trim();
+                if (rendered) {
+                    reminderLines.push(rendered);
+                }
+            }
+        }
+        if (input.dynamicReminders) {
+            for (const line of input.dynamicReminders) {
+                const trimmed = line.trim();
+                if (trimmed) {
+                    reminderLines.push(trimmed);
+                }
+            }
+        }
+
+        const turnBriefXml = input.turnBrief ? wrapXmlIfNeeded('turn-brief', input.turnBrief) : '';
+        const remindersXml = reminderLines.length > 0
+            ? `<dynamic-reminders>\n${reminderLines.join('\n')}\n</dynamic-reminders>`
+            : '';
+        const loreHintXml = typeof input.loreHint === 'string'
+            ? input.loreHint.trim()
+            : (input.loreHint?.hintXml?.trim() ?? '');
+
+        const tailBlocks = [turnBriefXml, remindersXml, loreHintXml].filter((s) => s.length > 0);
+        const tailSuffix = tailBlocks.join('\n\n');
+
+        // 2. User input (ingested ONCE on entry) + tail blocks
+        if (Array.isArray(input.userInput)) {
+            const ingestedParts = input.userInput.map((part) => {
+                if (part.type === 'text') {
+                    return {
+                        ...part,
+                        text: applyIngestRegexText(part.text, 'user', input.regex),
+                    };
+                }
+                return { ...part };
+            });
+            if (tailSuffix) {
+                ingestedParts.push({ type: 'text', text: tailSuffix });
+            }
+            if (ingestedParts.length > 0) {
+                layer2Messages.push({
+                    role: 'user',
+                    content: ingestedParts,
+                    ...(input.userName ? { name: input.userName } : {}),
+                });
+            }
+        } else {
+            const rawText = input.userInput ?? '';
+            const ingestedUser = rawText
+                ? applyIngestRegexText(rawText, 'user', input.regex)
+                : '';
+            const sections = [ingestedUser, tailSuffix].filter((s) => s.length > 0);
+            if (sections.length > 0) {
+                layer2Messages.push({
+                    role: 'user',
+                    content: sections.join('\n\n'),
+                    ...(input.userName ? { name: input.userName } : {}),
+                });
+            }
+        }
+
+        // 3. Enabled `tail` PromptBlocks
+        const tailPromptBlocks = (input.agent.promptBlocks ?? []).filter(
+            (b: PromptBlock) =>
+                b.enabled && b.placement === 'tail' && b.content.trim().length > 0,
+        );
+        for (const block of tailPromptBlocks) {
+            const rendered = substituteText(block.content, input.hostBridge, macroOverrides).trim();
+            if (rendered) {
+                layer2Messages.push({
+                    role: block.role,
+                    content: rendered,
+                });
+            }
+        }
+
+        return layer2Messages;
+    }
+
+    private computeCacheBreakpoints(params: {
+        layer0Count: number;
+        layer0EndIndex: number;
+        layer1Count: number;
+        layer1EndIndex: number;
+        isPersistent: boolean;
+        trajectoryStore?: TrajectoryStore;
+        agentId: string;
+    }): number[] {
+        const points: number[] = [];
+        const seen = new Set<number>();
+
+        const pushPoint = (idx: number) => {
+            if (idx >= 0 && !seen.has(idx)) {
+                seen.add(idx);
+                points.push(idx);
+            }
+        };
+
+        pushPoint(params.layer0EndIndex);
+
+        if (params.layer1Count > 0) {
+            if (params.isPersistent && params.trajectoryStore) {
+                for (const count of params.trajectoryStore.getTurnEndCounts(params.agentId)) {
+                    const globalIdx = params.layer0Count + count - 1;
+                    if (globalIdx > params.layer0EndIndex && globalIdx <= params.layer1EndIndex) {
+                        pushPoint(globalIdx);
+                    }
+                }
+            }
+            if (params.layer1EndIndex > params.layer0EndIndex) {
+                pushPoint(params.layer1EndIndex);
+            }
+        }
+
+        return points;
+    }
+}
+
+function extractUserTextForRadar(
+    userInput: string | CanonicalContentPart[] | undefined,
+): string {
+    if (!userInput) {
+        return '';
+    }
+    if (typeof userInput === 'string') {
+        return userInput;
+    }
+    return userInput
+        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+        .map((p) => p.text)
+        .join('\n');
+}
+
+function stripTailMetadataTags(text: string): string {
+    return text
+        .replace(/<turn-brief>[\s\S]*?<\/turn-brief>/g, '')
+        .replace(/<dynamic-reminders>[\s\S]*?<\/dynamic-reminders>/g, '')
+        .replace(/<lore-hint>[\s\S]*?<\/lore-hint>/g, '')
+        .trim();
+}
+
+function extractRecentTexts(messages: readonly CanonicalMessage[]): string[] {
+    const texts: string[] = [];
+    for (const msg of messages) {
+        if (msg.role === 'user' || msg.role === 'assistant') {
+            if (typeof msg.content === 'string') {
+                const cleaned = stripTailMetadataTags(msg.content);
+                if (cleaned) {
+                    texts.push(cleaned);
+                }
+            } else {
+                const text = stripTailMetadataTags(
+                    msg.content
+                        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+                        .map((p) => p.text)
+                        .join('\n'),
+                );
+                if (text) {
+                    texts.push(text);
+                }
+            }
+        }
+    }
+    return texts;
+}
