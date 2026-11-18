@@ -1,0 +1,1701 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ST-Agentic UI 原型</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    .thin-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+    .thin-scroll::-webkit-scrollbar-track { background: transparent; }
+    .thin-scroll::-webkit-scrollbar-thumb {
+      background: color-mix(in srgb, var(--muted-foreground) 30%, transparent);
+      border-radius: 9999px;
+    }
+    .pill-soft-primary {
+      background: color-mix(in srgb, var(--primary) 14%, transparent);
+      color: var(--primary);
+      border-color: color-mix(in srgb, var(--primary) 32%, transparent);
+    }
+    .pill-soft-success {
+      background: color-mix(in srgb, var(--success) 14%, transparent);
+      color: var(--success);
+      border-color: color-mix(in srgb, var(--success) 32%, transparent);
+    }
+    .pill-soft-warning {
+      background: color-mix(in srgb, var(--warning) 14%, transparent);
+      color: var(--warning);
+      border-color: color-mix(in srgb, var(--warning) 32%, transparent);
+    }
+    .pill-soft-error {
+      background: color-mix(in srgb, var(--error) 14%, transparent);
+      color: var(--error);
+      border-color: color-mix(in srgb, var(--error) 32%, transparent);
+    }
+    .diff-del {
+      background: color-mix(in srgb, var(--error) 14%, transparent);
+      color: var(--error);
+    }
+    .diff-add {
+      background: color-mix(in srgb, var(--success) 14%, transparent);
+      color: var(--success);
+    }
+    .shadow-boundary-badge {
+      background: color-mix(in srgb, var(--primary) 10%, transparent);
+      border: 1px dashed color-mix(in srgb, var(--primary) 40%, transparent);
+    }
+    .mobile-shell {
+      width: 390px;
+      height: 780px;
+      max-width: 100%;
+      border-radius: 28px;
+      border: 6px solid var(--border);
+      overflow: hidden;
+      box-shadow: 0 20px 50px color-mix(in srgb, var(--foreground) 15%, transparent);
+    }
+    .mobile-control {
+      font-size: 16px !important;
+      min-height: 40px;
+    }
+    .touch-target {
+      min-height: 40px;
+      min-width: 40px;
+    }
+
+    /* Shadow DOM 独立 Dark / Light 双主题色板（默认 Dark 对齐 SillyTavern 默认深色风格） */
+    #theme-scope[data-theme="dark"] {
+      --background: #14161b;
+      --sidebar: #1b1e25;
+      --content: #101216;
+      --card: #20242c;
+      --border: #2f3542;
+      --card-border: #2a303c;
+      --foreground: #e6e9ef;
+      --muted-foreground: #9aa3b2;
+      --primary: #6c8cff;
+      --primary-foreground: #ffffff;
+      --secondary: #2a303c;
+      --secondary-foreground: #e6e9ef;
+      --success: #34d399;
+      --warning: #fbbf24;
+      --error: #f87171;
+      color-scheme: dark;
+    }
+    #theme-scope[data-theme="light"] {
+      --background: #f4f6fa;
+      --sidebar: #eef1f6;
+      --content: #f8fafc;
+      --card: #ffffff;
+      --border: #dbe1eb;
+      --card-border: #e5eaf2;
+      --foreground: #181c24;
+      --muted-foreground: #5f697a;
+      --primary: #3b66f5;
+      --primary-foreground: #ffffff;
+      --secondary: #e8edf5;
+      --secondary-foreground: #181c24;
+      --success: #10b981;
+      --warning: #d97706;
+      --error: #dc2626;
+      color-scheme: light;
+    }
+  </style>
+</head>
+<body class="m-0 p-0 antialiased">
+<div id="theme-scope" data-theme="dark" class="bg-[var(--background)] text-[var(--foreground)] min-h-screen flex flex-col transition-colors duration-150">
+
+  <!-- 顶部原型场景切换栏 -->
+  <header class="shrink-0 bg-[var(--sidebar)] border-b border-[var(--border)] px-3 sm:px-5 py-2.5 flex flex-wrap items-center justify-between gap-2">
+    <div class="flex items-center gap-2.5">
+      <div class="w-7 h-7 rounded-lg bg-[var(--primary)] text-[var(--primary-foreground)] flex items-center justify-center shadow-sm">
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+      </div>
+      <div>
+        <div class="text-sm font-semibold leading-tight flex items-center gap-2">
+          <span>ST-Agentic UI 原型</span>
+          <span class="text-[11px] px-1.5 py-0.5 rounded border border-[var(--border)] bg-[var(--content)] text-[var(--muted-foreground)] font-normal">Shadow DOM 独立主题</span>
+        </div>
+        <div class="text-[11px] text-[var(--muted-foreground)]">100% 保留 ST 原生聊天 UI · 独立深/浅双色控制台与移动端页面栈</div>
+      </div>
+    </div>
+
+    <div class="flex flex-wrap items-center gap-2">
+      <!-- Dark / Light 主题切换 -->
+      <div class="flex items-center gap-1 bg-[var(--content)] p-1 rounded-lg border border-[var(--border)] text-xs">
+        <button id="theme-btn-dark" onclick="setTheme('dark')" class="px-2 py-1 rounded-md cursor-pointer flex items-center gap-1 transition">🌙 深色</button>
+        <button id="theme-btn-light" onclick="setTheme('light')" class="px-2 py-1 rounded-md cursor-pointer flex items-center gap-1 transition">☀️ 浅色</button>
+      </div>
+
+      <!-- 场景切换 -->
+      <div class="flex items-center gap-1 bg-[var(--content)] p-1 rounded-lg border border-[var(--border)]">
+        <button id="scene-chat" onclick="switchScene('chat')" class="px-2.5 py-1.5 rounded-md text-xs font-medium transition cursor-pointer flex items-center gap-1.5">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          <span>ST 原生挂载预览</span>
+        </button>
+        <button id="scene-desktop" onclick="switchScene('desktop')" class="px-2.5 py-1.5 rounded-md text-xs font-medium transition cursor-pointer flex items-center gap-1.5">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          <span>桌面控制台</span>
+        </button>
+        <button id="scene-mobile" onclick="switchScene('mobile')" class="px-2.5 py-1.5 rounded-md text-xs font-medium transition cursor-pointer flex items-center gap-1.5">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+          <span>移动端 390×844</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Toast 通知浮层 -->
+  <div id="toast-box" class="fixed bottom-4 right-4 z-50 flex flex-col gap-2 pointer-events-none"></div>
+
+  <!-- 导入 / 迁移 / 嵌卡模拟弹窗（用于演示部分兼容/自动迁移反馈） -->
+  <div id="modal-overlay" class="hidden fixed inset-0 z-40 bg-black/60 backdrop-blur-sm items-center justify-center p-4">
+    <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl max-w-lg w-full shadow-2xl overflow-hidden">
+      <div class="px-4 py-3 border-b border-[var(--border)] flex items-center justify-between">
+        <span id="modal-title" class="font-semibold text-sm">操作面板</span>
+        <button onclick="closeModal()" class="p-1.5 rounded-md hover:bg-[var(--secondary)] text-[var(--muted-foreground)] cursor-pointer">✕</button>
+      </div>
+      <div id="modal-body" class="p-4 text-xs space-y-3 max-h-[70vh] overflow-y-auto thin-scroll"></div>
+      <div class="px-4 py-2.5 border-t border-[var(--border)] bg-[var(--content)] flex justify-end gap-2">
+        <button onclick="closeModal()" class="px-3 py-1.5 rounded-md border border-[var(--border)] text-xs cursor-pointer hover:bg-[var(--secondary)]">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 主渲染容器 -->
+  <main id="app-root" class="flex-1 p-3 sm:p-5 flex justify-center items-start overflow-auto"></main>
+</div>
+
+  <script>
+    // =========================================================================
+    // 1. 原型核心状态模型（与 ARCHITECTURE.md 契约保持一致）
+    // =========================================================================
+    const NAV_ITEMS = [
+      { id: 'files', group: '当前会话', label: '文件与内容覆盖', short: '文件覆盖', desc: '工作区 / 变量 / WI Diff' },
+      { id: 'logs', group: '当前会话', label: '生成与工具日志', short: '生成日志', desc: '轮次调用链 / 缓存命中' },
+      { id: 'cache', group: '当前会话', label: '缓存水位与存档压平', short: '缓存压平', desc: '分块归档 / 冷层压平' },
+      { id: 'agents', group: '预设与系统', label: '智能体', short: '智能体', desc: '提示词积木 / 权限 / 水位' },
+      { id: 'pipeline', group: '预设与系统', label: '触发管线', short: '触发管线', desc: '四阶段 / 屏障 / @@扫描' },
+      { id: 'tools', group: '预设与系统', label: '工具与脚本', short: '工具脚本', desc: 'JS defineTool / 模拟测试' },
+      { id: 'regex', group: '预设与系统', label: '正则清洗', short: '正则清洗', desc: 'display / ingest / lore_read' },
+      { id: 'wi', group: '预设与系统', label: '世界书路由', short: '世界书路由', desc: '四类分流纠偏 / /preset/*' },
+      { id: 'connections', group: '预设与系统', label: 'API 连接', short: 'API连接', desc: '多模型 / 缓存断点策略' },
+    ];
+
+    const state = {
+      theme: 'dark',             // 'dark' | 'light'（默认 dark 对齐 ST）
+      scene: 'desktop',          // 'chat' | 'desktop' | 'mobile'
+      activeTab: 'files',        // 9 个视图之一
+      mobilePushDetail: false,   // 移动端 Master-Detail 页面推入栈
+      runMode: 'takeover',       // 'off' | 'companion' | 'takeover'
+      capsulePosition: 'bottom', // 'top' (姓名栏下) | 'bottom' (.mes_text 下，类似原版 work-indicator)
+      capsulePersist: 'keep',    // 'keep' (保留微缩条) | 'auto_hide' (全部完成后自动隐藏)
+      currentConnection: 'conn_claude',
+      currentPreset: '群像通用 Agent 预设',
+      magicMenuOpen: true,
+
+      // 聊天入口预览状态
+      chatBgTask: {
+        active: true,
+        elapsed: 8,
+        label: '🎨 插图生成中',
+        canceled: false,
+      },
+
+      // ① 文件与内容覆盖
+      fileFilter: 'all',
+      selectedFileId: 'f_vars',
+      fileViewMode: 'edit',      // 'edit' | 'diff'
+      files: [
+        {
+          id: 'f_vars',
+          ns: 'workspace',
+          path: '/state/variables.json',
+          layer: '#12#0 (暂存已提交)',
+          source: 'patch_variables',
+          content: JSON.stringify({
+            时间: '永历三年 · 秋分 戌时',
+            地点: '青云宗 · 听竹小筑',
+            主角灵力: 84,
+            林婉儿好感: 62,
+            银莲花线索: ['枯井密道', '半枚玉佩']
+          }, null, 2),
+          baseContent: JSON.stringify({
+            时间: '永历三年 · 秋分 申时',
+            地点: '青云宗 · 山门',
+            主角灵力: 90,
+            林婉儿好感: 55,
+            银莲花线索: ['枯井密道']
+          }, null, 2),
+        },
+        {
+          id: 'f_wi_12',
+          ns: 'worldinfo',
+          path: '/lorebooks/玄幻世界/银莲花结社-12.md',
+          layer: '#12#0 (WI 覆写)',
+          source: '@@replace (after_turn)',
+          content: '# 银莲花结社\n\n隐匿于各大仙门阴影中的地下组织。\n- 当前状态：**听竹小筑密道已被主角发现**\n- 警戒等级：中（尚未察觉主角持有半枚玉佩）',
+          baseContent: '# 银莲花结社\n\n隐匿于各大仙门阴影中的地下组织。\n- 当前状态：休眠潜伏中\n- 警戒等级：低',
+        },
+        {
+          id: 'f_outline',
+          ns: 'workspace',
+          path: '/memory/outline.md',
+          layer: '#11#0',
+          source: 'tool:write_file',
+          content: '## 第三卷：秋分暗涌\n1. 山门偶遇林婉儿（已完成）\n2. 查探听竹小筑枯井异象（进行中）\n3. 宗门大比前夜暗杀伏笔（待触发）',
+          baseContent: '## 第三卷：秋分暗涌\n1. 山门偶遇林婉儿（进行中）',
+        },
+        {
+          id: 'f_mes_12',
+          ns: 'message',
+          path: 'message://12#0 (展示层覆写)',
+          layer: '#12#0 (UI Only)',
+          source: '@@append_output',
+          content: '<details><summary>📊 当前状态快照（不进入模型缓存前缀）</summary>\n灵力：84/100 | 林婉儿好感：62 | 地点：听竹小筑\n</details>',
+          baseContent: '（无原书基线）',
+        }
+      ],
+
+      // ② 生成与工具日志
+      logFloorFilter: 'all',     // 'all' | '12' | '10'
+      selectedLogId: 'log_12_main',
+      logViewTab: 'steps',       // 'steps' | 'raw'
+      logs: [
+        {
+          id: 'log_12_main',
+          floor: 12,
+          phase: 'main_turn',
+          agent: '主叙事 Agent',
+          model: 'claude-sonnet-4-5',
+          duration: '1.8s',
+          status: 'done',
+          inputTokens: 28420,
+          cachedTokens: 27310,
+          outputTokens: 640,
+          steps: [
+            { step: 1, type: 'tool_call', name: 'read_file', args: '{"path": "/lorebooks/玄幻世界/银莲花结社-12.md"}', result: '已返回 412 字（命中尾部雷达建议，已触发沙箱宏求值）', ms: 12 },
+            { step: 2, type: 'tool_call', name: 'read_file', args: '{"path": "/state/variables.json"}', result: '{"地点":"青云宗 · 听竹小筑","林婉儿好感":62,...}', ms: 4 },
+            { step: 3, type: 'assistant', preview: '夜风穿过竹梢，石井边缘那道极浅的银莲花刻痕在月色下泛起冷光……', ms: 1780 }
+          ],
+          rawMessages: [
+            { role: 'system', note: 'Layer 0 静态前缀 (14,200 tokens · Cache Breakpoint #0)' },
+            { role: 'user', content: '...Turn 1..11 冻结轨迹 (13,110 tokens · Cache Breakpoint #1)...' },
+            { role: 'user', content: '我蹲下身摸向井沿刻痕。\n<lore-hint>- [未读] /lorebooks/玄幻世界/银莲花结社-12.md (命中: "银莲花", ~412字)</lore-hint>' }
+          ]
+        },
+        {
+          id: 'log_12_vars',
+          floor: 12,
+          phase: 'after_turn',
+          agent: '变量管家 (persistent)',
+          model: 'gemini-2.5-flash',
+          duration: '0.9s',
+          status: 'done',
+          inputTokens: 6820,
+          cachedTokens: 6480,
+          outputTokens: 118,
+          steps: [
+            { step: 1, type: 'tool_call', name: 'patch_variables', args: '[{"op":"replace","path":"/林婉儿好感","value":62}]', result: 'Schema 校验通过，已原子写入 #12#0 暂存层', ms: 6 }
+          ],
+          rawMessages: [
+            { role: 'system', note: '伴生持久轨 Layer 0 (3,100 tokens)' },
+            { role: 'user', content: '增量对话 #12：我蹲下身摸向井沿刻痕...' }
+          ]
+        },
+        {
+          id: 'log_10_main',
+          floor: 10,
+          phase: 'main_turn',
+          agent: '主叙事 Agent',
+          model: 'claude-sonnet-4-5',
+          duration: '1.4s',
+          status: 'done',
+          inputTokens: 24910,
+          cachedTokens: 23760,
+          outputTokens: 520,
+          steps: [
+            { step: 1, type: 'tool_call', name: 'search_files', args: '{"query": "林婉儿 身世", "topN": 3}', result: '命中 2 条档案：/lorebooks/人物/林婉儿-03.md (0.91)...', ms: 9 },
+            { step: 2, type: 'assistant', preview: '林婉儿指尖微顿，并没有立刻回答你关于旧玉佩的试探。', ms: 1390 }
+          ],
+          rawMessages: [{ role: 'system', note: 'Layer 0 静态前缀 (14,200 tokens)' }]
+        }
+      ],
+
+      // ③ 缓存水位与存档压平
+      watermarks: [
+        { id: 'wm_main', name: '主叙事 Agent', current: 31400, low: 18000, high: 36000, chunks: 2, summaryMode: '衔接用户 /memory/outline.md' },
+        { id: 'wm_vars', name: '变量管家 (persistent)', current: 9200, low: 6000, high: 16000, chunks: 1, summaryMode: '内置兜底块压缩' },
+        { id: 'wm_outline', name: '大纲记录员 (persistent)', current: 14800, low: 8000, high: 20000, chunks: 1, summaryMode: '衔接用户 /memory/outline.md' },
+      ],
+      storageStats: {
+        estimatedBytes: 2480 * 1024,
+        layers: 26,
+        compactedWatermark: 4,
+        autoCompact: true,
+        keepDepth: 12,
+        thresholdMB: 4,
+        previewReport: '',
+      },
+
+      // ④ 智能体
+      selectedAgentId: 'ag_main',
+      agents: [
+        {
+          id: 'ag_main',
+          name: '主叙事 Agent',
+          connectionId: 'inherit',
+          sessionMode: 'persistent',
+          highWatermark: 36000,
+          lowWatermark: 18000,
+          readGlobs: '/**',
+          writeGlobs: '/memory/**, /scratch/**',
+          tools: ['read_file', 'search_files', 'grep_search', 'list_dir', 'search_history', 'read_history'],
+          blocks: [
+            { id: 'b1', name: '通用叙事底座与 Pull 准则', role: 'system', placement: 'prefix', enabled: true, content: '你基于挂载在 /character/、/lorebooks/ 与 /state/ 中的设定体系运转。涉及专有名词、历史伏笔或角色属性时，请优先调用 read_file 或 search_files 查证后再动笔，不要凭常识编造。' },
+            { id: 'b2', name: '文风规范：古风白描与防抢话', role: 'system', placement: 'prefix', enabled: true, content: '保持第三人称沉浸式描写；严禁代替用户控制主角行动或内心独白；每段动作描写注重环境细节呼应。' },
+            { id: 'b3', name: '尾部状态与雷达注意提醒', role: 'system', placement: 'tail', enabled: true, content: '<lore-hint> 中包含与当前输入字面匹配的未读条目，可能是日常词汇误报，仅在剧情确实需要时 read_file。' }
+          ]
+        },
+        {
+          id: 'ag_vars',
+          name: '变量管家',
+          connectionId: 'conn_flash',
+          sessionMode: 'persistent',
+          highWatermark: 16000,
+          lowWatermark: 6000,
+          readGlobs: '/state/variables.json, /lorebooks/**',
+          writeGlobs: '/state/variables.json',
+          tools: ['read_variables', 'patch_variables', 'read_file'],
+          blocks: [
+            { id: 'bv1', name: '变量结算职责', role: 'system', placement: 'prefix', enabled: true, content: '根据最新一轮对话中的行动、消耗与人物态度变化，调用 patch_variables 对 /state/variables.json 做增量更新；若无变化则直接结束。' }
+          ]
+        },
+        {
+          id: 'ag_illust',
+          name: '插图导演',
+          connectionId: 'conn_flash',
+          sessionMode: 'ephemeral',
+          highWatermark: 12000,
+          lowWatermark: 4000,
+          readGlobs: '/character/**, /lorebooks/**',
+          writeGlobs: '',
+          tools: ['read_file', 'comfy_illustrate'],
+          blocks: [
+            { id: 'bi1', name: '构图与 Tag 提取', role: 'system', placement: 'prefix', enabled: true, content: '阅读本轮最富画面感的场景，查阅角色外貌档案后调用 comfy_illustrate 生成插图并自动挂载。' }
+          ]
+        }
+      ],
+
+      // ⑤ 触发管线
+      selectedTriggerId: 'tr_vars',
+      triggers: [
+        { id: 'tr_before', phase: 'before_turn', order: 1, barrier: 'turn', source: 'worldinfo', decorator: '@@trigger (世界事件推演)', agentId: 'ag_vars', group: '', enabled: true, condition: 'always', note: '前置检查时间流逝与宗门事件触发' },
+        { id: 'tr_main', phase: 'main_turn', order: 0, barrier: 'turn', source: 'preset', decorator: 'Main Narrative', agentId: 'ag_main', group: '', enabled: true, condition: 'always', note: '主叙事生成通道（流式输出）' },
+        { id: 'tr_vars', phase: 'after_turn', order: 1, barrier: 'turn', source: 'worldinfo', decorator: '@@variables_jsonpatch', agentId: 'ag_vars', group: '', enabled: true, condition: 'always', note: '结算灵力/好感/线索变量，下一轮前必等落盘' },
+        { id: 'tr_outline', phase: 'after_turn', order: 2, barrier: 'self', source: 'preset', decorator: '@@trigger (大纲与伏笔)', agentId: 'ag_vars', group: '', enabled: true, condition: 'interval: 2', note: '写 /memory/outline.md，自身队列串行不卡下一轮打字' },
+        { id: 'tr_illust', phase: 'after_turn', order: 3, barrier: 'none', source: 'worldinfo', decorator: '@@trigger (场景插图)', agentId: 'ag_illust', group: '', enabled: true, condition: 'regex: /(月色|战斗|对峙)/', note: '完全脱离后台生成，完成后严格回填到触发楼层' },
+        { id: 'tr_compact', phase: 'maintenance', order: 1, barrier: 'self', source: 'preset', decorator: 'Watermark Compaction', agentId: 'ag_main', group: '', enabled: true, condition: 'tokens >= 36000', note: '跨过高水位时原子分块归档 /history/chunk-*.md' },
+      ],
+
+      // ⑥ 工具与脚本
+      selectedToolId: 't_comfy',
+      toolTestInput: '{\n  "positivePrompt": "1girl, ink wash bamboo courtyard, moonlight, silver lotus carving",\n  "aspectRatio": "portrait"\n}',
+      toolTestOutput: '',
+      tools: [
+        {
+          id: 't_comfy',
+          name: 'comfy_illustrate',
+          kind: 'custom_js',
+          source: '世界书 @@tool comfy_illustrate',
+          enabled: true,
+          desc: '根据剧情画面构思提示词并调用本地 ComfyUI 生成插图挂载到当前消息',
+          code: `export default defineTool({
+  name: 'comfy_illustrate',
+  description: '根据当前剧情生成插图并挂载到本轮回复中',
+  parameters: z.object({
+    positivePrompt: z.string(),
+    aspectRatio: z.enum(['portrait', 'landscape', 'square']).default('portrait'),
+  }),
+  async execute(args, ctx) {
+    const resp = await fetch('http://127.0.0.1:8188/prompt', {
+      method: 'POST',
+      body: JSON.stringify({ prompt: args.positivePrompt, ratio: args.aspectRatio }),
+      signal: ctx.signal,
+    });
+    const url = '/user/images/comfy_mock_12.png';
+    await ctx.message.attachMedia({ type: 'image', url });
+    return \`插图已挂载至 #\${ctx.target.messageId}#\${ctx.target.swipeId}: \${url}\`;
+  },
+});`
+        },
+        {
+          id: 't_tts',
+          name: 'voice_narrate',
+          kind: 'slash_bridge',
+          source: '斜杠命令包装',
+          enabled: true,
+          desc: '调用酒馆 TTS 插件为关键对白生成角色语音并挂载到消息',
+          code: `// 零代码斜杠命令包装配置\n{\n  "command": "/tts {{charName}} {{line}}",\n  "params": {\n    "charName": "说话角色名",\n    "line": "需要配音的对白台词"\n  }\n}`
+        },
+        {
+          id: 't_read',
+          name: 'read_file',
+          kind: 'builtin',
+          source: '内置核心 VFS 工具',
+          enabled: true,
+          desc: '读取 VFS 指定路径文件（自动触发宏与可选 EJS 读取时沙箱求值）',
+          code: '// 内置工具由 src/core/tools/ 实现，受 ScopedToolGuard 读写路径白名单约束。'
+        }
+      ],
+
+      // ⑦ 正则清洗
+      selectedRegexId: 'rx_status',
+      regexSampleInput: '<think>\n用户正在调查井沿刻痕，应先读银莲花设定。\n</think>\n夜风穿过竹梢，石井边缘浮现半枚银莲花印记。\n<!-- status: {"hp":84,"location":"听竹小筑"} -->',
+      regexRules: [
+        { id: 'rx_status', name: '剥除历史内联状态注释', stage: 'ingest', pattern: '/<!--\\s*status:[\\s\\S]*?-->/g', replace: '', applyToUser: false, applyToAssistant: true, enabled: true },
+        { id: 'rx_think', name: '思考块样式折叠美化', stage: 'display', pattern: '/<think>([\\s\\S]*?)<\\/think>/g', replace: '[思考已折叠: $1]', applyToUser: false, applyToAssistant: true, enabled: true },
+        { id: 'rx_lore', name: '移除世界书作者注释', stage: 'lore_read', pattern: '/\\[作者注:[^\\]]*\\]/g', replace: '', applyToUser: false, applyToAssistant: false, enabled: true },
+      ],
+
+      // ⑧ 世界书路由
+      wiSubTab: 'router',       // 'router' | 'preset_files'
+      wiEntries: [
+        { id: 'wi_1', book: '玄幻世界', comment: '【规则】古风白描与防抢话指令', flag: '蓝灯 · @D0 System · 静态', autoClass: 'system_rule', overrideClass: 'auto', chars: 420 },
+        { id: 'wi_2', book: '玄幻世界', comment: '主角林玄 · 人物总纲 (空壳卡核心)', flag: '蓝灯 · Before Char · 静态', autoClass: 'core_manifest', overrideClass: 'auto', chars: 1380 },
+        { id: 'wi_3', book: '玄幻世界', comment: '银莲花结社-12', flag: '绿灯 · 关键词: 银莲花,密道', autoClass: 'on_demand_archive', overrideClass: 'auto', chars: 412 },
+        { id: 'wi_4', book: '玄幻世界', comment: '@@variables_jsonpatch 好感与灵力结算', flag: '含 @@ 触发器装饰器', autoClass: 'dynamic_or_trigger', overrideClass: 'auto', chars: 290 },
+        { id: 'wi_5', book: '玄幻世界', comment: '当前时辰动态提醒 (@D0)', flag: '蓝灯 · @D0 · 含 {{getvar}}', autoClass: 'dynamic_or_trigger', overrideClass: 'auto', chars: 95 },
+      ],
+      presetFiles: [
+        { name: 'style_guide.md', size: '1.8 KB', preview: '# 文风手册\n- 禁用现代网络词汇\n- 动作描写优先于心理直白抒情' },
+        { name: 'init_variables.json', size: '420 B', preview: '{\n  "时间": "永历三年 · 秋分 申时",\n  "主角灵力": 90\n}' },
+      ],
+
+      // ⑨ API 连接
+      selectedConnId: 'conn_claude',
+      connTestStatus: '',
+      connections: [
+        { id: 'conn_claude', name: '主力写作 (Claude / OpenRouter)', baseUrl: 'https://openrouter.ai/api/v1', model: 'anthropic/claude-sonnet-4.5', contextSize: 200000, maxTokens: 4096, temperature: 0.75, maxConcurrency: 3, cachePolicy: 'anthropic_explicit', stream: true, headersYaml: 'HTTP-Referer: https://sillytavern.local' },
+        { id: 'conn_flash', name: '后台快模型 (Gemini Flash)', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash', contextSize: 128000, maxTokens: 2048, temperature: 0.2, maxConcurrency: 6, cachePolicy: 'auto_prefix', stream: false, headersYaml: '' },
+        { id: 'conn_local', name: '本地模型 (LM Studio)', baseUrl: 'http://127.0.0.1:1234/v1', model: 'qwen3-32b-instruct', contextSize: 32768, maxTokens: 2048, temperature: 0.7, maxConcurrency: 1, cachePolicy: 'auto_prefix', stream: true, headersYaml: '' },
+      ],
+    };
+
+    // =========================================================================
+    // 2. 通用辅助工具
+    // =========================================================================
+    function esc(s) {
+      return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function showToast(msg, tone = 'primary') {
+      const box = document.getElementById('toast-box');
+      const el = document.createElement('div');
+      const toneCls = tone === 'success' ? 'pill-soft-success' : tone === 'warning' ? 'pill-soft-warning' : tone === 'error' ? 'pill-soft-error' : 'pill-soft-primary';
+      el.className = `pointer-events-auto px-3.5 py-2 rounded-lg border text-xs font-medium shadow-lg bg-[var(--card)] ${toneCls}`;
+      el.textContent = msg;
+      box.appendChild(el);
+      setTimeout(() => el.remove(), 2600);
+    }
+
+    function openModal(title, html) {
+      document.getElementById('modal-title').textContent = title;
+      document.getElementById('modal-body').innerHTML = html;
+      const ov = document.getElementById('modal-overlay');
+      ov.classList.remove('hidden');
+      ov.classList.add('flex');
+    }
+
+    function closeModal() {
+      const ov = document.getElementById('modal-overlay');
+      ov.classList.add('hidden');
+      ov.classList.remove('flex');
+    }
+
+    function runModeMeta(mode) {
+      if (mode === 'takeover') return { label: '完全接管', badge: 'pill-soft-primary', desc: '全链路接管单聊 + 三层缓存 + Pull 工具' };
+      if (mode === 'companion') return { label: '伴生模式', badge: 'pill-soft-success', desc: '主回复走 ST 原生 + 后台触发/胶囊桥接' };
+      return { label: '已关闭', badge: 'pill-soft-warning', desc: '扩展完全休眠，不拦截也不扣 Token' };
+    }
+
+    // 后台生图读秒模拟
+    setInterval(() => {
+      if (state.chatBgTask.active && !state.chatBgTask.canceled) {
+        state.chatBgTask.elapsed += 1;
+        if (state.scene === 'chat') {
+          const el = document.getElementById('capsule-bg-timer');
+          if (el) el.textContent = `${state.chatBgTask.elapsed}s`;
+        }
+      }
+    }, 1000);
+
+    // =========================================================================
+    // 3. 交互事件处理器
+    // =========================================================================
+    function switchScene(scene) {
+      state.scene = scene;
+      state.mobilePushDetail = false;
+      render();
+    }
+
+    function switchTab(tabId, pushDetail = false) {
+      state.activeTab = tabId;
+      if (state.scene === 'mobile') {
+        state.mobilePushDetail = pushDetail;
+      }
+      render();
+    }
+
+    function openConsoleTo(tabId, extra = {}) {
+      if (extra.floorFilter) state.logFloorFilter = extra.floorFilter;
+      if (extra.logId) state.selectedLogId = extra.logId;
+      if (extra.fileId) state.selectedFileId = extra.fileId;
+      if (extra.fileViewMode) state.fileViewMode = extra.fileViewMode;
+      state.activeTab = tabId;
+      state.scene = window.innerWidth < 768 ? 'mobile' : 'desktop';
+      state.mobilePushDetail = Boolean(extra.logId || extra.fileId);
+      render();
+    }
+
+    function setTheme(theme) {
+      state.theme = theme;
+      render();
+    }
+
+    function setRunMode(mode) {
+      state.runMode = mode;
+      showToast(`运行模式已切换为：${runModeMeta(mode).label}`, mode === 'off' ? 'warning' : 'success');
+      render();
+    }
+
+    function cancelBgTask(ev) {
+      if (ev) ev.stopPropagation();
+      state.chatBgTask.active = false;
+      state.chatBgTask.canceled = true;
+      showToast('已通过 AbortSignal 单独中止 #12#0 插图生成（不影响主发送框）', 'warning');
+      render();
+    }
+
+    function rerunAfterTriggers() {
+      state.chatBgTask = { active: true, elapsed: 1, label: '🎨 插图重新生成中', canceled: false };
+      showToast('已对最新楼层 #12#0 重新派发 after_turn 后台触发器', 'primary');
+      render();
+    }
+
+    function showImportMenu() {
+      openModal('导入 / 迁移与角色卡 PNG 嵌入管理', `
+        <div class="space-y-3">
+          <div class="p-3 rounded-lg border border-[var(--border)] bg-[var(--content)] space-y-2">
+            <div class="font-semibold text-[var(--foreground)]">1. 旧版 ST-CustomGeneration 自动单向迁移</div>
+            <p class="text-[var(--muted-foreground)]">检测到旧版扩展数据，只读拷贝转为新版结构（不破坏原数据）：ApiSettings → ApiConnection，Template → AgentProfile + TriggerRule，RegEx → display/ingest/lore_read，interceptGenerate → runMode。</p>
+            <button onclick="simulateMigration('cg')" class="px-3 py-1.5 rounded-md bg-[var(--primary)] text-[var(--primary-foreground)] text-xs font-medium cursor-pointer">执行旧版配置迁移预览</button>
+          </div>
+          <div class="p-3 rounded-lg border border-[var(--border)] bg-[var(--content)] space-y-2">
+            <div class="font-semibold text-[var(--foreground)]">2. 传统 SillyTavern OpenAI 预设部分兼容导入</div>
+            <p class="text-[var(--muted-foreground)]">仅提取用户自定义提示词积木（relative → prefix，@D0 → tail），<strong>自动忽略内置槽位与 @D&gt;=1 深度注入</strong>以守护缓存不变量。</p>
+            <button onclick="simulateMigration('st')" class="px-3 py-1.5 rounded-md border border-[var(--border)] bg-[var(--card)] text-xs font-medium cursor-pointer hover:bg-[var(--secondary)]">模拟导入传统 ST 预设并查看跳过摘要</button>
+          </div>
+          <div class="p-3 rounded-lg border border-[var(--border)] bg-[var(--content)] space-y-2">
+            <div class="font-semibold text-[var(--foreground)]">3. 角色卡 PNG 数据嵌入（embed-card）</div>
+            <p class="text-[var(--muted-foreground)]">同步写入 live character、json_data 与编辑表单三处镜像（agentic_embed_presets / agentic_embed_files），双读兼容旧版 cg_embed_*。</p>
+            <div class="flex flex-wrap gap-2">
+              <button onclick="showToast('已将当前预设与工作区初始文件写入角色卡 PNG（三处镜像同步完成）','success');closeModal();" class="px-3 py-1.5 rounded-md border border-[var(--border)] bg-[var(--card)] text-xs cursor-pointer hover:bg-[var(--secondary)]">关联当前预设与文件到角色卡</button>
+              <button onclick="showToast('已从角色卡导入 1 套预设与 3 个工作区初始文件','success');closeModal();" class="px-3 py-1.5 rounded-md border border-[var(--border)] bg-[var(--card)] text-xs cursor-pointer hover:bg-[var(--secondary)]">从角色卡导入</button>
+            </div>
+          </div>
+        </div>
+      `);
+    }
+
+    function simulateMigration(kind) {
+      if (kind === 'cg') {
+        openModal('旧版 ST-CustomGeneration 迁移报告', `
+          <div class="space-y-2">
+            <div class="p-2.5 rounded-md border pill-soft-success">✓ 已只读拷贝迁移 2 个 API 连接、1 套预设、4 个工作区文件（原 extension_settings.CustomGeneration 保持完整未改）</div>
+            <ul class="list-disc pl-4 space-y-1 text-[var(--muted-foreground)]">
+              <li><code>interceptGenerate: true</code> → 已设为 <strong>完全接管 (takeover)</strong></li>
+              <li><code>@@variables_jsonpatch</code> 模板 → 拆解为 <code>变量管家 (AgentProfile)</code> + <code>after_turn / turn 屏障规则</code></li>
+              <li><code>RegEx (非 ephemerality)</code> → 升级为 <code>ingest</code> 固化清洗，已丢弃 <code>minDepth/maxDepth</code></li>
+            </ul>
+          </div>
+        `);
+      } else {
+        openModal('传统 ST 预设导入报告（部分兼容）', `
+          <div class="space-y-2">
+            <div class="p-2.5 rounded-md border pill-soft-primary">✓ 成功导入 3 条自定义指令积木至「主叙事 Agent」</div>
+            <div class="p-2.5 rounded-md border pill-soft-warning">
+              <div class="font-semibold mb-1">已按缓存安全规则忽略以下不支持条目（共 4 项）：</div>
+              <ul class="list-disc pl-4 space-y-1">
+                <li>内置槽位：<code>charDescription</code>、<code>worldInfoBefore</code>、<code>chatHistory</code>（新版由 VFS 按需拉取）</li>
+                <li>深度注入：<code>【作者提示 @D4】</code>（@D&gt;=1 历史中间插拔必破前缀缓存）</li>
+              </ul>
+            </div>
+          </div>
+        `);
+      }
+    }
+
+    // =========================================================================
+    // 4. 场景 A：ST 原生聊天 DOM 无侵入挂载预览
+    // =========================================================================
+    function renderChatScene() {
+      const meta = runModeMeta(state.runMode);
+      const bg = state.chatBgTask;
+      const isIdle = !bg.active || bg.canceled;
+      const bgPill = bg.canceled
+        ? `<span class="px-1.5 py-0.5 rounded text-[11px] border pill-soft-warning shrink-0">插图已单独中止</span>`
+        : bg.active
+          ? `<span class="px-1.5 py-0.5 rounded text-[11px] border pill-soft-primary flex items-center gap-1 shrink-0">
+               <span>${esc(bg.label)}</span>
+               <span id="capsule-bg-timer" class="font-mono">${bg.elapsed}s</span>
+               <button onclick="cancelBgTask(event)" title="仅中止该后台任务" class="ml-0.5 w-4 h-4 rounded-full hover:bg-black/20 flex items-center justify-center font-bold cursor-pointer">×</button>
+             </span>`
+          : `<span class="px-1.5 py-0.5 rounded text-[11px] border pill-soft-success shrink-0">✓ 插图已回填</span>`;
+
+      const capsule10Html = state.capsulePersist === 'auto_hide' ? '' : `
+        <div class="my-1.5 flex items-center">
+          <button onclick="openConsoleTo('logs', { floorFilter: '10', logId: 'log_10_main' })" class="max-w-full px-2.5 py-1 rounded-lg border border-[var(--border)] bg-[var(--content)] hover:bg-[var(--secondary)] text-[11px] flex items-center gap-1.5 truncate cursor-pointer transition shadow-sm" title="Shadow DOM <agentic-capsule>（位于 .mes_text 之外）">
+            <span class="text-[var(--primary)]">✦</span>
+            <span class="truncate">2步检索 · 缓存 95.4% · [✓变量]</span>
+            <span class="text-[10px] px-1 rounded shadow-boundary-badge text-[var(--primary)] shrink-0">&lt;agentic-capsule&gt;</span>
+          </button>
+        </div>
+      `;
+
+      const capsule12Html = (isIdle && state.capsulePersist === 'auto_hide') ? '' : `
+        <div class="my-1.5 flex items-center">
+          <div onclick="openConsoleTo('logs', { floorFilter: '12', logId: 'log_12_main' })" class="max-w-full px-2.5 py-1 rounded-lg border border-[var(--border)] bg-[var(--content)] hover:bg-[var(--secondary)] text-[11px] flex flex-wrap items-center gap-1.5 cursor-pointer transition shadow-sm">
+            <span class="text-[var(--primary)] shrink-0">✦</span>
+            <span>3步 · 缓存 96.1%</span>
+            <button onclick="event.stopPropagation(); openConsoleTo('files', { fileId: 'f_vars', fileViewMode: 'diff' })" class="px-1.5 py-0.5 rounded border pill-soft-success text-[10px] shrink-0 cursor-pointer hover:opacity-80" title="查看变量 Diff">✓变量</button>
+            ${bgPill}
+            <span class="text-[10px] px-1 rounded shadow-boundary-badge text-[var(--primary)] shrink-0">Shadow DOM</span>
+          </div>
+        </div>
+      `;
+
+      return `
+        <div class="max-w-6xl w-full grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+          <!-- 左侧：模拟原生 SillyTavern #chat DOM（绝不替代 ST 聊天 UI） -->
+          <div class="lg:col-span-8 bg-[var(--card)] border border-[var(--border)] rounded-xl overflow-hidden shadow-sm">
+            <div class="px-3.5 py-2.5 bg-[var(--sidebar)] border-b border-[var(--border)] flex flex-wrap items-center justify-between gap-2">
+              <div class="flex items-center gap-2 text-xs font-semibold">
+                <span>ST 原生 #chat .mes DOM</span>
+                <span class="px-2 py-0.5 rounded border text-[10px] pill-soft-success">100% 保留原生结构与事件</span>
+              </div>
+              <div class="flex flex-wrap items-center gap-1.5 text-[11px]">
+                <div class="flex p-0.5 rounded bg-[var(--content)] border border-[var(--border)]">
+                  <button onclick="state.capsulePosition='top';render();" class="px-2 py-0.5 rounded cursor-pointer ${state.capsulePosition==='top'?'bg-[var(--primary)] text-[var(--primary-foreground)]':'text-[var(--muted-foreground)]'}">胶囊在正文上</button>
+                  <button onclick="state.capsulePosition='bottom';render();" class="px-2 py-0.5 rounded cursor-pointer ${state.capsulePosition==='bottom'?'bg-[var(--primary)] text-[var(--primary-foreground)]':'text-[var(--muted-foreground)]'}">胶囊在正文下</button>
+                </div>
+                <div class="flex p-0.5 rounded bg-[var(--content)] border border-[var(--border)]">
+                  <button onclick="state.capsulePersist='keep';render();" class="px-2 py-0.5 rounded cursor-pointer ${state.capsulePersist==='keep'?'bg-[var(--primary)] text-[var(--primary-foreground)]':'text-[var(--muted-foreground)]'}">完后保留</button>
+                  <button onclick="state.capsulePersist='auto_hide';render();" class="px-2 py-0.5 rounded cursor-pointer ${state.capsulePersist==='auto_hide'?'bg-[var(--primary)] text-[var(--primary-foreground)]':'text-[var(--muted-foreground)]'}">完后隐藏</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="p-3.5 space-y-3 bg-[var(--content)]">
+              <div class="px-3 py-1.5 rounded-lg border border-dashed border-[var(--border)] text-[11px] text-[var(--muted-foreground)]">
+                说明：左侧保留 ST 原生 <code>.mes_avatar</code>、<code>.ch_name</code>、<code>.mes_buttons</code>、<code>.mes_text</code> 与 Swipe 控件；仅在 <code>.mes_block</code> 内（<code>.mes_text</code> 外部）无侵入挂载一个 <code>&lt;agentic-capsule&gt;</code>，不干扰翻译/TTS/正则前端面板等扩展。
+              </div>
+
+              <!-- 模拟 ST 原生 .mes[mesid="10"] -->
+              <div class="bg-[var(--card)] border border-[var(--card-border)] rounded-xl p-3 flex gap-3 items-start">
+                <div class="w-10 h-10 rounded-full bg-[var(--secondary)] border border-[var(--border)] flex items-center justify-center text-xs font-semibold shrink-0">婉</div>
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center justify-between gap-2 text-xs mb-1">
+                    <div class="flex items-center gap-2">
+                      <span class="font-semibold">林婉儿</span>
+                      <span class="text-[11px] text-[var(--muted-foreground)]">#10 · 17:48</span>
+                    </div>
+                    <!-- ST 原生 .mes_buttons -->
+                    <div class="flex items-center gap-1.5 text-[11px] text-[var(--muted-foreground)] opacity-75">
+                      <span title="ST 原生朗读/翻译/编辑/更多按钮">🔊</span><span>🌐</span><span>✎</span><span>⋯</span>
+                    </div>
+                  </div>
+                  ${state.capsulePosition === 'top' ? capsule10Html : ''}
+                  <!-- ST 原生 .mes_text -->
+                  <div class="text-xs leading-relaxed text-[var(--foreground)] py-0.5">
+                    林婉儿指尖微顿，并没有立刻回答你关于旧玉佩的试探，只是将茶盏轻轻推向桌角。
+                  </div>
+                  ${state.capsulePosition === 'bottom' ? capsule10Html : ''}
+                </div>
+              </div>
+
+              <!-- 模拟 ST 原生用户楼层 .mes[mesid="11"] -->
+              <div class="bg-[var(--sidebar)] border border-[var(--border)] rounded-xl p-3 flex gap-3 items-start">
+                <div class="w-10 h-10 rounded-full bg-[var(--primary)]/20 border border-[var(--primary)]/40 text-[var(--primary)] flex items-center justify-center text-xs font-semibold shrink-0">我</div>
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center justify-between gap-2 text-xs mb-1">
+                    <div class="flex items-center gap-2">
+                      <span class="font-semibold">User</span>
+                      <span class="text-[11px] text-[var(--muted-foreground)]">#11 · 17:49</span>
+                    </div>
+                    <div class="flex items-center gap-1.5 text-[11px] text-[var(--muted-foreground)] opacity-75"><span>✎</span><span>⋯</span></div>
+                  </div>
+                  <div class="text-xs leading-relaxed">我假装没看见她的回避，起身走向竹院深处那口干涸的石井，蹲下身摸向井沿刻痕。</div>
+                </div>
+              </div>
+
+              <!-- 模拟 ST 原生 .mes[mesid="12"]（含 Swipe 与后台任务） -->
+              <div class="bg-[var(--card)] border border-[var(--primary)]/45 rounded-xl p-3 flex gap-3 items-start">
+                <div class="w-10 h-10 rounded-full bg-[var(--secondary)] border border-[var(--border)] flex items-center justify-center text-xs font-semibold shrink-0">叙</div>
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center justify-between gap-2 text-xs mb-1">
+                    <div class="flex items-center gap-2">
+                      <span class="font-semibold">旁白 / 群像导演</span>
+                      <span class="text-[11px] text-[var(--muted-foreground)]">#12 · 17:50</span>
+                    </div>
+                    <div class="flex items-center gap-1.5 text-[11px] text-[var(--muted-foreground)] opacity-75">
+                      <span>🔊</span><span>🌐</span><span>✎</span><span>⋯</span>
+                    </div>
+                  </div>
+                  ${state.capsulePosition === 'top' ? capsule12Html : ''}
+                  <div class="text-xs leading-relaxed py-0.5">
+                    夜风穿过竹梢，石井边缘那道极浅的银莲花刻痕在月色下泛起冷光。井壁内侧三寸处，隐约露出半截铜环的棱角。
+                  </div>
+                  ${state.capsulePosition === 'bottom' ? capsule12Html : ''}
+                  <!-- ST 原生 Swipe 控件 -->
+                  <div class="mt-2 pt-1.5 border-t border-[var(--card-border)] flex items-center justify-between text-[11px] text-[var(--muted-foreground)]">
+                    <span>‹ 1 / 2 › (ST 原生 Swipe 箭头正常生效)</span>
+                    <span>已提交层：#12#0</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 底部：模拟 ST 原生底部输入栏与左下角魔棒 #extensionsMenu -->
+            <div class="p-3 border-t border-[var(--border)] bg-[var(--sidebar)] flex items-center justify-between gap-2.5 relative">
+              <div class="relative">
+                <button onclick="state.magicMenuOpen = !state.magicMenuOpen; render();" class="px-2.5 py-2 rounded-lg border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-xs font-medium flex items-center gap-1.5 cursor-pointer" title="ST 原生 #extensionsMenu">
+                  <span>🪄</span>
+                  <span>扩展菜单</span>
+                </button>
+                ${state.magicMenuOpen ? `
+                  <div class="mt-2 w-64 bg-[var(--card)] border border-[var(--border)] rounded-xl shadow-xl p-1.5 space-y-1 text-xs">
+                    <div class="px-2.5 py-1 text-[10px] text-[var(--muted-foreground)] font-medium">挂载于 ST #extensionsMenu</div>
+                    <button onclick="openConsoleTo('files', { fileId: 'f_vars' })" class="w-full text-left px-2.5 py-2 rounded-lg hover:bg-[var(--secondary)] flex items-center justify-between cursor-pointer">
+                      <span>📁 文件与内容覆盖</span><span class="text-[10px] text-[var(--muted-foreground)]">直达①</span>
+                    </button>
+                    <button onclick="openConsoleTo('logs', { floorFilter: 'all' })" class="w-full text-left px-2.5 py-2 rounded-lg hover:bg-[var(--secondary)] flex items-center justify-between cursor-pointer">
+                      <span>📜 查看生成日志</span><span class="text-[10px] text-[var(--muted-foreground)]">直达②</span>
+                    </button>
+                    <button onclick="rerunAfterTriggers()" class="w-full text-left px-2.5 py-2 rounded-lg hover:bg-[var(--secondary)] flex items-center justify-between cursor-pointer text-[var(--primary)]">
+                      <span>🔁 重新运行后置触发</span><span class="text-[10px]">#12#0</span>
+                    </button>
+                  </div>
+                ` : ''}
+              </div>
+              <div class="flex-1 text-[11px] text-[var(--muted-foreground)] bg-[var(--content)] border border-[var(--border)] rounded-lg px-3 py-2 flex items-center justify-between">
+                <span>ST 原生发送栏：后台生图跑着也能直接打字发送…</span>
+                <span class="px-2 py-0.5 rounded bg-[var(--primary)] text-[var(--primary-foreground)] text-[10px]">发送</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 右侧：模拟 ST 顶部积木菜单 #extensions_settings 扩展设置抽屉 -->
+          <div class="lg:col-span-4 bg-[var(--card)] border border-[var(--border)] rounded-xl p-4 space-y-3 shadow-sm">
+            <div class="flex items-center justify-between">
+              <div class="font-semibold text-sm flex items-center gap-1.5">
+                <span>⚡ ST-Agentic</span>
+                <span class="text-[10px] text-[var(--muted-foreground)] font-normal">(#extensions_settings)</span>
+              </div>
+              <span class="text-[11px] px-2 py-0.5 rounded-full border ${meta.badge}">${meta.label}</span>
+            </div>
+            <p class="text-xs text-[var(--muted-foreground)]">扩展设置栏仅保留极简三档运行模式与一个开门按钮，全部复杂配置进入独立 Shadow DOM 控制台：</p>
+
+            <div class="grid grid-cols-3 gap-1 p-1 rounded-lg bg-[var(--content)] border border-[var(--border)] text-xs">
+              ${['off', 'companion', 'takeover'].map(m => `
+                <button onclick="setRunMode('${m}')" class="py-2 rounded-md font-medium cursor-pointer transition ${state.runMode === m ? 'bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'}">
+                  ${m === 'off' ? '关闭' : m === 'companion' ? '伴生' : '完全接管'}
+                </button>
+              `).join('')}
+            </div>
+            <div class="text-[11px] text-[var(--muted-foreground)] bg-[var(--content)] rounded-lg p-2.5 border border-[var(--card-border)]">
+              ${esc(meta.desc)}
+            </div>
+
+            <div class="space-y-1.5 text-xs">
+              <label class="text-[11px] text-[var(--muted-foreground)] block">当前预设</label>
+              <select onchange="state.currentPreset=this.value;showToast('已切换预设：'+this.value,'success')" class="w-full px-2.5 py-2 rounded-lg bg-[var(--content)] border border-[var(--border)] text-xs">
+                <option ${state.currentPreset === '群像通用 Agent 预设' ? 'selected' : ''}>群像通用 Agent 预设</option>
+                <option ${state.currentPreset === '单人深度扮演 (低开销)' ? 'selected' : ''}>单人深度扮演 (低开销)</option>
+              </select>
+            </div>
+
+            <button onclick="switchScene('desktop')" class="w-full py-2.5 rounded-lg bg-[var(--primary)] text-[var(--primary-foreground)] font-medium text-xs cursor-pointer shadow-sm hover:opacity-90 flex items-center justify-center gap-2">
+              <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+              <span>打开独立全能控制台</span>
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
+    // =========================================================================
+    // 5. 九大视图主画布渲染函数（桌面与移动端详页共用同一套数据驱动内核）
+    // =========================================================================
+    function renderActiveTabContent(isMobile) {
+      switch (state.activeTab) {
+        case 'files': return renderFilesTab(isMobile);
+        case 'logs': return renderLogsTab(isMobile);
+        case 'cache': return renderCacheTab(isMobile);
+        case 'agents': return renderAgentsTab(isMobile);
+        case 'pipeline': return renderPipelineTab(isMobile);
+        case 'tools': return renderToolsTab(isMobile);
+        case 'regex': return renderRegexTab(isMobile);
+        case 'wi': return renderWITab(isMobile);
+        case 'connections': return renderConnectionsTab(isMobile);
+        default: return '';
+      }
+    }
+
+    // ----- ① 文件与内容覆盖 -----
+    function renderFilesTab(isMobile) {
+      const list = state.files.filter(f => state.fileFilter === 'all' || f.ns === state.fileFilter);
+      const active = state.files.find(f => f.id === state.selectedFileId) || list[0];
+      const inpCls = isMobile ? 'mobile-control' : 'text-xs';
+
+      const masterHtml = `
+        <div class="flex flex-col h-full">
+          <div class="p-2.5 border-b border-[var(--border)] flex flex-wrap gap-1">
+            ${[['all','全部'], ['workspace','工作区'], ['worldinfo','WI覆写'], ['message','展示层']].map(([k, lbl]) => `
+              <button onclick="state.fileFilter='${k}';render();" class="px-2 py-1 rounded text-[11px] cursor-pointer border ${state.fileFilter===k ? 'pill-soft-primary font-medium' : 'border-transparent hover:bg-[var(--secondary)] text-[var(--muted-foreground)]'} ${isMobile ? 'touch-target' : ''}">${lbl}</button>
+            `).join('')}
+          </div>
+          <div class="flex-1 overflow-y-auto thin-scroll p-2 space-y-1.5">
+            ${list.map(f => `
+              <button onclick="state.selectedFileId='${f.id}'; ${isMobile ? 'state.mobilePushDetail=true;' : ''} render();" class="w-full text-left p-2.5 rounded-lg border transition cursor-pointer ${active?.id===f.id && !isMobile ? 'bg-[var(--content)] border-[var(--primary)]/50' : 'border-[var(--card-border)] hover:bg-[var(--secondary)]'} ${isMobile ? 'min-h-[48px]' : ''}">
+                <div class="text-xs font-mono font-medium truncate">${esc(f.path)}</div>
+                <div class="mt-1 flex items-center justify-between gap-2 text-[11px] text-[var(--muted-foreground)]">
+                  <span>${esc(f.source)}</span>
+                  <span class="px-1.5 py-0.5 rounded bg-[var(--sidebar)] border border-[var(--border)] text-[10px]">${esc(f.layer)}</span>
+                </div>
+              </button>
+            `).join('')}
+          </div>
+        </div>
+      `;
+
+      const detailHtml = active ? `
+        <div class="flex flex-col h-full">
+          <div class="px-3.5 py-2.5 border-b border-[var(--border)] bg-[var(--content)] flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div class="text-xs font-mono font-semibold">${esc(active.path)}</div>
+              <div class="text-[11px] text-[var(--muted-foreground)]">归属层: ${esc(active.layer)} · 来源: ${esc(active.source)}</div>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <div class="flex p-0.5 rounded-lg bg-[var(--sidebar)] border border-[var(--border)] text-[11px]">
+                <button onclick="state.fileViewMode='edit';render();" class="px-2.5 py-1 rounded cursor-pointer ${state.fileViewMode==='edit' ? 'bg-[var(--card)] font-medium shadow-sm' : 'text-[var(--muted-foreground)]'}">原位编辑</button>
+                <button onclick="state.fileViewMode='diff';render();" class="px-2.5 py-1 rounded cursor-pointer ${state.fileViewMode==='diff' ? 'bg-[var(--card)] font-medium shadow-sm' : 'text-[var(--muted-foreground)]'}">Diff 对比</button>
+              </div>
+              <button onclick="saveActiveFile()" class="px-2.5 py-1 rounded-md bg-[var(--primary)] text-[var(--primary-foreground)] text-[11px] font-medium cursor-pointer ${isMobile ? 'touch-target' : ''}">保存</button>
+              <button onclick="restoreActiveFile()" class="px-2.5 py-1 rounded-md border border-[var(--border)] text-[11px] hover:bg-[var(--secondary)] cursor-pointer ${isMobile ? 'touch-target' : ''}">恢复原版</button>
+            </div>
+          </div>
+          <div class="flex-1 p-3.5 overflow-y-auto thin-scroll flex flex-col gap-2">
+            ${state.fileViewMode === 'edit' ? `
+              <textarea id="file-editor-area" class="w-full flex-1 min-h-[300px] p-3 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono leading-relaxed focus:outline-none focus:border-[var(--primary)] ${inpCls}">${esc(active.content)}</textarea>
+            ` : `
+              <div class="rounded-lg border border-[var(--border)] overflow-hidden font-mono text-xs">
+                <div class="px-3 py-1.5 bg-[var(--sidebar)] border-b border-[var(--border)] text-[11px] text-[var(--muted-foreground)]">基线 / 原文 vs 当前分支 (${esc(active.layer)})</div>
+                <div class="p-3 space-y-1 bg-[var(--content)]">
+                  ${active.baseContent.split('\n').map(line => `<div class="diff-del px-2 py-0.5 rounded">- ${esc(line)}</div>`).join('')}
+                  ${active.content.split('\n').map(line => `<div class="diff-add px-2 py-0.5 rounded">+ ${esc(line)}</div>`).join('')}
+                </div>
+              </div>
+            `}
+          </div>
+        </div>
+      ` : '';
+
+      return renderSplitOrStack(isMobile, masterHtml, detailHtml, '选择文件或覆写条目');
+    }
+
+    function saveActiveFile() {
+      const active = state.files.find(f => f.id === state.selectedFileId);
+      const area = document.getElementById('file-editor-area');
+      if (active && area) {
+        active.content = area.value;
+        active.source = 'user-edit';
+        showToast(`已保存至当前分支 ${active.layer}`, 'success');
+        render();
+      }
+    }
+
+    function restoreActiveFile() {
+      const active = state.files.find(f => f.id === state.selectedFileId);
+      if (active) {
+        active.content = active.baseContent;
+        showToast('已清除当前层覆写并恢复基线内容', 'warning');
+        render();
+      }
+    }
+
+    // ----- ② 生成与工具日志 -----
+    function renderLogsTab(isMobile) {
+      const list = state.logs.filter(l => state.logFloorFilter === 'all' || String(l.floor) === state.logFloorFilter);
+      const active = state.logs.find(l => l.id === state.selectedLogId) || list[0];
+
+      const masterHtml = `
+        <div class="flex flex-col h-full">
+          <div class="p-2.5 border-b border-[var(--border)] flex items-center gap-1">
+            ${[['all','全部楼层'], ['12','仅 #12 楼'], ['10','仅 #10 楼']].map(([k, lbl]) => `
+              <button onclick="state.logFloorFilter='${k}';render();" class="px-2 py-1 rounded text-[11px] cursor-pointer border ${state.logFloorFilter===k ? 'pill-soft-primary font-medium' : 'border-transparent hover:bg-[var(--secondary)] text-[var(--muted-foreground)]'} ${isMobile ? 'touch-target' : ''}">${lbl}</button>
+            `).join('')}
+          </div>
+          <div class="flex-1 overflow-y-auto thin-scroll p-2 space-y-1.5">
+            ${list.map(l => {
+              const rate = ((l.cachedTokens / l.inputTokens) * 100).toFixed(1);
+              return `
+                <button onclick="state.selectedLogId='${l.id}'; ${isMobile ? 'state.mobilePushDetail=true;' : ''} render();" class="w-full text-left p-2.5 rounded-lg border transition cursor-pointer ${active?.id===l.id && !isMobile ? 'bg-[var(--content)] border-[var(--primary)]/50' : 'border-[var(--card-border)] hover:bg-[var(--secondary)]'}">
+                  <div class="flex items-center justify-between text-xs font-medium">
+                    <span>#${l.floor} · ${esc(l.agent)}</span>
+                    <span class="text-[10px] px-1.5 py-0.5 rounded border pill-soft-success">${rate}% 命中</span>
+                  </div>
+                  <div class="mt-1 flex items-center justify-between text-[11px] text-[var(--muted-foreground)]">
+                    <span>${esc(l.phase)} · ${l.steps.length} 步</span>
+                    <span>${esc(l.duration)}</span>
+                  </div>
+                </button>
+              `;
+            }).join('')}
+          </div>
+        </div>
+      `;
+
+      const hitRate = active ? ((active.cachedTokens / active.inputTokens) * 100).toFixed(1) : '0';
+      const detailHtml = active ? `
+        <div class="flex flex-col h-full">
+          <div class="px-3.5 py-2.5 border-b border-[var(--border)] bg-[var(--content)] flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div class="text-xs font-semibold">#${active.floor} · ${esc(active.agent)} <span class="font-mono text-[11px] text-[var(--muted-foreground)]">(${esc(active.model)})</span></div>
+              <div class="text-[11px] text-[var(--muted-foreground)]">阶段: ${esc(active.phase)} · 耗时 ${esc(active.duration)}</div>
+            </div>
+            <div class="flex p-0.5 rounded-lg bg-[var(--sidebar)] border border-[var(--border)] text-[11px]">
+              <button onclick="state.logViewTab='steps';render();" class="px-2.5 py-1 rounded cursor-pointer ${state.logViewTab==='steps' ? 'bg-[var(--card)] font-medium' : 'text-[var(--muted-foreground)]'}">执行步骤树</button>
+              <button onclick="state.logViewTab='raw';render();" class="px-2.5 py-1 rounded cursor-pointer ${state.logViewTab==='raw' ? 'bg-[var(--card)] font-medium' : 'text-[var(--muted-foreground)]'}">原始 Payload</button>
+            </div>
+          </div>
+
+          <div class="flex-1 p-3.5 overflow-y-auto thin-scroll space-y-3">
+            <!-- Token & 缓存命中卡 -->
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+              <div class="p-2.5 rounded-lg bg-[var(--content)] border border-[var(--card-border)]">
+                <div class="text-[10px] text-[var(--muted-foreground)]">Input Tokens</div>
+                <div class="font-mono font-semibold text-sm">${active.inputTokens.toLocaleString()}</div>
+              </div>
+              <div class="p-2.5 rounded-lg bg-[var(--content)] border pill-soft-success">
+                <div class="text-[10px]">Cached 命中</div>
+                <div class="font-mono font-semibold text-sm">${active.cachedTokens.toLocaleString()} (${hitRate}%)</div>
+              </div>
+              <div class="p-2.5 rounded-lg bg-[var(--content)] border border-[var(--card-border)]">
+                <div class="text-[10px] text-[var(--muted-foreground)]">Output Tokens</div>
+                <div class="font-mono font-semibold text-sm">${active.outputTokens}</div>
+              </div>
+              <div class="p-2.5 rounded-lg bg-[var(--content)] border border-[var(--card-border)] flex items-center justify-center">
+                <button onclick="showToast('已复制完整请求与响应 JSON 到剪贴板','success')" class="px-2.5 py-1.5 rounded border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-[11px] cursor-pointer">复制完整 JSON</button>
+              </div>
+            </div>
+
+            ${state.logViewTab === 'steps' ? `
+              <div class="space-y-2">
+                ${active.steps.map(st => `
+                  <div class="p-3 rounded-lg border border-[var(--border)] bg-[var(--content)] text-xs space-y-1.5">
+                    <div class="flex items-center justify-between">
+                      <span class="font-semibold flex items-center gap-1.5">
+                        <span class="px-1.5 py-0.5 rounded text-[10px] ${st.type==='tool_call' ? 'pill-soft-primary border' : 'pill-soft-success border'}">Step ${st.step}</span>
+                        <span class="font-mono">${esc(st.type === 'tool_call' ? st.name : 'Assistant 回复')}</span>
+                      </span>
+                      <span class="text-[11px] text-[var(--muted-foreground)]">${st.ms} ms</span>
+                    </div>
+                    ${st.type === 'tool_call' ? `
+                      <div class="font-mono text-[11px] bg-[var(--card)] p-2 rounded border border-[var(--card-border)] text-[var(--muted-foreground)]">入参: ${esc(st.args)}</div>
+                      <div class="text-[11px] text-[var(--foreground)]">返回: ${esc(st.result)}</div>
+                    ` : `
+                      <div class="text-xs text-[var(--foreground)]">${esc(st.preview)}</div>
+                    `}
+                  </div>
+                `).join('')}
+              </div>
+            ` : `
+              <pre class="p-3 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono text-[11px] overflow-x-auto leading-relaxed">${esc(JSON.stringify(active.rawMessages, null, 2))}</pre>
+            `}
+          </div>
+        </div>
+      ` : '';
+
+      return renderSplitOrStack(isMobile, masterHtml, detailHtml, '选择一条生成记录');
+    }
+
+    // ----- ③ 缓存水位与存档压平 -----
+    function renderCacheTab(isMobile) {
+      const st = state.storageStats;
+      return `
+        <div class="p-4 space-y-4 overflow-y-auto thin-scroll h-full">
+          <div class="bg-[var(--content)] border border-[var(--border)] rounded-xl p-4 space-y-3">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 class="text-sm font-semibold">上下文高低水位分块归档 (KV Cache 保护)</h3>
+                <p class="text-[11px] text-[var(--muted-foreground)]">未跨过高水位 H 前绝不修改历史或折叠旧工具输出，确保连续十几轮 100% 命中前缀缓存。</p>
+              </div>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+              ${state.watermarks.map((w, idx) => {
+                const pct = Math.min(100, Math.round((w.current / w.high) * 100));
+                const lowPct = Math.round((w.low / w.high) * 100);
+                return `
+                  <div class="p-3 rounded-lg bg-[var(--card)] border border-[var(--card-border)] space-y-2 text-xs">
+                    <div class="flex items-center justify-between font-medium">
+                      <span>${esc(w.name)}</span>
+                      <span class="font-mono text-[11px]">${(w.current/1000).toFixed(1)}k / ${(w.high/1000).toFixed(0)}k</span>
+                    </div>
+                    <div class="relative h-2.5 rounded-full bg-[var(--content)] border border-[var(--border)] overflow-hidden">
+                      <div class="h-full bg-[var(--primary)] transition-all" style="width:${pct}%"></div>
+                      <div title="低水位 L=${w.low}" class="absolute top-0 bottom-0 w-0.5 bg-[var(--warning)]" style="left:${lowPct}%"></div>
+                    </div>
+                    <div class="text-[10px] text-[var(--muted-foreground)] flex justify-between">
+                      <span>L=${(w.low/1000).toFixed(0)}k · 已归档 ${w.chunks} 块</span>
+                      <span>${esc(w.summaryMode)}</span>
+                    </div>
+                    <button onclick="compactContext(${idx})" class="w-full py-1.5 rounded border border-[var(--border)] hover:bg-[var(--secondary)] text-[11px] cursor-pointer ${isMobile ? 'touch-target' : ''}">立即分块归档至 L</button>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          </div>
+
+          <div class="bg-[var(--content)] border border-[var(--border)] rounded-xl p-4 space-y-3">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 class="text-sm font-semibold">ChatDataStore 存档冷层物理压平 (Storage Compaction)</h3>
+                <p class="text-[11px] text-[var(--muted-foreground)]">压平距今超过安全深度的冷楼层增量记录，丢弃冷楼层旧 Swipe 分支以防止 .jsonl 存档膨胀。</p>
+              </div>
+              <label class="text-xs flex items-center gap-1.5 cursor-pointer">
+                <input type="checkbox" ${st.autoCompact ? 'checked' : ''} onchange="state.storageStats.autoCompact=this.checked;showToast('自动冷层压平：'+(this.checked?'开启':'关闭'));render();" />
+                <span>自动压平</span>
+              </label>
+            </div>
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+              <div class="p-2.5 rounded-lg bg-[var(--card)] border border-[var(--card-border)]"><div class="text-[10px] text-[var(--muted-foreground)]">估算占用体积</div><div class="font-mono font-semibold">${(st.estimatedBytes / (1024*1024)).toFixed(2)} MiB</div></div>
+              <div class="p-2.5 rounded-lg bg-[var(--card)] border border-[var(--card-border)]"><div class="text-[10px] text-[var(--muted-foreground)]">活跃分支层数</div><div class="font-mono font-semibold">${st.layers} 层</div></div>
+              <div class="p-2.5 rounded-lg bg-[var(--card)] border border-[var(--card-border)]"><div class="text-[10px] text-[var(--muted-foreground)]">已压平水位</div><div class="font-mono font-semibold">Message #${st.compactedWatermark}</div></div>
+              <div class="p-2.5 rounded-lg bg-[var(--card)] border border-[var(--card-border)]"><div class="text-[10px] text-[var(--muted-foreground)]">保留热深度</div><div class="font-mono font-semibold">${st.keepDepth} 轮</div></div>
+            </div>
+            ${st.previewReport ? `<div class="p-2.5 rounded-lg border pill-soft-primary text-xs">${esc(st.previewReport)}</div>` : ''}
+            <div class="flex flex-wrap gap-2">
+              <button onclick="previewColdCompaction()" class="px-3 py-1.5 rounded-lg border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-xs cursor-pointer ${isMobile ? 'touch-target' : ''}">预览压平 (Dry Run)</button>
+              <button onclick="runColdCompaction()" class="px-3 py-1.5 rounded-lg bg-[var(--primary)] text-[var(--primary-foreground)] text-xs font-medium cursor-pointer ${isMobile ? 'touch-target' : ''}">立即压平冷层</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function compactContext(idx) {
+      const w = state.watermarks[idx];
+      w.current = w.low;
+      w.chunks += 1;
+      showToast(`${w.name} 已归档 /history/chunk-00${w.chunks}.md，降至 ${(w.low/1000).toFixed(0)}k`, 'success');
+      render();
+    }
+
+    function previewColdCompaction() {
+      state.storageStats.previewReport = '预览结果：将压平 14 条历史覆盖（含 2 条删除墓碑），回收 8 个冷分支层，预计释放约 1.18 MiB .jsonl 存储空间。';
+      render();
+    }
+
+    function runColdCompaction() {
+      state.storageStats.estimatedBytes = 1280 * 1024;
+      state.storageStats.layers = 12;
+      state.storageStats.compactedWatermark = 9;
+      state.storageStats.previewReport = '';
+      showToast('冷层物理压平完成，已释放约 1.18 MiB', 'success');
+      render();
+    }
+
+    // ----- ④ 智能体 -----
+    function renderAgentsTab(isMobile) {
+      const active = state.agents.find(a => a.id === state.selectedAgentId) || state.agents[0];
+      const inpCls = isMobile ? 'mobile-control' : 'text-xs';
+
+      const masterHtml = `
+        <div class="p-2.5 space-y-1.5 overflow-y-auto h-full">
+          ${state.agents.map(a => `
+            <button onclick="state.selectedAgentId='${a.id}'; ${isMobile ? 'state.mobilePushDetail=true;' : ''} render();" class="w-full text-left p-2.5 rounded-lg border cursor-pointer ${active.id===a.id && !isMobile ? 'bg-[var(--content)] border-[var(--primary)]/50' : 'border-[var(--card-border)] hover:bg-[var(--secondary)]'} ${isMobile ? 'min-h-[48px]' : ''}">
+              <div class="flex items-center justify-between text-xs font-semibold">
+                <span>${esc(a.name)}</span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded border ${a.sessionMode==='persistent' ? 'pill-soft-primary' : 'pill-soft-warning'}">${a.sessionMode}</span>
+              </div>
+              <div class="mt-1 text-[11px] text-[var(--muted-foreground)]">${a.blocks.length} 段积木 · ${a.tools.length} 个工具</div>
+            </button>
+          `).join('')}
+        </div>
+      `;
+
+      const detailHtml = `
+        <div class="p-4 space-y-4 overflow-y-auto thin-scroll h-full">
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">绑定 API 连接</label>
+              <select onchange="getActiveAgent().connectionId=this.value;showToast('已更新模型绑定');" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${inpCls}">
+                <option value="inherit" ${active.connectionId==='inherit'?'selected':''}>跟随当前主连接 (inherit)</option>
+                ${state.connections.map(c => `<option value="${c.id}" ${active.connectionId===c.id?'selected':''}>${esc(c.name)}</option>`).join('')}
+              </select>
+            </div>
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">会话轨迹模式</label>
+              <select onchange="getActiveAgent().sessionMode=this.value;render();" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${inpCls}">
+                <option value="persistent" ${active.sessionMode==='persistent'?'selected':''}>persistent（持久伴生缓存轨）</option>
+                <option value="ephemeral" ${active.sessionMode==='ephemeral'?'selected':''}>ephemeral（瞬态按需轨）</option>
+              </select>
+            </div>
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">VFS 只读白名单 (Glob)</label>
+              <input type="text" value="${esc(active.readGlobs)}" onchange="getActiveAgent().readGlobs=this.value" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono ${inpCls}" />
+            </div>
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">VFS 可写白名单 (Glob)</label>
+              <input type="text" value="${esc(active.writeGlobs)}" onchange="getActiveAgent().writeGlobs=this.value" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono ${inpCls}" />
+            </div>
+          </div>
+
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <div class="text-xs font-semibold">模块化提示词积木 (仅限 Prefix 静态头 与 Tail 当轮尾)</div>
+              <button onclick="addAgentBlock()" class="px-2.5 py-1 rounded border border-[var(--border)] text-[11px] hover:bg-[var(--secondary)] cursor-pointer ${isMobile ? 'touch-target' : ''}">+ 新增积木</button>
+            </div>
+            <div class="space-y-2">
+              ${active.blocks.map((b, i) => `
+                <div class="p-3 rounded-lg border border-[var(--border)] bg-[var(--content)] space-y-2">
+                  <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <label class="flex items-center gap-2 font-medium cursor-pointer">
+                      <input type="checkbox" ${b.enabled ? 'checked' : ''} onchange="getActiveAgent().blocks[${i}].enabled=this.checked;render();" />
+                      <span>${esc(b.name)}</span>
+                    </label>
+                    <div class="flex items-center gap-1">
+                      <select onchange="getActiveAgent().blocks[${i}].placement=this.value;render();" class="px-2 py-1 rounded bg-[var(--card)] border border-[var(--border)] text-[11px]">
+                        <option value="prefix" ${b.placement==='prefix'?'selected':''}>Layer 0 Prefix (缓存)</option>
+                        <option value="tail" ${b.placement==='tail'?'selected':''}>Layer 2 Tail (末尾)</option>
+                      </select>
+                      <button onclick="moveBlock(${i}, -1)" title="上移" class="px-2 py-1 rounded border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] cursor-pointer ${isMobile ? 'touch-target' : ''}">↑</button>
+                      <button onclick="moveBlock(${i}, 1)" title="下移" class="px-2 py-1 rounded border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] cursor-pointer ${isMobile ? 'touch-target' : ''}">↓</button>
+                    </div>
+                  </div>
+                  <textarea onchange="getActiveAgent().blocks[${i}].content=this.value" rows="2" class="w-full p-2 rounded bg-[var(--card)] border border-[var(--card-border)] leading-relaxed ${inpCls}">${esc(b.content)}</textarea>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        </div>
+      `;
+
+      return renderSplitOrStack(isMobile, masterHtml, detailHtml, '选择智能体');
+    }
+
+    function getActiveAgent() {
+      return state.agents.find(a => a.id === state.selectedAgentId) || state.agents[0];
+    }
+    function moveBlock(idx, delta) {
+      const ag = getActiveAgent();
+      const target = idx + delta;
+      if (target < 0 || target >= ag.blocks.length) return;
+      const tmp = ag.blocks[idx];
+      ag.blocks[idx] = ag.blocks[target];
+      ag.blocks[target] = tmp;
+      render();
+    }
+    function addAgentBlock() {
+      getActiveAgent().blocks.push({ id: 'b_' + Date.now(), name: '新指令积木', role: 'system', placement: 'prefix', enabled: true, content: '请在此编写提示词规则...' });
+      render();
+    }
+
+    // ----- ⑤ 触发管线 -----
+    function renderPipelineTab(isMobile) {
+      const phases = [
+        ['before_turn', 'Before Turn (前置推演)'],
+        ['main_turn', 'Main Turn (主叙事流式)'],
+        ['after_turn', 'After Turn (后置异步/媒体)'],
+        ['maintenance', 'Maintenance (水位维护)'],
+      ];
+      const active = state.triggers.find(t => t.id === state.selectedTriggerId) || state.triggers[0];
+      const inpCls = isMobile ? 'mobile-control' : 'text-xs';
+
+      const masterHtml = `
+        <div class="p-2.5 space-y-3 overflow-y-auto h-full">
+          ${phases.map(([ph, title]) => {
+            const items = state.triggers.filter(t => t.phase === ph).sort((a,b) => a.order - b.order);
+            return `
+              <div class="space-y-1.5">
+                <div class="text-[11px] font-semibold text-[var(--muted-foreground)] px-1">${title}</div>
+                ${items.map(t => `
+                  <button onclick="state.selectedTriggerId='${t.id}'; ${isMobile ? 'state.mobilePushDetail=true;' : ''} render();" class="w-full text-left p-2.5 rounded-lg border cursor-pointer ${active.id===t.id && !isMobile ? 'bg-[var(--content)] border-[var(--primary)]/50' : 'border-[var(--card-border)] hover:bg-[var(--secondary)]'} ${!t.enabled ? 'opacity-50' : ''}">
+                    <div class="flex items-center justify-between gap-2 text-xs font-medium">
+                      <span class="truncate">#${t.order} · ${esc(t.decorator)}</span>
+                      <span class="px-1.5 py-0.5 rounded text-[10px] border ${t.barrier==='turn'?'pill-soft-error':t.barrier==='self'?'pill-soft-warning':'pill-soft-primary'}">${t.barrier}</span>
+                    </div>
+                    <div class="mt-1 flex items-center justify-between text-[10px] text-[var(--muted-foreground)]">
+                      <span>来源: ${t.source === 'worldinfo' ? '世界书 @@' : '预设规则'}</span>
+                      <span>${esc(t.condition)}</span>
+                    </div>
+                  </button>
+                `).join('')}
+              </div>
+            `;
+          }).join('')}
+        </div>
+      `;
+
+      const detailHtml = `
+        <div class="p-4 space-y-4 overflow-y-auto h-full text-xs">
+          <div class="flex items-center justify-between border-b border-[var(--border)] pb-3">
+            <div>
+              <div class="text-sm font-semibold">${esc(active.decorator)}</div>
+              <div class="text-[11px] text-[var(--muted-foreground)]">来源：${active.source === 'worldinfo' ? '自动扫描当前激活世界书条目' : '预设内建规则'}</div>
+            </div>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" ${active.enabled?'checked':''} onchange="getActiveTrigger().enabled=this.checked;render();" />
+              <span>启用</span>
+            </label>
+          </div>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">并发屏障策略 (Barrier)</label>
+              <select onchange="getActiveTrigger().barrier=this.value;render();" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${inpCls}">
+                <option value="turn" ${active.barrier==='turn'?'selected':''}>turn (跨轮强屏障：下轮前必等)</option>
+                <option value="self" ${active.barrier==='self'?'selected':''}>self (仅自身队列串行：不挡下轮)</option>
+                <option value="none" ${active.barrier==='none'?'selected':''}>none (纯后台脱离：按楼层回填)</option>
+              </select>
+            </div>
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">批次序号 (Order)</label>
+              <input type="number" value="${active.order}" onchange="getActiveTrigger().order=Number(this.value)||0;render();" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${inpCls}" />
+            </div>
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">可选合并组 (@@group)</label>
+              <input type="text" placeholder="留空则默认 1对1 独立执行" value="${esc(active.group)}" onchange="getActiveTrigger().group=this.value" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${inpCls}" />
+            </div>
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">触发条件</label>
+              <input type="text" value="${esc(active.condition)}" onchange="getActiveTrigger().condition=this.value" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono ${inpCls}" />
+            </div>
+          </div>
+          <div>
+            <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">职责说明与指令</label>
+            <textarea rows="4" onchange="getActiveTrigger().note=this.value" class="w-full p-2.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${inpCls}">${esc(active.note)}</textarea>
+          </div>
+        </div>
+      `;
+
+      return renderSplitOrStack(isMobile, masterHtml, detailHtml, '选择触发规则');
+    }
+
+    function getActiveTrigger() { return state.triggers.find(t => t.id === state.selectedTriggerId) || state.triggers[0]; }
+
+    // ----- ⑥ 工具与脚本 -----
+    function renderToolsTab(isMobile) {
+      const active = state.tools.find(t => t.id === state.selectedToolId) || state.tools[0];
+      const inpCls = isMobile ? 'mobile-control' : 'text-xs';
+
+      const masterHtml = `
+        <div class="p-2.5 space-y-1.5 overflow-y-auto h-full">
+          ${state.tools.map(t => `
+            <button onclick="state.selectedToolId='${t.id}'; state.toolTestOutput=''; ${isMobile ? 'state.mobilePushDetail=true;' : ''} render();" class="w-full text-left p-2.5 rounded-lg border cursor-pointer ${active.id===t.id && !isMobile ? 'bg-[var(--content)] border-[var(--primary)]/50' : 'border-[var(--card-border)] hover:bg-[var(--secondary)]'}">
+              <div class="flex items-center justify-between text-xs font-mono font-semibold">
+                <span>${esc(t.name)}</span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] font-sans font-normal">${t.kind==='custom_js'?'原生JS':t.kind==='slash_bridge'?'斜杠命令':'内置'}</span>
+              </div>
+              <div class="mt-1 text-[11px] text-[var(--muted-foreground)] truncate">${esc(t.source)}</div>
+            </button>
+          `).join('')}
+        </div>
+      `;
+
+      const detailHtml = `
+        <div class="p-4 space-y-3 overflow-y-auto h-full flex flex-col">
+          <div class="flex items-center justify-between">
+            <div>
+              <div class="text-sm font-mono font-semibold">${esc(active.name)}</div>
+              <div class="text-[11px] text-[var(--muted-foreground)]">${esc(active.desc)}</div>
+            </div>
+            <span class="text-[11px] px-2 py-0.5 rounded border pill-soft-success">受控沙箱 · 锚定 #12#0</span>
+          </div>
+          <textarea oninput="getActiveTool().code=this.value" rows="10" class="w-full p-3 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono leading-relaxed ${inpCls}">${esc(active.code)}</textarea>
+
+          <div class="p-3 rounded-xl border border-[var(--border)] bg-[var(--content)] space-y-2">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold">▶ 沙箱模拟调用测试 (无需发真实聊天消息)</span>
+              <button onclick="runToolSandboxTest()" class="px-3 py-1 rounded-md bg-[var(--primary)] text-[var(--primary-foreground)] text-xs font-medium cursor-pointer ${isMobile ? 'touch-target' : ''}">▶ 运行测试</button>
+            </div>
+            <textarea id="tool-test-input" rows="3" class="w-full p-2 rounded bg-[var(--card)] border border-[var(--card-border)] font-mono ${inpCls}">${esc(state.toolTestInput)}</textarea>
+            ${state.toolTestOutput ? `<pre class="p-2.5 rounded bg-[var(--card)] border pill-soft-success font-mono text-[11px] overflow-x-auto">${esc(state.toolTestOutput)}</pre>` : ''}
+          </div>
+        </div>
+      `;
+
+      return renderSplitOrStack(isMobile, masterHtml, detailHtml, '选择工具');
+    }
+
+    function getActiveTool() { return state.tools.find(t => t.id === state.selectedToolId) || state.tools[0]; }
+
+    function runToolSandboxTest() {
+      const active = getActiveTool();
+      const inp = document.getElementById('tool-test-input')?.value || '{}';
+      try {
+        JSON.parse(inp);
+        state.toolTestInput = inp;
+        state.toolTestOutput = `[iframe 沙箱] Zod 参数校验通过\n[锚定上下文] target = { messageId: 12, swipeId: 0 }\n[返回值] "${active.name} 执行成功 (耗时 42ms，已安全清理内部定时器)"`;
+        showToast('沙箱模拟调用成功', 'success');
+      } catch (e) {
+        state.toolTestOutput = `[参数 JSON 解析错误] ${e.message}`;
+        showToast('参数格式有误', 'error');
+      }
+      render();
+    }
+
+    // ----- ⑦ 正则清洗 -----
+    function computeRegexOutputHtml(rule, sample) {
+      if (!rule) return '';
+      try {
+        const m = rule.pattern.match(/^\/([\s\S]*)\/([gimsuy]*)$/);
+        const re = m ? new RegExp(m[1], m[2]) : new RegExp(rule.pattern, 'g');
+        const out = sample.replace(re, rule.replace);
+        return `<div class="text-[11px] text-[var(--muted-foreground)] mb-1">替换后输出：</div><pre class="p-2.5 rounded bg-[var(--card)] border pill-soft-success font-mono whitespace-pre-wrap">${esc(out)}</pre>`;
+      } catch (err) {
+        return `<div class="p-2 rounded border pill-soft-error">正则语法错误：${esc(err.message)}</div>`;
+      }
+    }
+
+    function updateRegexPreview() {
+      const box = document.getElementById('regex-preview-output');
+      if (box) {
+        box.innerHTML = computeRegexOutputHtml(getActiveRegex(), state.regexSampleInput);
+      }
+    }
+
+    function renderRegexTab(isMobile) {
+      const active = state.regexRules.find(r => r.id === state.selectedRegexId) || state.regexRules[0];
+      const inpCls = isMobile ? 'mobile-control' : 'text-xs';
+
+      const masterHtml = `
+        <div class="p-2.5 space-y-1.5 overflow-y-auto h-full">
+          ${state.regexRules.map(r => `
+            <button onclick="state.selectedRegexId='${r.id}'; ${isMobile ? 'state.mobilePushDetail=true;' : ''} render();" class="w-full text-left p-2.5 rounded-lg border cursor-pointer ${active.id===r.id && !isMobile ? 'bg-[var(--content)] border-[var(--primary)]/50' : 'border-[var(--card-border)] hover:bg-[var(--secondary)]'}">
+              <div class="flex items-center justify-between text-xs font-medium">
+                <span class="truncate">${esc(r.name)}</span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded border ${r.stage==='ingest'?'pill-soft-primary':r.stage==='display'?'pill-soft-success':'pill-soft-warning'}">${r.stage}</span>
+              </div>
+              <div class="mt-1 font-mono text-[10px] text-[var(--muted-foreground)] truncate">${esc(r.pattern)}</div>
+            </button>
+          `).join('')}
+        </div>
+      `;
+
+      const detailHtml = `
+        <div class="p-4 space-y-3 overflow-y-auto h-full text-xs">
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">规则名称</label>
+              <input type="text" value="${esc(active.name)}" oninput="getActiveRegex().name=this.value" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${inpCls}" />
+            </div>
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">执行阶段 (缓存安全三档)</label>
+              <select onchange="getActiveRegex().stage=this.value;render();" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${inpCls}">
+                <option value="display" ${active.stage==='display'?'selected':''}>display (纯 DOM 美化，不改持久轨)</option>
+                <option value="ingest" ${active.stage==='ingest'?'selected':''}>ingest (入轨一次性清洗并永久固化)</option>
+                <option value="lore_read" ${active.stage==='lore_read'?'selected':''}>lore_read (VFS 读世界书后清洗)</option>
+              </select>
+            </div>
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">查找正则 (/pattern/flags)</label>
+              <input type="text" value="${esc(active.pattern)}" oninput="getActiveRegex().pattern=this.value;updateRegexPreview();" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono ${inpCls}" />
+            </div>
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">替换为 ($1, $2 捕获组)</label>
+              <input type="text" value="${esc(active.replace)}" oninput="getActiveRegex().replace=this.value;updateRegexPreview();" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono ${inpCls}" />
+            </div>
+          </div>
+
+          <div class="p-3 rounded-xl border border-[var(--border)] bg-[var(--content)] space-y-2">
+            <div class="font-semibold">实时正则替换预览（自研引擎，独立于 ST 宿主）</div>
+            <textarea oninput="state.regexSampleInput=this.value;updateRegexPreview();" rows="4" class="w-full p-2.5 rounded bg-[var(--card)] border border-[var(--card-border)] font-mono ${inpCls}">${esc(state.regexSampleInput)}</textarea>
+            <div id="regex-preview-output">${computeRegexOutputHtml(active, state.regexSampleInput)}</div>
+          </div>
+        </div>
+      `;
+
+      return renderSplitOrStack(isMobile, masterHtml, detailHtml, '选择正则规则');
+    }
+
+    function getActiveRegex() { return state.regexRules.find(r => r.id === state.selectedRegexId) || state.regexRules[0]; }
+
+    // ----- ⑧ 世界书路由 -----
+    function renderWITab(isMobile) {
+      const classLabel = {
+        system_rule: ['① 静态系统指令 (进 Layer 0)', 'pill-soft-primary'],
+        core_manifest: ['② 核心必读清单 (进 Manifest)', 'pill-soft-success'],
+        on_demand_archive: ['③ 按需档案库 (尾部去重雷达)', 'border-[var(--border)] bg-[var(--card)]'],
+        dynamic_or_trigger: ['④ 动态/脚本剥离 (走触发或尾部)', 'pill-soft-warning'],
+      };
+
+      return `
+        <div class="p-4 space-y-4 overflow-y-auto h-full">
+          <div class="flex items-center justify-between flex-wrap gap-2">
+            <div class="flex p-0.5 rounded-lg bg-[var(--content)] border border-[var(--border)] text-xs">
+              <button onclick="state.wiSubTab='router';render();" class="px-3 py-1.5 rounded-md cursor-pointer ${state.wiSubTab==='router'?'bg-[var(--card)] font-medium shadow-sm':'text-[var(--muted-foreground)]'}">中文卡 WI 四类分流预览与纠偏</button>
+              <button onclick="state.wiSubTab='preset_files';render();" class="px-3 py-1.5 rounded-md cursor-pointer ${state.wiSubTab==='preset_files'?'bg-[var(--card)] font-medium shadow-sm':'text-[var(--muted-foreground)]'}">预设文件管理 (/preset/*)</button>
+            </div>
+            <span class="text-[11px] text-[var(--muted-foreground)]">空壳角色卡补偿：<strong class="text-[var(--success)]">已自动激活</strong></span>
+          </div>
+
+          ${state.wiSubTab === 'router' ? `
+            <div class="space-y-2">
+              ${state.wiEntries.map((w, idx) => {
+                const eff = w.overrideClass === 'auto' ? w.autoClass : w.overrideClass;
+                const [lbl, cls] = classLabel[eff];
+                return `
+                  <div class="p-3 rounded-xl border border-[var(--border)] bg-[var(--content)] flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                    <div class="space-y-1">
+                      <div class="font-medium">${esc(w.comment)} <span class="text-[11px] text-[var(--muted-foreground)] font-normal">(${w.chars}字)</span></div>
+                      <div class="text-[11px] text-[var(--muted-foreground)]">特征：${esc(w.flag)} · <span class="px-1.5 py-0.5 rounded border text-[10px] ${cls}">${lbl}</span></div>
+                    </div>
+                    <select onchange="state.wiEntries[${idx}].overrideClass=this.value;showToast('已更新条目路由归属');render();" class="px-2.5 py-1.5 rounded-lg bg-[var(--card)] border border-[var(--border)] ${isMobile ? 'mobile-control w-full' : 'text-xs'}">
+                      <option value="auto" ${w.overrideClass==='auto'?'selected':''}>自动识别</option>
+                      <option value="system_rule" ${w.overrideClass==='system_rule'?'selected':''}>锁定 ① 静态系统指令</option>
+                      <option value="core_manifest" ${w.overrideClass==='core_manifest'?'selected':''}>锁定 ② 核心必读清单</option>
+                      <option value="on_demand_archive" ${w.overrideClass==='on_demand_archive'?'selected':''}>锁定 ③ 按需检索档案</option>
+                      <option value="dynamic_or_trigger" ${w.overrideClass==='dynamic_or_trigger'?'selected':''}>锁定 ④ 动态/脚本剥离</option>
+                    </select>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          ` : `
+            <div class="space-y-2.5">
+              ${state.presetFiles.map(pf => `
+                <div class="p-3 rounded-xl border border-[var(--border)] bg-[var(--content)] space-y-2 text-xs">
+                  <div class="flex items-center justify-between font-mono font-semibold">
+                    <span>/preset/${esc(pf.name)}</span>
+                    <span class="text-[11px] text-[var(--muted-foreground)] font-sans">${esc(pf.size)}</span>
+                  </div>
+                  <pre class="p-2.5 rounded bg-[var(--card)] border border-[var(--card-border)] text-[11px] overflow-x-auto">${esc(pf.preview)}</pre>
+                </div>
+              `).join('')}
+            </div>
+          `}
+        </div>
+      `;
+    }
+
+    // ----- ⑨ API 连接 -----
+    function renderConnectionsTab(isMobile) {
+      const active = state.connections.find(c => c.id === state.selectedConnId) || state.connections[0];
+      const inpCls = isMobile ? 'mobile-control' : 'text-xs';
+
+      const masterHtml = `
+        <div class="p-2.5 space-y-1.5 overflow-y-auto h-full">
+          ${state.connections.map(c => `
+            <button onclick="state.selectedConnId='${c.id}'; state.connTestStatus=''; ${isMobile ? 'state.mobilePushDetail=true;' : ''} render();" class="w-full text-left p-2.5 rounded-lg border cursor-pointer ${active.id===c.id && !isMobile ? 'bg-[var(--content)] border-[var(--primary)]/50' : 'border-[var(--card-border)] hover:bg-[var(--secondary)]'}">
+              <div class="text-xs font-semibold truncate">${esc(c.name)}</div>
+              <div class="mt-1 text-[10px] font-mono text-[var(--muted-foreground)] truncate">${esc(c.model)}</div>
+            </button>
+          `).join('')}
+        </div>
+      `;
+
+      const detailHtml = `
+        <div class="p-4 space-y-3 overflow-y-auto h-full text-xs">
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div class="sm:col-span-2">
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">Endpoint (Base URL)</label>
+              <input type="text" value="${esc(active.baseUrl)}" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono ${inpCls}" />
+            </div>
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">Model ID</label>
+              <input type="text" value="${esc(active.model)}" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono ${inpCls}" />
+            </div>
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">前缀缓存协议策略</label>
+              <select onchange="getActiveConn().cachePolicy=this.value;render();" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${inpCls}">
+                <option value="auto_prefix" ${active.cachePolicy==='auto_prefix'?'selected':''}>自动前缀缓存 (OpenAI / DeepSeek / Gemini)</option>
+                <option value="anthropic_explicit" ${active.cachePolicy==='anthropic_explicit'?'selected':''}>显式断点标记 (Anthropic / OpenRouter Claude)</option>
+              </select>
+            </div>
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">Context Size / Max Tokens</label>
+              <input type="text" value="${active.contextSize} / ${active.maxTokens}" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono ${inpCls}" />
+            </div>
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">最大并发数 (Max Concurrency)</label>
+              <input type="number" value="${active.maxConcurrency}" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${inpCls}" />
+            </div>
+          </div>
+          <div>
+            <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">自定义 Request Headers (YAML)</label>
+            <textarea rows="2" class="w-full p-2.5 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono ${inpCls}">${esc(active.headersYaml)}</textarea>
+          </div>
+          <div class="flex items-center gap-2">
+            <button onclick="state.connTestStatus='✓ 握手成功 (312ms) · 已确认支持 ' + (getActiveConn().cachePolicy==='anthropic_explicit'?'cache_control 显式断点':'自动前缀缓存'); render();" class="px-3 py-1.5 rounded-lg bg-[var(--primary)] text-[var(--primary-foreground)] text-xs font-medium cursor-pointer ${isMobile ? 'touch-target' : ''}">🔌 测试连通与缓存策略</button>
+          </div>
+          ${state.connTestStatus ? `<div class="p-2.5 rounded-lg border pill-soft-success">${esc(state.connTestStatus)}</div>` : ''}
+        </div>
+      `;
+
+      return renderSplitOrStack(isMobile, masterHtml, detailHtml, '选择连接');
+    }
+
+    function getActiveConn() { return state.connections.find(c => c.id === state.selectedConnId) || state.connections[0]; }
+
+    // 桌面双栏 <-> 移动 Master-Detail 页面栈核心容器
+    function renderSplitOrStack(isMobile, masterHtml, detailHtml, detailTitle) {
+      if (isMobile) {
+        if (state.mobilePushDetail) {
+          return `
+            <div class="flex flex-col h-full">
+              <div class="px-3 py-2 bg-[var(--sidebar)] border-b border-[var(--border)] flex items-center gap-2 shrink-0">
+                <button onclick="state.mobilePushDetail=false;render();" class="px-2.5 py-1.5 rounded-lg border border-[var(--border)] bg-[var(--card)] text-xs font-medium touch-target flex items-center gap-1 cursor-pointer">
+                  ← 返回列表
+                </button>
+                <span class="text-xs font-semibold truncate">${esc(detailTitle)}</span>
+              </div>
+              <div class="flex-1 overflow-y-auto">${detailHtml}</div>
+            </div>
+          `;
+        }
+        return `<div class="h-full overflow-y-auto">${masterHtml}</div>`;
+      }
+      return `
+        <div class="grid grid-cols-12 h-full">
+          <div class="col-span-4 border-r border-[var(--border)] bg-[var(--sidebar)]/50 overflow-hidden">${masterHtml}</div>
+          <div class="col-span-8 overflow-hidden">${detailHtml}</div>
+        </div>
+      `;
+    }
+
+    // =========================================================================
+    // 6. 场景 B & C：桌面大一统控制台 & 移动端 390×844 壳层
+    // =========================================================================
+    function renderConsoleHeader(isMobile) {
+      return `
+        <div class="px-3.5 py-2.5 bg-[var(--sidebar)] border-b border-[var(--border)] flex flex-wrap items-center justify-between gap-2 shrink-0">
+          <div class="flex items-center gap-2">
+            <span class="font-semibold text-sm flex items-center gap-1.5">⚡ ST-Agentic</span>
+            ${!isMobile ? `<span class="text-[10px] px-1.5 py-0.5 rounded shadow-boundary-badge text-[var(--primary)]">Shadow DOM 隔离 & 键盘防穿透</span>` : ''}
+          </div>
+          <div class="flex flex-wrap items-center gap-1.5 text-xs">
+            <div class="flex p-0.5 rounded-lg bg-[var(--content)] border border-[var(--border)]">
+              ${[['off','关'], ['companion','伴生'], ['takeover','接管']].map(([m, lbl]) => `
+                <button onclick="setRunMode('${m}')" class="px-2 py-1 rounded text-[11px] cursor-pointer ${state.runMode===m ? 'bg-[var(--primary)] text-[var(--primary-foreground)] font-medium' : 'text-[var(--muted-foreground)]'}">${lbl}</button>
+              `).join('')}
+            </div>
+            ${!isMobile ? `
+              <select onchange="state.currentPreset=this.value;showToast('已切换预设');" class="px-2 py-1 rounded-lg bg-[var(--content)] border border-[var(--border)] text-xs">
+                <option ${state.currentPreset==='群像通用 Agent 预设'?'selected':''}>群像通用 Agent 预设</option>
+                <option ${state.currentPreset==='单人深度扮演 (低开销)'?'selected':''}>单人深度扮演 (低开销)</option>
+              </select>
+            ` : ''}
+            <button onclick="setTheme(state.theme==='dark'?'light':'dark')" title="切换控制台深浅色主题" class="px-2 py-1 rounded-lg border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-xs cursor-pointer ${isMobile ? 'touch-target' : ''}">${state.theme==='dark'?'🌙':'☀️'}</button>
+            <button onclick="showImportMenu()" class="px-2.5 py-1 rounded-lg border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-xs cursor-pointer ${isMobile ? 'touch-target' : ''}">导入 / 嵌卡 ▾</button>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderDesktopConsole() {
+      const groups = ['当前会话', '预设与系统'];
+      return `
+        <div class="max-w-6xl w-full bg-[var(--card)] border border-[var(--border)] rounded-2xl shadow-2xl overflow-hidden flex flex-col" style="height: 680px;">
+          ${renderConsoleHeader(false)}
+          <div class="flex-1 flex min-h-0">
+            <!-- 左侧双分组 9 项导航 -->
+            <aside class="w-52 shrink-0 bg-[var(--sidebar)] border-r border-[var(--border)] p-2.5 overflow-y-auto thin-scroll space-y-4">
+              ${groups.map(g => `
+                <div class="space-y-1">
+                  <div class="px-2 text-[10px] font-semibold uppercase tracking-wider text-[var(--muted-foreground)]">${g}</div>
+                  ${NAV_ITEMS.filter(n => n.group === g).map(n => `
+                    <button onclick="switchTab('${n.id}')" class="w-full text-left px-2.5 py-2 rounded-lg text-xs transition cursor-pointer flex flex-col ${state.activeTab===n.id ? 'bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm' : 'hover:bg-[var(--secondary)] text-[var(--foreground)]'}">
+                      <span class="font-medium">${n.label}</span>
+                      <span class="text-[10px] ${state.activeTab===n.id ? 'opacity-85' : 'text-[var(--muted-foreground)]'}">${n.desc}</span>
+                    </button>
+                  `).join('')}
+                </div>
+              `).join('')}
+            </aside>
+            <!-- 右侧全高主画布 -->
+            <section class="flex-1 min-w-0 bg-[var(--card)] overflow-hidden">
+              ${renderActiveTabContent(false)}
+            </section>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderMobileConsole() {
+      return `
+        <div class="flex flex-col items-center gap-3 w-full">
+          <div class="text-xs text-[var(--muted-foreground)] flex flex-wrap items-center justify-center gap-2">
+            <span>📱 模拟 390×844 竖屏视口：</span>
+            <span class="px-2 py-0.5 rounded bg-[var(--card)] border border-[var(--border)]">单栏推入栈</span>
+            <span class="px-2 py-0.5 rounded bg-[var(--card)] border border-[var(--border)]">表单 ≥16px 防 iOS 放大</span>
+            <span class="px-2 py-0.5 rounded bg-[var(--card)] border border-[var(--border)]">触控热区 ≥40px</span>
+          </div>
+          <div class="mobile-shell bg-[var(--card)] flex flex-col">
+            ${renderConsoleHeader(true)}
+            <!-- 顶部横滑分组胶囊 -->
+            <div class="shrink-0 bg-[var(--content)] border-b border-[var(--border)] px-2 py-2 flex items-center gap-1.5 overflow-x-auto thin-scroll">
+              ${NAV_ITEMS.map(n => `
+                <button onclick="switchTab('${n.id}', false)" class="shrink-0 px-3 py-1.5 rounded-full text-xs font-medium touch-target cursor-pointer border ${state.activeTab===n.id ? 'bg-[var(--primary)] text-[var(--primary-foreground)] border-transparent' : 'bg-[var(--card)] border-[var(--border)] text-[var(--muted-foreground)]'}">${n.short}</button>
+              `).join('')}
+            </div>
+            <div class="flex-1 min-h-0 overflow-hidden bg-[var(--card)]">
+              ${renderActiveTabContent(true)}
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    // =========================================================================
+    // 7. 总渲染调度
+    // =========================================================================
+    function render() {
+      const scope = document.getElementById('theme-scope');
+      if (scope) scope.setAttribute('data-theme', state.theme);
+
+      ['dark', 'light'].forEach(t => {
+        const tb = document.getElementById('theme-btn-' + t);
+        if (tb) {
+          tb.className = `px-2 py-1 rounded-md cursor-pointer flex items-center gap-1 transition ${
+            state.theme === t ? 'bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm font-medium' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+          }`;
+        }
+      });
+
+      ['chat', 'desktop', 'mobile'].forEach(s => {
+        const btn = document.getElementById('scene-' + s);
+        if (btn) {
+          btn.className = `px-2.5 py-1.5 rounded-md text-xs font-medium transition cursor-pointer flex items-center gap-1.5 ${
+            state.scene === s ? 'bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+          }`;
+        }
+      });
+
+      const root = document.getElementById('app-root');
+      if (state.scene === 'chat') root.innerHTML = renderChatScene();
+      else if (state.scene === 'desktop') root.innerHTML = renderDesktopConsole();
+      else root.innerHTML = renderMobileConsole();
+    }
+
+    render();
+  </script>
+</body>
+</html>
