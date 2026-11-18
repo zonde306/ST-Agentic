@@ -1,0 +1,1496 @@
+import { z } from 'zod';
+import type {
+    HostBridge,
+    LLMRequest,
+    LLMStreamChunk,
+    LLMTransport,
+    ToolExecutionContext,
+} from '@/core/bridge';
+import {
+    createDefaultMainAgent,
+    createDefaultSettings,
+    resolveActivePreset,
+    resolveConnection,
+} from '@/core/config';
+import {
+    ContextAssembler,
+    TrajectoryStore,
+    type RegexSource,
+} from '@/core/context';
+import { TraceLogger } from '@/core/logger';
+import {
+    DecoratorParser,
+    LoreReadEvaluator,
+    TailRadar,
+    type LoreOverrideSource,
+} from '@/core/lore';
+import { applyRegexRules, RegexPipeline } from '@/core/regex';
+import { ChatDataStore, DATA_NAMESPACES, worldInfoKey } from '@/core/store';
+import {
+    compileCustomToolConfig,
+    compileLoreToolEntry,
+    createAbortError,
+    createBuiltinToolRegistry,
+    createToolExecutionContext,
+    isAbortError,
+    throwIfAborted,
+    ToolRegistry,
+    type DynamicVariableSchema,
+    type ScriptSandbox,
+    type ToolDefinition,
+} from '@/core/tools';
+import type {
+    AgentProfile,
+    AgentRunTrace,
+    ApiConnection,
+    CanonicalContentPart,
+    CanonicalMessage,
+    CanonicalToolCall,
+    CanonicalToolSchema,
+    ChatMessageSnapshot,
+    ClassifiedLoreEntry,
+    MessageTarget,
+    PipelinePhase,
+    Preset,
+    RadarScanResult,
+    RawLoreEntry,
+    RegexRule,
+    ScopedPermissions,
+    Settings,
+    TokenUsage,
+    ToolStepLog,
+} from '@/core/types';
+import { canonicalClone } from '@/core/utils';
+import { VirtualFileSystem } from '@/core/vfs';
+
+export const DEFAULT_SUBAGENT_TOOLS: readonly string[] = [
+    'list_dir',
+    'glob_files',
+    'grep_search',
+    'search_files',
+    'read_file',
+    'read_variables',
+    'search_history',
+    'read_history',
+];
+
+export interface SubAgentDescriptor {
+    name: string;
+    toolName: string;
+    description: string;
+    instructions: string;
+    paramNames: string[];
+    presetName?: string;
+    sourceEntry?: RawLoreEntry;
+}
+
+export class AgentExecutionError extends Error {
+    public readonly trace: AgentRunTrace;
+
+    constructor(message: string, trace: AgentRunTrace, causeError?: unknown) {
+        super(message, causeError !== undefined ? { cause: causeError } : undefined);
+        this.name = 'AgentExecutionError';
+        this.trace = trace;
+    }
+}
+
+export class MaxToolRoundsError extends AgentExecutionError {
+    public readonly maxToolRounds: number;
+
+    constructor(maxToolRounds: number, trace: AgentRunTrace) {
+        super(`Agent "${trace.agentName}" exceeded maxToolRounds (${maxToolRounds}).`, trace);
+        this.name = 'MaxToolRoundsError';
+        this.maxToolRounds = maxToolRounds;
+    }
+}
+
+export interface AgentRunnerDependencies {
+    bridge: HostBridge;
+    transport: LLMTransport;
+    settings?: Settings | (() => Settings);
+    toolRegistry?: ToolRegistry;
+    contextAssembler?: ContextAssembler;
+    trajectoryStore?: TrajectoryStore;
+    vfs?: VirtualFileSystem;
+    store?: ChatDataStore;
+    regexPipeline?: RegexPipeline | (() => RegexSource | undefined);
+    loreReadEvaluator?: LoreReadEvaluator;
+    tailRadar?: TailRadar;
+    traceLogger?: TraceLogger;
+    sandbox?: ScriptSandbox;
+    maxDelegationDepth?: number;
+}
+
+export interface AgentRunInput {
+    agent: AgentProfile | string;
+    target: MessageTarget;
+    phase: PipelinePhase;
+    userInput?: string | CanonicalContentPart[];
+    userName?: string;
+    turnBrief?: string;
+    dynamicReminders?: readonly string[];
+    includeCategory4DynamicEntries?: boolean;
+    loreEntries?: readonly (RawLoreEntry | ClassifiedLoreEntry)[];
+    loreHint?: string | RadarScanResult;
+    runTailRadar?: boolean;
+    recentChatMessages?: readonly (CanonicalMessage | ChatMessageSnapshot)[];
+    includeRecentChat?: boolean;
+    preset?: Preset;
+    connection?: ApiConnection;
+    regex?: RegexSource;
+    extraTools?: readonly ToolDefinition[];
+    enabledToolNames?: readonly string[];
+    permissions?: ScopedPermissions;
+    getVariableSchema?: () => DynamicVariableSchema | undefined;
+    subAgents?: readonly SubAgentDescriptor[];
+    allowSubAgentDelegation?: boolean;
+    includeSubAgentTools?: boolean;
+    triggerId?: string;
+    triggerLabel?: string;
+    staged?: boolean;
+    stream?: boolean;
+    signal?: AbortSignal;
+    vars?: Record<string, unknown>;
+    macroOverrides?: Record<string, string>;
+    characterFields?: Record<string, string>;
+    personaDescription?: string;
+    systemBasePrompt?: string;
+    forceRecompilePrefix?: boolean;
+    /** Internal recursion guard for nested `@@agent` delegation. */
+    delegationDepth?: number;
+    onTextDelta?: (delta: string) => void;
+    onReasoningDelta?: (delta: string) => void;
+    onToolStart?: (step: ToolStepLog) => void;
+    onToolComplete?: (step: ToolStepLog) => void;
+}
+
+export interface AgentRunResult {
+    runId: string;
+    target: MessageTarget;
+    phase: PipelinePhase;
+    agentProfileId: string;
+    content: string;
+    reasoningContent?: string;
+    toolSteps: ToolStepLog[];
+    usage: TokenUsage;
+    trace: AgentRunTrace;
+    rounds: number;
+    requestSnapshot?: AgentRunTrace['requestSnapshot'];
+}
+
+function sanitizeSubAgentToolSuffix(name: string): string {
+    const cleaned = name
+        .trim()
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}_]+/gu, '_')
+        .replace(/^_+|_+$/g, '');
+    return cleaned || 'subagent';
+}
+
+/**
+ * Extract `@@agent <name> [param1] [param2]...` descriptors from World Info entries.
+ */
+export function extractSubAgentDescriptors(
+    entries: readonly (RawLoreEntry | ClassifiedLoreEntry)[],
+): SubAgentDescriptor[] {
+    const descriptors: SubAgentDescriptor[] = [];
+    const seenToolNames = new Set<string>();
+
+    for (const item of entries) {
+        const rawEntry = 'entry' in item ? item.entry : item;
+        if (rawEntry.disable) {
+            continue;
+        }
+
+        const parsed = DecoratorParser.parseEntry(rawEntry);
+        const agentDec = parsed.decorators.find((d) => d.name === '@@agent');
+        if (!agentDec) {
+            continue;
+        }
+
+        const name = (agentDec.args[0] || rawEntry.comment || `agent_${rawEntry.uid}`).trim();
+        if (!name) {
+            continue;
+        }
+
+        const suffix = sanitizeSubAgentToolSuffix(name);
+        const toolName = `delegate_agent_${suffix}`;
+        if (seenToolNames.has(toolName)) {
+            continue;
+        }
+        seenToolNames.add(toolName);
+
+        const paramNames = agentDec.args
+            .slice(1)
+            .map((p) => p.trim())
+            .filter(Boolean);
+        const presetDec = parsed.decorators.find((d) => d.name === '@@preset');
+        const presetName = presetDec?.args[0]?.trim() || undefined;
+        const description =
+            rawEntry.comment?.trim() || `Delegate a focused sub-task to sub-agent "${name}"`;
+        const instructions = parsed.cleanContent.trim();
+
+        descriptors.push({
+            name,
+            toolName,
+            description,
+            instructions,
+            paramNames,
+            ...(presetName ? { presetName } : {}),
+            sourceEntry: rawEntry,
+        });
+    }
+
+    return descriptors;
+}
+
+function normalizeUsage(partial?: Partial<TokenUsage>): TokenUsage {
+    const inputTokens = partial?.inputTokens ?? 0;
+    const cachedTokens = partial?.cachedTokens ?? 0;
+    const outputTokens = partial?.outputTokens ?? 0;
+    const totalTokens = partial?.totalTokens ?? inputTokens + outputTokens;
+    const cacheHitRate =
+        partial?.cacheHitRate ?? (inputTokens > 0 ? cachedTokens / inputTokens : 0);
+
+    return {
+        inputTokens,
+        cachedTokens,
+        outputTokens,
+        totalTokens,
+        cacheHitRate,
+    };
+}
+
+function addUsage(acc: TokenUsage, round: TokenUsage): TokenUsage {
+    const inputTokens = acc.inputTokens + round.inputTokens;
+    const cachedTokens = acc.cachedTokens + round.cachedTokens;
+    const outputTokens = acc.outputTokens + round.outputTokens;
+    const totalTokens = (acc.totalTokens ?? 0) + (round.totalTokens ?? round.inputTokens + round.outputTokens);
+    return {
+        inputTokens,
+        cachedTokens,
+        outputTokens,
+        totalTokens,
+        cacheHitRate: inputTokens > 0 ? cachedTokens / inputTokens : 0,
+    };
+}
+
+function parseArgsForLog(rawArgs: string): Record<string, unknown> | string {
+    const trimmed = rawArgs.trim();
+    if (!trimmed) {
+        return {};
+    }
+    try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return parsed as Record<string, unknown>;
+        }
+    } catch {
+        // Preserve raw string if malformed so diagnostics show what the model produced.
+    }
+    return rawArgs;
+}
+
+function formatSubAgentTaskInput(
+    desc: SubAgentDescriptor,
+    args: Record<string, unknown>,
+): string {
+    if (desc.paramNames.length === 0) {
+        const task = typeof args.task === 'string' ? args.task : JSON.stringify(args);
+        return desc.instructions ? `${desc.instructions}\n\nTask:\n${task}` : task;
+    }
+
+    const lines: string[] = [];
+    if (desc.instructions) {
+        lines.push(desc.instructions, '');
+    }
+    lines.push('Parameters:');
+    for (const paramName of desc.paramNames) {
+        lines.push(`- ${paramName}: ${String(args[paramName] ?? '')}`);
+    }
+    return lines.join('\n');
+}
+
+function unwrapRawLoreEntries(
+    entries: readonly (RawLoreEntry | ClassifiedLoreEntry)[],
+): RawLoreEntry[] {
+    return entries.map((item) => ('entry' in item ? item.entry : item));
+}
+
+function assertValidTarget(target: MessageTarget): MessageTarget {
+    if (
+        !target
+        || !Number.isInteger(target.messageId)
+        || target.messageId < 0
+        || !Number.isInteger(target.swipeId)
+        || target.swipeId < 0
+    ) {
+        throw new Error(
+            `Invalid MessageTarget { messageId: ${String(target?.messageId)}, swipeId: ${String(target?.swipeId)} }`,
+        );
+    }
+    return Object.freeze({ messageId: target.messageId, swipeId: target.swipeId });
+}
+
+/**
+ * Multi-round Agent runtime executing `LLMTransport` <-> `ToolRegistry` loops
+ * over `ContextAssembler` + `TrajectoryStore`, emitting live events and recording
+ * complete `AgentRunTrace` telemetry in `TraceLogger`.
+ */
+export class AgentRunner {
+    public readonly bridge: HostBridge;
+    public readonly transport: LLMTransport;
+    public readonly store: ChatDataStore;
+    public readonly vfs: VirtualFileSystem;
+    public readonly contextAssembler: ContextAssembler;
+    public readonly trajectoryStore: TrajectoryStore;
+    public readonly traceLogger: TraceLogger;
+    public readonly baseToolRegistry: ToolRegistry;
+    public readonly loreReadEvaluator: LoreReadEvaluator;
+    public readonly tailRadar: TailRadar;
+
+    private readonly settingsProvider: () => Settings;
+    private readonly regexProvider?: RegexPipeline | (() => RegexSource | undefined);
+    private readonly sandbox?: ScriptSandbox;
+    private readonly maxDelegationDepth: number;
+    private runSequence = 0;
+
+    constructor(deps: AgentRunnerDependencies) {
+        this.bridge = deps.bridge;
+        this.transport = deps.transport;
+        this.settingsProvider =
+            typeof deps.settings === 'function'
+                ? deps.settings
+                : deps.settings
+                    ? () => deps.settings as Settings
+                    : () => createDefaultSettings();
+        this.regexProvider = deps.regexPipeline;
+        this.sandbox = deps.sandbox;
+        this.maxDelegationDepth = Math.max(0, deps.maxDelegationDepth ?? 1);
+
+        this.store = deps.store ?? deps.vfs?.store ?? new ChatDataStore(deps.bridge);
+        this.traceLogger = deps.traceLogger ?? new TraceLogger();
+        this.trajectoryStore = deps.trajectoryStore ?? new TrajectoryStore();
+        this.contextAssembler = deps.contextAssembler ?? new ContextAssembler();
+        this.baseToolRegistry = deps.toolRegistry ?? createBuiltinToolRegistry();
+
+        const resolveRegexForLore = (): RegexSource | undefined => {
+            if (typeof this.regexProvider === 'function') {
+                return this.regexProvider();
+            }
+            if (this.regexProvider) {
+                return this.regexProvider;
+            }
+            return resolveActivePreset(this.settingsProvider()).regexRules;
+        };
+
+        const defaultGetOverride = (world: string, uid: number, target?: MessageTarget) =>
+            this.store.get(DATA_NAMESPACES.WORLDINFO, worldInfoKey(world, uid), {
+                target,
+                includeStaged: true,
+            })?.content ?? null;
+
+        this.loreReadEvaluator =
+            deps.loreReadEvaluator
+            ?? new LoreReadEvaluator(this.bridge, {
+                getOverride: defaultGetOverride,
+                applyLoreReadRegex: (text) => {
+                    const rules = resolveRegexForLore();
+                    if (!rules) {
+                        return text;
+                    }
+                    if (rules instanceof RegexPipeline) {
+                        return rules.run(text, { stage: 'lore_read', sender: 'lore' });
+                    }
+                    return applyRegexRules(text, rules, { stage: 'lore_read', sender: 'lore' });
+                },
+            });
+
+        this.tailRadar = deps.tailRadar ?? new TailRadar(this.loreReadEvaluator);
+
+        this.vfs =
+            deps.vfs
+            ?? new VirtualFileSystem({
+                bridge: this.bridge,
+                store: this.store,
+                loreReadHook: this.loreReadEvaluator.toLoreReadHook(),
+                getPresetFiles: () => resolveActivePreset(this.settingsProvider()).files,
+            });
+    }
+
+    /** Execute a full single-agent or multi-round tool-calling turn. */
+    async run(input: AgentRunInput): Promise<AgentRunResult> {
+        return await this.runInternal(input);
+    }
+
+    private async runInternal(input: AgentRunInput): Promise<AgentRunResult> {
+        const target = assertValidTarget(input.target);
+        const signal = input.signal ?? new AbortController().signal;
+        throwIfAborted(signal);
+
+        const settings = this.settingsProvider();
+        const preset = input.preset ?? resolveActivePreset(settings);
+        const agent = this.resolveAgent(input.agent, preset);
+        const connection = input.connection ?? resolveConnection(settings, agent.connectionId);
+        const delegationDepth = input.delegationDepth ?? 0;
+
+        this.runSequence += 1;
+        const runId = `run_${target.messageId}_${target.swipeId}_${this.runSequence}`;
+        const startedAt = Date.now();
+
+        const regex = this.resolveRegexSource(input.regex, preset);
+        const loreEntries = input.loreEntries ?? (await this.loadRawLoreEntries());
+        throwIfAborted(signal);
+
+        const characterFields = input.characterFields ?? this.bridge.getCharacterFields();
+        const personaDescription = input.personaDescription ?? this.bridge.getPersonaDescription();
+        const permissions: ScopedPermissions = input.permissions ?? agent.permissions;
+        const staged = input.staged ?? (input.phase === 'before_turn' || input.phase === 'main_turn');
+        const effectiveReadSet =
+            agent.sessionMode === 'persistent'
+                ? this.trajectoryStore.getReadSet(agent.id)
+                : new Map<string, string>();
+
+        const workingVars =
+            input.vars ?? (await this.vfs.readVariables({ target, staged }).catch(() => ({})));
+        throwIfAborted(signal);
+
+        // Compile tool registry for this run (built-ins + preset customTools + @@tool + @@agent + extraTools)
+        const { registry, autoAttachedToolNames } = await this.buildRunRegistry({
+            agent,
+            preset,
+            loreEntries,
+            extraTools: input.extraTools,
+            subAgents: input.subAgents,
+            allowSubAgentDelegation:
+                input.allowSubAgentDelegation
+                ?? (input.phase === 'main_turn'
+                    || agent.enabledTools.some(
+                        (t) => t === 'call_agent' || t === 'delegate_agent_*' || t.startsWith('delegate_agent_'),
+                    )),
+            includeSubAgentTools: input.includeSubAgentTools ?? true,
+            delegationDepth,
+            parentPhase: input.phase,
+            target,
+            connection,
+            presetFiles: preset.files,
+            signal,
+        });
+
+        const enabledToolNames = this.resolveEnabledToolNames(
+            input.enabledToolNames ?? agent.enabledTools,
+            autoAttachedToolNames,
+            preset,
+        );
+        const canonicalTools: CanonicalToolSchema[] = registry.toCanonicalSchemas(
+            enabledToolNames,
+            preset.builtinToolSettings,
+        );
+
+        const recentChatMessages =
+            input.recentChatMessages
+            ?? (agent.sessionMode === 'ephemeral' && input.includeRecentChat !== false
+                ? this.snapshotRecentChat(target, input.phase, agent.ephemeralWindowSize)
+                : undefined);
+
+        const toolSteps: ToolStepLog[] = [];
+        let cumulativeUsage: TokenUsage = {
+            inputTokens: 0,
+            cachedTokens: 0,
+            outputTokens: 0,
+            totalTokens: 0,
+            cacheHitRate: 0,
+        };
+        let lastRequestSnapshot: AgentRunTrace['requestSnapshot'] | undefined;
+        let lastContent = '';
+        let lastReasoning = '';
+        let roundsCompleted = 0;
+
+        this.traceLogger.emit({
+            kind: 'phase_started',
+            target: { ...target },
+            timestamp: startedAt,
+            phase: input.phase,
+            runId,
+            agentProfileId: agent.id,
+        });
+
+        this.traceLogger.recordTrace(
+            {
+                runId,
+                target: { ...target },
+                phase: input.phase,
+                agentProfileId: agent.id,
+                agentName: agent.name,
+                ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+                connectionId: connection.id,
+                model: connection.model,
+                status: 'running',
+                startedAt,
+                durationMs: 0,
+                usage: { ...cumulativeUsage },
+                toolSteps: [],
+            },
+            false,
+        );
+
+        const toolCtx = createToolExecutionContext({
+            bridge: this.bridge,
+            vfs: this.vfs,
+            store: this.store,
+            target,
+            signal,
+            permissions,
+            readSet: effectiveReadSet,
+            staged,
+            source: `agent:${agent.id}`,
+            getVariableSchema: input.getVariableSchema,
+        });
+
+        const loreOverrides = this.collectWorldInfoOverrides(target, staged);
+
+        try {
+            const initialAssembled = await this.contextAssembler.assembleWithHost({
+                agent,
+                connectionId: connection.id,
+                tools: canonicalTools,
+                characterFields,
+                personaDescription,
+                loreEntries,
+                wiRouterOverrides: preset.wiRouterOverrides,
+                presetFiles: preset.files,
+                systemBasePrompt: input.systemBasePrompt,
+                forceRecompilePrefix: input.forceRecompilePrefix,
+                trajectoryStore: agent.sessionMode === 'persistent' ? this.trajectoryStore : undefined,
+                recentChatMessages,
+                userInput: input.userInput,
+                userName: input.userName,
+                turnBrief: input.turnBrief,
+                dynamicReminders: input.dynamicReminders,
+                includeCategory4DynamicEntries:
+                    input.includeCategory4DynamicEntries ?? (input.phase === 'main_turn'),
+                loreHint: input.loreHint,
+                runTailRadar: input.runTailRadar ?? (input.phase === 'main_turn'),
+                target,
+                hostBridge: this.bridge,
+                tailRadar: this.tailRadar,
+                regex,
+                vars: workingVars,
+                macroOverrides: input.macroOverrides,
+                signal,
+            });
+
+            // Sync read-time overrides into TailRadar if needed (already handled by loreReadEvaluator.getOverride).
+            void loreOverrides;
+
+            const turnMessages: CanonicalMessage[] = [...initialAssembled.layer2Messages];
+            const maxToolRounds = Math.max(0, agent.maxToolRounds);
+            let toolRoundsExecuted = 0;
+            let currentAssembled = initialAssembled;
+
+            // eslint-disable-next-line no-constant-condition
+            while (true) {
+                throwIfAborted(signal);
+
+                const llmRequest: LLMRequest = {
+                    ...currentAssembled.request,
+                    connectionId: connection.id,
+                    connection,
+                    stream: input.stream ?? connection.stream ?? true,
+                    signal,
+                };
+
+                lastRequestSnapshot = {
+                    messages: canonicalClone(llmRequest.messages),
+                    tools: canonicalClone(llmRequest.tools),
+                    ...(llmRequest.cacheBreakpoints
+                        ? { cacheBreakpoints: [...llmRequest.cacheBreakpoints] }
+                        : {}),
+                };
+
+                const turnOutput = await this.invokeLLM({
+                    request: llmRequest,
+                    useStream: Boolean(llmRequest.stream),
+                    target,
+                    phase: input.phase,
+                    runId,
+                    agentId: agent.id,
+                    signal,
+                    onTextDelta: input.onTextDelta,
+                    onReasoningDelta: input.onReasoningDelta,
+                });
+
+                roundsCompleted += 1;
+                cumulativeUsage = addUsage(cumulativeUsage, turnOutput.usage);
+                lastContent = turnOutput.content;
+                if (turnOutput.reasoningContent) {
+                    lastReasoning = turnOutput.reasoningContent;
+                }
+
+                if (turnOutput.toolCalls.length === 0) {
+                    if (agent.sessionMode === 'persistent') {
+                        this.trajectoryStore.setReadSet(effectiveReadSet, agent.id);
+                        this.contextAssembler.finalizeTurn({
+                            trajectoryStore: this.trajectoryStore,
+                            agentId: agent.id,
+                            target,
+                            turnMessages,
+                            finalAssistantMessage: {
+                                role: 'assistant',
+                                content: turnOutput.content,
+                                ...(turnOutput.reasoningContent
+                                    ? { reasoningContent: turnOutput.reasoningContent }
+                                    : {}),
+                            },
+                            regex,
+                        });
+                    }
+
+                    const endedAt = Date.now();
+                    const finalTrace = this.traceLogger.recordTrace(
+                        {
+                            runId,
+                            target: { ...target },
+                            phase: input.phase,
+                            agentProfileId: agent.id,
+                            agentName: agent.name,
+                            ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                            ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+                            connectionId: connection.id,
+                            model: connection.model,
+                            status: 'completed',
+                            startedAt,
+                            endedAt,
+                            durationMs: Math.max(0, endedAt - startedAt),
+                            usage: cumulativeUsage,
+                            toolSteps: canonicalClone(toolSteps),
+                            outputPreview: turnOutput.content.slice(0, 240),
+                            requestSnapshot: lastRequestSnapshot,
+                        },
+                        true,
+                    );
+
+                    this.traceLogger.emit({
+                        kind: 'phase_completed',
+                        target: { ...target },
+                        timestamp: endedAt,
+                        phase: input.phase,
+                        runId,
+                        agentProfileId: agent.id,
+                    });
+
+                    return {
+                        runId,
+                        target,
+                        phase: input.phase,
+                        agentProfileId: agent.id,
+                        content: turnOutput.content,
+                        ...(turnOutput.reasoningContent
+                            ? { reasoningContent: turnOutput.reasoningContent }
+                            : {}),
+                        toolSteps,
+                        usage: cumulativeUsage,
+                        trace: finalTrace,
+                        rounds: roundsCompleted,
+                        requestSnapshot: lastRequestSnapshot,
+                    };
+                }
+
+                // Enforce maxToolRounds guardrail before executing another round of tool calls.
+                if (toolRoundsExecuted >= maxToolRounds) {
+                    const endedAt = Date.now();
+                    const errorMessage = `Agent "${agent.name}" exceeded maxToolRounds (${maxToolRounds}).`;
+                    const errorTrace = this.traceLogger.recordTrace(
+                        {
+                            runId,
+                            target: { ...target },
+                            phase: input.phase,
+                            agentProfileId: agent.id,
+                            agentName: agent.name,
+                            ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                            ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+                            connectionId: connection.id,
+                            model: connection.model,
+                            status: 'error',
+                            startedAt,
+                            endedAt,
+                            durationMs: Math.max(0, endedAt - startedAt),
+                            usage: cumulativeUsage,
+                            toolSteps: canonicalClone(toolSteps),
+                            ...(lastContent ? { outputPreview: lastContent.slice(0, 240) } : {}),
+                            error: errorMessage,
+                            requestSnapshot: lastRequestSnapshot,
+                        },
+                        true,
+                    );
+                    throw new MaxToolRoundsError(maxToolRounds, errorTrace);
+                }
+
+                toolRoundsExecuted += 1;
+
+                turnMessages.push({
+                    role: 'assistant',
+                    content: turnOutput.content ?? '',
+                    ...(turnOutput.reasoningContent
+                        ? { reasoningContent: turnOutput.reasoningContent }
+                        : {}),
+                    toolCalls: canonicalClone(turnOutput.toolCalls),
+                });
+
+                for (const toolCall of turnOutput.toolCalls) {
+                    throwIfAborted(signal);
+                    const stepIndex = toolSteps.length;
+                    const stepStartedAt = Date.now();
+                    const parsedArgs = parseArgsForLog(toolCall.arguments);
+
+                    const startedStep: ToolStepLog = {
+                        stepIndex,
+                        toolCallId: toolCall.id,
+                        toolName: toolCall.name,
+                        args: parsedArgs,
+                        result: '',
+                        ok: true,
+                        durationMs: 0,
+                        startedAt: stepStartedAt,
+                    };
+
+                    this.traceLogger.emit({
+                        kind: 'tool_started',
+                        target: { ...target },
+                        timestamp: stepStartedAt,
+                        phase: input.phase,
+                        runId,
+                        agentProfileId: agent.id,
+                        toolStep: canonicalClone(startedStep),
+                    });
+                    input.onToolStart?.(startedStep);
+
+                    const execResult = await registry.executeToolCall(
+                        toolCall.name,
+                        toolCall.arguments,
+                        toolCtx,
+                    );
+                    throwIfAborted(signal);
+
+                    const completedStep: ToolStepLog = {
+                        stepIndex,
+                        toolCallId: toolCall.id,
+                        toolName: toolCall.name,
+                        args: parsedArgs,
+                        result: execResult.output,
+                        ok: execResult.ok,
+                        ...(execResult.error !== undefined ? { error: execResult.error } : {}),
+                        durationMs: execResult.durationMs,
+                        startedAt: stepStartedAt,
+                    };
+                    toolSteps.push(completedStep);
+
+                    this.traceLogger.emit({
+                        kind: 'tool_completed',
+                        target: { ...target },
+                        timestamp: Date.now(),
+                        phase: input.phase,
+                        runId,
+                        agentProfileId: agent.id,
+                        toolStep: canonicalClone(completedStep),
+                    });
+                    input.onToolComplete?.(completedStep);
+
+                    // Append tool result (including structured self-healing errors) for the next round.
+                    turnMessages.push({
+                        role: 'tool',
+                        toolCallId: toolCall.id,
+                        toolName: toolCall.name,
+                        content: execResult.output,
+                    });
+                }
+
+                // Re-assemble with frozen Layer 0 + frozen Layer 1 + appended inFlightMessages.
+                currentAssembled = this.contextAssembler.assemble({
+                    agent,
+                    connectionId: connection.id,
+                    tools: canonicalTools,
+                    characterFields,
+                    personaDescription,
+                    loreEntries,
+                    wiRouterOverrides: preset.wiRouterOverrides,
+                    presetFiles: preset.files,
+                    systemBasePrompt: input.systemBasePrompt,
+                    trajectoryStore: agent.sessionMode === 'persistent' ? this.trajectoryStore : undefined,
+                    recentChatMessages,
+                    inFlightMessages: turnMessages,
+                    hostBridge: this.bridge,
+                    regex,
+                    vars: workingVars,
+                    macroOverrides: input.macroOverrides,
+                    signal,
+                });
+            }
+        } catch (error) {
+            if (error instanceof MaxToolRoundsError) {
+                throw error;
+            }
+
+            const endedAt = Date.now();
+            const aborted = isAbortError(error) || signal.aborted;
+            const message = aborted
+                ? 'Agent run aborted'
+                : error instanceof Error
+                    ? error.message
+                    : String(error);
+
+            const failTrace = this.traceLogger.recordTrace(
+                {
+                    runId,
+                    target: { ...target },
+                    phase: input.phase,
+                    agentProfileId: agent.id,
+                    agentName: agent.name,
+                    ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                    ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+                    connectionId: connection.id,
+                    model: connection.model,
+                    status: aborted ? 'aborted' : 'error',
+                    startedAt,
+                    endedAt,
+                    durationMs: Math.max(0, endedAt - startedAt),
+                    usage: cumulativeUsage,
+                    toolSteps: canonicalClone(toolSteps),
+                    ...(lastContent ? { outputPreview: lastContent.slice(0, 240) } : {}),
+                    ...(lastReasoning && !lastContent ? { outputPreview: lastReasoning.slice(0, 240) } : {}),
+                    error: message,
+                    requestSnapshot: lastRequestSnapshot,
+                },
+                true,
+            );
+
+            if (aborted) {
+                throw error instanceof Error && isAbortError(error)
+                    ? error
+                    : createAbortError(message);
+            }
+
+            if (error instanceof AgentExecutionError) {
+                throw error;
+            }
+            throw new AgentExecutionError(message, failTrace, error);
+        }
+    }
+
+    private async invokeLLM(params: {
+        request: LLMRequest;
+        useStream: boolean;
+        target: MessageTarget;
+        phase: PipelinePhase;
+        runId: string;
+        agentId: string;
+        signal: AbortSignal;
+        onTextDelta?: (delta: string) => void;
+        onReasoningDelta?: (delta: string) => void;
+    }): Promise<{
+        content: string;
+        reasoningContent?: string;
+        toolCalls: CanonicalToolCall[];
+        usage: TokenUsage;
+        finishReason?: string;
+    }> {
+        throwIfAborted(params.signal);
+
+        if (!params.useStream) {
+            const resp = await racePromiseWithAbort(
+                this.transport.complete(params.request),
+                params.signal,
+                'LLM request aborted',
+            );
+            throwIfAborted(params.signal);
+            return {
+                content: resp.content ?? '',
+                ...(resp.reasoningContent ? { reasoningContent: resp.reasoningContent } : {}),
+                toolCalls: resp.toolCalls ?? [],
+                usage: normalizeUsage(resp.usage),
+                finishReason: resp.finishReason,
+            };
+        }
+
+        let content = '';
+        let reasoningContent = '';
+        const toolCallMap = new Map<number, CanonicalToolCall>();
+        let usage: TokenUsage = normalizeUsage();
+        let finishReason: string | undefined;
+
+        const iterator = this.transport.stream(params.request)[Symbol.asyncIterator]();
+        try {
+            // eslint-disable-next-line no-constant-condition
+            while (true) {
+                throwIfAborted(params.signal);
+                const nextResult = await racePromiseWithAbort(
+                    iterator.next(),
+                    params.signal,
+                    'LLM stream aborted',
+                );
+                if (nextResult.done) {
+                    break;
+                }
+                const chunk = nextResult.value;
+                throwIfAborted(params.signal);
+                this.consumeStreamChunk(chunk, {
+                    onText: (delta) => {
+                        content += delta;
+                        this.traceLogger.emit({
+                            kind: 'text_delta',
+                            target: { ...params.target },
+                            timestamp: Date.now(),
+                            phase: params.phase,
+                            runId: params.runId,
+                            agentProfileId: params.agentId,
+                            textDelta: delta,
+                        });
+                        params.onTextDelta?.(delta);
+                    },
+                    onReasoning: (delta) => {
+                        reasoningContent += delta;
+                        this.traceLogger.emit({
+                            kind: 'reasoning_delta',
+                            target: { ...params.target },
+                            timestamp: Date.now(),
+                            phase: params.phase,
+                            runId: params.runId,
+                            agentProfileId: params.agentId,
+                            reasoningDelta: delta,
+                        });
+                        params.onReasoningDelta?.(delta);
+                    },
+                    toolCallMap,
+                    onUsage: (u) => {
+                        usage = normalizeUsage(u);
+                    },
+                    onDone: (reason) => {
+                        if (reason) {
+                            finishReason = reason;
+                        }
+                    },
+                });
+            }
+        } finally {
+            if (typeof iterator.return === 'function') {
+                // Do not await iterator.return(): an aborted generator suspended on a hanging
+                // upstream await won't advance .return() until that underlying promise settles.
+                void iterator.return().catch(() => {});
+            }
+        }
+
+        throwIfAborted(params.signal);
+
+        const toolCalls = Array.from(toolCallMap.entries())
+            .sort(([a], [b]) => a - b)
+            .map(([, call]) => call);
+
+        return {
+            content,
+            ...(reasoningContent ? { reasoningContent } : {}),
+            toolCalls,
+            usage,
+            finishReason,
+        };
+    }
+
+    private consumeStreamChunk(
+        chunk: LLMStreamChunk,
+        handlers: {
+            onText: (delta: string) => void;
+            onReasoning: (delta: string) => void;
+            toolCallMap: Map<number, CanonicalToolCall>;
+            onUsage: (usage: TokenUsage) => void;
+            onDone: (finishReason?: string) => void;
+        },
+    ): void {
+        if (chunk.type === 'text_delta' && chunk.textDelta) {
+            handlers.onText(chunk.textDelta);
+            return;
+        }
+        if (chunk.type === 'reasoning_delta' && chunk.reasoningDelta) {
+            handlers.onReasoning(chunk.reasoningDelta);
+            return;
+        }
+        if (chunk.type === 'tool_call_delta') {
+            const idx = chunk.toolCallIndex ?? 0;
+            const existing = handlers.toolCallMap.get(idx) ?? {
+                id: `call_${idx}`,
+                name: '',
+                arguments: '',
+            };
+            if (chunk.toolCallId) {
+                existing.id = chunk.toolCallId;
+            }
+            if (chunk.toolName) {
+                existing.name = chunk.toolName;
+            }
+            if (chunk.argumentsDelta) {
+                existing.arguments += chunk.argumentsDelta;
+            }
+            if (chunk.thoughtSignature) {
+                existing.thoughtSignature = chunk.thoughtSignature;
+            }
+            handlers.toolCallMap.set(idx, existing);
+            return;
+        }
+        if (chunk.type === 'usage' && chunk.usage) {
+            handlers.onUsage(chunk.usage);
+            return;
+        }
+        if (chunk.type === 'done') {
+            handlers.onDone(chunk.finishReason);
+        }
+    }
+
+    private resolveAgent(agentInput: AgentProfile | string, preset: Preset): AgentProfile {
+        if (typeof agentInput !== 'string') {
+            return agentInput;
+        }
+        const found = preset.agents[agentInput];
+        if (found) {
+            return found;
+        }
+        if (agentInput === preset.mainAgentId) {
+            return createDefaultMainAgent({ id: agentInput });
+        }
+        throw new Error(`AgentProfile "${agentInput}" not found in preset "${preset.name}".`);
+    }
+
+    private resolveRegexSource(
+        override: RegexSource | undefined,
+        preset: Preset,
+    ): RegexSource | undefined {
+        if (override !== undefined) {
+            return override;
+        }
+        if (typeof this.regexProvider === 'function') {
+            return this.regexProvider();
+        }
+        if (this.regexProvider !== undefined) {
+            return this.regexProvider;
+        }
+        return preset.regexRules;
+    }
+
+    private async loadRawLoreEntries(): Promise<RawLoreEntry[]> {
+        const books = await this.bridge.listEnabledLorebooks();
+        const raw: RawLoreEntry[] = [];
+        for (const [world, entries] of books.entries()) {
+            for (const entry of entries) {
+                raw.push(entry.world ? entry : { ...entry, world });
+            }
+        }
+        return raw;
+    }
+
+    private snapshotRecentChat(
+        target: MessageTarget,
+        phase: PipelinePhase,
+        windowSize?: number,
+    ): ChatMessageSnapshot[] {
+        const chat = this.bridge.getChat();
+        if (!chat.length) {
+            return [];
+        }
+        const limit = Math.max(0, windowSize ?? 6);
+        if (limit === 0) {
+            return [];
+        }
+        const includeTarget = phase === 'after_turn' || phase === 'maintenance';
+        const eligible: ChatMessageSnapshot[] = [];
+        for (const msg of chat) {
+            if (msg.isSystem) {
+                continue;
+            }
+            if (includeTarget ? msg.id > target.messageId : msg.id >= target.messageId) {
+                continue;
+            }
+            const text =
+                msg.id === target.messageId
+                    ? (msg.swipes?.[target.swipeId] ?? msg.mes)
+                    : msg.mes;
+            if (!text?.trim()) {
+                continue;
+            }
+            eligible.push(
+                msg.id === target.messageId && text !== msg.mes
+                    ? { ...msg, mes: text }
+                    : msg,
+            );
+        }
+        return eligible.slice(-(limit * 4 + 4));
+    }
+
+    private collectWorldInfoOverrides(
+        target: MessageTarget,
+        staged: boolean,
+    ): LoreOverrideSource | undefined {
+        const rows = this.store.lookup(DATA_NAMESPACES.WORLDINFO, {
+            target,
+            includeStaged: staged,
+        });
+        if (rows.length === 0) {
+            return undefined;
+        }
+        const map = new Map<string, string>();
+        for (const row of rows) {
+            map.set(row.key, row.entry.content);
+        }
+        return map;
+    }
+
+    private async buildRunRegistry(params: {
+        agent: AgentProfile;
+        preset: Preset;
+        loreEntries: readonly (RawLoreEntry | ClassifiedLoreEntry)[];
+        extraTools?: readonly ToolDefinition[];
+        subAgents?: readonly SubAgentDescriptor[];
+        allowSubAgentDelegation: boolean;
+        includeSubAgentTools: boolean;
+        delegationDepth: number;
+        parentPhase: PipelinePhase;
+        target: MessageTarget;
+        connection: ApiConnection;
+        presetFiles: Record<string, string>;
+        signal: AbortSignal;
+    }): Promise<{ registry: ToolRegistry; autoAttachedToolNames: string[] }> {
+        const registry = this.baseToolRegistry.clone();
+        const autoAttachedToolNames: string[] = [];
+
+        // 1. Register preset customTools allowed for this agent
+        for (const custom of params.preset.customTools ?? []) {
+            if (!custom.enabled) {
+                continue;
+            }
+            if (
+                custom.allowedAgents?.length
+                && !custom.allowedAgents.includes(params.agent.id)
+            ) {
+                continue;
+            }
+            if (custom.kind === 'js' && !this.sandbox) {
+                continue;
+            }
+            try {
+                const compiled = await compileCustomToolConfig(custom, this.sandbox, {
+                    signal: params.signal,
+                });
+                for (const tool of compiled) {
+                    registry.register(tool, { replace: true });
+                }
+            } catch {
+                // Skip invalid custom tools without breaking the run; logged if invoked.
+            }
+        }
+
+        // 2. Register @@tool World Info entries when ScriptSandbox is available
+        const rawLore = unwrapRawLoreEntries(params.loreEntries);
+        if (this.sandbox) {
+            for (const entry of rawLore) {
+                if (entry.disable) {
+                    continue;
+                }
+                const parsed = DecoratorParser.parseEntry(entry);
+                if (!parsed.decorators.some((d) => d.name === '@@tool')) {
+                    continue;
+                }
+                try {
+                    const compiled = await compileLoreToolEntry(entry, this.sandbox, {
+                        signal: params.signal,
+                    });
+                    for (const tool of compiled) {
+                        registry.register(tool, { replace: true });
+                        if (params.parentPhase === 'main_turn') {
+                            autoAttachedToolNames.push(tool.name);
+                        }
+                    }
+                } catch {
+                    // Ignore malformed @@tool entry during tool compilation.
+                }
+            }
+        }
+
+        // 3. Register explicit extraTools
+        if (params.extraTools?.length) {
+            registry.registerAll(params.extraTools, { replace: true });
+        }
+
+        // 4. Register dynamic @@agent sub-agent delegation tools when within depth limit
+        if (
+            params.includeSubAgentTools
+            && params.allowSubAgentDelegation
+            && params.delegationDepth < this.maxDelegationDepth
+        ) {
+            const subAgents =
+                params.subAgents
+                ?? extractSubAgentDescriptors(params.loreEntries);
+
+            if (subAgents.length > 0) {
+                const lookupByName = new Map<string, SubAgentDescriptor>();
+                for (const desc of subAgents) {
+                    lookupByName.set(desc.name, desc);
+                    lookupByName.set(desc.toolName, desc);
+                    lookupByName.set(desc.name.toLowerCase(), desc);
+
+                    const toolDef = this.createSubAgentTool(desc, params);
+                    registry.register(toolDef, { replace: true });
+                    autoAttachedToolNames.push(desc.toolName);
+                }
+
+                const callAgentTool = this.createGenericCallAgentTool(subAgents, lookupByName, params);
+                registry.register(callAgentTool, { replace: true });
+            }
+        }
+
+        return { registry, autoAttachedToolNames };
+    }
+
+    private createSubAgentTool(
+        desc: SubAgentDescriptor,
+        parentParams: {
+            preset: Preset;
+            loreEntries: readonly (RawLoreEntry | ClassifiedLoreEntry)[];
+            target: MessageTarget;
+            parentPhase: PipelinePhase;
+            connection: ApiConnection;
+            delegationDepth: number;
+        },
+    ): ToolDefinition {
+        const schema = desc.paramNames.length > 0
+            ? z.object(
+                Object.fromEntries(
+                    desc.paramNames.map((param) => [
+                        param,
+                        z.string().describe(`Input argument "${param}" for sub-agent "${desc.name}".`),
+                    ]),
+                ),
+            )
+            : z.object({
+                task: z
+                    .string()
+                    .min(1)
+                    .describe(`Concise research or analysis task for sub-agent "${desc.name}".`),
+            });
+
+        return {
+            name: desc.toolName,
+            description: desc.description,
+            parameters: schema,
+            source: 'agent',
+            execute: async (args, ctx) => {
+                throwIfAborted(ctx.signal);
+                const taskPrompt = formatSubAgentTaskInput(desc, args as Record<string, unknown>);
+                return await this.executeChildSubAgent({
+                    desc,
+                    taskPrompt,
+                    ctx,
+                    parentParams,
+                });
+            },
+        };
+    }
+
+    private createGenericCallAgentTool(
+        subAgents: readonly SubAgentDescriptor[],
+        lookupByName: ReadonlyMap<string, SubAgentDescriptor>,
+        parentParams: {
+            preset: Preset;
+            loreEntries: readonly (RawLoreEntry | ClassifiedLoreEntry)[];
+            target: MessageTarget;
+            parentPhase: PipelinePhase;
+            connection: ApiConnection;
+            delegationDepth: number;
+        },
+    ): ToolDefinition {
+        const availableNames = subAgents.map((s) => s.name).join(', ');
+        const schema = z.object({
+            agent: z
+                .string()
+                .min(1)
+                .describe(`Sub-agent name to invoke (${availableNames}).`),
+            task: z
+                .string()
+                .min(1)
+                .describe('Concise task or question for the sub-agent to resolve and summarize.'),
+            params: z
+                .record(z.string(), z.unknown())
+                .optional()
+                .describe('Optional named arguments when the sub-agent declares custom parameters.'),
+        });
+
+        return {
+            name: 'call_agent',
+            description: `Delegate an isolated sub-task to a specialized sub-agent (${availableNames}) and return its concise summary.`,
+            parameters: schema,
+            source: 'agent',
+            execute: async (rawArgs, ctx) => {
+                throwIfAborted(ctx.signal);
+                const args = rawArgs as {
+                    agent: string;
+                    task: string;
+                    params?: Record<string, unknown>;
+                };
+                const key = args.agent.trim();
+                const desc =
+                    lookupByName.get(key)
+                    ?? lookupByName.get(key.toLowerCase())
+                    ?? lookupByName.get(`delegate_agent_${sanitizeSubAgentToolSuffix(key)}`);
+
+                if (!desc) {
+                    return JSON.stringify({
+                        ok: false,
+                        error: `Unknown sub-agent "${args.agent}". Available sub-agents: ${availableNames}`,
+                    });
+                }
+
+                const taskPrompt = args.params
+                    ? formatSubAgentTaskInput(desc, { ...args.params, task: args.task })
+                    : (desc.instructions ? `${desc.instructions}\n\nTask:\n${args.task}` : args.task);
+
+                return await this.executeChildSubAgent({
+                    desc,
+                    taskPrompt,
+                    ctx,
+                    parentParams,
+                });
+            },
+        };
+    }
+
+    private async executeChildSubAgent(params: {
+        desc: SubAgentDescriptor;
+        taskPrompt: string;
+        ctx: ToolExecutionContext;
+        parentParams: {
+            preset: Preset;
+            loreEntries: readonly (RawLoreEntry | ClassifiedLoreEntry)[];
+            target: MessageTarget;
+            parentPhase: PipelinePhase;
+            connection: ApiConnection;
+            delegationDepth: number;
+        };
+    }): Promise<string> {
+        const { desc, taskPrompt, ctx, parentParams } = params;
+        const referencedProfile = desc.presetName
+            ? parentParams.preset.agents[desc.presetName]
+            : parentParams.preset.agents[desc.name];
+
+        const childProfile: AgentProfile = referencedProfile
+            ? {
+                ...canonicalClone(referencedProfile),
+                id: referencedProfile.id,
+                sessionMode: 'ephemeral',
+                ephemeralWindowSize: 0,
+            }
+            : {
+                id: `subagent_${sanitizeSubAgentToolSuffix(desc.name)}`,
+                name: desc.name,
+                connectionId: parentParams.connection.id,
+                sessionMode: 'ephemeral',
+                ephemeralWindowSize: 0,
+                promptBlocks: [
+                    {
+                        id: 'subagent_system',
+                        name: `${desc.name} Instructions`,
+                        role: 'system',
+                        placement: 'prefix',
+                        content:
+                            'You are an isolated specialist sub-agent. Use read-only VFS tools to inspect relevant files and return a concise, factual summary for the parent agent.',
+                        enabled: true,
+                    },
+                ],
+                enabledTools: [...DEFAULT_SUBAGENT_TOOLS],
+                permissions: { read: ['/**'], write: [] },
+                maxToolRounds: 6,
+                description: desc.description,
+            };
+
+        try {
+            const childResult = await this.runInternal({
+                agent: childProfile,
+                preset: parentParams.preset,
+                target: parentParams.target,
+                phase: parentParams.parentPhase,
+                userInput: taskPrompt,
+                loreEntries: parentParams.loreEntries,
+                includeCategory4DynamicEntries: false,
+                runTailRadar: false,
+                includeRecentChat: false,
+                includeSubAgentTools: false,
+                allowSubAgentDelegation: false,
+                delegationDepth: parentParams.delegationDepth + 1,
+                staged: false,
+                stream: false,
+                signal: ctx.signal,
+            });
+
+            const summary = childResult.content.trim();
+            return summary || `Sub-agent "${desc.name}" completed with an empty response.`;
+        } catch (error) {
+            if (isAbortError(error) || ctx.signal.aborted) {
+                throw error instanceof Error && isAbortError(error) ? error : createAbortError();
+            }
+            const msg = error instanceof Error ? error.message : String(error);
+            return JSON.stringify({
+                ok: false,
+                agent: desc.name,
+                error: msg,
+            });
+        }
+    }
+
+    private resolveEnabledToolNames(
+        baseTools: readonly string[],
+        autoAttached: readonly string[],
+        preset: Preset,
+    ): string[] {
+        const merged = new Set<string>(baseTools);
+        for (const name of autoAttached) {
+            const override = preset.builtinToolSettings?.[name];
+            if (override && override.enabled === false) {
+                continue;
+            }
+            merged.add(name);
+        }
+        return Array.from(merged);
+    }
+}
+
+function racePromiseWithAbort<T>(
+    promise: Promise<T>,
+    signal: AbortSignal,
+    message: string,
+): Promise<T> {
+    if (signal.aborted) {
+        return Promise.reject(
+            signal.reason instanceof Error && isAbortError(signal.reason)
+                ? signal.reason
+                : createAbortError(message),
+        );
+    }
+
+    return new Promise<T>((resolve, reject) => {
+        const onAbort = () => {
+            reject(
+                signal.reason instanceof Error && isAbortError(signal.reason)
+                    ? signal.reason
+                    : createAbortError(message),
+            );
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        promise.then(
+            (val) => {
+                signal.removeEventListener('abort', onAbort);
+                resolve(val);
+            },
+            (err) => {
+                signal.removeEventListener('abort', onAbort);
+                reject(err);
+            },
+        );
+    });
+}
+
+export type { RegexRule };

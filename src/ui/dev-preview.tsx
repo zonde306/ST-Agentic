@@ -1,3 +1,6 @@
+import { registerAgenticCapsuleElement } from './capsule';
+import { registerSessionViews } from './session';
+import { type MountedAgenticShell, mountAgenticAppShell } from './shell';
 import {
     AppStore,
     createMockBackgroundTasks,
@@ -6,7 +9,7 @@ import {
     createMockUIServices,
     setDefaultAppStore,
 } from './store';
-import { type MountedAgenticShell, mountAgenticAppShell } from './shell';
+import { registerStudioViews } from './studio';
 
 export interface DevPreviewInstance extends MountedAgenticShell {
     dispose: () => void;
@@ -17,6 +20,10 @@ export interface DevPreviewInstance extends MountedAgenticShell {
  * settings, traces, background tasks, and UI services (`npm run dev:ui` / `build:dev-ui`).
  */
 export function mountDevPreview(): DevPreviewInstance {
+    registerAgenticCapsuleElement();
+    const unregisterSession = registerSessionViews();
+    const unregisterStudio = registerStudioViews();
+
     const services = createMockUIServices();
     const store = new AppStore({
         initialSettings: createMockSettings(),
@@ -56,6 +63,8 @@ export function mountDevPreview(): DevPreviewInstance {
             openBtn?.removeEventListener('click', onOpenClick);
             hostThemeBtn?.removeEventListener('click', onToggleHostTheme);
             mounted.unmount();
+            unregisterSession();
+            unregisterStudio();
             store.dispose();
         },
     };

@@ -50,9 +50,9 @@
 | **T2.1** | 三层上下文组装、持久轨与高低水位压缩 | Wave 2 | Track A | T1.1, T1.2, T1.3 | `src/core/context/**`, `tests/unit/context/**` | `[x]` |
 | **T2.2** | 内置工具集、斜杠包装模型与 JS 沙箱 | Wave 2 | Track B | T1.1, T1.3 | `src/core/tools/**`, `src/sandbox/**`, `tests/unit/tools/**`, `tests/browser/sandbox/**` | `[x]` |
 | **T2.3** | Shadow DOM 独立 `<dialog>` 壳与双主题 | Wave 2 | Track C | T1.2 | `src/ui/shell/**`, `src/ui/components/**`, `src/ui/store/**`, `src/ui/dev-preview.tsx` | `[x]` |
-| **T3.1** | AgentRunner、四阶段管线与三级屏障 | Wave 3 | Track A | T1.4, T2.1, T2.2 | `src/core/agents/**`, `src/core/triggers/**`, `src/core/logger/**`, `tests/unit/agents/**`, `tests/unit/triggers/**` | `[ ]` |
-| **T3.2** | 「当前会话」3 视图与 `<agentic-capsule>` | Wave 3 | Track B | T2.1, T2.3 | `src/ui/session/**`, `src/ui/capsule/**` | `[ ]` |
-| **T3.3** | 「预设与系统」6 视图与迁移/嵌卡弹窗 | Wave 3 | Track C | T2.2, T2.3 | `src/ui/studio/**` | `[ ]` |
+| **T3.1** | AgentRunner、四阶段管线与三级屏障 | Wave 3 | Track A | T1.4, T2.1, T2.2 | `src/core/agents/**`, `src/core/triggers/**`, `src/core/logger/**`, `tests/unit/agents/**`, `tests/unit/triggers/**` | `[x]` |
+| **T3.2** | 「当前会话」3 视图与 `<agentic-capsule>` | Wave 3 | Track B | T2.1, T2.3 | `src/ui/session/**`, `src/ui/capsule/**` | `[x]` |
+| **T3.3** | 「预设与系统」6 视图与迁移/嵌卡弹窗 | Wave 3 | Track C | T2.2, T2.3 | `src/ui/studio/**` | `[x]` |
 | **T4.1** | ST 宿主桥、三档模式、接管与流式上屏 | Wave 4 | Track A | T3.1, T3.2 | `src/host/st-bridge.ts`, `src/host/interceptor.ts`, `src/host/companion-hooks.ts`, `src/host/stream-renderer.ts` | `[ ]` |
 | **T4.2** | 斜杠桥、可选 EJS、嵌卡与多语言 | Wave 4 | Track B | T3.1, T3.3 | `src/host/slash-bridge.ts`, `src/host/ejs-adapter.ts`, `src/host/embed-card.ts`, `locales/**` | `[ ]` |
 | **T5.1** | 顶层装配入口、公开 API 与生产构建 | Wave 5a | Track A | T4.1, T4.2 | `src/index.ts`, `src/globals.d.ts`, `style.css` | `[ ]` |
