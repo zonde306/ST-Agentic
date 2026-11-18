@@ -38,6 +38,9 @@ export const AGENTIC_DIALOG_RESET_STYLES = `
     padding: 0 !important;
     border: none !important;
     background: transparent !important;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif !important;
+    font-size: 14px !important;
+    line-height: 1.5 !important;
 }
 @media (max-width: 767px) {
     #agentic-app {
@@ -135,6 +138,10 @@ export const AGENTIC_SHELL_STYLES = `
     height: 100%;
     min-width: 0;
     min-height: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--foreground);
 }
 
 *, *::before, *::after {
@@ -190,6 +197,9 @@ select {
     flex-direction: column;
     background: var(--card);
     color: var(--foreground);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
     border: 1px solid var(--border);
     border-radius: 16px;
     overflow: hidden;

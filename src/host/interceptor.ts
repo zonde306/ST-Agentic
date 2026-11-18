@@ -89,71 +89,21 @@ function resolveCacheHitRate(usage?: {
     return undefined;
 }
 
-function createGenerationUiGuard(controller: AbortController): () => void {
-    if (typeof document === 'undefined') {
+function createGenerationUiGuard(): () => void {
+    if (typeof document === 'undefined' || !document.body) {
         return () => {};
     }
 
     let active = true;
-    const applyLockState = () => {
-        if (!active || controller.signal.aborted) {
-            return;
-        }
-        document.body.dataset.generating = 'true';
-        document.body.dataset.agenticTakeover = 'true';
-        if (typeof deactivateSendButtons === 'function') {
-            deactivateSendButtons();
-        }
-        if (typeof hideSwipeButtons === 'function') {
-            hideSwipeButtons();
-        }
-
-        const mesStop = document.getElementById('mes_stop');
-        if (mesStop && mesStop.style.display === 'none') {
-            mesStop.style.display = 'flex';
-        }
-        const sendBut = document.getElementById('send_but');
-        if (sendBut && sendBut.style.display !== 'none') {
-            sendBut.style.display = 'none';
-        }
-    };
-
-    applyLockState();
-
-    const observer =
-        typeof MutationObserver === 'function'
-            ? new MutationObserver(() => {
-                  applyLockState();
-              })
-            : null;
-
-    if (observer) {
-        observer.observe(document.body, {
-            attributes: true,
-            attributeFilter: ['data-generating'],
-        });
-        const mesStop = document.getElementById('mes_stop');
-        if (mesStop) {
-            observer.observe(mesStop, {
-                attributes: true,
-                attributeFilter: ['style', 'class'],
-            });
-        }
-        const sendBut = document.getElementById('send_but');
-        if (sendBut) {
-            observer.observe(sendBut, {
-                attributes: true,
-                attributeFilter: ['style', 'class'],
-            });
-        }
-    }
+    // Scoped CSS on body[data-agentic-takeover="true"] prevents 0ms button flicker while ST unwinds unblockGeneration().
+    document.body.dataset.agenticTakeover = 'true';
+    document.body.dataset.generating = 'true';
 
     return () => {
         if (!active) {
             return;
         }
         active = false;
-        observer?.disconnect();
         delete document.body.dataset.agenticTakeover;
     };
 }
@@ -196,28 +146,38 @@ export function createAgenticInterceptor(
             setExternalAbortController(controller);
         }
 
-        const identity = bridge.getActiveIdentity();
-        const renderer = StreamRenderer.beginPlaceholder(action, {
-            getSettings,
-            getStore: () => orchestrator.store,
-            getAppStore,
-            substituteMacros: (text, overrides) => bridge.substituteMacros(text, overrides),
-            identity,
-        });
-        session.renderer = renderer;
+        let renderer: StreamRenderer | undefined;
 
         try {
+            if (typeof deactivateSendButtons === 'function') {
+                deactivateSendButtons();
+            }
+            if (typeof hideSwipeButtons === 'function') {
+                hideSwipeButtons();
+            }
+
+            const identity = bridge.getActiveIdentity();
+            const activeRenderer = StreamRenderer.beginPlaceholder(action, {
+                getSettings,
+                getStore: () => orchestrator.store,
+                getAppStore,
+                substituteMacros: (text, overrides) => bridge.substituteMacros(text, overrides),
+                identity,
+            });
+            renderer = activeRenderer;
+            session.renderer = activeRenderer;
+
             if (controller.signal.aborted) {
-                await renderer.abort({ wasUserStop: true, reason: 'Stopped before start' });
+                await activeRenderer.abort({ wasUserStop: true, reason: 'Stopped before start' });
                 return;
             }
 
-            renderer.setRetrievingStatus('Preparing turn context');
-            getAppStore?.()?.setActiveTarget(renderer.target);
+            activeRenderer.setRetrievingStatus('Preparing turn context');
+            getAppStore?.()?.setActiveTarget(activeRenderer.target);
 
             const prevMsg =
-                Array.isArray(chat) && renderer.target.messageId > 0
-                    ? (chat[renderer.target.messageId - 1] as
+                Array.isArray(chat) && activeRenderer.target.messageId > 0
+                    ? (chat[activeRenderer.target.messageId - 1] as
                           | { is_user?: unknown; mes?: unknown; name?: unknown }
                           | undefined)
                     : undefined;
@@ -232,23 +192,23 @@ export function createAgenticInterceptor(
 
             const result = await orchestrator.runTurn({
                 action,
-                target: renderer.target,
-                previousSwipeId: renderer.previousSwipeId,
+                target: activeRenderer.target,
+                previousSwipeId: activeRenderer.previousSwipeId,
                 userInput,
                 userName,
-                existingContent: action === 'continue' ? renderer.existingContent : undefined,
-                turnNumber: renderer.target.messageId + 1,
+                existingContent: action === 'continue' ? activeRenderer.existingContent : undefined,
+                turnNumber: activeRenderer.target.messageId + 1,
                 signal: controller.signal,
                 stream: true,
-                onTextDelta: (delta) => renderer.appendTextDelta(delta),
-                onReasoningDelta: (delta) => renderer.appendReasoningDelta(delta),
-                onToolStart: (step: ToolStepLog) => renderer.onToolStart(step.toolName),
-                onToolComplete: (step: ToolStepLog) => renderer.onToolComplete(step.toolName),
+                onTextDelta: (delta) => activeRenderer.appendTextDelta(delta),
+                onReasoningDelta: (delta) => activeRenderer.appendReasoningDelta(delta),
+                onToolStart: (step: ToolStepLog) => activeRenderer.onToolStart(step.toolName),
+                onToolComplete: (step: ToolStepLog) => activeRenderer.onToolComplete(step.toolName),
             });
 
             if (controller.signal.aborted) {
-                orchestrator.store.rollbackStagedData(renderer.target);
-                await renderer.abort({
+                orchestrator.store.rollbackStagedData(activeRenderer.target);
+                await activeRenderer.abort({
                     wasUserStop: true,
                     reason: 'Generation stopped',
                 });
@@ -256,7 +216,7 @@ export function createAgenticInterceptor(
             }
 
             const backgroundHandles = result.afterTurnTasks ?? [];
-            await renderer.finalize({
+            await activeRenderer.finalize({
                 finalText: result.content,
                 reasoningText: result.reasoningContent,
                 hasBackgroundTasks: backgroundHandles.length > 0,
@@ -269,19 +229,21 @@ export function createAgenticInterceptor(
                 for (const handle of backgroundHandles) {
                     void handle.promise.finally(() => {
                         remaining = Math.max(0, remaining - 1);
-                        renderer.updateBackgroundStatus(remaining);
+                        activeRenderer.updateBackgroundStatus(remaining);
                     });
                 }
             }
         } catch (error) {
-            orchestrator.store.rollbackStagedData(renderer.target);
+            if (renderer) {
+                orchestrator.store.rollbackStagedData(renderer.target);
+            }
             if (isAbortError(error, controller.signal)) {
-                await renderer.abort({ wasUserStop: true, reason: 'Stopped by user' });
+                await renderer?.abort({ wasUserStop: true, reason: 'Stopped by user' });
             } else {
                 const message = error instanceof Error ? error.message : String(error);
                 console.error('[ST-Agentic] Takeover generation failed:', error);
                 getAppStore?.()?.pushToast(`Generation failed: ${message}`, 'error');
-                await renderer.abort({ errorMessage: message });
+                await renderer?.abort({ errorMessage: message });
             }
         } finally {
             session.releaseGuard();
@@ -325,7 +287,7 @@ export function createAgenticInterceptor(
         }
 
         const controller = new AbortController();
-        const releaseGuard = createGenerationUiGuard(controller);
+        const releaseGuard = createGenerationUiGuard();
         const session: ActiveTakeoverSession = {
             controller,
             releaseGuard,

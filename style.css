@@ -31,3 +31,11 @@ agentic-capsule {
     align-items: center;
     justify-content: center;
 }
+
+body[data-agentic-takeover="true"] #send_but {
+    display: none !important;
+}
+
+body[data-agentic-takeover="true"] #mes_stop {
+    display: flex !important;
+}

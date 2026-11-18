@@ -123,6 +123,9 @@ const CAPSULE_STYLES = `
     border: 1px solid var(--cap-border);
     background: var(--cap-bg);
     color: var(--cap-fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 12px;
+    line-height: 1.4;
     overflow: hidden;
     color-scheme: dark;
 }
