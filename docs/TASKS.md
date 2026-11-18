@@ -53,8 +53,8 @@
 | **T3.1** | AgentRunner、四阶段管线与三级屏障 | Wave 3 | Track A | T1.4, T2.1, T2.2 | `src/core/agents/**`, `src/core/triggers/**`, `src/core/logger/**`, `tests/unit/agents/**`, `tests/unit/triggers/**` | `[x]` |
 | **T3.2** | 「当前会话」3 视图与 `<agentic-capsule>` | Wave 3 | Track B | T2.1, T2.3 | `src/ui/session/**`, `src/ui/capsule/**` | `[x]` |
 | **T3.3** | 「预设与系统」6 视图与迁移/嵌卡弹窗 | Wave 3 | Track C | T2.2, T2.3 | `src/ui/studio/**` | `[x]` |
-| **T4.1** | ST 宿主桥、三档模式、接管与流式上屏 | Wave 4 | Track A | T3.1, T3.2 | `src/host/st-bridge.ts`, `src/host/interceptor.ts`, `src/host/companion-hooks.ts`, `src/host/stream-renderer.ts` | `[ ]` |
-| **T4.2** | 斜杠桥、可选 EJS、嵌卡与多语言 | Wave 4 | Track B | T3.1, T3.3 | `src/host/slash-bridge.ts`, `src/host/ejs-adapter.ts`, `src/host/embed-card.ts`, `locales/**` | `[ ]` |
+| **T4.1** | ST 宿主桥、三档模式、接管与流式上屏 | Wave 4 | Track A | T3.1, T3.2 | `src/host/st-bridge.ts`, `src/host/interceptor.ts`, `src/host/companion-hooks.ts`, `src/host/stream-renderer.ts` | `[x]` |
+| **T4.2** | 斜杠桥、可选 EJS、嵌卡与多语言 | Wave 4 | Track B | T3.1, T3.3 | `src/host/slash-bridge.ts`, `src/host/ejs-adapter.ts`, `src/host/embed-card.ts`, `locales/**` | `[x]` |
 | **T5.1** | 顶层装配入口、公开 API 与生产构建 | Wave 5a | Track A | T4.1, T4.2 | `src/index.ts`, `src/globals.d.ts`, `style.css` | `[ ]` |
 | **T5.2** | 浏览器沙箱隔离与双视口 UI 契约测试 | Wave 5b | Track B | T3.2, T3.3, T5.1 | `tests/browser/ui/**` | `[ ]` |
 | **T5.3** | 真酒馆 + Mock SSE 端到端黄金路径验收 | Wave 5b | Track C | T5.1 | `tests/e2e/**` | `[ ]` |

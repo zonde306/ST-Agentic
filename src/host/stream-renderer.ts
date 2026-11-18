@@ -1,0 +1,903 @@
+import {
+    addCopyToCodeBlocks,
+    addOneMessage,
+    chat,
+    ensureSwipes,
+    getGeneratingApi,
+    getGeneratingModel,
+    messageFormatting,
+    refreshSwipeButtons,
+    saveChatConditional,
+    saveChatDebounced,
+    scrollChatToBottom,
+    showSwipeButtons,
+    syncMesToSwipe,
+    syncSwipeToMes,
+    updateMessageBlock,
+    updateSwipeCounter,
+} from '@st/script.js';
+import { eventSource, event_types } from '@st/scripts/events.js';
+import { power_user } from '@st/scripts/power-user.js';
+import { parseReasoningFromString, ReasoningType, updateReasoningUI } from '@st/scripts/reasoning.js';
+import { getMessageTimeStamp } from '@st/scripts/RossAscends-mods.js';
+
+import type { HostIdentity } from '@/core/bridge';
+import { resolveActivePreset } from '@/core/config';
+import { applyRegexRules } from '@/core/regex';
+import { ChatDataStore, DATA_NAMESPACES, MESSAGE_OVERRIDE_KEY } from '@/core/store';
+import type { GenerationAction } from '@/core/triggers';
+import type {
+    CapsulePosition,
+    MessageTarget,
+    RegexRule,
+    Settings,
+} from '@/core/types';
+import {
+    AgenticCapsuleElement,
+    placeAgenticCapsule,
+    registerAgenticCapsuleElement,
+} from '@/ui/capsule';
+import type { AppStore } from '@/ui/store';
+
+export interface StreamRendererDependencies {
+    getSettings: () => Settings | undefined;
+    getStore: () => ChatDataStore | undefined;
+    getAppStore?: () => AppStore | undefined;
+    substituteMacros: (text: string, overrides?: Record<string, string>) => string;
+    identity: HostIdentity;
+}
+
+export interface StreamSessionFinalizeOptions {
+    finalText: string;
+    reasoningText?: string;
+    hasBackgroundTasks?: boolean;
+    stepCount?: number;
+    cacheHitRate?: number;
+}
+
+export interface StreamSessionAbortOptions {
+    reason?: string;
+    errorMessage?: string;
+    wasUserStop?: boolean;
+}
+
+interface ExtractedDisplayParts {
+    visibleText: string;
+    reasoningText: string;
+}
+
+function getReasoningMarkers(): { prefix: string; suffix: string } {
+    const reasoningCfg = (power_user?.reasoning ?? {}) as {
+        prefix?: unknown;
+        suffix?: unknown;
+    };
+    const prefix =
+        typeof reasoningCfg.prefix === 'string' && reasoningCfg.prefix.length > 0
+            ? reasoningCfg.prefix
+            : '<think>';
+    const suffix =
+        typeof reasoningCfg.suffix === 'string' && reasoningCfg.suffix.length > 0
+            ? reasoningCfg.suffix
+            : '</think>';
+    return { prefix, suffix };
+}
+
+function splitStreamingReasoning(rawText: string, explicitReasoning: string): ExtractedDisplayParts {
+    const { prefix, suffix } = getReasoningMarkers();
+    if (!rawText) {
+        return { visibleText: '', reasoningText: explicitReasoning };
+    }
+
+    if (typeof parseReasoningFromString === 'function') {
+        const parsed = parseReasoningFromString(rawText, { strict: false }) as
+            | { reasoning?: string; content?: string }
+            | null
+            | undefined;
+        if (parsed && typeof parsed.content === 'string') {
+            let content = parsed.content;
+            let reasoning = parsed.reasoning ?? '';
+
+            // Handle in-progress unclosed thinking block while streaming.
+            const openIdx = content.indexOf(prefix);
+            if (openIdx !== -1 && content.indexOf(suffix, openIdx + prefix.length) === -1) {
+                const pendingThought = content.slice(openIdx + prefix.length).trimStart();
+                content = content.slice(0, openIdx).trimEnd();
+                reasoning = reasoning ? `${reasoning}\n${pendingThought}` : pendingThought;
+            }
+
+            const combinedReasoning = [explicitReasoning, reasoning]
+                .map((part) => part.trim())
+                .filter(Boolean)
+                .join('\n\n');
+            return { visibleText: content, reasoningText: combinedReasoning };
+        }
+    }
+
+    let visible = rawText;
+    const blocks: string[] = [];
+    let searchFrom = 0;
+    while (searchFrom < visible.length) {
+        const start = visible.indexOf(prefix, searchFrom);
+        if (start === -1) {
+            break;
+        }
+        const end = visible.indexOf(suffix, start + prefix.length);
+        if (end === -1) {
+            blocks.push(visible.slice(start + prefix.length).trim());
+            visible = visible.slice(0, start);
+            break;
+        }
+        blocks.push(visible.slice(start + prefix.length, end).trim());
+        visible = visible.slice(0, start) + visible.slice(end + suffix.length);
+        searchFrom = start;
+    }
+
+    const combinedReasoning = [explicitReasoning, ...blocks]
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .join('\n\n');
+
+    return {
+        visibleText: visible.trimStart(),
+        reasoningText: combinedReasoning,
+    };
+}
+
+function collectDisplayRules(settings?: Settings): RegexRule[] {
+    if (!settings) {
+        return [];
+    }
+    const preset = resolveActivePreset(settings);
+    return Array.isArray(preset?.regexRules) ? preset.regexRules : [];
+}
+
+function resolveCapsulePosition(settings?: Settings): CapsulePosition {
+    return settings?.capsulePosition ?? 'bottom';
+}
+
+function resolveModelLabel(settings?: Settings): string {
+    const hostModel = typeof getGeneratingModel === 'function' ? getGeneratingModel() : '';
+    if (hostModel) {
+        return hostModel;
+    }
+    if (settings) {
+        const preset = resolveActivePreset(settings);
+        const connId = preset?.agents?.[preset.mainAgentId]?.connectionId ?? settings.currentConnectionId;
+        const conn = settings.connections?.[connId];
+        if (conn?.model) {
+            return conn.model;
+        }
+    }
+    return 'agentic';
+}
+
+function getMesElement(messageId: number): HTMLElement | null {
+    if (typeof document === 'undefined') {
+        return null;
+    }
+    return document.querySelector<HTMLElement>(`#chat .mes[mesid="${messageId}"]`);
+}
+
+function removeMesElement(messageId: number): void {
+    const el = getMesElement(messageId);
+    el?.remove();
+}
+
+/**
+ * Manages 0ms native SillyTavern `.mes` placeholder creation, `requestAnimationFrame`-throttled
+ * markdown & reasoning updates, final persistence, and `<agentic-capsule>` lifecycle during takeover turns.
+ */
+export class StreamRenderer {
+    readonly target: MessageTarget;
+    readonly action: GenerationAction;
+    readonly previousSwipeId?: number;
+    readonly existingContent: string;
+
+    private readonly deps: StreamRendererDependencies;
+    private readonly createdNewMessage: boolean;
+    private readonly previousChatSwipeMes?: string;
+    private readonly previousChatSwipeInfo?: Record<string, unknown>;
+    private readonly startedAt = Date.now();
+
+    private currentRoundText = '';
+    private explicitReasoningText = '';
+    private pendingToolReset = false;
+    private reasoningStartMs?: number;
+    private reasoningEndMs?: number;
+    private stepCount = 0;
+
+    private rafHandle: number | null = null;
+    private needsFlush = false;
+    private finalized = false;
+
+    private capsuleEl: AgenticCapsuleElement | null = null;
+    private capsuleDisconnect?: () => void;
+
+    private constructor(
+        deps: StreamRendererDependencies,
+        target: MessageTarget,
+        action: GenerationAction,
+        createdNewMessage: boolean,
+        existingContent: string,
+        previousSwipeId?: number,
+        previousChatSwipeMes?: string,
+        previousChatSwipeInfo?: Record<string, unknown>,
+    ) {
+        this.deps = deps;
+        this.target = target;
+        this.action = action;
+        this.createdNewMessage = createdNewMessage;
+        this.existingContent = existingContent;
+        this.previousSwipeId = previousSwipeId;
+        this.previousChatSwipeMes = previousChatSwipeMes;
+        this.previousChatSwipeInfo = previousChatSwipeInfo;
+
+        this.mountCapsule();
+    }
+
+    /**
+     * Create or bind the native SillyTavern `.mes` block at 0ms before generation begins.
+     */
+    static beginPlaceholder(
+        action: GenerationAction,
+        deps: StreamRendererDependencies,
+        explicitPreviousSwipeId?: number,
+    ): StreamRenderer {
+        const chatList = Array.isArray(chat) ? chat : [];
+        const settings = deps.getSettings();
+        const modelTag = resolveModelLabel(settings);
+        const apiTag =
+            (typeof getGeneratingApi === 'function' ? getGeneratingApi() : '') || 'agentic';
+
+        if (action === 'continue' && chatList.length > 0) {
+            const messageId = chatList.length - 1;
+            const msg = chatList[messageId] as Record<string, unknown>;
+            const swipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
+            const existingContent = typeof msg.mes === 'string' ? msg.mes : '';
+            return new StreamRenderer(
+                deps,
+                { messageId, swipeId },
+                action,
+                false,
+                existingContent,
+            );
+        }
+
+        if (action === 'swipe' && chatList.length > 0) {
+            const messageId = chatList.length - 1;
+            const msg = chatList[messageId] as Record<string, unknown>;
+            if (typeof ensureSwipes === 'function') {
+                ensureSwipes(msg);
+            }
+            const swipes = Array.isArray(msg.swipes)
+                ? (msg.swipes as string[])
+                : ((msg.swipes = [String(msg.mes ?? '')]) as string[]);
+            const swipeInfo = Array.isArray(msg.swipe_info)
+                ? (msg.swipe_info as Array<Record<string, unknown>>)
+                : ((msg.swipe_info = [{}]) as Array<Record<string, unknown>>);
+
+            const targetSwipeId =
+                typeof msg.swipe_id === 'number' ? msg.swipe_id : swipes.length;
+            const prevSwipeId =
+                explicitPreviousSwipeId !== undefined
+                    ? explicitPreviousSwipeId
+                    : Math.max(0, targetSwipeId - 1);
+
+            const prevMes = typeof msg.mes === 'string' ? msg.mes : '';
+            const prevInfo = swipeInfo[prevSwipeId]
+                ? { ...swipeInfo[prevSwipeId] }
+                : undefined;
+
+            while (swipes.length <= targetSwipeId) {
+                swipes.push('');
+            }
+            while (swipeInfo.length <= targetSwipeId) {
+                swipeInfo.push({});
+            }
+
+            swipes[targetSwipeId] = '...';
+            swipeInfo[targetSwipeId] = {
+                send_date: typeof getMessageTimeStamp === 'function' ? getMessageTimeStamp() : Date.now(),
+                gen_started: new Date().toISOString(),
+                extra: {
+                    api: apiTag,
+                    model: modelTag,
+                },
+            };
+            msg.mes = '...';
+            msg.swipe_id = targetSwipeId;
+
+            if (typeof updateMessageBlock === 'function') {
+                const rawMes = msg.mes;
+                updateMessageBlock(
+                    messageId,
+                    {
+                        ...msg,
+                        extra: {
+                            ...((msg.extra as Record<string, unknown> | undefined) ?? {}),
+                            display_text: '...',
+                        },
+                    },
+                    { rerenderMessage: true },
+                );
+                if (msg.mes !== rawMes) {
+                    msg.mes = rawMes;
+                }
+            }
+            if (typeof updateSwipeCounter === 'function') {
+                updateSwipeCounter(messageId);
+            }
+
+            return new StreamRenderer(
+                deps,
+                { messageId, swipeId: targetSwipeId },
+                action,
+                false,
+                '',
+                prevSwipeId,
+                prevMes,
+                prevInfo,
+            );
+        }
+
+        // 'normal' or 'regenerate': append new native assistant message + placeholder DOM at 0ms.
+        const messageId = chatList.length;
+        const timestamp = typeof getMessageTimeStamp === 'function' ? getMessageTimeStamp() : Date.now();
+        const extra = {
+            api: apiTag,
+            model: modelTag,
+        };
+        const placeholder: Record<string, unknown> = {
+            name: deps.identity.charName || 'Assistant',
+            is_user: false,
+            is_system: false,
+            send_date: timestamp,
+            mes: '...',
+            swipes: ['...'],
+            swipe_id: 0,
+            swipe_info: [
+                {
+                    send_date: timestamp,
+                    gen_started: new Date().toISOString(),
+                    extra: { ...extra },
+                },
+            ],
+            extra,
+        };
+
+        chatList.push(placeholder);
+        if (typeof addOneMessage === 'function') {
+            addOneMessage(placeholder, {
+                type: 'normal',
+                showSwipes: false,
+                scroll: true,
+            });
+        }
+
+        return new StreamRenderer(
+            deps,
+            { messageId, swipeId: 0 },
+            action,
+            true,
+            '',
+        );
+    }
+
+    /** Update `<agentic-capsule>` state during `before_turn` retrieval. */
+    setRetrievingStatus(stepLabel = 'Preparing context'): void {
+        if (this.finalized) {
+            return;
+        }
+        this.capsuleEl?.setState({
+            status: 'retrieving',
+            currentStep: stepLabel,
+            stepCount: this.stepCount,
+        });
+    }
+
+    /** Push an incremental model text chunk and schedule a `requestAnimationFrame` DOM update. */
+    appendTextDelta(delta: string): void {
+        if (this.finalized || !delta) {
+            return;
+        }
+        if (this.pendingToolReset) {
+            this.currentRoundText = '';
+            this.pendingToolReset = false;
+        }
+        this.currentRoundText += delta;
+        this.capsuleEl?.setState({
+            status: 'streaming',
+            currentStep: 'Streaming response',
+            stepCount: this.stepCount,
+        });
+        this.scheduleFlush();
+    }
+
+    /** Push an incremental model reasoning chunk and update reasoning UI on next frame. */
+    appendReasoningDelta(delta: string): void {
+        if (this.finalized || !delta) {
+            return;
+        }
+        if (this.reasoningStartMs === undefined) {
+            this.reasoningStartMs = Date.now();
+        }
+        this.reasoningEndMs = Date.now();
+        this.explicitReasoningText += delta;
+        this.capsuleEl?.setState({
+            status: 'streaming',
+            currentStep: 'Reasoning',
+            stepCount: this.stepCount,
+        });
+        this.scheduleFlush();
+    }
+
+    /** Handle tool start mid-turn: mark round reset boundary and reflect active tool in capsule. */
+    onToolStart(toolName: string): void {
+        if (this.finalized) {
+            return;
+        }
+        this.stepCount += 1;
+        this.pendingToolReset = true;
+        this.capsuleEl?.setState({
+            status: 'retrieving',
+            currentStep: `Tool: ${toolName}`,
+            stepCount: this.stepCount,
+        });
+    }
+
+    /** Handle tool completion mid-turn. */
+    onToolComplete(toolName: string): void {
+        if (this.finalized) {
+            return;
+        }
+        this.capsuleEl?.setState({
+            status: 'retrieving',
+            currentStep: `Finished: ${toolName}`,
+            stepCount: this.stepCount,
+        });
+    }
+
+    /** Sync `<agentic-capsule>` background task indicator after `after_turn` is dispatched. */
+    updateBackgroundStatus(activeCount: number): void {
+        if (!this.capsuleEl) {
+            return;
+        }
+        if (activeCount > 0) {
+            this.capsuleEl.setState({
+                status: 'background-running',
+                currentStep: `${activeCount} background task${activeCount === 1 ? '' : 's'}`,
+            });
+        } else if (this.finalized) {
+            this.capsuleEl.setState({
+                status: 'done',
+                currentStep: '',
+            });
+        }
+    }
+
+    /** Return streamed raw text captured so far (plus `existingContent` for `continue`). */
+    getAccumulatedText(): string {
+        if (this.action === 'continue') {
+            return `${this.existingContent}${this.currentRoundText}`;
+        }
+        return this.currentRoundText;
+    }
+
+    /**
+     * Commit the final assistant text, persist chat & swipe state, render `display` regex/overrides,
+     * and emit native SillyTavern events.
+     */
+    async finalize(options: StreamSessionFinalizeOptions): Promise<void> {
+        if (this.finalized) {
+            return;
+        }
+        this.finalized = true;
+        this.cancelScheduledFlush();
+
+        const msg = this.getChatMessage();
+        if (msg) {
+            const { visibleText, reasoningText } = splitStreamingReasoning(
+                options.finalText,
+                [this.explicitReasoningText, options.reasoningText ?? '']
+                    .map((s) => s.trim())
+                    .filter(Boolean)
+                    .join('\n\n'),
+            );
+
+            msg.mes = visibleText;
+            this.commitSwipeAndMetadata(msg, visibleText, reasoningText);
+            this.renderToDom(msg, visibleText, reasoningText, true);
+
+            if (typeof syncMesToSwipe === 'function') {
+                syncMesToSwipe();
+            }
+            if (typeof refreshSwipeButtons === 'function') {
+                refreshSwipeButtons();
+            } else if (typeof showSwipeButtons === 'function') {
+                showSwipeButtons();
+            }
+
+            if (typeof saveChatConditional === 'function') {
+                await saveChatConditional();
+            } else {
+                saveChatDebounced();
+            }
+
+            const eventName =
+                this.action === 'continue'
+                    ? event_types.MESSAGE_UPDATED
+                    : event_types.MESSAGE_RECEIVED;
+            if (eventName) {
+                await eventSource.emit(eventName, this.target.messageId, this.action);
+            }
+            if (event_types.CHARACTER_MESSAGE_RENDERED) {
+                await eventSource.emit(
+                    event_types.CHARACTER_MESSAGE_RENDERED,
+                    this.target.messageId,
+                    this.action,
+                );
+            }
+        }
+
+        if (typeof scrollChatToBottom === 'function') {
+            scrollChatToBottom();
+        }
+
+        this.capsuleEl?.setState({
+            status: options.hasBackgroundTasks ? 'background-running' : 'done',
+            currentStep: options.hasBackgroundTasks ? 'Background tasks running' : '',
+            stepCount: options.stepCount ?? this.stepCount,
+            ...(options.cacheHitRate !== undefined ? { cacheHitRate: options.cacheHitRate } : {}),
+            errorMessage: '',
+        });
+        this.detachStoreListener();
+    }
+
+    /**
+     * Abort streaming gracefully: keep partial text if generated (or on `continue`),
+     * otherwise cleanly revert the empty placeholder or failed swipe.
+     */
+    async abort(options: StreamSessionAbortOptions = {}): Promise<void> {
+        if (this.finalized) {
+            return;
+        }
+        this.finalized = true;
+        this.cancelScheduledFlush();
+
+        const partialRaw = this.currentRoundText;
+        const hasPartialText = partialRaw.trim().length > 0;
+        const msg = this.getChatMessage();
+
+        if (this.action === 'continue') {
+            if (msg) {
+                const combined = hasPartialText
+                    ? `${this.existingContent}${partialRaw}`
+                    : this.existingContent;
+                const { visibleText, reasoningText } = splitStreamingReasoning(
+                    combined,
+                    this.explicitReasoningText,
+                );
+                msg.mes = visibleText;
+                this.commitSwipeAndMetadata(msg, visibleText, reasoningText);
+                this.renderToDom(msg, visibleText, reasoningText, true);
+                if (typeof saveChatConditional === 'function') {
+                    await saveChatConditional();
+                } else {
+                    saveChatDebounced();
+                }
+            }
+        } else if (hasPartialText && msg) {
+            const { visibleText, reasoningText } = splitStreamingReasoning(
+                partialRaw,
+                this.explicitReasoningText,
+            );
+            msg.mes = visibleText;
+            this.commitSwipeAndMetadata(msg, visibleText, reasoningText);
+            this.renderToDom(msg, visibleText, reasoningText, true);
+            if (typeof syncMesToSwipe === 'function') {
+                syncMesToSwipe();
+            }
+            if (typeof saveChatConditional === 'function') {
+                await saveChatConditional();
+            } else {
+                saveChatDebounced();
+            }
+        } else if (this.createdNewMessage) {
+            if (Array.isArray(chat) && this.target.messageId === chat.length - 1) {
+                chat.pop();
+            }
+            removeMesElement(this.target.messageId);
+            this.detachStoreListener();
+            this.capsuleEl?.remove();
+            this.capsuleEl = null;
+            if (typeof showSwipeButtons === 'function') {
+                showSwipeButtons();
+            }
+            return;
+        } else if (this.action === 'swipe' && msg) {
+            this.revertAbortedSwipe(msg);
+            if (typeof updateSwipeCounter === 'function') {
+                updateSwipeCounter(this.target.messageId);
+            }
+            if (typeof refreshSwipeButtons === 'function') {
+                refreshSwipeButtons();
+            }
+        }
+
+        if (typeof showSwipeButtons === 'function') {
+            showSwipeButtons();
+        }
+
+        if (this.capsuleEl) {
+            if (options.errorMessage) {
+                this.capsuleEl.setState({
+                    status: 'error',
+                    errorMessage: options.errorMessage,
+                    currentStep: '',
+                    stepCount: this.stepCount,
+                });
+            } else {
+                this.capsuleEl.setState({
+                    status: 'done',
+                    currentStep: options.wasUserStop ? 'Stopped' : '',
+                    stepCount: this.stepCount,
+                });
+            }
+        }
+        this.detachStoreListener();
+    }
+
+    private getChatMessage(): Record<string, unknown> | undefined {
+        if (!Array.isArray(chat)) {
+            return undefined;
+        }
+        return chat[this.target.messageId] as Record<string, unknown> | undefined;
+    }
+
+    private mountCapsule(): void {
+        if (typeof document === 'undefined') {
+            return;
+        }
+        const mesElement = getMesElement(this.target.messageId);
+        if (!mesElement) {
+            return;
+        }
+
+        registerAgenticCapsuleElement();
+        const existing = mesElement.querySelector<AgenticCapsuleElement>('agentic-capsule');
+        const capsule =
+            existing ?? (document.createElement('agentic-capsule') as AgenticCapsuleElement);
+        placeAgenticCapsule(mesElement, capsule, resolveCapsulePosition(this.deps.getSettings()));
+
+        const appStore = this.deps.getAppStore?.();
+        if (appStore) {
+            this.capsuleDisconnect?.();
+            this.capsuleDisconnect = capsule.connectStore(appStore, this.target);
+        }
+
+        capsule.setState({
+            status: 'retrieving',
+            currentStep: 'Starting turn',
+            stepCount: 0,
+            errorMessage: '',
+        });
+        this.capsuleEl = capsule;
+    }
+
+    private detachStoreListener(): void {
+        this.capsuleDisconnect?.();
+        this.capsuleDisconnect = undefined;
+    }
+
+    private scheduleFlush(): void {
+        this.needsFlush = true;
+        if (this.rafHandle !== null) {
+            return;
+        }
+        const schedule =
+            typeof requestAnimationFrame === 'function'
+                ? requestAnimationFrame
+                : (cb: FrameRequestCallback) => setTimeout(() => cb(Date.now()), 16) as unknown as number;
+
+        this.rafHandle = schedule(() => {
+            this.rafHandle = null;
+            if (!this.needsFlush || this.finalized) {
+                return;
+            }
+            this.needsFlush = false;
+            this.flushStreamingFrame();
+        });
+    }
+
+    private cancelScheduledFlush(): void {
+        if (this.rafHandle === null) {
+            return;
+        }
+        if (typeof cancelAnimationFrame === 'function') {
+            cancelAnimationFrame(this.rafHandle);
+        } else {
+            clearTimeout(this.rafHandle);
+        }
+        this.rafHandle = null;
+        this.needsFlush = false;
+    }
+
+    private flushStreamingFrame(): void {
+        const msg = this.getChatMessage();
+        if (!msg) {
+            return;
+        }
+        const rawCombined = this.getAccumulatedText();
+        const { visibleText, reasoningText } = splitStreamingReasoning(
+            rawCombined,
+            this.explicitReasoningText,
+        );
+        const shownText = visibleText.length > 0 ? visibleText : '...';
+        this.commitReasoningFields(msg, reasoningText);
+        this.renderToDom(msg, shownText, reasoningText, false);
+    }
+
+    private commitReasoningFields(msg: Record<string, unknown>, reasoningText: string): void {
+        if (!reasoningText) {
+            return;
+        }
+        const extra = ((msg.extra ??= {}) as Record<string, unknown>);
+        extra.reasoning = reasoningText;
+        extra.reasoning_type = this.explicitReasoningText.trim()
+            ? (ReasoningType?.Model ?? 'model')
+            : (ReasoningType?.Parsed ?? 'parsed');
+        if (this.reasoningStartMs !== undefined) {
+            extra.reasoning_duration = Math.max(
+                0,
+                (this.reasoningEndMs ?? Date.now()) - this.reasoningStartMs,
+            );
+        }
+    }
+
+    private commitSwipeAndMetadata(
+        msg: Record<string, unknown>,
+        visibleText: string,
+        reasoningText: string,
+    ): void {
+        this.commitReasoningFields(msg, reasoningText);
+
+        const swipes = Array.isArray(msg.swipes)
+            ? (msg.swipes as string[])
+            : ((msg.swipes = []) as string[]);
+        while (swipes.length <= this.target.swipeId) {
+            swipes.push('');
+        }
+        swipes[this.target.swipeId] = visibleText;
+
+        const swipeInfo = Array.isArray(msg.swipe_info)
+            ? (msg.swipe_info as Array<Record<string, unknown>>)
+            : ((msg.swipe_info = []) as Array<Record<string, unknown>>);
+        while (swipeInfo.length <= this.target.swipeId) {
+            swipeInfo.push({});
+        }
+
+        const existingInfo = swipeInfo[this.target.swipeId] ?? {};
+        swipeInfo[this.target.swipeId] = {
+            ...existingInfo,
+            send_date: existingInfo.send_date ?? msg.send_date ?? Date.now(),
+            gen_started: existingInfo.gen_started ?? new Date(this.startedAt).toISOString(),
+            gen_finished: new Date().toISOString(),
+            extra: {
+                ...((existingInfo.extra as Record<string, unknown> | undefined) ?? {}),
+                ...((msg.extra as Record<string, unknown> | undefined) ?? {}),
+            },
+        };
+    }
+
+    private renderToDom(
+        msg: Record<string, unknown>,
+        visibleText: string,
+        reasoningText: string,
+        addCopyButtons: boolean,
+    ): void {
+        const mesElement = getMesElement(this.target.messageId);
+        if (!mesElement) {
+            return;
+        }
+
+        const store = this.deps.getStore();
+        const override = store
+            ? store.getPending(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, {
+                  target: this.target,
+              }) ?? store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target: this.target })
+            : null;
+        const baseDisplayText =
+            typeof override?.content === 'string' && override.content.length > 0
+                ? override.content
+                : visibleText;
+
+        const displayRules = collectDisplayRules(this.deps.getSettings());
+        const formattedInput =
+            displayRules.length > 0
+                ? this.deps.substituteMacros(
+                      applyRegexRules(baseDisplayText, displayRules, {
+                          stage: 'display',
+                          sender: 'assistant',
+                      }),
+                  )
+                : baseDisplayText;
+
+        const mesTextEl = mesElement.querySelector<HTMLElement>('.mes_text');
+        if (mesTextEl && typeof messageFormatting === 'function') {
+            const html = messageFormatting(
+                formattedInput,
+                typeof msg.name === 'string' ? msg.name : this.deps.identity.charName,
+                Boolean(msg.is_system),
+                Boolean(msg.is_user),
+                this.target.messageId,
+            );
+            mesTextEl.innerHTML = html;
+        } else if (typeof updateMessageBlock === 'function') {
+            const rawSnapshot = msg.mes;
+            updateMessageBlock(
+                this.target.messageId,
+                {
+                    ...msg,
+                    mes: formattedInput,
+                    extra: {
+                        ...((msg.extra as Record<string, unknown> | undefined) ?? {}),
+                        display_text: formattedInput,
+                    },
+                },
+                { rerenderMessage: true },
+            );
+            if (msg.mes !== rawSnapshot) {
+                msg.mes = rawSnapshot;
+            }
+        }
+
+        if (reasoningText && typeof updateReasoningUI === 'function') {
+            updateReasoningUI(mesElement);
+        }
+        if (addCopyButtons && typeof addCopyToCodeBlocks === 'function') {
+            addCopyToCodeBlocks(mesElement);
+        }
+    }
+
+    private revertAbortedSwipe(msg: Record<string, unknown>): void {
+        const prevSwipeId = this.previousSwipeId ?? 0;
+        const swipes = Array.isArray(msg.swipes) ? (msg.swipes as string[]) : undefined;
+        const swipeInfo = Array.isArray(msg.swipe_info)
+            ? (msg.swipe_info as Array<Record<string, unknown>>)
+            : undefined;
+
+        if (swipes && this.target.swipeId === swipes.length - 1 && swipes.length > 1) {
+            swipes.pop();
+        }
+        if (swipeInfo && this.target.swipeId === swipeInfo.length - 1 && swipeInfo.length > 1) {
+            swipeInfo.pop();
+        }
+
+        msg.swipe_id = prevSwipeId;
+        if (this.previousChatSwipeMes !== undefined) {
+            msg.mes = this.previousChatSwipeMes;
+            if (swipes && prevSwipeId < swipes.length) {
+                swipes[prevSwipeId] = this.previousChatSwipeMes;
+            }
+        }
+        if (this.previousChatSwipeInfo && swipeInfo && prevSwipeId < swipeInfo.length) {
+            swipeInfo[prevSwipeId] = this.previousChatSwipeInfo;
+        }
+
+        if (typeof syncSwipeToMes === 'function') {
+            syncSwipeToMes();
+        }
+
+        const mesElement = getMesElement(this.target.messageId);
+        if (mesElement && typeof msg.mes === 'string') {
+            this.renderToDom(
+                msg,
+                msg.mes,
+                typeof (msg.extra as Record<string, unknown> | undefined)?.reasoning === 'string'
+                    ? String((msg.extra as Record<string, unknown>).reasoning)
+                    : '',
+                true,
+            );
+        }
+    }
+}
