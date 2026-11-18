@@ -1,0 +1,55 @@
+{
+    "compilerOptions": {
+        "target": "ESNext",
+        "module": "ESNext",
+        "outDir": "dist",
+        "strict": true,
+        "esModuleInterop": true,
+        "sourceMap": true,
+        "forceConsistentCasingInFileNames": true,
+        "allowJs": true,
+        "moduleDetection": "auto",
+        "moduleResolution": "bundler",
+        "allowUmdGlobalAccess": true,
+        "allowSyntheticDefaultImports": true,
+        "strictBindCallApply": true,
+        "checkJs": false,
+        "noUnusedLocals": true,
+        "noUnusedParameters": false,
+        "noImplicitReturns": true,
+        "noFallthroughCasesInSwitch": true,
+        "skipLibCheck": true,
+        "jsx": "react-jsx",
+        "jsxImportSource": "preact",
+        "lib": [
+            "DOM",
+            "DOM.Iterable",
+            "ESNext"
+        ],
+        "types": [
+            "lodash",
+            "jquery",
+            "toastr",
+            "select2",
+            "dialog-polyfill",
+            "jqueryui",
+            "vitest/globals"
+        ],
+        "baseUrl": ".",
+        "paths": {
+            "@/*": ["src/*"],
+            "@st/*": ["../../../../*"]
+        }
+    },
+    "include": [
+        "src/**/*.ts",
+        "src/**/*.tsx",
+        "src/**/*.js",
+        "tests/**/*.ts",
+        "tests/**/*.tsx"
+    ],
+    "exclude": [
+        "**/node_modules/**",
+        "**/dist/**"
+    ]
+}

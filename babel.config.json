@@ -1,0 +1,21 @@
+{
+  "presets": [
+    [
+      "@babel/preset-env",
+      {
+        "useBuiltIns": "usage",
+        "corejs": "3",
+        "modules": false
+      }
+    ],
+    [
+      "@babel/preset-react",
+      {
+        "runtime": "automatic",
+        "importSource": "preact"
+      }
+    ],
+    "@babel/preset-typescript"
+  ],
+  "sourceMaps": true
+}

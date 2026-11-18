@@ -1,0 +1,13 @@
+node_modules/
+dist/
+
+*.js
+*.cjs
+*.mjs
+*.d.ts
+.github/
+.vscode/
+.kilocode/
+docs/
+locales/
+plans/
