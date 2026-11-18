@@ -1,0 +1,54 @@
+import type { MessageTarget } from './messages';
+
+export type DataNamespace =
+    | 'files'
+    | 'variables'
+    | 'worldinfo'
+    | 'message'
+    | 'character-files'
+    | 'persona-files';
+
+export interface CompactionReport {
+    dryRun: boolean;
+    compactedMessages: number;
+    removedLayers: number;
+    flattenedEntries: number;
+    estimatedBytesBefore: number;
+    estimatedBytesAfter: number;
+    freedBytes: number;
+    previousWatermark: number;
+    newWatermark: number;
+}
+
+export type VfsEntryKind = 'file' | 'directory';
+
+export interface VfsEntryStat {
+    path: string;
+    name: string;
+    kind: VfsEntryKind;
+    size: number;
+    writable: boolean;
+    mount: string;
+    source?: string;
+    overridden?: boolean;
+}
+
+export interface VfsSearchHit {
+    path: string;
+    score: number;
+    title?: string;
+    snippet?: string;
+    line?: number;
+    matchedTerms?: string[];
+}
+
+export interface LoreReadContext {
+    world: string;
+    uid: number;
+    path: string;
+    target?: MessageTarget;
+    rawContent: string;
+    overriddenContent?: string;
+}
+
+export type LoreReadHook = (context: LoreReadContext) => Promise<string> | string;

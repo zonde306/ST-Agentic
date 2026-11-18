@@ -40,9 +40,9 @@
 
 | 任务 ID | 任务名称 | 波次 | 轨道 | 前置依赖 | 独占写路径（Owned Paths）摘要 | 状态 |
 | :--- | :--- | :---: | :---: | :--- | :--- | :---: |
-| **T0.1** | 工具链校准与防腐层 Lint 守卫 | Wave 0 | Serial | 无 | `package.json`, `tsconfig.json`, `vitest.config.ts`, `.eslintrc.cjs`, `manifest.json` | `[ ]` |
-| **T0.2** | 核心领域类型、防腐接口与基础原语 | Wave 0 | Serial | T0.1 | `src/core/types/**`, `src/core/bridge/**`, `src/core/utils/**`, `tests/unit/utils/**` | `[ ]` |
-| **T0.3** | 测试基座桩模块与标准测试语料 | Wave 0 | Serial | T0.2 | `tests/mocks/**`, `tests/fixtures/**` | `[ ]` |
+| **T0.1** | 工具链校准与防腐层 Lint 守卫 | Wave 0 | Serial | 无 | `package.json`, `tsconfig.json`, `vitest.config.ts`, `.eslintrc.cjs`, `manifest.json` | `[x]` |
+| **T0.2** | 核心领域类型、防腐接口与基础原语 | Wave 0 | Serial | T0.1 | `src/core/types/**`, `src/core/bridge/**`, `src/core/utils/**`, `tests/unit/utils/**` | `[x]` |
+| **T0.3** | 测试基座桩模块与标准测试语料 | Wave 0 | Serial | T0.2 | `tests/mocks/**`, `tests/fixtures/**` | `[x]` |
 | **T1.1** | 分层数据存储、冷层压平与 VFS 引擎 | Wave 1 | Track A | T0.3 | `src/core/store/**`, `src/core/vfs/**`, `tests/unit/store/**`, `tests/unit/vfs/**` | `[ ]` |
 | **T1.2** | 自研正则引擎、配置状态与自动迁移 | Wave 1 | Track B | T0.3 | `src/core/regex/**`, `src/core/migration/**`, `src/core/config/**`, `tests/unit/regex/**`, `tests/unit/migration/**` | `[ ]` |
 | **T1.3** | WI 装饰器解析、四类分流与尾部雷达 | Wave 1 | Track C | T0.3 | `src/core/lore/**`, `tests/unit/lore/**` | `[ ]` |

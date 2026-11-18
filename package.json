@@ -16,13 +16,14 @@
   },
   "scripts": {
     "build": "webpack --mode production",
-    "dev:ui": "webpack --mode development --watch",
-    "lint": "eslint src tests --ext .ts,.tsx",
-    "lint:fix": "eslint src tests --ext .ts,.tsx --fix",
-    "test": "vitest run tests/unit",
-    "test:unit": "vitest run tests/unit",
-    "test:browser": "vitest run tests/browser",
-    "test:e2e": "vitest run tests/e2e",
+    "dev:ui": "webpack --entry ./src/ui/dev-preview.tsx --output-filename dev-preview.js --mode development --watch",
+    "build:dev-ui": "webpack --entry ./src/ui/dev-preview.tsx --output-filename dev-preview.js --mode development",
+    "lint": "eslint src tests --ext .ts,.tsx --no-error-on-unmatched-pattern",
+    "lint:fix": "eslint src tests --ext .ts,.tsx --fix --no-error-on-unmatched-pattern",
+    "test": "vitest run --project unit",
+    "test:unit": "vitest run --project unit",
+    "test:browser": "vitest run --project browser",
+    "test:e2e": "vitest run --project e2e",
     "typecheck": "tsc --noEmit"
   },
   "browserslist": {
@@ -42,6 +43,7 @@
     "@babel/preset-env": "^7.29.2",
     "@babel/preset-react": "^7.29.7",
     "@babel/preset-typescript": "^7.28.5",
+    "@playwright/test": "^1.50.0",
     "@types/ejs": "^3.1.5",
     "@types/jquery": "^4.0.0",
     "@types/lodash": "^4.17.24",
@@ -49,6 +51,8 @@
     "@types/toastr": "^2.1.43",
     "@typescript-eslint/eslint-plugin": "^8.59.0",
     "@typescript-eslint/parser": "^8.59.0",
+    "@vitest/browser": "^5.1.0",
+    "@vitest/browser-playwright": "^5.1.0",
     "babel-loader": "^9.2.1",
     "core-js": "^3.40.0",
     "diff": "^9.0.0",
@@ -56,11 +60,13 @@
     "eslint-plugin-jsdoc": "^61.7.1",
     "jsonrepair": "^3.14.0",
     "minisearch": "^7.2.0",
+    "playwright": "^1.50.0",
     "terser-webpack-plugin": "^5.5.0",
     "typescript": "^5.9.3",
     "vitest": "^5.1.0",
     "webpack": "^5.112.2",
     "webpack-cli": "^5.1.4",
+    "yaml": "^2.7.0",
     "zod": "^4.3.6"
   }
 }

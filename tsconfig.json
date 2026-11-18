@@ -12,6 +12,7 @@
         "moduleResolution": "bundler",
         "allowUmdGlobalAccess": true,
         "allowSyntheticDefaultImports": true,
+        "resolveJsonModule": true,
         "strictBindCallApply": true,
         "checkJs": false,
         "noUnusedLocals": true,

@@ -33,8 +33,14 @@ module.exports = {
     {
       files: ['src/core/**/*.ts', 'src/core/**/*.tsx'],
       rules: {
-        'no-restricted-imports': ['error', { patterns: ['@st/*', 'jquery'] }],
+        'no-restricted-imports': ['error', { patterns: ['@st/*', 'jquery', '../../../../*', '../../../../../*'] }],
         'no-restricted-globals': ['error', 'window', 'document', '$', 'jQuery'],
+      },
+    },
+    {
+      files: ['src/ui/**/*.ts', 'src/ui/**/*.tsx', 'src/sandbox/**/*.ts', 'src/sandbox/**/*.tsx'],
+      rules: {
+        'no-restricted-imports': ['error', { patterns: ['@st/*', 'jquery'] }],
       },
     },
   ],

@@ -1,0 +1,37 @@
+{
+  "world": "条件分支测试书",
+  "entries": [
+    {
+      "world": "条件分支测试书",
+      "uid": 201,
+      "comment": "林晚好感度阶段档案",
+      "content": "基础档案：林晚对 {{user}} 保持礼貌距离。\n<% if (getvar('favorability') >= 50) { %>秘密档案：她已经将旧灯塔二楼隔间的备用钥匙交给了你。<% } else { %>秘密档案：她仍旧拒绝透露关于旧灯塔隔间的秘密。<% } %>\n态度标签：<%= getvar('favorability') >= 50 ? '信赖' : '戒备' %>",
+      "keys": ["林晚", "好感", "信任"],
+      "keysecondary": [],
+      "constant": false,
+      "selective": false,
+      "selectiveLogic": 0,
+      "disable": false,
+      "position": 1,
+      "depth": 4,
+      "order": 100,
+      "role": 0
+    },
+    {
+      "world": "条件分支测试书",
+      "uid": 202,
+      "comment": "灰港潮汐通告",
+      "content": "<% if (getvar('tide') === 'high') { %>高潮警报：码头下层通道已被海水淹没。<% } else { %>平潮状态：码头下层通道可安全通行。<% } %>",
+      "keys": ["天气", "潮汐", "码头"],
+      "keysecondary": [],
+      "constant": false,
+      "selective": false,
+      "selectiveLogic": 0,
+      "disable": false,
+      "position": 1,
+      "depth": 4,
+      "order": 90,
+      "role": 0
+    }
+  ]
+}

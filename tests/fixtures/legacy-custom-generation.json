@@ -1,0 +1,254 @@
+{
+  "apis": {
+    "Default": {
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "sk-legacy-secret-key",
+      "model": "gpt-4o",
+      "contextSize": 64000,
+      "maxTokens": 4096,
+      "temperature": 0.8,
+      "topK": 40,
+      "topP": 0.95,
+      "frequencyPenalty": 0.1,
+      "presencePenalty": 0,
+      "stream": true,
+      "includeHeaders": { "X-Custom": "1" },
+      "includeBody": {},
+      "excludeBody": {},
+      "promptPostProcessing": "none",
+      "linkedPreset": "LegacyRP",
+      "maxConcurrency": 2
+    },
+    "FastModel": {
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "sk-fast-key",
+      "model": "deepseek-chat",
+      "contextSize": 32000,
+      "maxTokens": 2048,
+      "temperature": 0.3,
+      "topK": 20,
+      "topP": 0.9,
+      "frequencyPenalty": 0,
+      "presencePenalty": 0,
+      "stream": false,
+      "includeHeaders": {},
+      "includeBody": {},
+      "excludeBody": {},
+      "promptPostProcessing": "merge",
+      "linkedPreset": "",
+      "maxConcurrency": 4
+    }
+  },
+  "currentApi": "Default",
+  "presets": {
+    "LegacyRP": {
+      "name": "LegacyRP",
+      "prompts": [
+        {
+          "name": "Main Prompt",
+          "role": "system",
+          "triggers": [],
+          "prompt": "",
+          "injectionPosition": "relative",
+          "enabled": true,
+          "internal": "main",
+          "injectionDepth": 4,
+          "injectionOrder": 100,
+          "maxDepth": 999
+        },
+        {
+          "name": "全局文风指导",
+          "role": "system",
+          "triggers": ["normal", "swipe", "regenerate"],
+          "prompt": "保持描写细腻，避免空洞总结。",
+          "injectionPosition": "relative",
+          "enabled": true,
+          "internal": null,
+          "injectionDepth": 4,
+          "injectionOrder": 100,
+          "maxDepth": 999
+        },
+        {
+          "name": "Chat History",
+          "role": "system",
+          "triggers": [],
+          "prompt": "",
+          "injectionPosition": "relative",
+          "enabled": true,
+          "internal": "chatHistory",
+          "injectionDepth": 4,
+          "injectionOrder": 100,
+          "maxDepth": 65535
+        },
+        {
+          "name": "旧版深度3注入",
+          "role": "system",
+          "triggers": [],
+          "prompt": "此深度注入在新架构中应被跳过。",
+          "injectionPosition": "inChat",
+          "enabled": true,
+          "internal": null,
+          "injectionDepth": 3,
+          "injectionOrder": 100,
+          "maxDepth": 999
+        },
+        {
+          "name": "尾部格式提醒",
+          "role": "system",
+          "triggers": [],
+          "prompt": "回复末尾附带简短环境声响描写。",
+          "injectionPosition": "inChat",
+          "enabled": true,
+          "internal": null,
+          "injectionDepth": 0,
+          "injectionOrder": 100,
+          "maxDepth": 999
+        }
+      ],
+      "regexs": [
+        {
+          "name": "展示层状态栏折叠",
+          "regex": "/<status>([\\s\\S]*?)<\\/status>/g",
+          "replace": "<details><summary>状态</summary>$1</details>",
+          "userInput": false,
+          "aiOutput": true,
+          "worldInfo": false,
+          "enabled": true,
+          "minDepth": null,
+          "maxDepth": null,
+          "ephemerality": true,
+          "request": false,
+          "response": true
+        },
+        {
+          "name": "世界书注释清洗",
+          "regex": "/<!--([\\s\\S]*?)-->/g",
+          "replace": "",
+          "userInput": false,
+          "aiOutput": false,
+          "worldInfo": true,
+          "enabled": true,
+          "minDepth": null,
+          "maxDepth": null,
+          "ephemerality": false,
+          "request": true,
+          "response": false
+        },
+        {
+          "name": "入轨冗余标签剥离",
+          "regex": "/<debug_note>[\\s\\S]*?<\\/debug_note>/g",
+          "replace": "",
+          "userInput": false,
+          "aiOutput": true,
+          "worldInfo": false,
+          "enabled": true,
+          "minDepth": 1,
+          "maxDepth": 10,
+          "ephemerality": false,
+          "request": true,
+          "response": true
+        }
+      ],
+      "templates": {
+        "trigger:@@replace:": {
+          "id": "legacy-replace",
+          "kind": "trigger",
+          "binding": "@@replace",
+          "tag": "",
+          "prompts": [
+            {
+              "name": "Instruction",
+              "role": "user",
+              "triggers": [],
+              "prompt": "Update the document based on the latest turn.",
+              "injectionPosition": "relative",
+              "enabled": true,
+              "internal": null,
+              "injectionDepth": 4,
+              "injectionOrder": 100,
+              "maxDepth": 999
+            }
+          ],
+          "regex": "/<doc>([\\s\\S]+?)<\\/doc>/i",
+          "findRegex": "",
+          "filters": ["worldInfoDepth", "authorsNoteDepth"],
+          "retryCount": 3,
+          "retryInterval": 1000
+        },
+        "trigger:@@variables_json:stats": {
+          "id": "legacy-vars-stats",
+          "kind": "trigger",
+          "binding": "@@variables_json",
+          "tag": "stats",
+          "prompts": [
+            {
+              "name": "Stats Prompt",
+              "role": "system",
+              "triggers": [],
+              "prompt": "Extract numeric variable changes as JSON.",
+              "injectionPosition": "relative",
+              "enabled": true,
+              "internal": null,
+              "injectionDepth": 4,
+              "injectionOrder": 100,
+              "maxDepth": 999
+            }
+          ],
+          "regex": "",
+          "findRegex": "/<scene>([\\s\\S]+?)<\\/scene>/",
+          "filters": [],
+          "retryCount": 2,
+          "retryInterval": 500
+        },
+        "agent:archivist": {
+          "id": "legacy-agent-archivist",
+          "kind": "agent",
+          "binding": "archivist",
+          "tag": "",
+          "prompts": [
+            {
+              "name": "Archivist System",
+              "role": "system",
+              "triggers": [],
+              "prompt": "You are a concise lore archivist.",
+              "injectionPosition": "relative",
+              "enabled": true,
+              "internal": null,
+              "injectionDepth": 4,
+              "injectionOrder": 100,
+              "maxDepth": 999
+            }
+          ],
+          "regex": "",
+          "findRegex": "",
+          "filters": [],
+          "retryCount": 1,
+          "retryInterval": 500
+        }
+      },
+      "tools": {
+        "read_file": {
+          "enabled": true,
+          "triggers": [],
+          "parameters": {
+            "path": "Target file path"
+          },
+          "description": "Read a file from VFS"
+        }
+      },
+      "files": {
+        "style-guide.md": "# 文风参考\n优先使用感官细节描写。"
+      }
+    }
+  },
+  "currentPreset": "LegacyRP",
+  "interceptGenerate": true,
+  "storage": {
+    "autoCompact": true,
+    "keepDepth": 24,
+    "sizeThreshold": 524288,
+    "pruneLegacy": true,
+    "fuzzyIndexFiles": true
+  },
+  "migrations": {}
+}

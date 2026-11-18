@@ -1,0 +1,192 @@
+{
+  "chat_completion_source": "openai",
+  "openai_model": "gpt-4o",
+  "openai_max_context": 64000,
+  "openai_max_tokens": 4096,
+  "temperature": 0.9,
+  "top_k": 40,
+  "top_p": 0.95,
+  "frequency_penalty": 0.15,
+  "presence_penalty": 0.05,
+  "stream_openai": true,
+  "prompts": [
+    {
+      "identifier": "main",
+      "name": "Main Prompt",
+      "role": "system",
+      "content": "Write {{char}}'s next reply in a fictional roleplay.",
+      "system_prompt": true,
+      "marker": false,
+      "injection_position": 0,
+      "injection_depth": 4,
+      "injection_order": 100,
+      "injection_trigger": []
+    },
+    {
+      "identifier": "worldInfoBefore",
+      "name": "World Info (before)",
+      "role": "system",
+      "content": "",
+      "system_prompt": true,
+      "marker": true,
+      "injection_position": 0,
+      "injection_depth": 4,
+      "injection_order": 100,
+      "injection_trigger": []
+    },
+    {
+      "identifier": "personaDescription",
+      "name": "Persona Description",
+      "role": "system",
+      "content": "",
+      "system_prompt": true,
+      "marker": true,
+      "injection_position": 0,
+      "injection_depth": 4,
+      "injection_order": 100,
+      "injection_trigger": []
+    },
+    {
+      "identifier": "charDescription",
+      "name": "Char Description",
+      "role": "system",
+      "content": "",
+      "system_prompt": true,
+      "marker": true,
+      "injection_position": 0,
+      "injection_depth": 4,
+      "injection_order": 100,
+      "injection_trigger": []
+    },
+    {
+      "identifier": "charPersonality",
+      "name": "Char Personality",
+      "role": "system",
+      "content": "",
+      "system_prompt": true,
+      "marker": true,
+      "injection_position": 0,
+      "injection_depth": 4,
+      "injection_order": 100,
+      "injection_trigger": []
+    },
+    {
+      "identifier": "scenario",
+      "name": "Scenario",
+      "role": "system",
+      "content": "",
+      "system_prompt": true,
+      "marker": true,
+      "injection_position": 0,
+      "injection_depth": 4,
+      "injection_order": 100,
+      "injection_trigger": []
+    },
+    {
+      "identifier": "dialogueExamples",
+      "name": "Chat Examples",
+      "role": "system",
+      "content": "",
+      "system_prompt": true,
+      "marker": true,
+      "injection_position": 0,
+      "injection_depth": 4,
+      "injection_order": 100,
+      "injection_trigger": []
+    },
+    {
+      "identifier": "worldInfoAfter",
+      "name": "World Info (after)",
+      "role": "system",
+      "content": "",
+      "system_prompt": true,
+      "marker": true,
+      "injection_position": 0,
+      "injection_depth": 4,
+      "injection_order": 100,
+      "injection_trigger": []
+    },
+    {
+      "identifier": "chatHistory",
+      "name": "Chat History",
+      "role": "system",
+      "content": "",
+      "system_prompt": true,
+      "marker": true,
+      "injection_position": 0,
+      "injection_depth": 4,
+      "injection_order": 100,
+      "injection_trigger": []
+    },
+    {
+      "identifier": "custom-narrative-rule",
+      "name": "核心文风与破限规则",
+      "role": "system",
+      "content": "避免出现重复排比句式，优先描写人物细微肢体与环境氛围。",
+      "system_prompt": false,
+      "marker": false,
+      "injection_position": 0,
+      "injection_depth": 4,
+      "injection_order": 100,
+      "injection_trigger": []
+    },
+    {
+      "identifier": "custom-d0-reminder",
+      "name": "文末视角锚定 (@D0)",
+      "role": "system",
+      "content": "紧承上一句剧情继续叙事，保持第三人称克制口吻。",
+      "system_prompt": false,
+      "marker": false,
+      "injection_position": 1,
+      "injection_depth": 0,
+      "injection_order": 100,
+      "injection_trigger": []
+    },
+    {
+      "identifier": "custom-d4-injection",
+      "name": "历史中间深度提醒 (@D4)",
+      "role": "system",
+      "content": "不要在长文中间突然插入上帝视角旁白。",
+      "system_prompt": false,
+      "marker": false,
+      "injection_position": 1,
+      "injection_depth": 4,
+      "injection_order": 100,
+      "injection_trigger": []
+    }
+  ],
+  "prompt_order": [
+    {
+      "character_id": 100001,
+      "order": [
+        { "identifier": "main", "enabled": true },
+        { "identifier": "worldInfoBefore", "enabled": true },
+        { "identifier": "personaDescription", "enabled": true },
+        { "identifier": "charDescription", "enabled": true },
+        { "identifier": "charPersonality", "enabled": true },
+        { "identifier": "scenario", "enabled": true },
+        { "identifier": "custom-narrative-rule", "enabled": true },
+        { "identifier": "dialogueExamples", "enabled": true },
+        { "identifier": "worldInfoAfter", "enabled": true },
+        { "identifier": "chatHistory", "enabled": true },
+        { "identifier": "custom-d4-injection", "enabled": true },
+        { "identifier": "custom-d0-reminder", "enabled": true }
+      ]
+    }
+  ],
+  "extensions": {
+    "regex_scripts": [
+      {
+        "scriptName": "剥离思考标签",
+        "findRegex": "/<think>[\\s\\S]*?<\\/think>/g",
+        "replaceString": "",
+        "placement": [2],
+        "disabled": false,
+        "markdownOnly": false,
+        "promptOnly": true,
+        "minDepth": null,
+        "maxDepth": null
+      }
+    ]
+  }
+}
