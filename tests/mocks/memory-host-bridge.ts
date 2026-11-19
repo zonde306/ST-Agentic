@@ -1,4 +1,4 @@
-import type { HostBridge, HostIdentity } from '@/core/bridge';
+import type { HostBridge, HostIdentity, WriteChatMessageOptions } from '@/core/bridge';
 import type {
     ChatMessageSnapshot,
     MediaAttachment,
@@ -34,6 +34,11 @@ export class MemoryHostBridge implements HostBridge {
     public hostLuminance: 'dark' | 'light';
 
     public saveChatCalls = 0;
+    public writtenMessages: Array<{
+        target: MessageTarget;
+        content: string;
+        options?: WriteChatMessageOptions;
+    }> = [];
     public mediaAttachments: Array<{ target: MessageTarget; media: MediaAttachment }> = [];
     public refreshedViews: MessageTarget[] = [];
     public slashCalls: Array<{ command: string; aborted: boolean }> = [];
@@ -93,6 +98,85 @@ export class MemoryHostBridge implements HostBridge {
 
     saveChatDebounced(): void {
         this.saveChatCalls += 1;
+    }
+
+    readChatMessage(target: MessageTarget): string | null {
+        if (
+            !Number.isInteger(target.messageId) ||
+            target.messageId < 0 ||
+            target.messageId >= this.chat.length ||
+            !Number.isInteger(target.swipeId) ||
+            target.swipeId < 0
+        ) {
+            return null;
+        }
+        const msg = this.chat[target.messageId];
+        if (!msg) {
+            return null;
+        }
+        if (Array.isArray(msg.swipes) && target.swipeId < msg.swipes.length) {
+            return typeof msg.swipes[target.swipeId] === 'string'
+                ? msg.swipes[target.swipeId]
+                : '';
+        }
+        if (target.swipeId === 0 && (!Array.isArray(msg.swipes) || msg.swipes.length === 0)) {
+            return typeof msg.mes === 'string' ? msg.mes : '';
+        }
+        return null;
+    }
+
+    async writeChatMessage(
+        target: MessageTarget,
+        content: string,
+        options?: WriteChatMessageOptions,
+    ): Promise<void> {
+        if (
+            !Number.isInteger(target.messageId) ||
+            target.messageId < 0 ||
+            target.messageId >= this.chat.length ||
+            !Number.isInteger(target.swipeId) ||
+            target.swipeId < 0
+        ) {
+            return;
+        }
+        const msg = this.chat[target.messageId];
+        if (!msg) {
+            return;
+        }
+
+        this.writtenMessages.push({
+            target: { ...target },
+            content,
+            ...(options !== undefined ? { options: { ...options } } : {}),
+        });
+
+        const swipes = Array.isArray(msg.swipes)
+            ? msg.swipes
+            : (msg.swipes = [typeof msg.mes === 'string' ? msg.mes : '']);
+        const swipeInfo = Array.isArray(msg.swipeInfo)
+            ? msg.swipeInfo
+            : (msg.swipeInfo = []);
+
+        while (swipes.length <= target.swipeId) {
+            swipes.push('');
+        }
+        while (swipeInfo.length <= target.swipeId) {
+            swipeInfo.push({});
+        }
+
+        swipes[target.swipeId] = content;
+
+        const activeSwipeId = msg.swipeId ?? 0;
+        if (activeSwipeId === target.swipeId) {
+            msg.mes = content;
+            await this.refreshMessageView(target);
+        }
+
+        this.saveChatDebounced();
+
+        if (options?.emitEvent) {
+            this.emitHostEvent('MESSAGE_UPDATED', target.messageId);
+        }
     }
 
     getActiveIdentity(): HostIdentity {

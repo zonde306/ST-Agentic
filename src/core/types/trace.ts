@@ -21,7 +21,9 @@ export interface ToolStepLog {
     startedAt: number;
 }
 
-export type AgentRunStatus = 'running' | 'completed' | 'aborted' | 'error';
+export type InterruptedReason = 'user_stop' | 'length' | 'error' | 'empty_output';
+
+export type AgentRunStatus = 'running' | 'completed' | 'interrupted' | 'aborted' | 'error';
 
 export interface AgentRunTrace {
     runId: string;
@@ -40,6 +42,7 @@ export interface AgentRunTrace {
     usage: TokenUsage;
     toolSteps: ToolStepLog[];
     outputPreview?: string;
+    interruptedReason?: InterruptedReason;
     error?: string;
     requestSnapshot?: {
         messages: CanonicalMessage[];
@@ -72,6 +75,9 @@ export type GenerationEventKind =
     | 'tool_completed'
     | 'text_delta'
     | 'reasoning_delta'
+    | 'output_preview'
+    | 'turn_interrupted'
+    | 'turn_resumed'
     | 'background_task_updated'
     | 'trace_recorded'
     | 'turn_completed'
@@ -87,6 +93,8 @@ export interface GenerationEventPayload {
     agentProfileId?: string;
     textDelta?: string;
     reasoningDelta?: string;
+    outputPreview?: string;
+    interruptedReason?: InterruptedReason;
     toolStep?: ToolStepLog;
     task?: BackgroundTaskStatus;
     trace?: AgentRunTrace;

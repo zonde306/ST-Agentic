@@ -184,6 +184,8 @@ export function getRunStatusMeta(status: AgentRunStatus): { label: string; tone:
             return { label: '已完成', tone: 'success' };
         case 'running':
             return { label: '运行中', tone: 'primary' };
+        case 'interrupted':
+            return { label: '已中断', tone: 'warning' };
         case 'aborted':
             return { label: '已中止', tone: 'warning' };
         case 'error':

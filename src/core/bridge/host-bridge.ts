@@ -12,6 +12,14 @@ export interface HostIdentity {
     personaAvatar: string;
 }
 
+export interface WriteChatMessageOptions {
+    /**
+     * Whether to emit native host update events (`MESSAGE_UPDATED`).
+     * Keep `false` during streaming or internal staging; set `true` on post-turn edits.
+     */
+    emitEvent?: boolean;
+}
+
 /**
  * Host Anti-Corruption Interface: `src/core/**` accesses chat state, assets,
  * macros, and SillyTavern services exclusively through this bridge.
@@ -22,6 +30,23 @@ export interface HostBridge {
     getMetadata(): Record<string, unknown>;
     saveChatDebounced(): void;
     getActiveIdentity(): HostIdentity;
+
+    /**
+     * Read the raw clean markdown content of the specified `(messageId, swipeId)` target
+     * (without `display` regex transforms), or `null` when the message or swipe does not exist.
+     */
+    readChatMessage(target: MessageTarget): string | null;
+
+    /**
+     * Write raw content directly to the specified `(messageId, swipeId)` target:
+     * updates `swipes[swipeId]`, syncs `mes` and refreshes the message view when targeting
+     * the active swipe, and calls `saveChatDebounced()`.
+     */
+    writeChatMessage(
+        target: MessageTarget,
+        content: string,
+        options?: WriteChatMessageOptions,
+    ): Promise<void>;
 
     // 2. Character, persona & World Info assets
     getCharacterFields(): Record<string, string>;

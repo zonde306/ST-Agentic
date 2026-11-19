@@ -14,7 +14,7 @@ import {
     updateMessageBlock,
 } from '@st/script.js';
 import { MEDIA_SOURCE, MEDIA_TYPE } from '@st/scripts/constants.js';
-import { eventSource } from '@st/scripts/events.js';
+import { eventSource, event_types } from '@st/scripts/events.js';
 import { extension_settings } from '@st/scripts/extensions.js';
 import { user_avatar } from '@st/scripts/personas.js';
 import { power_user } from '@st/scripts/power-user.js';
@@ -27,7 +27,7 @@ import {
     world_info,
 } from '@st/scripts/world-info.js';
 
-import type { HostBridge, HostIdentity } from '@/core/bridge';
+import type { HostBridge, HostIdentity, WriteChatMessageOptions } from '@/core/bridge';
 import { resolveActivePreset } from '@/core/config';
 import { applyRegexRules } from '@/core/regex';
 import { ChatDataStore, DATA_NAMESPACES, MESSAGE_OVERRIDE_KEY } from '@/core/store';
@@ -292,6 +292,80 @@ export class STHostBridge implements HostBridge {
 
     saveChatDebounced(): void {
         saveChatDebounced();
+    }
+
+    readChatMessage(target: MessageTarget): string | null {
+        if (
+            !Array.isArray(chat) ||
+            !Number.isInteger(target.messageId) ||
+            target.messageId < 0 ||
+            target.messageId >= chat.length ||
+            !Number.isInteger(target.swipeId) ||
+            target.swipeId < 0
+        ) {
+            return null;
+        }
+        const msg = chat[target.messageId] as Record<string, unknown> | undefined;
+        if (!msg) {
+            return null;
+        }
+        if (Array.isArray(msg.swipes) && target.swipeId < msg.swipes.length) {
+            const rawSwipe = msg.swipes[target.swipeId];
+            return typeof rawSwipe === 'string' ? rawSwipe : '';
+        }
+        if (target.swipeId === 0 && (!Array.isArray(msg.swipes) || msg.swipes.length === 0)) {
+            return typeof msg.mes === 'string' ? msg.mes : '';
+        }
+        return null;
+    }
+
+    async writeChatMessage(
+        target: MessageTarget,
+        content: string,
+        options?: WriteChatMessageOptions,
+    ): Promise<void> {
+        if (
+            !Array.isArray(chat) ||
+            !Number.isInteger(target.messageId) ||
+            target.messageId < 0 ||
+            target.messageId >= chat.length ||
+            !Number.isInteger(target.swipeId) ||
+            target.swipeId < 0
+        ) {
+            return;
+        }
+        const msg = chat[target.messageId] as Record<string, unknown> | undefined;
+        if (!msg) {
+            return;
+        }
+
+        const swipes = Array.isArray(msg.swipes)
+            ? (msg.swipes as unknown[])
+            : ((msg.swipes = [typeof msg.mes === 'string' ? msg.mes : '']) as unknown[]);
+        const swipeInfo = Array.isArray(msg.swipe_info)
+            ? (msg.swipe_info as Array<Record<string, unknown>>)
+            : ((msg.swipe_info = []) as Array<Record<string, unknown>>);
+
+        while (swipes.length <= target.swipeId) {
+            swipes.push('');
+        }
+        while (swipeInfo.length <= target.swipeId) {
+            swipeInfo.push({});
+        }
+
+        swipes[target.swipeId] = content;
+
+        const activeSwipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
+        if (activeSwipeId === target.swipeId) {
+            msg.mes = content;
+            await this.refreshMessageView(target);
+        }
+
+        saveChatDebounced();
+
+        if (options?.emitEvent && event_types.MESSAGE_UPDATED) {
+            await eventSource.emit(event_types.MESSAGE_UPDATED, target.messageId);
+        }
     }
 
     getActiveIdentity(): HostIdentity {

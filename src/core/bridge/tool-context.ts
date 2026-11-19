@@ -16,6 +16,7 @@ export interface ToolEditResult {
 export interface ToolFsApi {
     read(path: string): Promise<string>;
     write(path: string, content: string): Promise<void>;
+    append?(path: string, content: string): Promise<void>;
     edit(path: string, oldText: string, newText: string): Promise<ToolEditResult>;
     list(dirPath?: string): Promise<VfsEntryStat[]>;
     search(query: string, opts?: { pathPrefix?: string; limit?: number }): Promise<VfsSearchHit[]>;

@@ -11,7 +11,7 @@ import { saveMetadataDebounced } from '@st/scripts/extensions.js';
 import { translate } from '@st/scripts/i18n.js';
 import { power_user } from '@st/scripts/power-user.js';
 import { accountStorage } from '@st/scripts/util/AccountStorage.js';
-import type { HostBridge } from '@/core/bridge';
+import type { HostBridge, WriteChatMessageOptions } from '@/core/bridge';
 import {
     DEFAULT_FILE_MAP_SIZE_LIMIT,
     exportPreset,
@@ -159,7 +159,7 @@ function getActiveDataStore(
 }
 
 function createFallbackStBridge(): HostBridge {
-    return {
+    const bridge: HostBridge = {
         getChat(): ChatMessageSnapshot[] {
             const list = Array.isArray(chat) ? chat : [];
             return list.map((msg, index) => ({
@@ -185,6 +185,77 @@ function createFallbackStBridge(): HostBridge {
                 saveMetadataDebounced();
             } catch {
                 // Ignore if ST metadata save hooks are unavailable in isolated tests.
+            }
+        },
+        readChatMessage(target: MessageTarget): string | null {
+            if (
+                !Array.isArray(chat) ||
+                !Number.isInteger(target.messageId) ||
+                target.messageId < 0 ||
+                target.messageId >= chat.length ||
+                !Number.isInteger(target.swipeId) ||
+                target.swipeId < 0
+            ) {
+                return null;
+            }
+            const msg = chat[target.messageId] as Record<string, unknown> | undefined;
+            if (!msg) {
+                return null;
+            }
+            if (Array.isArray(msg.swipes) && target.swipeId < msg.swipes.length) {
+                const rawSwipe = msg.swipes[target.swipeId];
+                return typeof rawSwipe === 'string' ? rawSwipe : '';
+            }
+            if (target.swipeId === 0 && (!Array.isArray(msg.swipes) || msg.swipes.length === 0)) {
+                return typeof msg.mes === 'string' ? msg.mes : '';
+            }
+            return null;
+        },
+        async writeChatMessage(
+            target: MessageTarget,
+            content: string,
+            options?: WriteChatMessageOptions,
+        ): Promise<void> {
+            if (
+                !Array.isArray(chat) ||
+                !Number.isInteger(target.messageId) ||
+                target.messageId < 0 ||
+                target.messageId >= chat.length ||
+                !Number.isInteger(target.swipeId) ||
+                target.swipeId < 0
+            ) {
+                return;
+            }
+            const msg = chat[target.messageId] as Record<string, unknown> | undefined;
+            if (!msg) {
+                return;
+            }
+            const swipes = Array.isArray(msg.swipes)
+                ? (msg.swipes as unknown[])
+                : ((msg.swipes = [typeof msg.mes === 'string' ? msg.mes : '']) as unknown[]);
+            const swipeInfo = Array.isArray(msg.swipe_info)
+                ? (msg.swipe_info as Array<Record<string, unknown>>)
+                : ((msg.swipe_info = []) as Array<Record<string, unknown>>);
+
+            while (swipes.length <= target.swipeId) {
+                swipes.push('');
+            }
+            while (swipeInfo.length <= target.swipeId) {
+                swipeInfo.push({});
+            }
+
+            swipes[target.swipeId] = content;
+
+            const activeSwipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
+            if (activeSwipeId === target.swipeId) {
+                msg.mes = content;
+                await bridge.refreshMessageView(target);
+            }
+
+            bridge.saveChatDebounced();
+
+            if (options?.emitEvent && event_types?.MESSAGE_UPDATED && typeof eventSource?.emit === 'function') {
+                await eventSource.emit(event_types.MESSAGE_UPDATED, target.messageId);
             }
         },
         getActiveIdentity() {
@@ -223,6 +294,7 @@ function createFallbackStBridge(): HostBridge {
             return hashText(text);
         },
     };
+    return bridge;
 }
 
 function resolveCharacter(chid?: number | string): ResolvedCharacterEntry | null {

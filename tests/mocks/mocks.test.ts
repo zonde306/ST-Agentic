@@ -44,6 +44,83 @@ describe('Wave 0 test mocks', () => {
         });
     });
 
+    it('MemoryHostBridge readChatMessage and writeChatMessage handle swipes, active mes sync, and MESSAGE_UPDATED events', async () => {
+        const bridge = new MemoryHostBridge({
+            chat: [
+                {
+                    id: 0,
+                    name: 'User',
+                    isUser: true,
+                    mes: '你好',
+                    swipeId: 0,
+                },
+                {
+                    id: 1,
+                    name: '艾琳',
+                    isUser: false,
+                    mes: '第二页内容',
+                    swipeId: 1,
+                    swipes: ['第一页内容', '第二页内容'],
+                    swipeInfo: [{}, {}],
+                },
+            ],
+        });
+
+        // readChatMessage: fallback swipe 0 when swipes is omitted
+        expect(bridge.readChatMessage({ messageId: 0, swipeId: 0 })).toBe('你好');
+        expect(bridge.readChatMessage({ messageId: 0, swipeId: 1 })).toBeNull();
+
+        // readChatMessage: valid swipes & missing message/swipe -> null
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe('第一页内容');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 1 })).toBe('第二页内容');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 2 })).toBeNull();
+        expect(bridge.readChatMessage({ messageId: 99, swipeId: 0 })).toBeNull();
+        expect(bridge.readChatMessage({ messageId: -1, swipeId: 0 })).toBeNull();
+
+        // writeChatMessage on inactive swipe leaves mes intact and does not refresh view
+        await bridge.writeChatMessage({ messageId: 1, swipeId: 0 }, '第一页修订');
+        expect(bridge.chat[1].swipes?.[0]).toBe('第一页修订');
+        expect(bridge.chat[1].mes).toBe('第二页内容');
+        expect(bridge.refreshedViews).toHaveLength(0);
+        expect(bridge.saveChatCalls).toBe(1);
+        expect(bridge.emittedEvents).toHaveLength(0);
+
+        // writeChatMessage on active swipe updates mes, refreshes view, pads swipes/swipeInfo, and emits MESSAGE_UPDATED when requested
+        await bridge.writeChatMessage(
+            { messageId: 1, swipeId: 1 },
+            '第二页修订',
+            { emitEvent: true },
+        );
+        expect(bridge.chat[1].swipes?.[1]).toBe('第二页修订');
+        expect(bridge.chat[1].mes).toBe('第二页修订');
+        expect(bridge.refreshedViews).toEqual([{ messageId: 1, swipeId: 1 }]);
+        expect(bridge.saveChatCalls).toBe(2);
+        expect(bridge.emittedEvents).toEqual([{ event: 'MESSAGE_UPDATED', payload: 1 }]);
+
+        // Writing to a new swipe slot on message without swipes initializes and pads swipes/swipeInfo without altering active swipe 0 mes
+        await bridge.writeChatMessage({ messageId: 0, swipeId: 2 }, '第三页');
+        expect(bridge.chat[0].swipes).toEqual(['你好', '', '第三页']);
+        expect(bridge.chat[0].swipeInfo).toHaveLength(3);
+        expect(bridge.chat[0].mes).toBe('你好');
+        expect(bridge.writtenMessages).toHaveLength(3);
+
+        // readChatMessage falls back to mes when swipes is empty [] and swipeId is 0
+        bridge.pushMessage({
+            name: '艾琳',
+            isUser: false,
+            mes: '空swipes回退',
+            swipes: [],
+        });
+        expect(bridge.readChatMessage({ messageId: 2, swipeId: 0 })).toBe('空swipes回退');
+        expect(bridge.readChatMessage({ messageId: 2, swipeId: 1 })).toBeNull();
+
+        // writeChatMessage on missing message/negative swipe is a safe no-op
+        await bridge.writeChatMessage({ messageId: 99, swipeId: 0 }, 'ignored');
+        await bridge.writeChatMessage({ messageId: 0, swipeId: -1 }, 'ignored');
+        expect(bridge.writtenMessages).toHaveLength(3);
+        expect(bridge.saveChatCalls).toBe(3);
+    });
+
     it('ScriptedLLMTransport streams text, reasoning, incremental tool calls, usage, and honors AbortSignal', async () => {
         const transport = new ScriptedLLMTransport([
             {
