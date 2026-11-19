@@ -4,7 +4,9 @@ import {
     type BranchKey,
     type CanonicalMessage,
     type CanonicalToolSchema,
+    type InterruptedReason,
     type MessageTarget,
+    type NamespaceDataMap,
     parseBranchKey,
     toBranchKey,
 } from '@/core/types';
@@ -66,9 +68,21 @@ export interface SerializedAgentTrajectory {
     } | null;
 }
 
+export interface InterruptedTurnCheckpoint {
+    agentId: string;
+    target: MessageTarget;
+    reason: InterruptedReason;
+    errorMessage?: string;
+    completedTurnMessages: CanonicalMessage[];
+    readSetSnapshot: Record<string, string>;
+    stagedSnapshot: NamespaceDataMap;
+    createdAt: number;
+}
+
 export interface SerializedTrajectoryStore {
     version: 1;
     threads: Record<string, SerializedAgentTrajectory>;
+    interrupted?: Record<BranchKey, InterruptedTurnCheckpoint>;
 }
 
 interface InternalTrajectoryState {
@@ -166,11 +180,20 @@ function normalizeTurnEndCounts(
  */
 export class TrajectoryStore {
     private readonly threads = new Map<string, InternalTrajectoryState>();
+    private readonly interrupted = new Map<BranchKey, InterruptedTurnCheckpoint>();
 
     constructor(initial?: SerializedTrajectoryStore) {
         if (initial && initial.version === 1 && initial.threads) {
             for (const [agentId, rawThread] of Object.entries(initial.threads)) {
                 this.threads.set(agentId, deserializeThread(agentId, rawThread));
+            }
+            if (initial.interrupted && typeof initial.interrupted === 'object' && !Array.isArray(initial.interrupted)) {
+                for (const [key, rawCp] of Object.entries(initial.interrupted)) {
+                    const cp = deserializeInterruptedCheckpoint(key, rawCp);
+                    if (cp) {
+                        this.interrupted.set(toBranchKey(cp.target), cp);
+                    }
+                }
             }
         }
     }
@@ -509,6 +532,17 @@ export class TrajectoryStore {
             this.restoreBeforeMessage(messageId, id);
         }
 
+        for (const [key, cp] of Array.from(this.interrupted.entries())) {
+            const parsed = parseBranchKey(key);
+            if (
+                parsed
+                && parsed.messageId >= messageId
+                && (agentId === undefined || cp.agentId === agentId)
+            ) {
+                this.interrupted.delete(key);
+            }
+        }
+
         return removedCount;
     }
 
@@ -526,12 +560,84 @@ export class TrajectoryStore {
             }
         }
 
+        const interruptedCp = this.interrupted.get(branchKey);
+        if (interruptedCp && (agentId === undefined || interruptedCp.agentId === agentId)) {
+            this.interrupted.delete(branchKey);
+        }
+
         return removedCount;
     }
 
     /** Clear a persistent thread completely (including frozen Layer 0 prefix). */
     clearThread(agentId: string = DEFAULT_MAIN_AGENT_ID): void {
         this.threads.delete(agentId);
+        for (const [key, cp] of Array.from(this.interrupted.entries())) {
+            if (cp.agentId === agentId) {
+                this.interrupted.delete(key);
+            }
+        }
+    }
+
+    /** Save an interrupted turn checkpoint bound to `checkpoint.target`. */
+    saveInterruptedCheckpoint(checkpoint: InterruptedTurnCheckpoint): void {
+        assertValidTarget(checkpoint.target);
+        const key = toBranchKey(checkpoint.target);
+        this.interrupted.set(key, storeInterruptedCheckpoint(checkpoint));
+    }
+
+    /** Read a defensive clone of the interrupted turn checkpoint for `target`, if any. */
+    getInterruptedCheckpoint(target: MessageTarget): InterruptedTurnCheckpoint | undefined {
+        const cp = this.interrupted.get(toBranchKey(target));
+        return cp ? cloneInterruptedCheckpoint(cp) : undefined;
+    }
+
+    /** List defensive clones of all persisted interrupted turn checkpoints. */
+    listInterruptedCheckpoints(): Map<BranchKey, InterruptedTurnCheckpoint> {
+        const result = new Map<BranchKey, InterruptedTurnCheckpoint>();
+        for (const [key, cp] of this.interrupted.entries()) {
+            result.set(key, cloneInterruptedCheckpoint(cp));
+        }
+        return result;
+    }
+
+    /** Remove the interrupted turn checkpoint bound to `target`. */
+    clearInterruptedCheckpoint(target: MessageTarget): boolean {
+        return this.interrupted.delete(toBranchKey(target));
+    }
+
+    /**
+     * Replace all thread states (including checkpoints, frozenPrefix, readSet, messages)
+     * and interrupted turn checkpoints with defensive copies from `source`.
+     */
+    replaceFrom(source: TrajectoryStore): void {
+        if (source === this) {
+            return;
+        }
+        this.threads.clear();
+        this.interrupted.clear();
+
+        for (const [agentId, sourceState] of source.threads.entries()) {
+            const clonedCheckpoints = new Map<BranchKey, BranchCheckpoint>();
+            for (const [key, cp] of sourceState.checkpoints.entries()) {
+                clonedCheckpoints.set(key, cloneCheckpoint(cp));
+            }
+            this.threads.set(agentId, {
+                agentId: sourceState.agentId,
+                messages: [...sourceState.messages],
+                readSet: new Map(sourceState.readSet),
+                checkpoints: clonedCheckpoints,
+                archivedUpToChunk: sourceState.archivedUpToChunk,
+                turnEndCounts: [...sourceState.turnEndCounts],
+                compactionHeaderCount: sourceState.compactionHeaderCount,
+                frozenPrefix: sourceState.frozenPrefix
+                    ? freezeStaticPrefix(sourceState.frozenPrefix)
+                    : null,
+            });
+        }
+
+        for (const [key, cp] of source.interrupted.entries()) {
+            this.interrupted.set(key, storeInterruptedCheckpoint(cp));
+        }
     }
 
     /** Serialize all persistent threads with deduplicated message pools for metadata persistence. */
@@ -542,10 +648,26 @@ export class TrajectoryStore {
             threads[agentId] = serializeThread(state);
         }
 
-        return {
+        const serialized: SerializedTrajectoryStore = {
             version: 1,
             threads,
         };
+
+        if (this.interrupted.size > 0) {
+            const interrupted: Record<BranchKey, InterruptedTurnCheckpoint> = {};
+            const sortedKeys = Array.from(this.interrupted.keys()).sort((a, b) =>
+                a < b ? -1 : a > b ? 1 : 0,
+            );
+            for (const key of sortedKeys) {
+                const cp = this.interrupted.get(key);
+                if (cp) {
+                    interrupted[key] = cloneInterruptedCheckpoint(cp);
+                }
+            }
+            serialized.interrupted = interrupted;
+        }
+
+        return serialized;
     }
 
     /** Restore a `TrajectoryStore` from a serialized snapshot. */
@@ -607,6 +729,115 @@ function cloneCheckpoint(cp: BranchCheckpoint): BranchCheckpoint {
         turnEndCounts: [...cp.turnEndCounts],
         compactionHeaderCount: cp.compactionHeaderCount,
         ...(cp.messagesSnapshot ? { messagesSnapshot: [...cp.messagesSnapshot] } : {}),
+    };
+}
+
+const VALID_INTERRUPTED_REASONS = new Set<InterruptedReason>([
+    'user_stop',
+    'length',
+    'error',
+    'empty_output',
+]);
+
+function isPlainObjectRecord(value: unknown): value is Record<string, unknown> {
+    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isValidTargetObject(target: unknown): target is MessageTarget {
+    if (!isPlainObjectRecord(target)) {
+        return false;
+    }
+    return (
+        typeof target.messageId === 'number'
+        && Number.isInteger(target.messageId)
+        && target.messageId >= 0
+        && typeof target.swipeId === 'number'
+        && Number.isInteger(target.swipeId)
+        && target.swipeId >= 0
+    );
+}
+
+function storeInterruptedCheckpoint(cp: InterruptedTurnCheckpoint): InterruptedTurnCheckpoint {
+    return {
+        agentId: cp.agentId,
+        target: { messageId: cp.target.messageId, swipeId: cp.target.swipeId },
+        reason: cp.reason,
+        ...(cp.errorMessage !== undefined ? { errorMessage: cp.errorMessage } : {}),
+        completedTurnMessages: cp.completedTurnMessages.map(freezeCanonicalMessage),
+        readSetSnapshot: canonicalClone(cp.readSetSnapshot ?? {}),
+        stagedSnapshot: canonicalClone(cp.stagedSnapshot ?? {}),
+        createdAt: cp.createdAt,
+    };
+}
+
+function cloneInterruptedCheckpoint(cp: InterruptedTurnCheckpoint): InterruptedTurnCheckpoint {
+    return {
+        agentId: cp.agentId,
+        target: { messageId: cp.target.messageId, swipeId: cp.target.swipeId },
+        reason: cp.reason,
+        ...(cp.errorMessage !== undefined ? { errorMessage: cp.errorMessage } : {}),
+        completedTurnMessages: cp.completedTurnMessages.map((msg) => canonicalClone(msg)),
+        readSetSnapshot: canonicalClone(cp.readSetSnapshot),
+        stagedSnapshot: canonicalClone(cp.stagedSnapshot),
+        createdAt: cp.createdAt,
+    };
+}
+
+function deserializeInterruptedCheckpoint(
+    key: string,
+    raw: unknown,
+): InterruptedTurnCheckpoint | null {
+    if (!isPlainObjectRecord(raw)) {
+        return null;
+    }
+
+    const parsedKey = parseBranchKey(key);
+    const target = isValidTargetObject(raw.target)
+        ? { messageId: raw.target.messageId, swipeId: raw.target.swipeId }
+        : parsedKey;
+    if (!target) {
+        return null;
+    }
+
+    const agentId =
+        typeof raw.agentId === 'string' && raw.agentId.length > 0
+            ? raw.agentId
+            : DEFAULT_MAIN_AGENT_ID;
+    const reason: InterruptedReason =
+        typeof raw.reason === 'string' && VALID_INTERRUPTED_REASONS.has(raw.reason as InterruptedReason)
+            ? (raw.reason as InterruptedReason)
+            : 'error';
+    const completedTurnMessages = Array.isArray(raw.completedTurnMessages)
+        ? raw.completedTurnMessages.map(freezeCanonicalMessage)
+        : [];
+
+    const readSetSnapshot: Record<string, string> = {};
+    if (isPlainObjectRecord(raw.readSetSnapshot)) {
+        for (const [path, hash] of Object.entries(raw.readSetSnapshot)) {
+            if (typeof hash === 'string') {
+                readSetSnapshot[path] = hash;
+            }
+        }
+    }
+
+    const stagedSnapshot: NamespaceDataMap = isPlainObjectRecord(raw.stagedSnapshot)
+        ? canonicalClone(raw.stagedSnapshot as NamespaceDataMap)
+        : {};
+
+    const createdAt =
+        typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt)
+            ? raw.createdAt
+            : 0;
+
+    return {
+        agentId,
+        target,
+        reason,
+        ...(typeof raw.errorMessage === 'string' ? { errorMessage: raw.errorMessage } : {}),
+        completedTurnMessages,
+        readSetSnapshot: canonicalClone(readSetSnapshot),
+        stagedSnapshot,
+        createdAt,
     };
 }
 

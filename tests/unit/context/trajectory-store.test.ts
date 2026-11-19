@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { TrajectoryStore } from '@/core/context';
+import { type InterruptedTurnCheckpoint, TrajectoryStore } from '@/core/context';
 import { type CanonicalMessage, toBranchKey } from '@/core/types';
 import { MemoryHostBridge } from '../../mocks';
 
@@ -176,5 +176,187 @@ describe('TrajectoryStore', () => {
         expect(reloaded.restoreBranch({ messageId: 1, swipeId: 0 }, 'main')).toBe(true);
         expect(reloaded.getMessages('main')[1].content).toBe('Swipe 0');
         expect(reloaded.getReadSet('main').get('/lorebooks/x.md')).toBe('hash-x');
+    });
+
+    it('persists, clones, round-trips, and replaces InterruptedTurnCheckpoints cleanly', () => {
+        const bridge = new MemoryHostBridge();
+        const store = new TrajectoryStore();
+
+        expect(() => {
+            store.saveInterruptedCheckpoint({
+                agentId: 'main',
+                target: { messageId: -1, swipeId: 0 },
+                reason: 'user_stop',
+                completedTurnMessages: [],
+                readSetSnapshot: {},
+                stagedSnapshot: {},
+                createdAt: 1000,
+            });
+        }).toThrow(/Invalid MessageTarget/);
+
+        const inputCheckpoint: InterruptedTurnCheckpoint = {
+            agentId: 'main',
+            target: { messageId: 5, swipeId: 1 },
+            reason: 'length',
+            errorMessage: 'max_tokens reached',
+            completedTurnMessages: [
+                { role: 'user', content: 'Continue story' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [{ id: 'tc_1', name: 'read_file', arguments: '{"path":"/lorebooks/a.md"}' }],
+                },
+                { role: 'tool', toolCallId: 'tc_1', toolName: 'read_file', content: 'Lore text' },
+            ],
+            readSetSnapshot: { '/lorebooks/a.md': 'hash-a' },
+            stagedSnapshot: {
+                variables: {
+                    'variables.json': { source: 'main', content: '{"hp":9}' },
+                },
+            },
+            createdAt: 123456,
+        };
+
+        store.saveInterruptedCheckpoint(inputCheckpoint);
+
+        // Mutating original input object must not mutate stored checkpoint
+        inputCheckpoint.completedTurnMessages.push({ role: 'user', content: 'hacked' });
+        inputCheckpoint.readSetSnapshot['/lorebooks/a.md'] = 'tampered';
+        inputCheckpoint.stagedSnapshot.variables['variables.json'].content = 'tampered';
+
+        const loaded = store.getInterruptedCheckpoint({ messageId: 5, swipeId: 1 });
+        expect(loaded).toBeDefined();
+        expect(loaded?.reason).toBe('length');
+        expect(loaded?.errorMessage).toBe('max_tokens reached');
+        expect(loaded?.completedTurnMessages).toHaveLength(3);
+        expect(loaded?.readSetSnapshot).toEqual({ '/lorebooks/a.md': 'hash-a' });
+        expect(loaded?.stagedSnapshot.variables['variables.json'].content).toBe('{"hp":9}');
+
+        // Mutating returned defensive clone must not mutate stored checkpoint
+        loaded!.readSetSnapshot['/lorebooks/a.md'] = 'mutated-clone';
+        loaded!.completedTurnMessages.pop();
+        expect(store.getInterruptedCheckpoint({ messageId: 5, swipeId: 1 })?.completedTurnMessages).toHaveLength(3);
+        expect(store.getInterruptedCheckpoint({ messageId: 5, swipeId: 1 })?.readSetSnapshot['/lorebooks/a.md']).toBe('hash-a');
+
+        const listed = store.listInterruptedCheckpoints();
+        expect(listed.size).toBe(1);
+        expect(listed.has(toBranchKey({ messageId: 5, swipeId: 1 }))).toBe(true);
+
+        // Serialize/deserialize round-trip (via HostBridge too)
+        store.appendTurn([{ role: 'user', content: 'Prev turn' }, { role: 'assistant', content: 'Prev reply' }], 'main');
+        store.recordCheckpoint({ messageId: 3, swipeId: 0 }, 'main');
+        store.setFrozenPrefix(
+            {
+                tools: [{ name: 'write_file', description: 'Write', parameters: { type: 'object' } }],
+                messages: [{ role: 'system', content: 'Base' }],
+                layer0EndIndex: 0,
+            },
+            'main',
+        );
+        store.saveToHost(bridge);
+
+        const reloaded = TrajectoryStore.loadFromHost(bridge);
+        const reloadedCp = reloaded.getInterruptedCheckpoint({ messageId: 5, swipeId: 1 });
+        expect(reloadedCp).toEqual({
+            agentId: 'main',
+            target: { messageId: 5, swipeId: 1 },
+            reason: 'length',
+            errorMessage: 'max_tokens reached',
+            completedTurnMessages: [
+                { role: 'user', content: 'Continue story' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [{ id: 'tc_1', name: 'read_file', arguments: '{"path":"/lorebooks/a.md"}' }],
+                },
+                { role: 'tool', toolCallId: 'tc_1', toolName: 'read_file', content: 'Lore text' },
+            ],
+            readSetSnapshot: { '/lorebooks/a.md': 'hash-a' },
+            stagedSnapshot: {
+                variables: {
+                    'variables.json': { source: 'main', content: '{"hp":9}' },
+                },
+            },
+            createdAt: 123456,
+        });
+
+        // replaceFrom copies threads, checkpoints, frozenPrefix, and interrupted checkpoints cleanly
+        const replacementTarget = new TrajectoryStore();
+        replacementTarget.appendTurn([{ role: 'user', content: 'Stale' }], 'stale_agent');
+        replacementTarget.saveInterruptedCheckpoint({
+            agentId: 'stale_agent',
+            target: { messageId: 99, swipeId: 0 },
+            reason: 'error',
+            completedTurnMessages: [],
+            readSetSnapshot: {},
+            stagedSnapshot: {},
+            createdAt: 1,
+        });
+
+        replacementTarget.replaceFrom(reloaded);
+        expect(replacementTarget.hasThread('stale_agent')).toBe(false);
+        expect(replacementTarget.getInterruptedCheckpoint({ messageId: 99, swipeId: 0 })).toBeUndefined();
+        expect(replacementTarget.getFrozenPrefix('main')?.messages[0].content).toBe('Base');
+        expect(replacementTarget.getCheckpoint({ messageId: 3, swipeId: 0 }, 'main')).toBeDefined();
+        expect(replacementTarget.getInterruptedCheckpoint({ messageId: 5, swipeId: 1 })?.reason).toBe('length');
+
+        // Self-replace is a safe no-op
+        replacementTarget.replaceFrom(replacementTarget);
+        expect(replacementTarget.getInterruptedCheckpoint({ messageId: 5, swipeId: 1 })?.reason).toBe('length');
+
+        // Backwards compatibility with legacy v1 serialized payloads lacking `interrupted`
+        const legacyRestored = TrajectoryStore.deserialize({
+            version: 1,
+            threads: store.serialize().threads,
+        });
+        expect(legacyRestored.listInterruptedCheckpoints().size).toBe(0);
+        expect(legacyRestored.serialize().interrupted).toBeUndefined();
+
+        expect(reloaded.clearInterruptedCheckpoint({ messageId: 5, swipeId: 1 })).toBe(true);
+        expect(reloaded.clearInterruptedCheckpoint({ messageId: 5, swipeId: 1 })).toBe(false);
+        expect(reloaded.getInterruptedCheckpoint({ messageId: 5, swipeId: 1 })).toBeUndefined();
+    });
+
+    it('auto-cleans interrupted checkpoints on pruneSwipe, pruneFromMessage, and clearThread', () => {
+        const store = new TrajectoryStore();
+
+        const makeCp = (agentId: string, messageId: number, swipeId: number): InterruptedTurnCheckpoint => ({
+            agentId,
+            target: { messageId, swipeId },
+            reason: 'user_stop',
+            completedTurnMessages: [{ role: 'user', content: `m${messageId}#${swipeId}` }],
+            readSetSnapshot: {},
+            stagedSnapshot: {},
+            createdAt: 100,
+        });
+
+        store.saveInterruptedCheckpoint(makeCp('main', 1, 0));
+        store.saveInterruptedCheckpoint(makeCp('main', 3, 0));
+        store.saveInterruptedCheckpoint(makeCp('main', 3, 1));
+        store.saveInterruptedCheckpoint(makeCp('chronicler', 4, 0));
+
+        // pruneSwipe with mismatched agentId preserves the checkpoint
+        store.pruneSwipe({ messageId: 3, swipeId: 0 }, 'chronicler');
+        expect(store.getInterruptedCheckpoint({ messageId: 3, swipeId: 0 })).toBeDefined();
+
+        // pruneSwipe with matching agentId (even when threads map has no entry yet) removes it
+        store.pruneSwipe({ messageId: 3, swipeId: 0 }, 'main');
+        expect(store.getInterruptedCheckpoint({ messageId: 3, swipeId: 0 })).toBeUndefined();
+        expect(store.getInterruptedCheckpoint({ messageId: 3, swipeId: 1 })).toBeDefined();
+
+        // pruneFromMessage filtered by agentId removes only matching agent's >= messageId checkpoints
+        store.pruneFromMessage(3, 'main');
+        expect(store.getInterruptedCheckpoint({ messageId: 3, swipeId: 1 })).toBeUndefined();
+        expect(store.getInterruptedCheckpoint({ messageId: 1, swipeId: 0 })).toBeDefined();
+        expect(store.getInterruptedCheckpoint({ messageId: 4, swipeId: 0 })).toBeDefined();
+
+        // clearThread removes remaining checkpoints for that agent only
+        store.clearThread('main');
+        expect(store.getInterruptedCheckpoint({ messageId: 1, swipeId: 0 })).toBeUndefined();
+        expect(store.getInterruptedCheckpoint({ messageId: 4, swipeId: 0 })).toBeDefined();
+
+        // pruneFromMessage without agentId removes all remaining >= messageId
+        store.pruneFromMessage(4);
+        expect(store.getInterruptedCheckpoint({ messageId: 4, swipeId: 0 })).toBeUndefined();
     });
 });
