@@ -431,7 +431,11 @@ export class DecoratorCompiler {
             const defaultBarrier: BarrierPolicy = phase === 'before_turn' ? 'turn' : 'self';
             const barrier = parseBarrierValue(params.barrier, defaultBarrier);
             const isScript = Boolean(scriptDec);
-            const targetPath = params.target?.trim() || (replaceDec ? vfsPath : varsDec ? '/state/variables.json' : undefined);
+            const rawTargetPath = params.target?.trim() || (replaceDec ? vfsPath : varsDec ? '/state/variables.json' : undefined);
+            const targetPath =
+                rawTargetPath === 'output.md' || rawTargetPath === './output.md'
+                    ? '/output.md'
+                    : rawTargetPath;
             const condition = extractCondition(entry, params);
             const tag = params.tag?.trim() || triggerDec?.args[0]?.trim() || undefined;
 
@@ -470,23 +474,27 @@ export class DecoratorCompiler {
                 const tools =
                     targetPath === '/state/variables.json'
                         ? ['read_variables', 'patch_variables', 'read_file']
-                        : targetPath
-                            ? ['read_file', 'edit_file', 'write_file', 'read_variables']
-                            : [
-                                'list_dir',
-                                'search_files',
-                                'read_file',
-                                'edit_file',
-                                'write_file',
-                                'read_variables',
-                                'patch_variables',
-                            ];
+                        : targetPath === '/output.md'
+                            ? ['read_file', 'edit_file', 'append_file', 'write_file', 'read_variables']
+                            : targetPath
+                                ? ['read_file', 'edit_file', 'write_file', 'read_variables']
+                                : [
+                                    'list_dir',
+                                    'search_files',
+                                    'read_file',
+                                    'edit_file',
+                                    'write_file',
+                                    'read_variables',
+                                    'patch_variables',
+                                ];
                 const permissions: ScopedPermissions =
                     targetPath === '/state/variables.json'
                         ? { read: ['/state/variables.json', '/lorebooks/**', '/memory/**'], write: ['/state/variables.json'] }
-                        : targetPath
-                            ? { read: [targetPath, '/state/variables.json', '/lorebooks/**'], write: [targetPath] }
-                            : { read: ['/**'], write: ['/memory/**', '/scratch/**', '/lorebooks/**', '/state/variables.json'] };
+                        : targetPath === '/output.md'
+                            ? { read: ['/**', '/state/variables.json'], write: ['/output.md'] }
+                            : targetPath
+                                ? { read: [targetPath, '/state/variables.json', '/lorebooks/**'], write: [targetPath] }
+                                : { read: ['/**'], write: ['/memory/**', '/scratch/**', '/lorebooks/**', '/state/variables.json'] };
 
                 derivedAgent = buildDerivedTriggerAgent({
                     id: agentProfileId,
@@ -611,7 +619,7 @@ export class DecoratorCompiler {
             return { trigger, derivedAgent, warnings };
         }
 
-        // 4. Legacy @@append_output* / @@replace_output* -> append_reply_view / replace_reply_view
+        // 4. Legacy @@append_output* / @@replace_output* -> direct /output.md edits
         if (appendOutputDec || replaceOutputDec) {
             const activeDec = (appendOutputDec ?? replaceOutputDec)!;
             const isAppend = Boolean(appendOutputDec);
@@ -621,16 +629,25 @@ export class DecoratorCompiler {
             const barrier: BarrierPolicy = phase === 'before_turn' ? 'turn' : 'self';
             const tag = activeDec.args[0]?.trim() || undefined;
             const agentProfileId = `wi_agent_${sanitizeSegment(entry.world)}_${entry.uid}`;
-            const viewTool = isAppend ? 'append_reply_view' : 'replace_reply_view';
 
             const derivedAgent = buildDerivedTriggerAgent({
                 id: agentProfileId,
                 name: `${label} (${activeDec.name})`,
-                systemInstruction: `You update only the display layer of the anchored message using ${viewTool}. Never alter underlying conversation history.`,
-                enabledTools: [viewTool, 'read_file', 'read_variables'],
+                systemInstruction: isAppend
+                    ? [
+                        'You append content to the anchored message stored at /output.md.',
+                        'Inspect /output.md via read_file if needed, and append directly via append_file (or edit_file) on /output.md.',
+                    ].join('\n')
+                    : [
+                        'You edit the anchored message stored at /output.md.',
+                        'First inspect the current message via read_file("/output.md"), then apply edits directly via edit_file or write_file on /output.md.',
+                    ].join('\n'),
+                enabledTools: isAppend
+                    ? ['read_file', 'append_file', 'edit_file', 'read_variables', 'append_reply_view']
+                    : ['read_file', 'edit_file', 'write_file', 'append_file', 'read_variables', 'replace_reply_view'],
                 permissions: {
                     read: ['/**'],
-                    write: [],
+                    write: ['/output.md'],
                 },
             });
 
@@ -647,6 +664,7 @@ export class DecoratorCompiler {
                 ...(groupName ? { groupName } : {}),
                 condition: extractCondition(entry, {}),
                 instructionTemplate: parsed.cleanContent.trim(),
+                targetPath: '/output.md',
                 decorator: activeDec.name,
                 enabled: true,
             };
@@ -662,6 +680,10 @@ export class DecoratorCompiler {
             const barrier: BarrierPolicy = phase === 'before_turn' ? 'turn' : 'self';
             const tag = ejsDec.args[0]?.trim() || undefined;
             const isReplaceLore = ejsDec.name.startsWith('@@replace_ejs');
+            const isOutputEjs =
+                ejsDec.name.startsWith('@@append_output_ejs')
+                || ejsDec.name.startsWith('@@replace_output_ejs');
+            const targetPath = isReplaceLore ? vfsPath : isOutputEjs ? '/output.md' : undefined;
 
             const trigger: TriggerRule = {
                 id: ruleId,
@@ -676,7 +698,7 @@ export class DecoratorCompiler {
                 ...(groupName ? { groupName } : {}),
                 condition: extractCondition(entry, {}),
                 instructionTemplate: parsed.cleanContent,
-                ...(isReplaceLore ? { targetPath: vfsPath } : {}),
+                ...(targetPath ? { targetPath } : {}),
                 decorator: ejsDec.name,
                 scriptCode: parsed.cleanContent,
                 enabled: true,

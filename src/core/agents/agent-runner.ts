@@ -14,6 +14,7 @@ import {
 } from '@/core/config';
 import {
     ContextAssembler,
+    type InterruptedTurnCheckpoint,
     TrajectoryStore,
     type RegexSource,
 } from '@/core/context';
@@ -49,6 +50,7 @@ import type {
     CanonicalToolSchema,
     ChatMessageSnapshot,
     ClassifiedLoreEntry,
+    InterruptedReason,
     MessageTarget,
     PipelinePhase,
     Preset,
@@ -60,8 +62,12 @@ import type {
     TokenUsage,
     ToolStepLog,
 } from '@/core/types';
-import { canonicalClone } from '@/core/utils';
-import { VirtualFileSystem } from '@/core/vfs';
+import { canonicalClone, normalizeVfsPath } from '@/core/utils';
+import { OUTPUT_FILE_PATH, VirtualFileSystem } from '@/core/vfs';
+import {
+    IncrementalOutputStreamExtractor,
+    type ToolCallDeltaInput,
+} from './output-stream-extractor';
 
 export const DEFAULT_SUBAGENT_TOOLS: readonly string[] = [
     'list_dir',
@@ -73,6 +79,16 @@ export const DEFAULT_SUBAGENT_TOOLS: readonly string[] = [
     'search_history',
     'read_history',
 ];
+
+export const REQUIRED_OUTPUT_MODE_TOOLS: readonly string[] = [
+    'read_file',
+    'write_file',
+    'append_file',
+    'edit_file',
+];
+
+const EMPTY_OUTPUT_CHECK_PROMPT =
+    '[System Check] /output.md is still empty. Plain assistant text is NOT displayed to the user. Write the final response to /output.md via write_file and review it before finishing.';
 
 export interface SubAgentDescriptor {
     name: string;
@@ -101,6 +117,32 @@ export class MaxToolRoundsError extends AgentExecutionError {
         super(`Agent "${trace.agentName}" exceeded maxToolRounds (${maxToolRounds}).`, trace);
         this.name = 'MaxToolRoundsError';
         this.maxToolRounds = maxToolRounds;
+    }
+}
+
+export class TurnInterruptedError extends Error {
+    public readonly reason: InterruptedReason;
+    public readonly salvagedOutput: string;
+    public readonly checkpoint: InterruptedTurnCheckpoint;
+    public readonly trace: AgentRunTrace;
+    public readonly causeError?: string;
+
+    constructor(params: {
+        reason: InterruptedReason;
+        salvagedOutput: string;
+        checkpoint: InterruptedTurnCheckpoint;
+        trace: AgentRunTrace;
+        errorMessage?: string;
+    }) {
+        super(params.errorMessage ?? `Agent turn interrupted (${params.reason}).`);
+        this.name = 'TurnInterruptedError';
+        this.reason = params.reason;
+        this.salvagedOutput = params.salvagedOutput;
+        this.checkpoint = params.checkpoint;
+        this.trace = params.trace;
+        if (params.errorMessage !== undefined) {
+            this.causeError = params.errorMessage;
+        }
     }
 }
 
@@ -156,9 +198,16 @@ export interface AgentRunInput {
     personaDescription?: string;
     systemBasePrompt?: string;
     forceRecompilePrefix?: boolean;
+    /** Force mandatory `/output.md` mode (defaults to `phase === 'main_turn' && delegationDepth === 0`). */
+    requireOutputFile?: boolean;
+    /** Prior in-flight turn messages used when resuming from an `InterruptedTurnCheckpoint`. */
+    resumeMessages?: readonly CanonicalMessage[];
+    /** Prior `Read-Set` snapshot restored on resume without scanning `TrajectoryStore`. */
+    initialReadSet?: ReadonlyMap<string, string> | Record<string, string>;
     /** Internal recursion guard for nested `@@agent` delegation. */
     delegationDepth?: number;
     onTextDelta?: (delta: string) => void;
+    onOutputPreview?: (previewText: string) => void;
     onReasoningDelta?: (delta: string) => void;
     onToolStart?: (step: ToolStepLog) => void;
     onToolComplete?: (step: ToolStepLog) => void;
@@ -332,6 +381,73 @@ function assertValidTarget(target: MessageTarget): MessageTarget {
     return Object.freeze({ messageId: target.messageId, swipeId: target.swipeId });
 }
 
+function isLengthFinishReason(finishReason?: string): boolean {
+    return (
+        finishReason === 'length'
+        || finishReason === 'max_tokens'
+        || finishReason === 'MAX_TOKENS'
+    );
+}
+
+function isOutputMutationToolCall(
+    toolCallName: string,
+    parsedArgs: Record<string, unknown> | string,
+): boolean {
+    if (toolCallName === 'append_reply_view' || toolCallName === 'replace_reply_view') {
+        return true;
+    }
+    if (
+        (toolCallName === 'write_file' || toolCallName === 'append_file' || toolCallName === 'edit_file')
+        && typeof parsedArgs === 'object'
+        && parsedArgs !== null
+        && typeof parsedArgs.path === 'string'
+    ) {
+        try {
+            return normalizeVfsPath(parsedArgs.path) === OUTPUT_FILE_PATH;
+        } catch {
+            return false;
+        }
+    }
+    return false;
+}
+
+function resolveInitialReadSet(
+    initialReadSet: ReadonlyMap<string, string> | Record<string, string> | undefined,
+    sessionMode: AgentProfile['sessionMode'],
+    trajectoryStore: TrajectoryStore,
+    agentId: string,
+): Map<string, string> {
+    if (initialReadSet) {
+        if (
+            initialReadSet instanceof Map
+            || typeof (initialReadSet as { entries?: unknown }).entries === 'function'
+        ) {
+            return new Map((initialReadSet as ReadonlyMap<string, string>).entries());
+        }
+        const map = new Map<string, string>();
+        for (const [path, hash] of Object.entries(initialReadSet as Record<string, string>)) {
+            if (typeof hash === 'string') {
+                map.set(path, hash);
+            }
+        }
+        return map;
+    }
+    return sessionMode === 'persistent'
+        ? trajectoryStore.getReadSet(agentId)
+        : new Map<string, string>();
+}
+
+function buildOutputModePermissions(base: ScopedPermissions): ScopedPermissions {
+    return {
+        read: base.read.includes(OUTPUT_FILE_PATH)
+            ? [...base.read]
+            : [...base.read, OUTPUT_FILE_PATH],
+        write: base.write.includes(OUTPUT_FILE_PATH)
+            ? [...base.write]
+            : [...base.write, OUTPUT_FILE_PATH],
+    };
+}
+
 /**
  * Multi-round Agent runtime executing `LLMTransport` <-> `ToolRegistry` loops
  * over `ContextAssembler` + `TrajectoryStore`, emitting live events and recording
@@ -433,6 +549,8 @@ export class AgentRunner {
         const agent = this.resolveAgent(input.agent, preset);
         const connection = input.connection ?? resolveConnection(settings, agent.connectionId);
         const delegationDepth = input.delegationDepth ?? 0;
+        const isMainOutputMode =
+            input.requireOutputFile ?? (input.phase === 'main_turn' && delegationDepth === 0);
 
         this.runSequence += 1;
         const runId = `run_${target.messageId}_${target.swipeId}_${this.runSequence}`;
@@ -444,12 +562,17 @@ export class AgentRunner {
 
         const characterFields = input.characterFields ?? this.bridge.getCharacterFields();
         const personaDescription = input.personaDescription ?? this.bridge.getPersonaDescription();
-        const permissions: ScopedPermissions = input.permissions ?? agent.permissions;
+        const basePermissions: ScopedPermissions = input.permissions ?? agent.permissions;
+        const permissions: ScopedPermissions = isMainOutputMode
+            ? buildOutputModePermissions(basePermissions)
+            : basePermissions;
         const staged = input.staged ?? (input.phase === 'before_turn' || input.phase === 'main_turn');
-        const effectiveReadSet =
-            agent.sessionMode === 'persistent'
-                ? this.trajectoryStore.getReadSet(agent.id)
-                : new Map<string, string>();
+        const effectiveReadSet = resolveInitialReadSet(
+            input.initialReadSet,
+            agent.sessionMode,
+            this.trajectoryStore,
+            agent.id,
+        );
 
         const workingVars =
             input.vars ?? (await this.vfs.readVariables({ target, staged }).catch(() => ({})));
@@ -477,9 +600,10 @@ export class AgentRunner {
             signal,
         });
 
+        const requiredOutputTools = isMainOutputMode ? REQUIRED_OUTPUT_MODE_TOOLS : [];
         const enabledToolNames = this.resolveEnabledToolNames(
             input.enabledToolNames ?? agent.enabledTools,
-            autoAttachedToolNames,
+            [...autoAttachedToolNames, ...requiredOutputTools],
             preset,
         );
         const canonicalTools: CanonicalToolSchema[] = registry.toCanonicalSchemas(
@@ -549,9 +673,196 @@ export class AgentRunner {
         });
 
         const loreOverrides = this.collectWorldInfoOverrides(target, staged);
+        const initialOutput = isMainOutputMode
+            ? await this.vfs.readFile(OUTPUT_FILE_PATH, { target, staged }).catch(() => '')
+            : '';
+        const extractor = isMainOutputMode
+            ? new IncrementalOutputStreamExtractor({
+                initialOutput,
+                onPreview: (fullText) => {
+                    this.traceLogger.emit({
+                        kind: 'output_preview',
+                        target: { ...target },
+                        timestamp: Date.now(),
+                        phase: input.phase,
+                        runId,
+                        agentProfileId: agent.id,
+                        outputPreview: fullText,
+                    });
+                    input.onOutputPreview?.(fullText);
+                },
+            })
+            : undefined;
+
+        const turnMessages: CanonicalMessage[] = input.resumeMessages
+            ? canonicalClone([...input.resumeMessages])
+            : [];
+        const completedTurnMessages: CanonicalMessage[] = input.resumeMessages
+            ? canonicalClone([...input.resumeMessages])
+            : [];
+
+        const recordFailureAndThrow = (
+            aborted: boolean,
+            message: string,
+            originalError?: unknown,
+        ): never => {
+            const endedAt = Date.now();
+            const failTrace = this.traceLogger.recordTrace(
+                {
+                    runId,
+                    target: { ...target },
+                    phase: input.phase,
+                    agentProfileId: agent.id,
+                    agentName: agent.name,
+                    ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                    ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+                    connectionId: connection.id,
+                    model: connection.model,
+                    status: aborted ? 'aborted' : 'error',
+                    startedAt,
+                    endedAt,
+                    durationMs: Math.max(0, endedAt - startedAt),
+                    usage: cumulativeUsage,
+                    toolSteps: canonicalClone(toolSteps),
+                    ...(lastContent ? { outputPreview: lastContent.slice(0, 240) } : {}),
+                    ...(lastReasoning && !lastContent
+                        ? { outputPreview: lastReasoning.slice(0, 240) }
+                        : {}),
+                    error: message,
+                    requestSnapshot: lastRequestSnapshot,
+                },
+                true,
+            );
+
+            if (aborted) {
+                throw originalError instanceof Error && isAbortError(originalError)
+                    ? originalError
+                    : createAbortError(message);
+            }
+            if (originalError instanceof AgentExecutionError) {
+                throw originalError;
+            }
+            throw new AgentExecutionError(message, failTrace, originalError);
+        };
+
+        const salvageAndInterrupt = async (
+            reason: InterruptedReason,
+            errorMessage?: string,
+            originalError?: unknown,
+        ): Promise<never> => {
+            const salvaged = extractor?.getSalvageableOutput() ?? null;
+            if (salvaged !== null && salvaged.length > 0) {
+                await this.vfs.writeFile(OUTPUT_FILE_PATH, salvaged, {
+                    target,
+                    staged,
+                    source: 'salvage',
+                });
+                this.traceLogger.emit({
+                    kind: 'output_preview',
+                    target: { ...target },
+                    timestamp: Date.now(),
+                    phase: input.phase,
+                    runId,
+                    agentProfileId: agent.id,
+                    outputPreview: salvaged,
+                });
+                input.onOutputPreview?.(salvaged);
+            }
+
+            const currentOutput = await this.vfs
+                .readFile(OUTPUT_FILE_PATH, { target, staged })
+                .catch(() => '');
+
+            const hasCompletedToolRounds =
+                toolSteps.length > 0 || input.resumeMessages !== undefined;
+            const hasProgress =
+                currentOutput.length > 0
+                || hasCompletedToolRounds
+                || this.store.hasPending(target)
+                || reason === 'empty_output';
+
+            if (!hasProgress) {
+                const isAborted =
+                    reason === 'user_stop' || isAbortError(originalError) || signal.aborted;
+                const fallbackMsg = isAborted
+                    ? 'Agent run aborted'
+                    : errorMessage
+                        ?? (reason === 'length'
+                            ? 'Generation hit max_tokens length limit before producing any output'
+                            : 'Agent execution failed');
+                return recordFailureAndThrow(isAborted, fallbackMsg, originalError);
+            }
+
+            const resolvedErrorMessage =
+                errorMessage
+                ?? (reason === 'user_stop'
+                    ? 'Generation interrupted by user'
+                    : reason === 'length'
+                        ? 'Generation interrupted by max_tokens length limit'
+                        : reason === 'empty_output'
+                            ? 'Model finished without writing to /output.md'
+                            : 'Generation interrupted due to error');
+
+            const endedAt = Date.now();
+            const interruptedTrace = this.traceLogger.recordTrace(
+                {
+                    runId,
+                    target: { ...target },
+                    phase: input.phase,
+                    agentProfileId: agent.id,
+                    agentName: agent.name,
+                    ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                    ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+                    connectionId: connection.id,
+                    model: connection.model,
+                    status: 'interrupted',
+                    interruptedReason: reason,
+                    startedAt,
+                    endedAt,
+                    durationMs: Math.max(0, endedAt - startedAt),
+                    usage: cumulativeUsage,
+                    toolSteps: canonicalClone(toolSteps),
+                    ...(currentOutput
+                        ? { outputPreview: currentOutput.slice(0, 240) }
+                        : lastContent
+                            ? { outputPreview: lastContent.slice(0, 240) }
+                            : {}),
+                    error: resolvedErrorMessage,
+                    requestSnapshot: lastRequestSnapshot,
+                },
+                true,
+            );
+
+            if (completedTurnMessages.length === 0 && input.userInput !== undefined) {
+                completedTurnMessages.push({
+                    role: 'user',
+                    content: canonicalClone(input.userInput),
+                    ...(input.userName ? { name: input.userName } : {}),
+                });
+            }
+
+            const checkpoint: InterruptedTurnCheckpoint = {
+                agentId: agent.id,
+                target: { messageId: target.messageId, swipeId: target.swipeId },
+                reason,
+                errorMessage: resolvedErrorMessage,
+                completedTurnMessages: canonicalClone(completedTurnMessages),
+                readSetSnapshot: Object.fromEntries(effectiveReadSet.entries()),
+                stagedSnapshot: this.store.snapshotStagedData(target),
+                createdAt: endedAt,
+            };
+
+            throw new TurnInterruptedError({
+                reason,
+                salvagedOutput: currentOutput,
+                checkpoint,
+                trace: interruptedTrace,
+                errorMessage: resolvedErrorMessage,
+            });
+        };
 
         try {
-            const initialAssembled = await this.contextAssembler.assembleWithHost({
+            const baseAssembleInput = {
                 agent,
                 connectionId: connection.id,
                 tools: canonicalTools,
@@ -561,33 +872,48 @@ export class AgentRunner {
                 wiRouterOverrides: preset.wiRouterOverrides,
                 presetFiles: preset.files,
                 systemBasePrompt: input.systemBasePrompt,
-                forceRecompilePrefix: input.forceRecompilePrefix,
                 trajectoryStore: agent.sessionMode === 'persistent' ? this.trajectoryStore : undefined,
                 recentChatMessages,
-                userInput: input.userInput,
-                userName: input.userName,
-                turnBrief: input.turnBrief,
-                dynamicReminders: input.dynamicReminders,
-                includeCategory4DynamicEntries:
-                    input.includeCategory4DynamicEntries ?? (input.phase === 'main_turn'),
-                loreHint: input.loreHint,
-                runTailRadar: input.runTailRadar ?? (input.phase === 'main_turn'),
-                target,
                 hostBridge: this.bridge,
-                tailRadar: this.tailRadar,
                 regex,
                 vars: workingVars,
                 macroOverrides: input.macroOverrides,
                 signal,
-            });
+            };
+
+            let currentAssembled = input.resumeMessages !== undefined
+                ? this.contextAssembler.assemble({
+                    ...baseAssembleInput,
+                    forceRecompilePrefix: input.forceRecompilePrefix,
+                    inFlightMessages: turnMessages,
+                })
+                : await this.contextAssembler.assembleWithHost({
+                    ...baseAssembleInput,
+                    forceRecompilePrefix: input.forceRecompilePrefix,
+                    userInput: input.userInput,
+                    userName: input.userName,
+                    turnBrief: input.turnBrief,
+                    dynamicReminders: input.dynamicReminders,
+                    includeCategory4DynamicEntries:
+                        input.includeCategory4DynamicEntries ?? (input.phase === 'main_turn'),
+                    loreHint: input.loreHint,
+                    runTailRadar: input.runTailRadar ?? (input.phase === 'main_turn'),
+                    target,
+                    tailRadar: this.tailRadar,
+                });
 
             // Sync read-time overrides into TailRadar if needed (already handled by loreReadEvaluator.getOverride).
             void loreOverrides;
 
-            const turnMessages: CanonicalMessage[] = [...initialAssembled.layer2Messages];
+            if (input.resumeMessages === undefined) {
+                const initialLayer2 = canonicalClone(currentAssembled.layer2Messages);
+                turnMessages.push(...initialLayer2);
+                completedTurnMessages.push(...canonicalClone(initialLayer2));
+            }
+
             const maxToolRounds = Math.max(0, agent.maxToolRounds);
             let toolRoundsExecuted = 0;
-            let currentAssembled = initialAssembled;
+            let emptyOutputRetried = false;
 
             // eslint-disable-next-line no-constant-condition
             while (true) {
@@ -617,8 +943,11 @@ export class AgentRunner {
                     runId,
                     agentId: agent.id,
                     signal,
-                    onTextDelta: input.onTextDelta,
+                    onTextDelta: isMainOutputMode ? undefined : input.onTextDelta,
                     onReasoningDelta: input.onReasoningDelta,
+                    onToolCallDelta: extractor
+                        ? (idx, delta) => extractor.feedToolCallDelta(idx, delta)
+                        : undefined,
                 });
 
                 roundsCompleted += 1;
@@ -628,7 +957,56 @@ export class AgentRunner {
                     lastReasoning = turnOutput.reasoningContent;
                 }
 
+                // Intercept max_tokens length truncation BEFORE attempting to parse/execute partial tool JSON.
+                if (isMainOutputMode && isLengthFinishReason(turnOutput.finishReason)) {
+                    return await salvageAndInterrupt('length');
+                }
+
                 if (turnOutput.toolCalls.length === 0) {
+                    let finalContent = turnOutput.content;
+                    if (isMainOutputMode) {
+                        const currentOutput = await this.vfs
+                            .readFile(OUTPUT_FILE_PATH, { target, staged })
+                            .catch(() => '');
+
+                        if (currentOutput.trim().length === 0) {
+                            if (!emptyOutputRetried && toolRoundsExecuted < maxToolRounds) {
+                                emptyOutputRetried = true;
+                                toolRoundsExecuted += 1;
+
+                                const emptyAssistantMsg: CanonicalMessage = {
+                                    role: 'assistant',
+                                    content: turnOutput.content ?? '',
+                                    ...(turnOutput.reasoningContent
+                                        ? { reasoningContent: turnOutput.reasoningContent }
+                                        : {}),
+                                };
+                                const systemCheckMsg: CanonicalMessage = {
+                                    role: 'user',
+                                    content: EMPTY_OUTPUT_CHECK_PROMPT,
+                                };
+                                turnMessages.push(emptyAssistantMsg, systemCheckMsg);
+                                completedTurnMessages.push(
+                                    canonicalClone(emptyAssistantMsg),
+                                    canonicalClone(systemCheckMsg),
+                                );
+
+                                currentAssembled = this.contextAssembler.assemble({
+                                    ...baseAssembleInput,
+                                    inFlightMessages: turnMessages,
+                                });
+                                continue;
+                            }
+
+                            return await salvageAndInterrupt(
+                                'empty_output',
+                                'Model finished without writing to /output.md',
+                            );
+                        }
+
+                        finalContent = currentOutput;
+                    }
+
                     if (agent.sessionMode === 'persistent') {
                         this.trajectoryStore.setReadSet(effectiveReadSet, agent.id);
                         this.contextAssembler.finalizeTurn({
@@ -665,7 +1043,7 @@ export class AgentRunner {
                             durationMs: Math.max(0, endedAt - startedAt),
                             usage: cumulativeUsage,
                             toolSteps: canonicalClone(toolSteps),
-                            outputPreview: turnOutput.content.slice(0, 240),
+                            outputPreview: finalContent.slice(0, 240),
                             requestSnapshot: lastRequestSnapshot,
                         },
                         true,
@@ -685,7 +1063,7 @@ export class AgentRunner {
                         target,
                         phase: input.phase,
                         agentProfileId: agent.id,
-                        content: turnOutput.content,
+                        content: finalContent,
                         ...(turnOutput.reasoningContent
                             ? { reasoningContent: turnOutput.reasoningContent }
                             : {}),
@@ -729,14 +1107,16 @@ export class AgentRunner {
 
                 toolRoundsExecuted += 1;
 
-                turnMessages.push({
+                const assistantToolMsg: CanonicalMessage = {
                     role: 'assistant',
                     content: turnOutput.content ?? '',
                     ...(turnOutput.reasoningContent
                         ? { reasoningContent: turnOutput.reasoningContent }
                         : {}),
                     toolCalls: canonicalClone(turnOutput.toolCalls),
-                });
+                };
+                turnMessages.push(assistantToolMsg);
+                const roundToolResults: CanonicalMessage[] = [];
 
                 for (const toolCall of turnOutput.toolCalls) {
                     throwIfAborted(signal);
@@ -771,6 +1151,18 @@ export class AgentRunner {
                         toolCall.arguments,
                         toolCtx,
                     );
+
+                    if (
+                        extractor
+                        && execResult.ok
+                        && isOutputMutationToolCall(toolCall.name, parsedArgs)
+                    ) {
+                        const currentOut = await this.vfs
+                            .readFile(OUTPUT_FILE_PATH, { target, staged })
+                            .catch(() => '');
+                        extractor.markToolExecuted(currentOut);
+                    }
+
                     throwIfAborted(signal);
 
                     const completedStep: ToolStepLog = {
@@ -798,41 +1190,40 @@ export class AgentRunner {
                     input.onToolComplete?.(completedStep);
 
                     // Append tool result (including structured self-healing errors) for the next round.
-                    turnMessages.push({
+                    const toolResultMsg: CanonicalMessage = {
                         role: 'tool',
                         toolCallId: toolCall.id,
                         toolName: toolCall.name,
                         content: execResult.output,
-                    });
+                    };
+                    turnMessages.push(toolResultMsg);
+                    roundToolResults.push(toolResultMsg);
+                }
+
+                // Append closed assistant(tool_calls) -> tool_results round ONLY after all calls succeed.
+                completedTurnMessages.push(
+                    canonicalClone(assistantToolMsg),
+                    ...roundToolResults.map((msg) => canonicalClone(msg)),
+                );
+
+                if (extractor) {
+                    const currentOut = await this.vfs
+                        .readFile(OUTPUT_FILE_PATH, { target, staged })
+                        .catch(() => '');
+                    extractor.resetRound(currentOut);
                 }
 
                 // Re-assemble with frozen Layer 0 + frozen Layer 1 + appended inFlightMessages.
                 currentAssembled = this.contextAssembler.assemble({
-                    agent,
-                    connectionId: connection.id,
-                    tools: canonicalTools,
-                    characterFields,
-                    personaDescription,
-                    loreEntries,
-                    wiRouterOverrides: preset.wiRouterOverrides,
-                    presetFiles: preset.files,
-                    systemBasePrompt: input.systemBasePrompt,
-                    trajectoryStore: agent.sessionMode === 'persistent' ? this.trajectoryStore : undefined,
-                    recentChatMessages,
+                    ...baseAssembleInput,
                     inFlightMessages: turnMessages,
-                    hostBridge: this.bridge,
-                    regex,
-                    vars: workingVars,
-                    macroOverrides: input.macroOverrides,
-                    signal,
                 });
             }
         } catch (error) {
-            if (error instanceof MaxToolRoundsError) {
+            if (error instanceof MaxToolRoundsError || error instanceof TurnInterruptedError) {
                 throw error;
             }
 
-            const endedAt = Date.now();
             const aborted = isAbortError(error) || signal.aborted;
             const message = aborted
                 ? 'Agent run aborted'
@@ -840,41 +1231,15 @@ export class AgentRunner {
                     ? error.message
                     : String(error);
 
-            const failTrace = this.traceLogger.recordTrace(
-                {
-                    runId,
-                    target: { ...target },
-                    phase: input.phase,
-                    agentProfileId: agent.id,
-                    agentName: agent.name,
-                    ...(input.triggerId ? { triggerId: input.triggerId } : {}),
-                    ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
-                    connectionId: connection.id,
-                    model: connection.model,
-                    status: aborted ? 'aborted' : 'error',
-                    startedAt,
-                    endedAt,
-                    durationMs: Math.max(0, endedAt - startedAt),
-                    usage: cumulativeUsage,
-                    toolSteps: canonicalClone(toolSteps),
-                    ...(lastContent ? { outputPreview: lastContent.slice(0, 240) } : {}),
-                    ...(lastReasoning && !lastContent ? { outputPreview: lastReasoning.slice(0, 240) } : {}),
-                    error: message,
-                    requestSnapshot: lastRequestSnapshot,
-                },
-                true,
-            );
-
-            if (aborted) {
-                throw error instanceof Error && isAbortError(error)
-                    ? error
-                    : createAbortError(message);
+            if (isMainOutputMode) {
+                return await salvageAndInterrupt(
+                    aborted ? 'user_stop' : 'error',
+                    message,
+                    error,
+                );
             }
 
-            if (error instanceof AgentExecutionError) {
-                throw error;
-            }
-            throw new AgentExecutionError(message, failTrace, error);
+            return recordFailureAndThrow(aborted, message, error);
         }
     }
 
@@ -888,6 +1253,7 @@ export class AgentRunner {
         signal: AbortSignal;
         onTextDelta?: (delta: string) => void;
         onReasoningDelta?: (delta: string) => void;
+        onToolCallDelta?: (index: number, delta: ToolCallDeltaInput) => void;
     }): Promise<{
         content: string;
         reasoningContent?: string;
@@ -904,10 +1270,19 @@ export class AgentRunner {
                 'LLM request aborted',
             );
             throwIfAborted(params.signal);
+            const toolCalls = resp.toolCalls ?? [];
+            if (params.onToolCallDelta && toolCalls.length > 0) {
+                toolCalls.forEach((tc, idx) => {
+                    params.onToolCallDelta?.(idx, {
+                        name: tc.name,
+                        argumentsDelta: tc.arguments,
+                    });
+                });
+            }
             return {
                 content: resp.content ?? '',
                 ...(resp.reasoningContent ? { reasoningContent: resp.reasoningContent } : {}),
-                toolCalls: resp.toolCalls ?? [],
+                toolCalls,
                 usage: normalizeUsage(resp.usage),
                 finishReason: resp.finishReason,
             };
@@ -962,6 +1337,7 @@ export class AgentRunner {
                         params.onReasoningDelta?.(delta);
                     },
                     toolCallMap,
+                    onToolCallDelta: params.onToolCallDelta,
                     onUsage: (u) => {
                         usage = normalizeUsage(u);
                     },
@@ -1001,6 +1377,7 @@ export class AgentRunner {
             onText: (delta: string) => void;
             onReasoning: (delta: string) => void;
             toolCallMap: Map<number, CanonicalToolCall>;
+            onToolCallDelta?: (index: number, delta: ToolCallDeltaInput) => void;
             onUsage: (usage: TokenUsage) => void;
             onDone: (finishReason?: string) => void;
         },
@@ -1033,6 +1410,10 @@ export class AgentRunner {
                 existing.thoughtSignature = chunk.thoughtSignature;
             }
             handlers.toolCallMap.set(idx, existing);
+            handlers.onToolCallDelta?.(idx, {
+                ...(chunk.toolName !== undefined ? { name: chunk.toolName } : {}),
+                ...(chunk.argumentsDelta !== undefined ? { argumentsDelta: chunk.argumentsDelta } : {}),
+            });
             return;
         }
         if (chunk.type === 'usage' && chunk.usage) {

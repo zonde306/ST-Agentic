@@ -5,7 +5,12 @@ import {
     createDefaultPreset,
     createDefaultSettings,
 } from '@/core/config';
-import { AgentRunner, MaxToolRoundsError } from '@/core/agents';
+import {
+    AgentExecutionError,
+    AgentRunner,
+    MaxToolRoundsError,
+    TurnInterruptedError,
+} from '@/core/agents';
 import { TraceLogger } from '@/core/logger';
 import { compileVariableSchemaEntries } from '@/core/tools';
 import type { GenerationEventPayload, RawLoreEntry } from '@/core/types';
@@ -88,7 +93,7 @@ function makeTestSetup(opts: {
 }
 
 describe('AgentRunner & TraceLogger', () => {
-    it('executes multi-round tool calls with streaming events, KV prefix invariance, and accurate TokenUsage', async () => {
+    it('executes multi-round tool calls with /output.md preview streaming, KV prefix invariance, and accurate TokenUsage', async () => {
         const { bridge, traceLogger, transport, runner } = makeTestSetup();
         const vfs = runner.vfs;
         await vfs.writeFile('/notes/clue.md', '旧灯塔二楼暗格密码：3719\n状态：未开启', {
@@ -99,6 +104,7 @@ describe('AgentRunner & TraceLogger', () => {
         traceLogger.subscribe((ev) => events.push(ev));
 
         const textDeltas: string[] = [];
+        const outputPreviews: string[] = [];
         const reasoningDeltas: string[] = [];
 
         transport.enqueue(
@@ -115,9 +121,24 @@ describe('AgentRunner & TraceLogger', () => {
                 usage: { inputTokens: 1000, cachedTokens: 600, outputTokens: 40 },
             },
             {
-                reasoningContent: '已掌握密码，给出回复。',
-                content: '我在二楼暗格中记下了密码 3719。',
+                reasoningContent: '已掌握密码，写入 /output.md。',
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'call_write_1',
+                        name: 'write_file',
+                        arguments: JSON.stringify({
+                            path: '/output.md',
+                            content: '我在二楼暗格中记下了密码 3719。',
+                        }),
+                    },
+                ],
                 usage: { inputTokens: 1120, cachedTokens: 980, outputTokens: 25 },
+            },
+            {
+                reasoningContent: '核对无误。',
+                content: '内部核对完成：密码已正确写入 /output.md。',
+                usage: { inputTokens: 1180, cachedTokens: 1080, outputTokens: 15 },
             },
         );
 
@@ -127,55 +148,84 @@ describe('AgentRunner & TraceLogger', () => {
             phase: 'main_turn',
             userInput: '查看二楼线索并告诉我结果。',
             onTextDelta: (d) => textDeltas.push(d),
+            onOutputPreview: (full) => outputPreviews.push(full),
             onReasoningDelta: (d) => reasoningDeltas.push(d),
         });
 
         expect(res.content).toBe('我在二楼暗格中记下了密码 3719。');
-        expect(res.rounds).toBe(2);
-        expect(res.toolSteps).toHaveLength(1);
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe(
+            '我在二楼暗格中记下了密码 3719。',
+        );
+        expect(res.rounds).toBe(3);
+        expect(res.toolSteps).toHaveLength(2);
         expect(res.toolSteps[0].toolName).toBe('read_file');
         expect(res.toolSteps[0].ok).toBe(true);
         expect(res.toolSteps[0].result).toContain('3719');
+        expect(res.toolSteps[1].toolName).toBe('write_file');
+        expect(res.toolSteps[1].ok).toBe(true);
 
-        expect(textDeltas.join('')).toBe('我在二楼暗格中记下了密码 3719。');
+        // Plain assistant text is isolated from onTextDelta in main_turn; output_preview streams /output.md
+        expect(textDeltas).toEqual([]);
+        expect(outputPreviews.length).toBeGreaterThan(0);
+        expect(outputPreviews[outputPreviews.length - 1]).toBe('我在二楼暗格中记下了密码 3719。');
         expect(reasoningDeltas.join('')).toContain('先列出目录并读取线索文件');
 
-        // Accurate cumulative usage across both rounds
-        expect(res.usage.inputTokens).toBe(2120);
-        expect(res.usage.cachedTokens).toBe(1580);
-        expect(res.usage.outputTokens).toBe(65);
-        expect(res.usage.totalTokens).toBe(2185);
-        expect(res.usage.cacheHitRate).toBeCloseTo(1580 / 2120, 4);
+        // Accurate cumulative usage across all 3 rounds
+        expect(res.usage.inputTokens).toBe(3300);
+        expect(res.usage.cachedTokens).toBe(2660);
+        expect(res.usage.outputTokens).toBe(80);
+        expect(res.usage.totalTokens).toBe(3380);
+        expect(res.usage.cacheHitRate).toBeCloseTo(2660 / 3300, 4);
 
         // Streamed & lifecycle events recorded
         const kinds = events.map((e) => e.kind);
         expect(kinds).toContain('phase_started');
         expect(kinds).toContain('reasoning_delta');
+        expect(kinds).toContain('output_preview');
         expect(kinds).toContain('tool_started');
         expect(kinds).toContain('tool_completed');
-        expect(kinds).toContain('text_delta');
         expect(kinds).toContain('trace_recorded');
         expect(kinds).toContain('phase_completed');
 
-        // Prefix invariance between round 0 and round 1, and into Turn 2
-        expect(transport.requests).toHaveLength(2);
+        // Prefix invariance across rounds and into Turn 2
+        expect(transport.requests).toHaveLength(3);
         assertAppendOnlyPrefix(transport.requests[0], transport.requests[1]);
+        assertAppendOnlyPrefix(transport.requests[1], transport.requests[2]);
 
         bridge.pushMessage({ id: 2, name: '沈默', isUser: true, mes: '继续前进。' });
         bridge.pushMessage({ id: 3, name: '林晚', isUser: false, mes: '', swipeId: 0 });
-        transport.enqueue({
-            content: '我推开了暗格的门。',
-            usage: { inputTokens: 1200, cachedTokens: 1100, outputTokens: 15 },
-        });
-        await runner.run({
+        transport.enqueue(
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'call_write_2',
+                        name: 'write_file',
+                        arguments: JSON.stringify({
+                            path: '/output.md',
+                            content: '我推开了暗格的门。',
+                        }),
+                    },
+                ],
+                usage: { inputTokens: 1200, cachedTokens: 1100, outputTokens: 15 },
+            },
+            {
+                content: 'Turn 2 review ok.',
+                usage: { inputTokens: 1240, cachedTokens: 1180, outputTokens: 8 },
+            },
+        );
+        const res2 = await runner.run({
             agent: 'main',
             target: { messageId: 3, swipeId: 0 },
             phase: 'main_turn',
             userInput: '继续前进。',
         });
 
-        assertAppendOnlyPrefix(transport.requests[1], transport.requests[2]);
+        expect(res2.content).toBe('我推开了暗格的门。');
+        assertAppendOnlyPrefix(transport.requests[2], transport.requests[3]);
+        assertAppendOnlyPrefix(transport.requests[3], transport.requests[4]);
         expect(runner.trajectoryStore.getReadSet('main').has('/notes/clue.md')).toBe(true);
+        expect(runner.trajectoryStore.getReadSet('main').has('/output.md')).toBe(false);
     });
 
     it('self-heals in-round when patch_variables fails Zod schema or edit_file anchor misses', async () => {
@@ -229,7 +279,7 @@ describe('AgentRunner & TraceLogger', () => {
                     },
                 ],
             },
-            // Round 2: LLM reads structured errors from tool results and corrects itself in-round!
+            // Round 2: LLM reads structured errors from tool results, corrects itself, and writes /output.md!
             async (req) => {
                 const toolMsgs = req.messages.filter((m) => m.role === 'tool');
                 expect(toolMsgs).toHaveLength(2);
@@ -254,12 +304,20 @@ describe('AgentRunner & TraceLogger', () => {
                                 replace: '警戒：高',
                             }),
                         },
+                        {
+                            id: 'c_write_out',
+                            name: 'write_file',
+                            arguments: JSON.stringify({
+                                path: '/output.md',
+                                content: '已完成自愈修正并更新状态。',
+                            }),
+                        },
                     ],
                 };
             },
-            // Round 3: final answer
+            // Round 3: internal finish summary
             {
-                content: '已完成自愈修正并更新状态。',
+                content: 'Review complete.',
             },
         );
 
@@ -273,7 +331,7 @@ describe('AgentRunner & TraceLogger', () => {
 
         expect(res.content).toBe('已完成自愈修正并更新状态。');
         expect(res.rounds).toBe(3);
-        expect(res.toolSteps.map((s) => s.ok)).toEqual([false, false, true, true]);
+        expect(res.toolSteps.map((s) => s.ok)).toEqual([false, false, true, true, true]);
         expect(res.toolSteps[0].error).toContain('hp');
         expect(res.toolSteps[1].error).toContain('Target text not found');
 
@@ -287,7 +345,7 @@ describe('AgentRunner & TraceLogger', () => {
         expect(bridge.getChat().length).toBe(2);
     });
 
-    it('delegates @@agent sub-agent calls in isolated ephemeral child runs and returns summary text', async () => {
+    it('delegates @@agent sub-agent calls in isolated plain-text child runs and integrates into /output.md', async () => {
         const archivistEntry: RawLoreEntry = {
             world: 'Lore',
             uid: 50,
@@ -324,10 +382,11 @@ describe('AgentRunner & TraceLogger', () => {
         });
 
         // Turn sequence:
-        // 0: parent LLM asks to call delegate_agent_archivist
+        // 0: parent LLM calls delegate_agent_archivist
         // 1: child sub-agent calls read_file on secretLoreEntry
-        // 2: child sub-agent returns concise summary
-        // 3: parent LLM uses child summary for final reply
+        // 2: child sub-agent returns concise plain-text summary (no /output.md required!)
+        // 3: parent LLM writes /output.md using child summary
+        // 4: parent LLM finishes with internal summary
         transport.enqueue(
             {
                 content: '',
@@ -362,8 +421,21 @@ describe('AgentRunner & TraceLogger', () => {
                 const toolMsg = req.messages.find((m) => m.role === 'tool' && m.toolName === 'delegate_agent_archivist');
                 expect(String(toolMsg?.content)).toContain('三瓣银莲花铜徽');
                 return {
-                    content: '据档案记载，那是前灵能炉工程师建立的组织，以三瓣银莲花铜徽为信物。',
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'write_parent_out',
+                            name: 'write_file',
+                            arguments: JSON.stringify({
+                                path: '/output.md',
+                                content: '据档案记载，那是前灵能炉工程师建立的组织，以三瓣银莲花铜徽为信物。',
+                            }),
+                        },
+                    ],
                 };
+            },
+            {
+                content: 'Internal: integrated archivist summary into /output.md.',
             },
         );
 
@@ -374,7 +446,8 @@ describe('AgentRunner & TraceLogger', () => {
             userInput: '帮我查一下银莲花结社的底细。',
         });
 
-        expect(res.content).toContain('三瓣银莲花铜徽');
+        expect(res.content).toBe('据档案记载，那是前灵能炉工程师建立的组织，以三瓣银莲花铜徽为信物。');
+        expect(res.content).not.toContain('Internal:');
         expect(res.toolSteps[0].toolName).toBe('delegate_agent_archivist');
         expect(res.toolSteps[0].result).toContain('摘要：由前灵能炉工程师创立');
 
@@ -521,5 +594,459 @@ describe('AgentRunner & TraceLogger', () => {
             agentProfileId: 'main',
         });
         expect(filtered.every((t) => t.target.messageId === 4 && t.phase === 'main_turn' && t.agentProfileId === 'main')).toBe(true);
+    });
+
+    it('supports write /output.md -> in-turn review -> edit_file(/output.md) while hiding internal summary and guaranteeing Layer 0 output tools', async () => {
+        // Deliberately configure mainAgent WITHOUT output tools or /output.md write permissions
+        const { bridge, transport, runner, settings, preset } = makeTestSetup({
+            enabledTools: ['list_dir'],
+            writePermissions: ['/scratch/**'],
+        });
+        // Disable append_file via builtinToolSettings on the active preset to verify override is respected
+        settings.presets[preset.id].builtinToolSettings = {
+            append_file: { enabled: false },
+        };
+
+        const textDeltas: string[] = [];
+        const previews: string[] = [];
+        const reasonings: string[] = [];
+
+        transport.enqueue(
+            (req) => {
+                const toolNames = req.tools.map((t) => t.name);
+                expect(toolNames).toContain('read_file');
+                expect(toolNames).toContain('write_file');
+                expect(toolNames).toContain('edit_file');
+                expect(toolNames).not.toContain('append_file');
+
+                return {
+                    reasoningContent: '先写初稿到 /output.md。',
+                    content: 'Internal draft note: writing scene now.',
+                    toolCalls: [
+                        {
+                            id: 'write_draft',
+                            name: 'write_file',
+                            arguments: JSON.stringify({
+                                path: '/output.md',
+                                content: '林晚在三号泊位点亮了错误的煤油灯。',
+                            }),
+                        },
+                    ],
+                };
+            },
+            {
+                reasoningContent: '自检发现用词有误，改为铜制风灯。',
+                content: 'Internal review: fixing lamp type.',
+                toolCalls: [
+                    {
+                        id: 'edit_fix',
+                        name: 'edit_file',
+                        arguments: JSON.stringify({
+                            path: '/output.md',
+                            search: '错误的煤油灯',
+                            replace: '铜制防风灯',
+                        }),
+                    },
+                ],
+            },
+            {
+                content: 'Review passed. No remaining errors.',
+            },
+        );
+
+        const res = await runner.run({
+            agent: 'main',
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'main_turn',
+            userInput: '描写林晚在码头的动作。',
+            onTextDelta: (d) => textDeltas.push(d),
+            onOutputPreview: (p) => previews.push(p),
+            onReasoningDelta: (r) => reasonings.push(r),
+        });
+
+        expect(res.content).toBe('林晚在三号泊位点亮了铜制防风灯。');
+        expect(res.content).not.toContain('Review passed');
+        expect(res.content).not.toContain('Internal');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe(
+            '林晚在三号泊位点亮了铜制防风灯。',
+        );
+        expect(textDeltas).toEqual([]);
+        expect(previews[previews.length - 1]).toBe('林晚在三号泊位点亮了错误的煤油灯。');
+        expect(reasonings.join('')).toContain('自检发现用词有误');
+        expect(res.trace.outputPreview).toBe('林晚在三号泊位点亮了铜制防风灯。');
+
+        // Internal review summary is recorded in TrajectoryStore, NOT the user-visible message
+        const traj = runner.trajectoryStore.getMessages('main');
+        expect(String(traj[traj.length - 1].content)).toBe('Review passed. No remaining errors.');
+    });
+
+    it('allows @@agent child reviewer during main_turn to inspect /output.md and return plain-text critique', async () => {
+        const reviewerEntry: RawLoreEntry = {
+            world: 'Review',
+            uid: 80,
+            comment: '设定审核员',
+            content: '@@agent reviewer\n检查 /output.md 中的设定错误并返回简明修正建议。',
+            keys: [],
+            keysecondary: [],
+            constant: false,
+            selective: false,
+            disable: false,
+            position: 0,
+            depth: 0,
+            order: 1,
+            role: 0,
+        };
+
+        const { bridge, transport, runner } = makeTestSetup({
+            lorebooks: { Review: [reviewerEntry] },
+        });
+
+        transport.enqueue(
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'w1',
+                        name: 'write_file',
+                        arguments: JSON.stringify({
+                            path: '/output.md',
+                            content: '灰港守夜人佩戴银色徽章。',
+                        }),
+                    },
+                ],
+            },
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'rev_1',
+                        name: 'delegate_agent_reviewer',
+                        arguments: JSON.stringify({ task: '核查 /output.md 是否符合灰港设定' }),
+                    },
+                ],
+            },
+            // Child reviewer reads /output.md and returns plain text directly
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'child_read_out',
+                        name: 'read_file',
+                        arguments: JSON.stringify({ path: '/output.md' }),
+                    },
+                ],
+            },
+            (req) => {
+                const toolRes = req.messages.find((m) => m.role === 'tool');
+                expect(String(toolRes?.content)).toBe('灰港守夜人佩戴银色徽章。');
+                return {
+                    content: '问题：徽章应为三瓣银莲花铜徽，非银色。',
+                };
+            },
+            // Parent applies reviewer critique via edit_file
+            (req) => {
+                const reviewResult = req.messages.find(
+                    (m) => m.role === 'tool' && m.toolName === 'delegate_agent_reviewer',
+                );
+                expect(String(reviewResult?.content)).toContain('三瓣银莲花铜徽');
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'fix_badge',
+                            name: 'edit_file',
+                            arguments: JSON.stringify({
+                                path: '/output.md',
+                                search: '银色徽章',
+                                replace: '三瓣银莲花铜徽',
+                            }),
+                        },
+                    ],
+                };
+            },
+            {
+                content: 'All reviewer edits applied.',
+            },
+        );
+
+        const res = await runner.run({
+            agent: 'main',
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'main_turn',
+            userInput: '写出守夜人登场描写并自审。',
+        });
+
+        expect(res.content).toBe('灰港守夜人佩戴三瓣银莲花铜徽。');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe(
+            '灰港守夜人佩戴三瓣银莲花铜徽。',
+        );
+    });
+
+    it('retries once when /output.md is empty and throws TurnInterruptedError(empty_output) if still empty', async () => {
+        const { bridge, transport, runner } = makeTestSetup({ maxToolRounds: 4 });
+
+        // Case 1: Model forgets to write /output.md -> [System Check] -> self-heals on retry
+        transport.enqueue(
+            {
+                content: '我直接用纯文本回答了，忘了写文件。',
+            },
+            (req) => {
+                const lastMsg = req.messages[req.messages.length - 1];
+                expect(lastMsg.role).toBe('user');
+                expect(String(lastMsg.content)).toContain('[System Check] /output.md is still empty');
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'heal_write',
+                            name: 'write_file',
+                            arguments: JSON.stringify({
+                                path: '/output.md',
+                                content: '自愈后正确写入 /output.md 的正文。',
+                            }),
+                        },
+                    ],
+                };
+            },
+            {
+                content: '已完成修正。',
+            },
+        );
+
+        const healed = await runner.run({
+            agent: 'main',
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'main_turn',
+            userInput: '开始第一回合。',
+        });
+        expect(healed.content).toBe('自愈后正确写入 /output.md 的正文。');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe(
+            '自愈后正确写入 /output.md 的正文。',
+        );
+
+        // Case 2: Model still refuses to write /output.md after retry -> TurnInterruptedError('empty_output')
+        bridge.pushMessage({ id: 2, name: '沈默', isUser: true, mes: '第二回合' });
+        bridge.pushMessage({ id: 3, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+        transport.enqueue(
+            { content: '第一次纯文本' },
+            { content: '第二次依然是纯文本' },
+        );
+
+        let caught: unknown;
+        try {
+            await runner.run({
+                agent: 'main',
+                target: { messageId: 3, swipeId: 0 },
+                phase: 'main_turn',
+                userInput: '开始第二回合。',
+            });
+        } catch (err) {
+            caught = err;
+        }
+
+        expect(caught).toBeInstanceOf(TurnInterruptedError);
+        const interrupted = caught as TurnInterruptedError;
+        expect(interrupted.reason).toBe('empty_output');
+        expect(interrupted.salvagedOutput).toBe('');
+        expect(interrupted.trace.status).toBe('interrupted');
+        expect(interrupted.trace.interruptedReason).toBe('empty_output');
+        expect(interrupted.checkpoint.target).toEqual({ messageId: 3, swipeId: 0 });
+        expect(interrupted.checkpoint.completedTurnMessages.some((m) => String(m.content).includes('[System Check]'))).toBe(true);
+    });
+
+    it('salvages /output.md and emits TurnInterruptedError on user_stop, stream error, and finishReason=length (streaming & non-streaming)', async () => {
+        // 1. Streaming finishReason: 'length' with incomplete tool JSON -> intercepted BEFORE Zod/tool execution!
+        const { bridge, settings, transport, runner, traceLogger } = makeTestSetup({ stream: true });
+        const previews: string[] = [];
+
+        transport.enqueue({
+            chunks: [
+                {
+                    type: 'tool_call_delta',
+                    toolCallIndex: 0,
+                    toolCallId: 'tc_trunc',
+                    toolName: 'write_file',
+                    argumentsDelta: '{"path":"/output.md","content":"半截流式正文被长度',
+                },
+                {
+                    type: 'tool_call_delta',
+                    toolCallIndex: 0,
+                    argumentsDelta: '截断了', // Intentionally unclosed JSON!
+                },
+                {
+                    type: 'done',
+                    finishReason: 'length',
+                },
+            ],
+        });
+
+        let lengthErr: unknown;
+        try {
+            await runner.run({
+                agent: 'main',
+                target: { messageId: 1, swipeId: 0 },
+                phase: 'main_turn',
+                userInput: '写长文。',
+                onOutputPreview: (p) => previews.push(p),
+            });
+        } catch (err) {
+            lengthErr = err;
+        }
+
+        expect(lengthErr).toBeInstanceOf(TurnInterruptedError);
+        const lenInterrupted = lengthErr as TurnInterruptedError;
+        expect(lenInterrupted.reason).toBe('length');
+        expect(lenInterrupted.salvagedOutput).toBe('半截流式正文被长度截断了');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe('半截流式正文被长度截断了');
+        expect(previews[previews.length - 1]).toBe('半截流式正文被长度截断了');
+        // Unclosed tool call MUST NOT appear in checkpoint.completedTurnMessages
+        expect(lenInterrupted.checkpoint.completedTurnMessages.some((m) => Boolean(m.toolCalls?.length))).toBe(false);
+
+        // 2. Non-streaming finishReason: 'length' with truncated toolCalls -> salvaged cleanly without Zod retry loop
+        bridge.pushMessage({ id: 2, name: '沈默', isUser: true, mes: '非流式截断' });
+        bridge.pushMessage({ id: 3, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+        transport.enqueue({
+            content: '',
+            toolCalls: [
+                {
+                    id: 'tc_nonstream',
+                    name: 'write_file',
+                    arguments: '{"path":"/output.md","content":"非流式截断半截内容',
+                },
+            ],
+            finishReason: 'length',
+        });
+
+        let nonStreamErr: unknown;
+        try {
+            await runner.run({
+                agent: 'main',
+                target: { messageId: 3, swipeId: 0 },
+                phase: 'main_turn',
+                stream: false,
+                userInput: '非流式测试。',
+            });
+        } catch (err) {
+            nonStreamErr = err;
+        }
+        expect(nonStreamErr).toBeInstanceOf(TurnInterruptedError);
+        expect((nonStreamErr as TurnInterruptedError).reason).toBe('length');
+        expect((nonStreamErr as TurnInterruptedError).salvagedOutput).toBe('非流式截断半截内容');
+
+        // 3. Stream network error mid-write_file -> salvages partial content & preserves prior completed rounds
+        bridge.pushMessage({ id: 4, name: '沈默', isUser: true, mes: '网络断流' });
+        bridge.pushMessage({ id: 5, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+        await runner.vfs.writeFile('/notes/fact.md', '关键事实：灯塔下有暗渠。', {
+            target: { messageId: 4, swipeId: 0 },
+        });
+        transport.enqueue(
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'read_fact',
+                        name: 'read_file',
+                        arguments: JSON.stringify({ path: '/notes/fact.md' }),
+                    },
+                ],
+            },
+            {
+                chunks: [
+                    {
+                        type: 'tool_call_delta',
+                        toolCallIndex: 0,
+                        toolCallId: 'w_err',
+                        toolName: 'write_file',
+                        argumentsDelta: '{"path":"/output.md","content":"暗渠之中传来',
+                    },
+                ],
+                error: new Error('SSE connection dropped'),
+                errorAfterChunks: 1,
+            },
+        );
+
+        let netErr: unknown;
+        try {
+            await runner.run({
+                agent: 'main',
+                target: { messageId: 5, swipeId: 0 },
+                phase: 'main_turn',
+                userInput: '检查暗渠。',
+            });
+        } catch (err) {
+            netErr = err;
+        }
+        expect(netErr).toBeInstanceOf(TurnInterruptedError);
+        const netInterrupted = netErr as TurnInterruptedError;
+        expect(netInterrupted.reason).toBe('error');
+        expect(netInterrupted.salvagedOutput).toBe('暗渠之中传来');
+        expect(netInterrupted.checkpoint.readSetSnapshot['/notes/fact.md']).toBeDefined();
+        expect(netInterrupted.checkpoint.completedTurnMessages.some((m) => m.role === 'tool')).toBe(true);
+
+        // 4. user_stop mid-append_file -> salvages base + decoded chunk
+        bridge.pushMessage({ id: 6, name: '沈默', isUser: true, mes: '手动停止' });
+        bridge.pushMessage({ id: 7, name: '林晚', isUser: false, mes: '已有前缀。', swipeId: 0 });
+        const stopController = new AbortController();
+        const stopTransport = {
+            complete: transport.complete.bind(transport),
+            async *stream() {
+                yield {
+                    type: 'tool_call_delta' as const,
+                    toolCallIndex: 0,
+                    toolCallId: 'app_stop',
+                    toolName: 'append_file',
+                    argumentsDelta: '{"path":"/output.md","content":"新追加的半截',
+                };
+                stopController.abort();
+                await new Promise<never>(() => {});
+            },
+        };
+        const stopRunner = new AgentRunner({
+            bridge,
+            transport: stopTransport,
+            settings,
+            traceLogger,
+        });
+
+        let stopErr: unknown;
+        try {
+            await stopRunner.run({
+                agent: 'main',
+                target: { messageId: 7, swipeId: 0 },
+                phase: 'main_turn',
+                userInput: '继续追加。',
+                signal: stopController.signal,
+            });
+        } catch (err) {
+            stopErr = err;
+        }
+        expect(stopErr).toBeInstanceOf(TurnInterruptedError);
+        expect((stopErr as TurnInterruptedError).reason).toBe('user_stop');
+        expect((stopErr as TurnInterruptedError).salvagedOutput).toBe('已有前缀。新追加的半截');
+        expect(bridge.readChatMessage({ messageId: 7, swipeId: 0 })).toBe('已有前缀。新追加的半截');
+
+        // 5. True 0-progress error on Round 1 -> throws AgentExecutionError (NOT TurnInterruptedError)
+        bridge.pushMessage({ id: 8, name: '沈默', isUser: true, mes: '零产出失败' });
+        bridge.pushMessage({ id: 9, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+        const errTransport = new ScriptedLLMTransport([{ error: new Error('503 Upstream down') }]);
+        const errRunner = new AgentRunner({
+            bridge,
+            transport: errTransport,
+            settings,
+            traceLogger,
+        });
+        let zeroProgressErr: unknown;
+        try {
+            await errRunner.run({
+                agent: 'main',
+                target: { messageId: 9, swipeId: 0 },
+                phase: 'main_turn',
+                userInput: '零产出失败',
+            });
+        } catch (err) {
+            zeroProgressErr = err;
+        }
+        expect(zeroProgressErr).toBeInstanceOf(AgentExecutionError);
+        expect(zeroProgressErr).not.toBeInstanceOf(TurnInterruptedError);
     });
 });

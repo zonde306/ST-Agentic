@@ -169,7 +169,11 @@ describe('DecoratorCompiler & Trigger Grouping', () => {
         expect(compiled.triggers).toHaveLength(4);
         const [appendRule, ejsRule, triggerRule, scriptRule] = compiled.triggers;
 
-        expect(compiled.derivedAgents[appendRule.agentProfileId].enabledTools).toContain('append_reply_view');
+        expect(appendRule.targetPath).toBe('/output.md');
+        expect(compiled.derivedAgents[appendRule.agentProfileId].enabledTools).toEqual(
+            expect.arrayContaining(['read_file', 'append_file', 'edit_file', 'read_variables', 'append_reply_view']),
+        );
+        expect(compiled.derivedAgents[appendRule.agentProfileId].permissions.write).toEqual(['/output.md']);
         expect(appendRule.phase).toBe('after_turn');
 
         expect(ejsRule.kind).toBe('script');
@@ -303,5 +307,69 @@ describe('DecoratorCompiler & Trigger Grouping', () => {
             },
         ];
         expect(groupTriggersForExecution(scriptRules)).toHaveLength(2);
+    });
+
+    it('compiles @@replace_output*, @@append_output*, @@trigger target=/output.md, and *_output_ejs* to /output.md direct-edit contracts', () => {
+        const compiler = new DecoratorCompiler();
+        const compiled = compiler.compile([
+            makeEntry({
+                uid: 30,
+                comment: '正文局部修校',
+                content: '@@replace_output\n修正正文中的错别字与状态数值。',
+            }),
+            makeEntry({
+                uid: 31,
+                comment: '前置占位写入',
+                content: '@@append_output_before\n预设开场分隔符。',
+            }),
+            makeEntry({
+                uid: 32,
+                comment: '输出文件触发器',
+                content: '@@trigger phase=after order=2 barrier=self target=/output.md\n润色 /output.md 末尾段落。',
+            }),
+            makeEntry({
+                uid: 33,
+                comment: 'EJS 输出追加',
+                content: '@@append_output_ejs\n[HP=<%= hp %>]',
+            }),
+            makeEntry({
+                uid: 34,
+                comment: 'EJS 输出替换',
+                content: '@@replace_output_ejs_before\n[Init]',
+            }),
+        ]);
+
+        expect(compiled.triggers).toHaveLength(5);
+        const [replaceOut, appendBefore, triggerOut, appendEjs, replaceEjsBefore] = compiled.triggers;
+
+        expect(replaceOut.targetPath).toBe('/output.md');
+        expect(replaceOut.phase).toBe('after_turn');
+        expect(replaceOut.barrier).toBe('self');
+        expect(compiled.derivedAgents[replaceOut.agentProfileId].enabledTools).toEqual(
+            expect.arrayContaining(['read_file', 'edit_file', 'write_file', 'append_file', 'read_variables', 'replace_reply_view']),
+        );
+        expect(compiled.derivedAgents[replaceOut.agentProfileId].permissions).toEqual({
+            read: ['/**'],
+            write: ['/output.md'],
+        });
+
+        expect(appendBefore.targetPath).toBe('/output.md');
+        expect(appendBefore.phase).toBe('before_turn');
+        expect(appendBefore.barrier).toBe('turn');
+        expect(compiled.derivedAgents[appendBefore.agentProfileId].permissions.write).toEqual(['/output.md']);
+
+        expect(triggerOut.targetPath).toBe('/output.md');
+        expect(compiled.derivedAgents[triggerOut.agentProfileId].enabledTools).toEqual(
+            expect.arrayContaining(['read_file', 'edit_file', 'append_file', 'write_file', 'read_variables']),
+        );
+        expect(compiled.derivedAgents[triggerOut.agentProfileId].permissions).toEqual({
+            read: ['/**', '/state/variables.json'],
+            write: ['/output.md'],
+        });
+
+        expect(appendEjs.targetPath).toBe('/output.md');
+        expect(appendEjs.kind).toBe('script');
+        expect(replaceEjsBefore.targetPath).toBe('/output.md');
+        expect(replaceEjsBefore.phase).toBe('before_turn');
     });
 });

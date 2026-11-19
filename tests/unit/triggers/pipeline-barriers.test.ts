@@ -5,11 +5,30 @@ import {
     createDefaultPreset,
     createDefaultSettings,
 } from '@/core/config';
+import { TrajectoryStore } from '@/core/context';
 import { TraceLogger } from '@/core/logger';
-import { PipelineOrchestrator } from '@/core/triggers';
-import type { RawLoreEntry, Settings, TriggerRule } from '@/core/types';
+import { PipelineOrchestrator, TurnInterruptedError } from '@/core/triggers';
+import type { GenerationEventPayload, RawLoreEntry, Settings, TriggerRule } from '@/core/types';
 import { IframeJsSandbox } from '@/sandbox';
-import { DeferredGate, MemoryHostBridge, ScriptedLLMTransport } from '../../mocks';
+import {
+    assertAppendOnlyPrefix,
+    DeferredGate,
+    MemoryHostBridge,
+    ScriptedLLMTransport,
+} from '../../mocks';
+
+function writeOutputTurn(text: string, id: string = 'write_out') {
+    return {
+        content: '',
+        toolCalls: [
+            {
+                id,
+                name: 'write_file',
+                arguments: JSON.stringify({ path: '/output.md', content: text }),
+            },
+        ],
+    };
+}
 
 function createPipelineFixture(options: {
     triggers?: TriggerRule[];
@@ -144,8 +163,9 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
                 executionOrder.push('t1_main');
                 expect(String(req.messages[req.messages.length - 1].content)).toContain('<turn-brief>');
                 expect(String(req.messages[req.messages.length - 1].content)).toContain('T1 Brief: HP=100');
-                return { content: 'Turn 1 Reply' };
+                return writeOutputTurn('Turn 1 Reply', 'w_t1');
             },
+            { content: 't1 main done' },
             async () => {
                 executionOrder.push('t1_after_turn_barrier_enter');
                 await turn1BarrierGate.wait();
@@ -203,8 +223,9 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
             (req) => {
                 executionOrder.push('t2_main');
                 expect(String(req.messages[req.messages.length - 1].content)).toContain('T2 Brief: HP=75');
-                return { content: 'Turn 2 Reply' };
+                return writeOutputTurn('Turn 2 Reply', 'w_t2');
             },
+            { content: 't2 main done' },
             {
                 content: '',
                 toolCalls: [
@@ -285,14 +306,16 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
         bridge.pushMessage({ id: 3, name: '林晚', isUser: false, mes: '', swipeId: 0 });
 
         transport.enqueue(
-            { content: 'Main Turn 1' },
+            writeOutputTurn('Main Turn 1', 'w_self_1'),
+            { content: 'm1 done' },
             async () => {
                 selfOrder.push('self_t1_start');
                 await t1SelfGate.wait();
                 selfOrder.push('self_t1_finish');
                 return { content: 'Outline T1 done' };
             },
-            { content: 'Main Turn 2' },
+            writeOutputTurn('Main Turn 2', 'w_self_2'),
+            { content: 'm2 done' },
             async () => {
                 selfOrder.push('self_t2_start');
                 return { content: 'Outline T2 done' };
@@ -362,10 +385,11 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
 
         // Turn 1 (messageId: 1, swipeId: 0) triggers detached 'none' illustration task
         bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '前往灯塔' });
-        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '灯塔在雨雾中闪烁。', swipeId: 0 });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
 
         transport.enqueue(
-            { content: '灯塔在雨雾中闪烁。' },
+            writeOutputTurn('灯塔在雨雾中闪烁。', 'w_lighthouse'),
+            { content: 'main 1 done' },
             async () => {
                 await t1NoneGate.wait();
                 return {
@@ -399,8 +423,11 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
             const uId = (turn - 1) * 2;
             const aId = uId + 1;
             bridge.pushMessage({ id: uId, name: '沈默', isUser: true, mes: `继续第${turn}轮对话` });
-            bridge.pushMessage({ id: aId, name: '林晚', isUser: false, mes: `第${turn}轮回复`, swipeId: 0 });
-            transport.enqueue({ content: `第${turn}轮回复` });
+            bridge.pushMessage({ id: aId, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+            transport.enqueue(
+                writeOutputTurn(`第${turn}轮回复`, `w_turn_${turn}`),
+                { content: `turn ${turn} done` },
+            );
 
             const res = await orchestrator.runTurn({
                 action: 'normal',
@@ -415,18 +442,17 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
         t1NoneGate.resolve();
         await t1.afterTurnTasks[0].promise;
 
-        // Attachment & display view override MUST anchor strictly to { messageId: 1, swipeId: 0 }!
+        // Attachment & /output.md message write MUST anchor strictly to { messageId: 1, swipeId: 0 }!
         expect(bridge.mediaAttachments).toHaveLength(1);
         expect(bridge.mediaAttachments[0].target).toEqual({ messageId: 1, swipeId: 0 });
         expect(bridge.mediaAttachments[0].media.url).toBe('/img/lighthouse-1-0.png');
 
-        const viewOverride1 = orchestrator.store.get('message', '', {
-            target: { messageId: 1, swipeId: 0 },
-        });
-        expect(viewOverride1?.content).toContain('[插图已回填至1#0]');
+        const msg1Text = bridge.readChatMessage({ messageId: 1, swipeId: 0 });
+        expect(msg1Text).toContain('灯塔在雨雾中闪烁。');
+        expect(msg1Text).toContain('[插图已回填至1#0]');
 
         // Later turns (e.g. messageId 7) remain completely untouched!
-        expect(orchestrator.store.get('message', '', { target: { messageId: 7, swipeId: 0 } })).toBeNull();
+        expect(bridge.readChatMessage({ messageId: 7, swipeId: 0 })).toBe('第4轮回复');
     });
 
     it('enforces Swipe, Regenerate, Continue, and targeted single-task Cancel causal isolation', async () => {
@@ -477,10 +503,11 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
 
         // Turn 1 on message 1#0
         bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: 'U0' });
-        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: 'A1#0', swipeId: 0 });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
         transport.enqueue(
             { content: 'Brief 1' },
-            { content: 'Reply 1#0' },
+            writeOutputTurn('Reply 1#0', 'w_1_0'),
+            { content: 'done 1#0' },
             async () => {
                 await olderTurnGate.wait();
                 return { content: 'Bg 1#0 finished' };
@@ -499,14 +526,15 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
             id: 3,
             name: '林晚',
             isUser: false,
-            mes: 'A3#0',
+            mes: '',
             swipeId: 0,
-            swipes: ['A3#0', ''],
+            swipes: ['', ''],
             swipeInfo: [{}, {}],
         });
         transport.enqueue(
             { content: 'Brief 3#0' },
-            { content: 'Reply 3#0' },
+            writeOutputTurn('Reply 3#0', 'w_3_0'),
+            { content: 'done 3#0' },
             async () => {
                 await swipeGate.wait();
                 return { content: 'Bg 3#0 should abort' };
@@ -531,11 +559,12 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
             { content: 'Brief 3#1' },
             (req) => {
                 // TrajectoryStore must have rolled back to Turn 1 (1#0), NOT containing Reply 3#0!
-                const allTexts = req.messages.map((m) => String(m.content)).join('\n');
-                expect(allTexts).toContain('Reply 1#0');
-                expect(allTexts).not.toContain('Reply 3#0');
-                return { content: 'Reply 3#1' };
+                const serialized = JSON.stringify(req.messages);
+                expect(serialized).toContain('Reply 1#0');
+                expect(serialized).not.toContain('Reply 3#0');
+                return writeOutputTurn('Reply 3#1', 'w_3_1');
             },
+            { content: 'done 3#1' },
             { content: 'Bg 3#1 finished' },
         );
 
@@ -563,19 +592,30 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
         olderTurnGate.resolve();
         await orchestrator.barrierCoordinator.awaitAllSettled();
 
-        // Action: CONTINUE on 3#1 -> MUST skip before_turn and append to 3#1 trajectory!
+        // Action: CONTINUE on 3#1 -> MUST skip before_turn and append to /output.md without double-merging!
         bridge.chat[3].mes = 'Reply 3#1';
-        bridge.chat[3].swipes = ['A3#0', 'Reply 3#1'];
+        bridge.chat[3].swipes = ['Reply 3#0', 'Reply 3#1'];
         transport.enqueue(
             (req) => {
-                const allTexts = req.messages.map((m) => String(m.content)).join('\n');
+                const serialized = JSON.stringify(req.messages);
                 const lastMsgText = String(req.messages[req.messages.length - 1].content);
-                expect(allTexts).toContain('Reply 3#1');
+                expect(serialized).toContain('Reply 3#1');
                 // Continue skips before_turn: no new <turn-brief> in Layer 2 continuation message
                 expect(lastMsgText).not.toContain('<turn-brief>');
                 expect(lastMsgText).toContain('Continue seamlessly');
-                return { content: ' ...continued!' };
+                expect(lastMsgText).toContain('/output.md');
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'app_3_1',
+                            name: 'append_file',
+                            arguments: JSON.stringify({ path: '/output.md', content: ' ...continued!' }),
+                        },
+                    ],
+                };
             },
+            { content: 'Continue review done' },
             { content: 'Bg continue finished' },
         );
 
@@ -588,6 +628,7 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
         expect(continued.beforeTurnResults).toHaveLength(0);
         expect(continued.deltaContent).toBe(' ...continued!');
         expect(continued.content).toBe('Reply 3#1 ...continued!');
+        expect(bridge.readChatMessage({ messageId: 3, swipeId: 1 })).toBe('Reply 3#1 ...continued!');
         await orchestrator.barrierCoordinator.awaitAllSettled();
 
         // Action: REGENERATE from message 3 -> clears layers & checkpoints >= 3 and re-runs full turn
@@ -598,12 +639,13 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
         transport.enqueue(
             { content: 'Brief 3 regen' },
             (req) => {
-                const allTexts = req.messages.map((m) => String(m.content)).join('\n');
-                expect(allTexts).toContain('Reply 1#0');
-                expect(allTexts).not.toContain('Reply 3#1');
-                expect(allTexts).not.toContain('...continued!');
-                return { content: 'Regenerated 3#1' };
+                const serialized = JSON.stringify(req.messages);
+                expect(serialized).toContain('Reply 1#0');
+                expect(serialized).not.toContain('Reply 3#1');
+                expect(serialized).not.toContain('...continued!');
+                return writeOutputTurn('Regenerated 3#1', 'w_regen');
             },
+            { content: 'done regen' },
             { content: 'Bg regen finished' },
         );
 
@@ -763,8 +805,9 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
             (req) => {
                 // before_turn 0-token script returned "ScriptBrief: ready" -> injected into <turn-brief>
                 expect(String(req.messages[req.messages.length - 1].content)).toContain('ScriptBrief: ready');
-                return { content: '我看到银莲花刻痕。'.repeat(15) };
+                return writeOutputTurn('我看到银莲花刻痕。'.repeat(15), 'w_lore_1');
             },
+            { content: 'main 1 done' },
             (req) => {
                 // Grouped A + B merged into 1 single LLM invocation
                 const prompt = String(req.messages[req.messages.length - 1].content);
@@ -780,15 +823,13 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
             userInput: '检查剧本',
             turnNumber: 1,
         });
-        bridge.chat[1].mes = t1.content;
-        bridge.chat[1].swipes = [t1.content];
 
         await orchestrator.barrierCoordinator.awaitAllSettled();
 
         expect(ejsCalls).toHaveLength(1);
         expect(t1.beforeTurnBrief).toBe('ScriptBrief: ready');
-        // 1 main_turn call + 1 merged @@group call (scripts consumed 0 LLM tokens!)
-        expect(transport.requests).toHaveLength(2);
+        // 2 main_turn calls (write_file + finish) + 1 merged @@group call (scripts consumed 0 LLM tokens!)
+        expect(transport.requests).toHaveLength(3);
 
         const varsT1 = await orchestrator.vfs.readVariables({ target: { messageId: 1, swipeId: 0 } });
         expect(varsT1.scriptRan).toBe(true);
@@ -800,7 +841,8 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
         bridge.pushMessage({ id: 2, name: '沈默', isUser: true, mes: '第二回合' });
         bridge.pushMessage({ id: 3, name: '林晚', isUser: false, mes: '', swipeId: 0 });
         transport.enqueue(
-            { content: '第二回合足够长的回复内容。'.repeat(20) },
+            writeOutputTurn('第二回合足够长的回复内容。'.repeat(20), 'w_lore_2'),
+            { content: 'main 2 done' },
             { content: 'Digest T2 completed' },
         );
 
@@ -869,7 +911,8 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
         bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
 
         transport.enqueue(
-            { content: '主角被流矢擦伤。' },
+            writeOutputTurn('主角被流矢擦伤。', 'w_hurt'),
+            { content: 'main hurt done' },
             {
                 content: '',
                 toolCalls: [
@@ -945,5 +988,464 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
         await Promise.all([h1.promise, h2.promise]);
 
         expect(sharedOrder).toEqual(['a_start', 'a_end', 'b_start', 'b_end']);
+    });
+
+    it('recovers across 2 consecutive length interruptions via resumeTurn and continue while preserving 100% KV prefix invariance and staged data', async () => {
+        const beforeScriptTrigger: TriggerRule = {
+            id: 'tr_before_stage',
+            label: 'Before Stager',
+            source: 'preset',
+            phase: 'before_turn',
+            order: 1,
+            barrier: 'turn',
+            agentProfileId: 'script',
+            kind: 'script',
+            condition: { type: 'always' },
+            instructionTemplate: '',
+            scriptCode: 'await vars.set("stagedBefore", true); return "StageBrief: ready";',
+            enabled: true,
+        };
+
+        const loreEntry: RawLoreEntry = {
+            world: 'Harbor',
+            uid: 70,
+            comment: '秘密档案',
+            content: '三号泊位地下室的密道钥匙藏在铜锚后方。',
+            keys: ['铜锚', '密道'],
+            keysecondary: [],
+            constant: false,
+            selective: false,
+            disable: false,
+            position: 1,
+            depth: 4,
+            order: 1,
+            role: 0,
+        };
+
+        const { bridge, transport, traceLogger, orchestrator } = createPipelineFixture({
+            triggers: [beforeScriptTrigger],
+            lorebooks: { Harbor: [loreEntry] },
+        });
+
+        const events: GenerationEventPayload[] = [];
+        traceLogger.subscribe((ev) => events.push(ev));
+
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '检查铜锚并写出长篇记录' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+
+        // Hop 1: Round 0 reads lore file (populates Read-Set); Round 1 hits finishReason='length' mid-write_file!
+        transport.enqueue(
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'hop1_read_lore',
+                        name: 'read_file',
+                        arguments: JSON.stringify({ path: '/lorebooks/Harbor/秘密档案-70.md' }),
+                    },
+                ],
+            },
+            {
+                chunks: [
+                    {
+                        type: 'tool_call_delta',
+                        toolCallIndex: 0,
+                        toolCallId: 'hop1_write_trunc',
+                        toolName: 'write_file',
+                        argumentsDelta: '{"path":"/output.md","content":"第一段：码头夜雾。',
+                    },
+                    { type: 'done', finishReason: 'length' },
+                ],
+            },
+        );
+
+        let hop1Err: unknown;
+        try {
+            await orchestrator.runTurn({
+                action: 'normal',
+                target: { messageId: 1, swipeId: 0 },
+                userInput: '检查铜锚并写出长篇记录',
+                stream: true,
+            });
+        } catch (err) {
+            hop1Err = err;
+        }
+
+        expect(hop1Err).toBeInstanceOf(TurnInterruptedError);
+        const hop1Interrupted = hop1Err as TurnInterruptedError;
+        expect(hop1Interrupted.reason).toBe('length');
+        expect(hop1Interrupted.salvagedOutput).toBe('第一段：码头夜雾。');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe('第一段：码头夜雾。');
+        expect(orchestrator.store.hasPending({ messageId: 1, swipeId: 0 })).toBe(true);
+        expect(events.some((e) => e.kind === 'turn_interrupted' && e.interruptedReason === 'length')).toBe(true);
+
+        // Persisted in HostBridge metadata -> survives TrajectoryStore.loadFromHost reload
+        const reloadedStore = TrajectoryStore.loadFromHost(bridge);
+        const persistedCp = reloadedStore.getInterruptedCheckpoint({ messageId: 1, swipeId: 0 });
+        expect(persistedCp).toBeDefined();
+        expect(persistedCp?.readSetSnapshot['/lorebooks/Harbor/秘密档案-70.md']).toBeDefined();
+        expect(JSON.parse(persistedCp!.stagedSnapshot.variables['variables.json'].content)).toMatchObject({
+            stagedBefore: true,
+        });
+
+        const hop1Req = transport.requests[1];
+
+        // Hop 2: explicit resumeTurn() -> appends second segment, then hits finishReason='length' AGAIN!
+        transport.enqueue((req) => {
+            assertAppendOnlyPrefix(hop1Req, req);
+            const lastMsg = req.messages[req.messages.length - 1];
+            expect(lastMsg.role).toBe('user');
+            expect(String(lastMsg.content)).toContain('[System Recovery]');
+            expect(String(lastMsg.content)).toContain('第一段：码头夜雾。');
+            expect(String(lastMsg.content)).not.toContain('<lore-hint>');
+
+            return {
+                chunks: [
+                    {
+                        type: 'tool_call_delta',
+                        toolCallIndex: 0,
+                        toolCallId: 'hop2_append_trunc',
+                        toolName: 'append_file',
+                        argumentsDelta: '{"path":"/output.md","content":"第二段：银莲花徽记。',
+                    },
+                    { type: 'done', finishReason: 'length' },
+                ],
+            };
+        });
+
+        let hop2Err: unknown;
+        try {
+            await orchestrator.resumeTurn({
+                target: { messageId: 1, swipeId: 0 },
+                stream: true,
+            });
+        } catch (err) {
+            hop2Err = err;
+        }
+
+        expect(hop2Err).toBeInstanceOf(TurnInterruptedError);
+        const hop2Interrupted = hop2Err as TurnInterruptedError;
+        expect(hop2Interrupted.reason).toBe('length');
+        expect(hop2Interrupted.salvagedOutput).toBe('第一段：码头夜雾。第二段：银莲花徽记。');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe(
+            '第一段：码头夜雾。第二段：银莲花徽记。',
+        );
+
+        const hop2Req = transport.requests[2];
+
+        // Hop 3: runTurn({ action: 'continue' }) auto-detects checkpoint -> appends final segment, edits in-turn, and finishes!
+        transport.enqueue(
+            (req) => {
+                assertAppendOnlyPrefix(hop2Req, req);
+                const lastMsg = req.messages[req.messages.length - 1];
+                expect(String(lastMsg.content)).toContain('[System Recovery]');
+                expect(String(lastMsg.content)).toContain('第二段：银莲花徽记。');
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'hop3_append_end',
+                            name: 'append_file',
+                            arguments: JSON.stringify({
+                                path: '/output.md',
+                                content: '第三段：真相大白。',
+                            }),
+                        },
+                    ],
+                };
+            },
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'hop3_edit_review',
+                        name: 'edit_file',
+                        arguments: JSON.stringify({
+                            path: '/output.md',
+                            search: '真相大白',
+                            replace: '暗门开启',
+                        }),
+                    },
+                ],
+            },
+            {
+                content: 'All 3 hops reviewed and complete.',
+            },
+        );
+
+        const hop3Res = await orchestrator.runTurn({
+            action: 'continue',
+            target: { messageId: 1, swipeId: 0 },
+            stream: true,
+        });
+
+        expect(hop3Res.content).toBe('第一段：码头夜雾。第二段：银莲花徽记。第三段：暗门开启。');
+        expect(hop3Res.deltaContent).toBe('第三段：暗门开启。');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe(
+            '第一段：码头夜雾。第二段：银莲花徽记。第三段：暗门开启。',
+        );
+        expect(orchestrator.trajectoryStore.getInterruptedCheckpoint({ messageId: 1, swipeId: 0 })).toBeUndefined();
+        expect(events.some((e) => e.kind === 'turn_resumed')).toBe(true);
+        expect(events.some((e) => e.kind === 'turn_completed')).toBe(true);
+
+        // Staged before_turn variable survived both interrupts and committed on Hop 3 completion!
+        const finalVars = await orchestrator.vfs.readVariables({ target: { messageId: 1, swipeId: 0 } });
+        expect(finalVars.stagedBefore).toBe(true);
+
+        const hop3LastReq = transport.requests[transport.requests.length - 1];
+
+        // Turn 2 after multi-hop resume STILL preserves 100% KV Cache prefix invariance!
+        bridge.pushMessage({ id: 2, name: '沈默', isUser: true, mes: '进入暗门。' });
+        bridge.pushMessage({ id: 3, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+        transport.enqueue(
+            (req) => {
+                assertAppendOnlyPrefix(hop3LastReq, req);
+                return writeOutputTurn('我们顺着暗门台阶下行。', 'w_turn2_after_resume');
+            },
+            { content: 'Turn 2 ok' },
+        );
+        const turn2Res = await orchestrator.runTurn({
+            action: 'normal',
+            target: { messageId: 3, swipeId: 0 },
+            userInput: '进入暗门。',
+            stream: false,
+        });
+        expect(turn2Res.content).toBe('我们顺着暗门台阶下行。');
+
+        // Also verify swipe & regenerate clear interrupted checkpoints cleanly
+        bridge.pushMessage({ id: 4, name: '沈默', isUser: true, mes: '测试清理' });
+        bridge.pushMessage({
+            id: 5,
+            name: '林晚',
+            isUser: false,
+            mes: '',
+            swipeId: 0,
+            swipes: ['', ''],
+            swipeInfo: [{}, {}],
+        });
+        orchestrator.trajectoryStore.saveInterruptedCheckpoint({
+            agentId: 'main',
+            target: { messageId: 5, swipeId: 0 },
+            reason: 'user_stop',
+            completedTurnMessages: [{ role: 'user', content: '测试清理' }],
+            readSetSnapshot: {},
+            stagedSnapshot: {},
+            createdAt: Date.now(),
+        });
+        bridge.chat[5].swipeId = 1;
+        transport.enqueue(writeOutputTurn('Swipe 1 clean', 'w_s1'), { content: 'done' });
+        await orchestrator.runTurn({
+            action: 'swipe',
+            target: { messageId: 5, swipeId: 1 },
+            previousSwipeId: 0,
+            userInput: '测试清理',
+        });
+        expect(orchestrator.trajectoryStore.getInterruptedCheckpoint({ messageId: 5, swipeId: 0 })).toBeUndefined();
+    });
+
+    it('runs @@replace_output and @@trigger target=/output.md direct edits with anchor-miss self-heal and per-floor /output.md@M#S barriers', async () => {
+        const loreEntries: RawLoreEntry[] = [
+            {
+                world: 'EditBook',
+                uid: 10,
+                comment: '正文局部修校',
+                content: '@@replace_output\n@@batch_order 1\n把文中错词修正。',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 1,
+                depth: 4,
+                order: 1,
+                role: 0,
+            },
+            {
+                world: 'EditBook',
+                uid: 11,
+                comment: '追加状态尾部',
+                content: '@@trigger phase=after order=2 barrier=self target=/output.md\n在 /output.md 末尾追加状态标签。',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 1,
+                depth: 4,
+                order: 2,
+                role: 0,
+            },
+        ];
+
+        const { bridge, transport, orchestrator } = createPipelineFixture({
+            lorebooks: { EditBook: loreEntries },
+        });
+
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '检查铁门' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+
+        transport.enqueue(
+            // main_turn writes initial /output.md
+            writeOutputTurn('林晚走近生锈铁门。', 'w_door'),
+            { content: 'main done' },
+            // Trigger 1 (@@replace_output, order 1): bad anchor -> self-heal via read_file('/output.md') -> edit_file succeeds!
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'bad_anchor_edit',
+                        name: 'edit_file',
+                        arguments: JSON.stringify({
+                            path: '/output.md',
+                            search: '不存在的旧铁门',
+                            replace: '铜锁暗门',
+                        }),
+                    },
+                ],
+            },
+            (req) => {
+                const errMsg = req.messages.find((m) => m.role === 'tool');
+                expect(String(errMsg?.content)).toContain('Target text not found');
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'reread_out',
+                            name: 'read_file',
+                            arguments: JSON.stringify({ path: '/output.md' }),
+                        },
+                    ],
+                };
+            },
+            (req) => {
+                const readMsg = req.messages.filter((m) => m.role === 'tool')[1];
+                expect(String(readMsg?.content)).toBe('林晚走近生锈铁门。');
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'fixed_anchor_edit',
+                            name: 'edit_file',
+                            arguments: JSON.stringify({
+                                path: '/output.md',
+                                search: '生锈铁门',
+                                replace: '铜锁暗门',
+                            }),
+                        },
+                    ],
+                };
+            },
+            { content: 'replace_output done' },
+            // Trigger 2 (@@trigger target=/output.md, order 2): serialized behind Trigger 1 via path:/output.md@1#0, appends after edit!
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'read_after_edit',
+                        name: 'read_file',
+                        arguments: JSON.stringify({ path: '/output.md' }),
+                    },
+                ],
+            },
+            (req) => {
+                const readMsg = req.messages.find((m) => m.role === 'tool');
+                expect(String(readMsg?.content)).toBe('林晚走近铜锁暗门。');
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'append_badge',
+                            name: 'append_file',
+                            arguments: JSON.stringify({
+                                path: '/output.md',
+                                content: '\n[状态：警戒]',
+                            }),
+                        },
+                    ],
+                };
+            },
+            { content: 'append trigger done' },
+        );
+
+        const turnRes = await orchestrator.runTurn({
+            action: 'normal',
+            target: { messageId: 1, swipeId: 0 },
+            userInput: '检查铁门',
+        });
+        expect(turnRes.afterTurnTasks).toHaveLength(2);
+        await orchestrator.barrierCoordinator.awaitAllSettled();
+
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe(
+            '林晚走近铜锁暗门。\n[状态：警戒]',
+        );
+
+        // Verify BarrierCoordinator floor-scoped /output.md@M#S locks:
+        // Same floor (1#0) serializes FIFO; different floor (3#0) executes in parallel without blocking!
+        const floor1Gate = new DeferredGate<void>();
+        const log: string[] = [];
+
+        const f1TaskA = orchestrator.barrierCoordinator.dispatch(
+            {
+                target: { messageId: 1, swipeId: 0 },
+                phase: 'after_turn',
+                barrier: 'self',
+                agentProfileId: 'editor_a',
+                label: 'Editor A on 1#0',
+                targetPath: '/output.md',
+            },
+            async () => {
+                log.push('1#0:A:start');
+                await floor1Gate.wait();
+                log.push('1#0:A:end');
+            },
+        );
+        const f1TaskB = orchestrator.barrierCoordinator.dispatch(
+            {
+                target: { messageId: 1, swipeId: 0 },
+                phase: 'after_turn',
+                barrier: 'self',
+                agentProfileId: 'editor_b',
+                label: 'Editor B on 1#0',
+                targetPath: '/output.md',
+            },
+            async () => {
+                log.push('1#0:B:start');
+                log.push('1#0:B:end');
+            },
+        );
+        const f3TaskC = orchestrator.barrierCoordinator.dispatch(
+            {
+                target: { messageId: 3, swipeId: 0 },
+                phase: 'after_turn',
+                barrier: 'self',
+                agentProfileId: 'editor_c',
+                label: 'Editor C on 3#0',
+                targetPath: '/output.md',
+            },
+            async () => {
+                log.push('3#0:C:start');
+                log.push('3#0:C:end');
+            },
+        );
+
+        await floor1Gate.waitUntilWaiting();
+        expect(f1TaskA.getStatus().state).toBe('running');
+        expect(f1TaskB.getStatus().state).toBe('queued');
+
+        // Different floor (3#0) completes immediately while 1#0 A is still blocked!
+        await f3TaskC.promise;
+        expect(f3TaskC.getStatus().state).toBe('completed');
+        expect(log).toEqual(['1#0:A:start', '3#0:C:start', '3#0:C:end']);
+
+        floor1Gate.resolve();
+        await Promise.all([f1TaskA.promise, f1TaskB.promise]);
+        expect(log).toEqual([
+            '1#0:A:start',
+            '3#0:C:start',
+            '3#0:C:end',
+            '1#0:A:end',
+            '1#0:B:start',
+            '1#0:B:end',
+        ]);
     });
 });

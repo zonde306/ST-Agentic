@@ -3,6 +3,7 @@ import {
     AgentRunner,
     type AgentRunResult,
     type SubAgentDescriptor,
+    TurnInterruptedError,
 } from '@/core/agents';
 import type { HostBridge, LLMTransport, ToolExecutionContext } from '@/core/bridge';
 import {
@@ -55,7 +56,7 @@ import type {
     ToolStepLog,
     TriggerRule,
 } from '@/core/types';
-import { VirtualFileSystem } from '@/core/vfs';
+import { OUTPUT_FILE_PATH, VirtualFileSystem } from '@/core/vfs';
 import {
     BarrierCoordinator,
     type DispatchedTaskHandle,
@@ -107,10 +108,24 @@ export interface RunTurnInput {
     signal?: AbortSignal;
     stream?: boolean;
     onTextDelta?: (delta: string) => void;
+    onOutputPreview?: (previewText: string) => void;
     onReasoningDelta?: (delta: string) => void;
     onToolStart?: (step: ToolStepLog) => void;
     onToolComplete?: (step: ToolStepLog) => void;
 }
+
+export interface ResumeTurnInput {
+    target: MessageTarget;
+    signal?: AbortSignal;
+    stream?: boolean;
+    onTextDelta?: (delta: string) => void;
+    onOutputPreview?: (previewText: string) => void;
+    onReasoningDelta?: (delta: string) => void;
+    onToolStart?: (step: ToolStepLog) => void;
+    onToolComplete?: (step: ToolStepLog) => void;
+}
+
+export { TurnInterruptedError };
 
 export interface TriggerExecutionResult {
     unitId: string;
@@ -144,7 +159,7 @@ export interface RunTurnResult {
 }
 
 const DEFAULT_CONTINUATION_PROMPT =
-    '[Continue seamlessly from the end of your previous assistant message without repeating prior text.]';
+    '[Continue seamlessly from the end of your previous assistant message in /output.md without repeating prior text. Call read_file("/output.md") if needed, then extend or fix /output.md via append_file or edit_file before finishing.]';
 
 function freezeTarget(target: MessageTarget): MessageTarget {
     if (
@@ -172,16 +187,6 @@ function contentToPlainText(input: string | CanonicalContentPart[] | undefined):
         .filter((part): part is { type: 'text'; text: string } => part.type === 'text')
         .map((part) => part.text)
         .join('\n');
-}
-
-function mergeContinuationText(existing: string, delta: string): string {
-    if (!existing) {
-        return delta;
-    }
-    if (!delta) {
-        return existing;
-    }
-    return `${existing}${delta}`;
 }
 
 function normalizeTriggerSchema(
@@ -328,6 +333,19 @@ export class PipelineOrchestrator {
         const turnSignal = input.signal ?? new AbortController().signal;
         throwIfAborted(turnSignal);
 
+        if (input.action === 'continue' && this.trajectoryStore.getInterruptedCheckpoint(target)) {
+            return await this.resumeTurn({
+                target,
+                signal: turnSignal,
+                stream: input.stream,
+                onTextDelta: input.onTextDelta,
+                onOutputPreview: input.onOutputPreview,
+                onReasoningDelta: input.onReasoningDelta,
+                onToolStart: input.onToolStart,
+                onToolComplete: input.onToolComplete,
+            });
+        }
+
         const settings = this.settingsProvider();
         const preset = resolveActivePreset(settings);
         const rawUserText = contentToPlainText(input.userInput);
@@ -349,9 +367,11 @@ export class PipelineOrchestrator {
                     };
                     this.barrierCoordinator.abortTarget(oldTarget, 'Message swiped away');
                     this.store.rollbackStagedData(oldTarget);
+                    this.trajectoryStore.clearInterruptedCheckpoint(oldTarget);
                 }
                 this.barrierCoordinator.abortTarget(target, 'Swipe rerun');
                 this.store.rollbackStagedData(target);
+                this.trajectoryStore.clearInterruptedCheckpoint(target);
                 this.restoreTrajectoriesBeforeMessage(target.messageId);
             } else if (input.action === 'regenerate') {
                 this.barrierCoordinator.abortFromMessage(target.messageId, 'Regenerated');
@@ -366,26 +386,13 @@ export class PipelineOrchestrator {
             throwIfAborted(turnSignal);
 
             // 3. Load lorebooks & compile @@ decorators once per turn
-            const loreEntries = await this.loadRawLoreEntries();
-            throwIfAborted(turnSignal);
-
-            const compiled = this.decoratorCompiler.compile(loreEntries, { preset });
-            const effectiveAgents: Record<string, AgentProfile> = {
-                ...compiled.derivedAgents,
-                ...preset.agents,
-            };
-            const allTriggers: TriggerRule[] = [
-                ...preset.triggers,
-                ...compiled.triggers,
-            ];
-            const globalVarSchema = await this.compileGlobalVariableSchema(compiled.schemaEntries);
-            throwIfAborted(turnSignal);
+            const env = await this.compileTurnEnvironment(preset, turnSignal);
 
             // 4. [Phase 1: before_turn] (skipped on `'continue'`)
             const beforeTurnResults: TriggerExecutionResult[] = [];
             if (input.action !== 'continue') {
                 const beforeUnits = groupTriggersForExecution(
-                    allTriggers.filter((t) => t.phase === 'before_turn'),
+                    env.allTriggers.filter((t) => t.phase === 'before_turn'),
                 );
                 await this.executeOrderedSyncUnits(beforeUnits, {
                     target,
@@ -393,10 +400,10 @@ export class PipelineOrchestrator {
                     userText: rawUserText,
                     assistantText: '',
                     preset,
-                    effectiveAgents,
-                    loreEntries,
-                    subAgents: compiled.subAgents,
-                    globalVarSchema,
+                    effectiveAgents: env.effectiveAgents,
+                    loreEntries: env.loreEntries,
+                    subAgents: env.subAgents,
+                    globalVarSchema: env.globalVarSchema,
                     staged: true,
                     signal: turnSignal,
                     resultsOut: beforeTurnResults,
@@ -411,8 +418,13 @@ export class PipelineOrchestrator {
             const beforeTurnBrief = briefParts.length > 0 ? briefParts.join('\n\n') : undefined;
 
             // 5. [Phase 2: main_turn]
+            const existingText =
+                input.action === 'continue'
+                    ? (input.existingContent ?? this.readExistingChatMessageText(target))
+                    : '';
+
             const mainAgent =
-                effectiveAgents[preset.mainAgentId]
+                env.effectiveAgents[preset.mainAgentId]
                 ?? createDefaultMainAgent({ id: preset.mainAgentId });
             const mainUserInput =
                 input.action === 'continue'
@@ -427,75 +439,47 @@ export class PipelineOrchestrator {
                 userInput: mainUserInput,
                 userName: input.userName,
                 turnBrief: beforeTurnBrief,
-                loreEntries,
-                subAgents: compiled.subAgents,
-                getVariableSchema: globalVarSchema ? () => globalVarSchema : undefined,
+                loreEntries: env.loreEntries,
+                subAgents: env.subAgents,
+                getVariableSchema: env.globalVarSchema ? () => env.globalVarSchema : undefined,
                 staged: true,
                 stream: input.stream,
                 signal: turnSignal,
                 onTextDelta: input.onTextDelta,
+                onOutputPreview: input.onOutputPreview,
                 onReasoningDelta: input.onReasoningDelta,
                 onToolStart: input.onToolStart,
                 onToolComplete: input.onToolComplete,
             });
             throwIfAborted(turnSignal);
 
-            // Commit before_turn + main_turn staged writes atomically to target (messageId, swipeId)
-            this.store.commitStagedData(target);
-
-            const deltaContent = mainRun.content;
-            const existingText =
+            const combinedContent = mainRun.content;
+            const deltaContent =
                 input.action === 'continue'
-                    ? (input.existingContent ?? this.readExistingChatMessageText(target))
-                    : '';
-            const combinedContent =
-                input.action === 'continue'
-                    ? mergeContinuationText(existingText, deltaContent)
-                    : deltaContent;
+                    ? (existingText && combinedContent.startsWith(existingText)
+                        ? combinedContent.slice(existingText.length)
+                        : combinedContent)
+                    : combinedContent;
 
-            // 6. [Phase 3: after_turn] Non-blocking background dispatch
-            const afterTurnTasks = await this.dispatchAfterTurnUnits({
-                target,
-                turnNumber,
-                userText: rawUserText,
-                assistantText: combinedContent,
-                preset,
-                effectiveAgents,
-                allTriggers,
-                loreEntries,
-                subAgents: compiled.subAgents,
-                globalVarSchema,
-                signal: turnSignal,
-            });
-
-            // 7. [Phase 4: maintenance] Watermark compaction check
-            const maintenanceTasks = this.dispatchMaintenanceChecks({
-                target,
-                preset,
-                effectiveAgents,
-                allTriggers,
-                loreEntries,
-            });
-
-            this.traceLogger.emit({
-                kind: 'turn_completed',
-                target: { ...target },
-                timestamp: Date.now(),
-            });
-
-            return {
+            return await this.finalizeCompletedTurn({
                 target,
                 action: input.action,
-                content: combinedContent,
+                turnNumber,
+                rawUserText,
+                combinedContent,
                 deltaContent,
-                ...(mainRun.reasoningContent ? { reasoningContent: mainRun.reasoningContent } : {}),
-                ...(beforeTurnBrief !== undefined ? { beforeTurnBrief } : {}),
+                beforeTurnBrief,
                 beforeTurnResults,
                 mainRun,
-                afterTurnTasks,
-                maintenanceTasks,
-            };
+                preset,
+                env,
+                signal: turnSignal,
+            });
         } catch (error) {
+            if (error instanceof TurnInterruptedError) {
+                return this.handleTurnInterrupted(target, error);
+            }
+
             // Roll back uncommitted staged data if before_turn / main_turn failed or aborted
             this.store.rollbackStagedData(target);
 
@@ -520,6 +504,253 @@ export class PipelineOrchestrator {
             });
             throw error;
         }
+    }
+
+    /**
+     * Resume an interrupted `main_turn` from its persisted `InterruptedTurnCheckpoint`
+     * while preserving 100% byte-for-byte Prefix KV Cache invariance over completed rounds.
+     */
+    async resumeTurn(input: ResumeTurnInput): Promise<RunTurnResult> {
+        const target = freezeTarget(input.target);
+        const turnSignal = input.signal ?? new AbortController().signal;
+        throwIfAborted(turnSignal);
+
+        const cp = this.trajectoryStore.getInterruptedCheckpoint(target);
+        if (!cp) {
+            throw new Error(
+                `No interrupted turn checkpoint found for target ${target.messageId}#${target.swipeId}.`,
+            );
+        }
+
+        const settings = this.settingsProvider();
+        const preset = resolveActivePreset(settings);
+        const turnNumber = this.resolveTurnNumber(target.messageId);
+        const { userText: rawUserText } = this.readTurnExchangeText(target);
+
+        this.traceLogger.emit({
+            kind: 'turn_resumed',
+            target: { ...target },
+            timestamp: Date.now(),
+            agentProfileId: cp.agentId,
+            interruptedReason: cp.reason,
+        });
+
+        try {
+            await this.barrierCoordinator.awaitTurnBarriers({ signal: turnSignal });
+            throwIfAborted(turnSignal);
+
+            const env = await this.compileTurnEnvironment(preset, turnSignal);
+
+            this.restoreTrajectoriesBeforeMessage(target.messageId);
+            this.store.restoreStagedData(target, cp.stagedSnapshot);
+
+            const currentOutput = await this.vfs
+                .readFile(OUTPUT_FILE_PATH, { target, staged: true })
+                .catch(() => '');
+
+            const recoveryPrompt = [
+                `[System Recovery] Previous generation was interrupted (reason: ${cp.reason}).`,
+                `Current /output.md already has ${currentOutput.length} chars saved (ending with: ${JSON.stringify(currentOutput.slice(-200))}).`,
+                'Inspect /output.md if needed, seamlessly continue writing the remaining content using append_file or edit_file on /output.md WITHOUT repeating already-written text, and review /output.md for completeness and errors before finishing.',
+            ].join('\n');
+
+            const mainAgent =
+                env.effectiveAgents[cp.agentId]
+                ?? env.effectiveAgents[preset.mainAgentId]
+                ?? createDefaultMainAgent({ id: preset.mainAgentId });
+
+            const mainRun = await this.agentRunner.run({
+                agent: mainAgent,
+                preset,
+                target,
+                phase: 'main_turn',
+                resumeMessages: [
+                    ...cp.completedTurnMessages,
+                    { role: 'user', content: recoveryPrompt },
+                ],
+                initialReadSet: cp.readSetSnapshot,
+                loreEntries: env.loreEntries,
+                subAgents: env.subAgents,
+                getVariableSchema: env.globalVarSchema ? () => env.globalVarSchema : undefined,
+                staged: true,
+                stream: input.stream,
+                signal: turnSignal,
+                onTextDelta: input.onTextDelta,
+                onOutputPreview: input.onOutputPreview,
+                onReasoningDelta: input.onReasoningDelta,
+                onToolStart: input.onToolStart,
+                onToolComplete: input.onToolComplete,
+            });
+            throwIfAborted(turnSignal);
+
+            this.trajectoryStore.clearInterruptedCheckpoint(target);
+
+            const combinedContent = mainRun.content;
+            const deltaContent =
+                currentOutput && combinedContent.startsWith(currentOutput)
+                    ? combinedContent.slice(currentOutput.length)
+                    : combinedContent;
+
+            return await this.finalizeCompletedTurn({
+                target,
+                action: 'continue',
+                turnNumber,
+                rawUserText,
+                combinedContent,
+                deltaContent,
+                beforeTurnResults: [],
+                mainRun,
+                preset,
+                env,
+                signal: turnSignal,
+            });
+        } catch (error) {
+            if (error instanceof TurnInterruptedError) {
+                return this.handleTurnInterrupted(target, error);
+            }
+
+            const aborted = isAbortError(error) || turnSignal.aborted;
+            if (aborted) {
+                this.traceLogger.emit({
+                    kind: 'turn_aborted',
+                    target: { ...target },
+                    timestamp: Date.now(),
+                    error: error instanceof Error ? error.message : 'Turn resume aborted',
+                });
+                throw error instanceof Error && isAbortError(error)
+                    ? error
+                    : createAbortError('Turn resume aborted');
+            }
+
+            this.traceLogger.emit({
+                kind: 'turn_error',
+                target: { ...target },
+                timestamp: Date.now(),
+                error: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+        }
+    }
+
+    private async compileTurnEnvironment(
+        preset: Preset,
+        signal: AbortSignal,
+    ): Promise<{
+        loreEntries: RawLoreEntry[];
+        effectiveAgents: Record<string, AgentProfile>;
+        allTriggers: TriggerRule[];
+        subAgents: SubAgentDescriptor[];
+        globalVarSchema: z.ZodTypeAny | undefined;
+    }> {
+        const loreEntries = await this.loadRawLoreEntries();
+        throwIfAborted(signal);
+
+        const compiled = this.decoratorCompiler.compile(loreEntries, { preset });
+        const effectiveAgents: Record<string, AgentProfile> = {
+            ...compiled.derivedAgents,
+            ...preset.agents,
+        };
+        const allTriggers: TriggerRule[] = [
+            ...preset.triggers,
+            ...compiled.triggers,
+        ];
+        const globalVarSchema = await this.compileGlobalVariableSchema(compiled.schemaEntries);
+        throwIfAborted(signal);
+
+        return {
+            loreEntries,
+            effectiveAgents,
+            allTriggers,
+            subAgents: compiled.subAgents,
+            globalVarSchema,
+        };
+    }
+
+    private handleTurnInterrupted(target: MessageTarget, error: TurnInterruptedError): never {
+        this.trajectoryStore.saveInterruptedCheckpoint(error.checkpoint);
+        this.trajectoryStore.saveToHost(this.bridge);
+        this.traceLogger.emit({
+            kind: 'turn_interrupted',
+            target: { ...target },
+            timestamp: Date.now(),
+            agentProfileId: error.checkpoint.agentId,
+            interruptedReason: error.reason,
+            outputPreview: error.salvagedOutput,
+            ...(error.causeError ? { error: error.causeError } : {}),
+        });
+        throw error;
+    }
+
+    private async finalizeCompletedTurn(params: {
+        target: MessageTarget;
+        action: GenerationAction;
+        turnNumber: number;
+        rawUserText: string;
+        combinedContent: string;
+        deltaContent: string;
+        beforeTurnBrief?: string;
+        beforeTurnResults: TriggerExecutionResult[];
+        mainRun: AgentRunResult;
+        preset: Preset;
+        env: {
+            loreEntries: RawLoreEntry[];
+            effectiveAgents: Record<string, AgentProfile>;
+            allTriggers: TriggerRule[];
+            subAgents: SubAgentDescriptor[];
+            globalVarSchema: z.ZodTypeAny | undefined;
+        };
+        signal: AbortSignal;
+    }): Promise<RunTurnResult> {
+        // Commit before_turn + main_turn staged writes atomically to target (messageId, swipeId)
+        this.store.commitStagedData(params.target);
+        this.trajectoryStore.saveToHost(this.bridge);
+
+        // [Phase 3: after_turn] Non-blocking background dispatch
+        const afterTurnTasks = await this.dispatchAfterTurnUnits({
+            target: params.target,
+            turnNumber: params.turnNumber,
+            userText: params.rawUserText,
+            assistantText: params.combinedContent,
+            preset: params.preset,
+            effectiveAgents: params.env.effectiveAgents,
+            allTriggers: params.env.allTriggers,
+            loreEntries: params.env.loreEntries,
+            subAgents: params.env.subAgents,
+            globalVarSchema: params.env.globalVarSchema,
+            signal: params.signal,
+        });
+
+        // [Phase 4: maintenance] Watermark compaction check
+        const maintenanceTasks = this.dispatchMaintenanceChecks({
+            target: params.target,
+            preset: params.preset,
+            effectiveAgents: params.env.effectiveAgents,
+            allTriggers: params.env.allTriggers,
+            loreEntries: params.env.loreEntries,
+        });
+
+        this.traceLogger.emit({
+            kind: 'turn_completed',
+            target: { ...params.target },
+            timestamp: Date.now(),
+        });
+
+        return {
+            target: params.target,
+            action: params.action,
+            content: params.combinedContent,
+            deltaContent: params.deltaContent,
+            ...(params.mainRun.reasoningContent
+                ? { reasoningContent: params.mainRun.reasoningContent }
+                : {}),
+            ...(params.beforeTurnBrief !== undefined
+                ? { beforeTurnBrief: params.beforeTurnBrief }
+                : {}),
+            beforeTurnResults: params.beforeTurnResults,
+            mainRun: params.mainRun,
+            afterTurnTasks,
+            maintenanceTasks,
+        };
     }
 
     /**
@@ -1390,7 +1621,7 @@ function mergeUnitPermissions(
     for (const rule of triggers) {
         if (rule.targetPath) {
             read.add(rule.targetPath);
-            if (rule.source === 'worldinfo') {
+            if (rule.source === 'worldinfo' || rule.targetPath === OUTPUT_FILE_PATH) {
                 write.add(rule.targetPath);
             }
         }
@@ -1406,12 +1637,25 @@ function resolveUnitTools(
     triggers: readonly TriggerRule[],
 ): string[] {
     if (baseTools.length > 0) {
-        return [...baseTools];
+        const merged = new Set(baseTools);
+        for (const rule of triggers) {
+            if (rule.targetPath === OUTPUT_FILE_PATH) {
+                merged.add('read_file');
+                merged.add('edit_file');
+                merged.add('append_file');
+                merged.add('write_file');
+            }
+        }
+        return Array.from(merged);
     }
     const tools = new Set<string>(['read_file', 'read_variables']);
     for (const rule of triggers) {
         if (rule.targetPath === '/state/variables.json') {
             tools.add('patch_variables');
+        } else if (rule.targetPath === OUTPUT_FILE_PATH) {
+            tools.add('edit_file');
+            tools.add('append_file');
+            tools.add('write_file');
         } else if (rule.targetPath) {
             tools.add('edit_file');
             tools.add('write_file');

@@ -216,7 +216,7 @@ export class BarrierCoordinator {
 
         const queueKeys =
             descriptor.barrier === 'self'
-                ? this.buildSelfQueueKeys(descriptor.agentProfileId, descriptor.targetPath)
+                ? this.buildSelfQueueKeys(descriptor.agentProfileId, descriptor.targetPath, target)
                 : [];
         const predecessors =
             descriptor.barrier === 'self'
@@ -465,11 +465,19 @@ export class BarrierCoordinator {
         return count;
     }
 
-    private buildSelfQueueKeys(agentProfileId: string, targetPath?: string): string[] {
+    private buildSelfQueueKeys(
+        agentProfileId: string,
+        targetPath?: string,
+        target?: MessageTarget,
+    ): string[] {
         const keys = [`agent:${agentProfileId}`];
         const trimmedPath = targetPath?.trim();
         if (trimmedPath) {
-            keys.push(`path:${trimmedPath}`);
+            if ((trimmedPath === '/output.md' || trimmedPath === 'output.md') && target) {
+                keys.push(`path:/output.md@${target.messageId}#${target.swipeId}`);
+            } else {
+                keys.push(`path:${trimmedPath}`);
+            }
         }
         return keys;
     }
