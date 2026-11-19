@@ -2,7 +2,13 @@ import { z } from 'zod';
 import type { ToolExecutionContext } from '@/core/bridge';
 import type { VfsSearchHit } from '@/core/types';
 import { hashText, normalizeVfsPath } from '@/core/utils';
-import { ScopedToolGuard, VfsError, sliceLines, utf8ByteLength } from '@/core/vfs';
+import {
+    OUTPUT_FILE_PATH,
+    ScopedToolGuard,
+    VfsError,
+    sliceLines,
+    utf8ByteLength,
+} from '@/core/vfs';
 import type { ToolDefinition } from './registry';
 import { createAbortError, isAbortError, throwIfAborted } from './script-sandbox';
 
@@ -203,9 +209,17 @@ const WRITE_FILE_SCHEMA = z.object({
         .string()
         .min(1)
         .describe(
-            'Target VFS path, e.g. "/memory/notes.md", "/global/prefs.md", or "/lorebooks/<book>/<entry>.md".',
+            'Target VFS path, e.g. "/output.md", "/memory/notes.md", "/global/prefs.md", or "/lorebooks/<book>/<entry>.md".',
         ),
     content: z.string().describe('Full replacement content to write to the file.'),
+});
+
+const APPEND_FILE_SCHEMA = z.object({
+    content: z.string().describe('Content to append verbatim to the end of the target file.'),
+    path: z
+        .string()
+        .min(1)
+        .describe('Writable VFS file path (e.g. "/output.md" or "/memory/notes.md").'),
 });
 
 const EDIT_FILE_SCHEMA = z.object({
@@ -219,7 +233,7 @@ const EDIT_FILE_SCHEMA = z.object({
         .describe('Replacement text. Use an empty string "" to delete the matched snippet.'),
 });
 
-/** Create the 7 built-in VFS tools backed by `ctx.fs` (`ScopedToolGuard`). */
+/** Create the 8 built-in VFS tools backed by `ctx.fs` (`ScopedToolGuard`). */
 export function createFsTools(): ToolDefinition[] {
     const listDirTool: ToolDefinition<typeof LIST_DIR_SCHEMA> = {
         name: 'list_dir',
@@ -366,7 +380,7 @@ export function createFsTools(): ToolDefinition[] {
                         : raw;
                 }
 
-                if (ctx.readSet && !hasRange) {
+                if (ctx.readSet && !hasRange && normalizedPath !== OUTPUT_FILE_PATH) {
                     const hashable = extractHashableBody(normalizedPath, content);
                     const digest = await hashText(hashable);
                     ctx.readSet.set(normalizedPath, digest);
@@ -394,6 +408,44 @@ export function createFsTools(): ToolDefinition[] {
                     ok: true,
                     path: normalizedPath,
                     bytes: utf8ByteLength(args.content),
+                    target: ctx.target,
+                });
+            } catch (error) {
+                return formatFsError(error, ctx.signal);
+            }
+        },
+    };
+
+    const appendFileTool: ToolDefinition<typeof APPEND_FILE_SCHEMA> = {
+        name: 'append_file',
+        description:
+            'Append content verbatim to the end of a writable VFS file bound to the current causal branch target (e.g. "/output.md" or "/memory/notes.md").',
+        parameters: APPEND_FILE_SCHEMA,
+        source: 'builtin',
+        async execute(args, ctx) {
+            throwIfAborted(ctx.signal);
+            try {
+                const normalizedPath = normalizeVfsPath(args.path);
+                if (typeof ctx.fs.append === 'function') {
+                    await ctx.fs.append(normalizedPath, args.content);
+                } else {
+                    let existing = '';
+                    try {
+                        existing = await ctx.fs.read(normalizedPath);
+                    } catch (error) {
+                        if (
+                            !(error instanceof VfsError && error.code === 'ENOENT')
+                            && !/not found|missing|enoent/i.test((error as Error)?.message ?? '')
+                        ) {
+                            throw error;
+                        }
+                    }
+                    await ctx.fs.write(normalizedPath, `${existing}${args.content}`);
+                }
+                return JSON.stringify({
+                    ok: true,
+                    path: normalizedPath,
+                    appendedBytes: utf8ByteLength(args.content),
                     target: ctx.target,
                 });
             } catch (error) {
@@ -439,6 +491,7 @@ export function createFsTools(): ToolDefinition[] {
         searchFilesTool,
         readFileTool,
         writeFileTool,
+        appendFileTool,
         editFileTool,
     ];
 }

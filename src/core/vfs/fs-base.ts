@@ -76,6 +76,7 @@ export interface VfsMount {
     listDir(relPath: string, opts?: VfsTargetOptions): Promise<VfsEntryStat[]>;
     readFile(relPath: string, opts?: VfsReadOptions): Promise<string>;
     writeFile(relPath: string, content: string, opts?: VfsWriteOptions): Promise<void>;
+    appendFile?(relPath: string, content: string, opts?: VfsWriteOptions): Promise<void>;
     editFile(
         relPath: string,
         oldText: string,

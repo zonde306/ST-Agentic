@@ -4,6 +4,7 @@ import { LoreReadEvaluator, TailRadar, WIClassifier } from '@/core/lore';
 import { ChatDataStore, DATA_NAMESPACES, MESSAGE_OVERRIDE_KEY } from '@/core/store';
 import {
     BUILTIN_TOOL_NAMES,
+    ChatMessageViewAdapter,
     ToolRegistry,
     createBuiltinToolRegistry,
     createToolExecutionContext,
@@ -132,7 +133,7 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         expect(parsed.error).toContain('player.role');
     });
 
-    it('registers all 14 built-in tools and executes VFS tools through ScopedToolGuard', async () => {
+    it('registers all 15 built-in tools and executes VFS tools through ScopedToolGuard', async () => {
         const bridge = setupWorkspaceBridge();
         const store = new ChatDataStore(bridge);
         const vfs = new VirtualFileSystem({ bridge, store });
@@ -144,6 +145,8 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         });
 
         const registry = createBuiltinToolRegistry();
+        expect(BUILTIN_TOOL_NAMES).toHaveLength(15);
+        expect(BUILTIN_TOOL_NAMES).toContain('append_file');
         expect(registry.names().sort()).toEqual([...BUILTIN_TOOL_NAMES].sort());
 
         const ctx = createToolExecutionContext({
@@ -152,12 +155,12 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
             store,
             target: { messageId: 1, swipeId: 0 },
             permissions: {
-                read: ['/memory/**', '/lorebooks/**', '/character/**'],
-                write: ['/memory/**'],
+                read: ['/memory/**', '/lorebooks/**', '/character/**', '/output.md'],
+                write: ['/memory/**', '/output.md'],
             },
         });
 
-        // Allowed list_dir, glob_files, search_files, grep_search, read_file, write_file, edit_file
+        // Allowed list_dir, glob_files, search_files, grep_search, read_file, write_file, append_file, edit_file
         const listRes = JSON.parse((await registry.executeToolCall('list_dir', { path: '/memory' }, ctx)).output);
         expect(listRes.ok).toBe(true);
         expect(listRes.entries.map((e: { name: string }) => e.name)).toContain('notes.md');
@@ -184,6 +187,12 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         );
         expect(writeRes.ok).toBe(true);
 
+        const appendRes = JSON.parse(
+            (await registry.executeToolCall('append_file', { path: '/memory/clue.md', content: '（已核实）' }, ctx)).output,
+        );
+        expect(appendRes.ok).toBe(true);
+        expect(appendRes.appendedBytes).toBeGreaterThan(0);
+
         const editRes = JSON.parse(
             (
                 await registry.executeToolCall(
@@ -195,8 +204,19 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         );
         expect(editRes.ok).toBe(true);
         expect((await registry.executeToolCall('read_file', { path: '/memory/clue.md' }, ctx)).output).toBe(
-            '线索：银徽',
+            '线索：银徽（已核实）',
         );
+
+        // append_file on /output.md writes verbatim without auto-newline directly to bound message
+        const outWrite = JSON.parse(
+            (await registry.executeToolCall('write_file', { path: '/output.md', content: '前半句' }, ctx)).output,
+        );
+        expect(outWrite.ok).toBe(true);
+        const outAppend = JSON.parse(
+            (await registry.executeToolCall('append_file', { path: '/output.md', content: '后半句' }, ctx)).output,
+        );
+        expect(outAppend.ok).toBe(true);
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe('前半句后半句');
 
         // Unauthorized read & write blocked by ScopedToolGuard
         const deniedRead = await registry.executeToolCall('read_file', { path: '/secret/private.md' }, ctx);
@@ -210,6 +230,14 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         );
         expect(deniedWrite.ok).toBe(false);
         expect(deniedWrite.output).toContain('EACCES');
+
+        const deniedAppend = await registry.executeToolCall(
+            'append_file',
+            { path: '/secret/private.md', content: 'tamper' },
+            ctx,
+        );
+        expect(deniedAppend.ok).toBe(false);
+        expect(deniedAppend.output).toContain('EACCES');
 
         // Path traversal blocked
         const traversal = await registry.executeToolCall(
@@ -270,6 +298,12 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         });
         expect(scanAfter.candidates).toHaveLength(0);
         expect(scanAfter.hintXml).toBe('');
+
+        // Full read of /output.md MUST NEVER pollute ctx.readSet
+        const outRead = await registry.executeToolCall('read_file', { path: '/output.md' }, ctx);
+        expect(outRead.ok).toBe(true);
+        expect(outRead.output).toBe('初始回复正文。');
+        expect(readSet.has('/output.md')).toBe(false);
     });
 
     it('executes search_history and read_history strictly over /history/* within permissions', async () => {
@@ -312,7 +346,7 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         expect(trav.ok).toBe(false);
     });
 
-    it('binds append_reply_view, replace_reply_view, and attach_media strictly to ctx.target and honors AbortSignal', async () => {
+    it('binds append_reply_view, replace_reply_view, and attach_media directly to ST messages on ctx.target and honors AbortSignal', async () => {
         const bridge = setupWorkspaceBridge();
         const store = new ChatDataStore(bridge);
         const registry = createBuiltinToolRegistry();
@@ -329,46 +363,58 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         bridge.pushMessage({ name: 'User', isUser: true, mes: '后续消息 2' });
         bridge.pushMessage({ name: 'Assistant', isUser: false, mes: '后续回复 3' });
 
-        // append_reply_view writes ONLY to ChatDataStore 'message' layer for #1#0 and calls refreshMessageView
+        // append_reply_view writes directly to target ST message (/output.md) and calls refreshMessageView,
+        // without writing DATA_NAMESPACES.MESSAGE
         const appendRes = await registry.executeToolCall(
             'append_reply_view',
             { text: '[状态栏] 好感: 20' },
             ctx,
         );
         expect(appendRes.ok).toBe(true);
-        expect(bridge.chat[1].mes).toBe('初始回复正文。'); // raw chat history immutable!
-        expect(bridge.chat[1].swipes?.[0]).toBe('初始回复正文。');
-        expect(store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target })?.content).toBe(
-            '初始回复正文。\n[状态栏] 好感: 20',
-        );
-        expect(store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target: { messageId: 1, swipeId: 1 } })).toBeNull();
-        expect(store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target: { messageId: 3, swipeId: 0 } })).toBeNull();
-        expect(bridge.refreshedViews).toEqual([{ messageId: 1, swipeId: 0 }]);
+        expect(bridge.readChatMessage(target)).toBe('初始回复正文。\n[状态栏] 好感: 20');
+        expect(bridge.chat[1].mes).toBe('初始回复正文。\n[状态栏] 好感: 20');
+        expect(bridge.chat[1].swipes?.[0]).toBe('初始回复正文。\n[状态栏] 好感: 20');
+        expect(bridge.chat[1].swipes?.[1]).toBe('第二页候选正文。');
+        expect(bridge.chat[3].mes).toBe('后续回复 3');
+        expect(store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target })).toBeNull();
+        expect(bridge.refreshedViews).toContainEqual({ messageId: 1, swipeId: 0 });
 
-        // Second append_reply_view accumulates on top of existing 'message' override without mutating chat.mes
+        // Second append_reply_view accumulates cleanly on top of direct ST message content
         const appendRes2 = await registry.executeToolCall(
             'append_reply_view',
             { text: '[状态栏 2] 理智: 85' },
             ctx,
         );
         expect(appendRes2.ok).toBe(true);
-        expect(store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target })?.content).toBe(
+        expect(bridge.readChatMessage(target)).toBe(
             '初始回复正文。\n[状态栏] 好感: 20\n[状态栏 2] 理智: 85',
         );
-        expect(bridge.chat[1].mes).toBe('初始回复正文。');
+        expect(store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target })).toBeNull();
 
-        // replace_reply_view overwrites display layer without touching raw chat
+        // replace_reply_view directly updates ST message without writing DATA_NAMESPACES.MESSAGE
         const replaceRes = await registry.executeToolCall(
             'replace_reply_view',
             { text: '美化后的展示文本' },
             ctx,
         );
         expect(replaceRes.ok).toBe(true);
-        expect(store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target })?.content).toBe(
-            '美化后的展示文本',
+        expect(bridge.readChatMessage(target)).toBe('美化后的展示文本');
+        expect(bridge.chat[1].mes).toBe('美化后的展示文本');
+        expect(store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target })).toBeNull();
+
+        // Direct ChatMessageViewAdapter without vfs option falls back to HostBridge.readChatMessage/writeChatMessage
+        const directAdapter = new ChatMessageViewAdapter(
+            bridge,
+            store,
+            { messageId: 1, swipeId: 1 },
+            new AbortController().signal,
         );
-        expect(bridge.chat[1].mes).toBe('初始回复正文。');
-        expect(bridge.refreshedViews).toHaveLength(3);
+        await directAdapter.appendView('[页2附注]');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 1 })).toBe('第二页候选正文。\n[页2附注]');
+        expect(bridge.chat[1].mes).toBe('美化后的展示文本'); // inactive swipe does not overwrite active mes
+        await directAdapter.replaceView('第二页重写');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 1 })).toBe('第二页重写');
+        expect(store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target: { messageId: 1, swipeId: 1 } })).toBeNull();
 
         // attach_media binds strictly to frozen target #1#0
         const mediaRes = await registry.executeToolCall(
@@ -400,10 +446,11 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
             registry.executeToolCall('append_reply_view', { text: 'should not write' }, abortedCtx),
         ).rejects.toMatchObject({ name: 'AbortError' });
         expect(bridge.mediaAttachments).toHaveLength(1);
+        expect(bridge.readChatMessage({ messageId: 3, swipeId: 0 })).toBe('后续回复 3');
         expect(store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target: { messageId: 3, swipeId: 0 } })).toBeNull();
     });
 
-    it('supports minimal ToolFsApi without native grep or read-range options via fallbacks', async () => {
+    it('supports minimal ToolFsApi without native grep, append, or read-range options via fallbacks', async () => {
         const bridge = setupWorkspaceBridge();
         const files: Record<string, string> = {
             '/notes/a.md': 'line 1\nline 2 target\nline 3',
@@ -443,6 +490,22 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         );
         expect(sliceRes.ok).toBe(true);
         expect(sliceRes.output).toBe('line 2 target');
+
+        const appendFallbackExisting = await registry.executeToolCall(
+            'append_file',
+            { path: '/notes/a.md', content: '\nline 4' },
+            ctx,
+        );
+        expect(appendFallbackExisting.ok).toBe(true);
+        expect(files['/notes/a.md']).toBe('line 1\nline 2 target\nline 3\nline 4');
+
+        const appendFallbackNew = await registry.executeToolCall(
+            'append_file',
+            { path: '/notes/new.md', content: 'fresh' },
+            ctx,
+        );
+        expect(appendFallbackNew.ok).toBe(true);
+        expect(files['/notes/new.md']).toBe('fresh');
 
         const grepRes = JSON.parse(
             (await registry.executeToolCall('grep_search', { query: 'target', path_prefix: '/notes' }, ctx)).output,

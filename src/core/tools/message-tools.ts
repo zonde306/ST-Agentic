@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import type { HostBridge, ToolMessageApi } from '@/core/bridge';
-import { ChatDataStore, DATA_NAMESPACES, MESSAGE_OVERRIDE_KEY } from '@/core/store';
+import type { ChatDataStore } from '@/core/store';
 import type { MediaAttachment, MessageTarget } from '@/core/types';
+import { OUTPUT_FILE_PATH, type VirtualFileSystem } from '@/core/vfs';
 import type { ToolDefinition } from './registry';
 import { createAbortError, isAbortError, throwIfAborted } from './script-sandbox';
 
@@ -22,43 +23,41 @@ function assertValidMessageTarget(target: MessageTarget | undefined): MessageTar
 
 export interface ChatMessageViewAdapterOptions {
     staged?: boolean;
+    vfs?: VirtualFileSystem;
 }
 
 /**
  * `ToolMessageApi` adapter strictly bound to a frozen `MessageTarget` and `AbortSignal`.
- * Writes display overrides exclusively into `ChatDataStore`'s non-layered `message`
- * namespace (preserving raw chat history and Prefix KV Cache) and notifies `HostBridge`.
+ * Reads and writes `/output.md` (real host `chat[messageId]` / `swipes[swipeId]` via VFS
+ * or `HostBridge.readChatMessage`/`writeChatMessage`) and triggers `refreshMessageView`.
  */
 export class ChatMessageViewAdapter implements ToolMessageApi {
     private readonly target: MessageTarget;
     private readonly staged: boolean;
+    private readonly vfs?: VirtualFileSystem;
 
     constructor(
         private readonly bridge: HostBridge,
-        private readonly store: ChatDataStore,
+        _store: ChatDataStore,
         target: MessageTarget,
         private readonly signal: AbortSignal,
         options: ChatMessageViewAdapterOptions = {},
     ) {
         this.target = { messageId: target.messageId, swipeId: target.swipeId };
         this.staged = options.staged === true;
+        this.vfs = options.vfs;
     }
 
     async appendView(text: string): Promise<void> {
         throwIfAborted(this.signal);
         const boundTarget = assertValidMessageTarget(this.target);
-        const existing = this.store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, {
-            target: boundTarget,
-            includeStaged: this.staged,
-        });
 
-        let baseText: string;
-        if (existing) {
-            baseText = existing.content;
-        } else {
-            const msg = this.bridge.getChat()[boundTarget.messageId];
-            baseText = msg?.swipes?.[boundTarget.swipeId] ?? msg?.mes ?? '';
-        }
+        const baseText = this.vfs
+            ? await this.vfs.readFile(OUTPUT_FILE_PATH, {
+                target: boundTarget,
+                staged: this.staged,
+            })
+            : (this.bridge.readChatMessage(boundTarget) ?? '');
 
         const nextText = !baseText
             ? text
@@ -67,13 +66,15 @@ export class ChatMessageViewAdapter implements ToolMessageApi {
                 : `${baseText}\n${text}`;
 
         throwIfAborted(this.signal);
-        this.store.set(
-            DATA_NAMESPACES.MESSAGE,
-            MESSAGE_OVERRIDE_KEY,
-            'append_reply_view',
-            nextText,
-            { target: boundTarget, staged: this.staged },
-        );
+        if (this.vfs) {
+            await this.vfs.writeFile(OUTPUT_FILE_PATH, nextText, {
+                target: boundTarget,
+                staged: this.staged,
+                source: 'append_reply_view',
+            });
+        } else {
+            await this.bridge.writeChatMessage(boundTarget, nextText, { emitEvent: false });
+        }
 
         await this.bridge.refreshMessageView({ ...boundTarget });
         throwIfAborted(this.signal);
@@ -82,13 +83,16 @@ export class ChatMessageViewAdapter implements ToolMessageApi {
     async replaceView(text: string): Promise<void> {
         throwIfAborted(this.signal);
         const boundTarget = assertValidMessageTarget(this.target);
-        this.store.set(
-            DATA_NAMESPACES.MESSAGE,
-            MESSAGE_OVERRIDE_KEY,
-            'replace_reply_view',
-            text,
-            { target: boundTarget, staged: this.staged },
-        );
+
+        if (this.vfs) {
+            await this.vfs.writeFile(OUTPUT_FILE_PATH, text, {
+                target: boundTarget,
+                staged: this.staged,
+                source: 'replace_reply_view',
+            });
+        } else {
+            await this.bridge.writeChatMessage(boundTarget, text, { emitEvent: false });
+        }
 
         await this.bridge.refreshMessageView({ ...boundTarget });
         throwIfAborted(this.signal);

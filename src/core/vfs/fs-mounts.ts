@@ -4,7 +4,13 @@ import {
     DATA_NAMESPACES,
     VARIABLES_DOC_KEY,
 } from '@/core/store';
-import type { VfsEntryStat } from '@/core/types';
+import {
+    type BranchKey,
+    type MessageTarget,
+    type VfsEntryStat,
+    parseBranchKey,
+    toBranchKey,
+} from '@/core/types';
 import { canonicalClone } from '@/core/utils';
 import {
     VfsError,
@@ -30,6 +36,8 @@ export const PRESET_MOUNT = 'preset';
 export const HISTORY_MOUNT = 'history';
 export const STATE_MOUNT = 'state';
 export const VARIABLES_FILE_NAME = 'variables.json';
+export const OUTPUT_FILE_NAME = 'output.md';
+export const OUTPUT_FILE_PATH = '/output.md';
 
 export const GLOBAL_VFS_EXTENSION_KEY = 'agentic_global_files';
 export const AGENTIC_HISTORY_KEY = 'agentic_history';
@@ -259,6 +267,16 @@ export class WorkspaceMount implements VfsMount {
             content,
             { target: opts.target, staged: opts.staged },
         );
+    }
+
+    async appendFile(relPath: string, content: string, opts: VfsWriteOptions = {}): Promise<void> {
+        const clean = relPath.replace(/^\/+/, '');
+        if (!clean) {
+            throw new VfsError('Cannot append to root directory "/"', 'EISDIR', '/');
+        }
+        const existing = this.readStored(clean, opts);
+        const nextContent = `${existing?.content ?? ''}${content}`;
+        await this.writeFile(clean, nextContent, opts);
     }
 
     async editFile(
@@ -1254,5 +1272,217 @@ export class HistoryMount implements VfsMount {
         const created: Record<string, string> = {};
         metadata[AGENTIC_HISTORY_KEY] = created;
         return created;
+    }
+}
+
+/**
+ * `/output.md` — non-layered per-`(messageId, swipeId)` output mount backed directly
+ * by `HostBridge.readChatMessage` / `writeChatMessage`, with a `preCreateBuffers`
+ * map for companion-mode `before_turn` writes before the host creates the AI bubble.
+ */
+export class OutputMount implements VfsMount {
+    public readonly mountName = 'output';
+    public readonly writable = true;
+    private readonly preCreateBuffers = new Map<BranchKey, string>();
+
+    constructor(private readonly bridge: HostBridge) {}
+
+    async stat(relPath: string, opts?: VfsTargetOptions): Promise<VfsEntryStat | null> {
+        if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
+            return null;
+        }
+        const target = this.resolveTarget(opts);
+        if (!target) {
+            return null;
+        }
+        const hostContent = this.bridge.readChatMessage(target);
+        const current = hostContent ?? this.preCreateBuffers.get(toBranchKey(target)) ?? '';
+        return {
+            path: OUTPUT_FILE_PATH,
+            name: OUTPUT_FILE_NAME,
+            kind: 'file',
+            size: utf8ByteLength(current),
+            writable: true,
+            mount: this.mountName,
+        };
+    }
+
+    async listDir(relPath: string, opts?: VfsTargetOptions): Promise<VfsEntryStat[]> {
+        if (relPath !== '') {
+            return [];
+        }
+        const entry = await this.stat(OUTPUT_FILE_NAME, opts);
+        return entry ? [entry] : [];
+    }
+
+    async readFile(relPath: string, opts: VfsReadOptions = {}): Promise<string> {
+        if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
+            throw new VfsNotFoundError(`/${relPath}`);
+        }
+        const target = this.resolveTarget(opts);
+        if (!target) {
+            return sliceLines('', opts.startLine, opts.endLine);
+        }
+
+        const branchKey = toBranchKey(target);
+        const raw = this.bridge.readChatMessage(target);
+        if (raw !== null) {
+            this.preCreateBuffers.delete(branchKey);
+            return sliceLines(raw, opts.startLine, opts.endLine);
+        }
+
+        const buffered = this.preCreateBuffers.get(branchKey) ?? '';
+        return sliceLines(buffered, opts.startLine, opts.endLine);
+    }
+
+    async writeFile(relPath: string, content: string, opts: VfsWriteOptions = {}): Promise<void> {
+        if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
+            throw new VfsNotFoundError(`/${relPath}`);
+        }
+        const target = this.resolveTarget(opts);
+        if (!target) {
+            throw new VfsError(
+                'No target message available for /output.md',
+                'EINVAL',
+                OUTPUT_FILE_PATH,
+            );
+        }
+
+        const branchKey = toBranchKey(target);
+        if (this.bridge.readChatMessage(target) !== null) {
+            this.preCreateBuffers.delete(branchKey);
+            await this.bridge.writeChatMessage(target, content, { emitEvent: false });
+        } else {
+            this.preCreateBuffers.set(branchKey, content);
+        }
+    }
+
+    async appendFile(relPath: string, content: string, opts: VfsWriteOptions = {}): Promise<void> {
+        if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
+            throw new VfsNotFoundError(`/${relPath}`);
+        }
+        const current = await this.readFile(relPath, opts);
+        await this.writeFile(relPath, `${current}${content}`, opts);
+    }
+
+    async editFile(
+        relPath: string,
+        oldText: string,
+        newText: string,
+        opts: VfsWriteOptions = {},
+    ): Promise<ToolEditResult> {
+        if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
+            return { ok: false, path: `/${relPath}`, message: `File not found: /${relPath}` };
+        }
+        const current = await this.readFile(relPath, opts);
+        if (!oldText || !current.includes(oldText)) {
+            return {
+                ok: false,
+                path: OUTPUT_FILE_PATH,
+                message: `Target text not found in ${OUTPUT_FILE_PATH}`,
+            };
+        }
+        const updated = current.replace(oldText, newText);
+        if (updated !== current) {
+            await this.writeFile(relPath, updated, opts);
+        }
+        return {
+            ok: true,
+            path: OUTPUT_FILE_PATH,
+            message: `Edited ${OUTPUT_FILE_PATH}`,
+        };
+    }
+
+    async deleteFile(relPath: string, opts: VfsWriteOptions = {}): Promise<boolean> {
+        if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
+            return false;
+        }
+        const target = this.resolveTarget(opts);
+        if (!target) {
+            return false;
+        }
+        this.preCreateBuffers.delete(toBranchKey(target));
+        if (this.bridge.readChatMessage(target) !== null) {
+            await this.bridge.writeChatMessage(target, '', { emitEvent: false });
+        }
+        return true;
+    }
+
+    async listFiles(opts?: VfsTargetOptions): Promise<VfsEntryStat[]> {
+        const entry = await this.stat(OUTPUT_FILE_NAME, opts);
+        return entry ? [entry] : [];
+    }
+
+    async collectSearchDocs(opts?: VfsTargetOptions): Promise<VfsSearchDocument[]> {
+        const target = this.resolveTarget(opts);
+        if (!target) {
+            return [];
+        }
+        const hostContent = this.bridge.readChatMessage(target);
+        const current = hostContent ?? this.preCreateBuffers.get(toBranchKey(target)) ?? '';
+        if (!current) {
+            return [];
+        }
+        return [
+            {
+                path: OUTPUT_FILE_PATH,
+                title: OUTPUT_FILE_NAME,
+                content: current,
+            },
+        ];
+    }
+
+    /** Retrieve and clear any buffered `before_turn` output for `target`. */
+    flushPreCreateBuffer(target: MessageTarget): string | undefined {
+        const key = toBranchKey(target);
+        const buffered = this.preCreateBuffers.get(key);
+        if (buffered !== undefined) {
+            this.preCreateBuffers.delete(key);
+        }
+        return buffered;
+    }
+
+    /** Inspect any buffered `before_turn` output for `target` without clearing it. */
+    peekPreCreateBuffer(target: MessageTarget): string | undefined {
+        return this.preCreateBuffers.get(toBranchKey(target));
+    }
+
+    /** Discard all pre-create buffers belonging to messages `>= messageId`. */
+    clearPreCreateBuffersFrom(messageId: number): void {
+        if (!Number.isInteger(messageId) || messageId < 0) {
+            return;
+        }
+        for (const key of Array.from(this.preCreateBuffers.keys())) {
+            const parsed = parseBranchKey(key);
+            if (parsed && parsed.messageId >= messageId) {
+                this.preCreateBuffers.delete(key);
+            }
+        }
+    }
+
+    private resolveTarget(opts?: VfsTargetOptions): MessageTarget | null {
+        if (
+            opts?.target
+            && Number.isInteger(opts.target.messageId)
+            && opts.target.messageId >= 0
+            && Number.isInteger(opts.target.swipeId)
+            && opts.target.swipeId >= 0
+        ) {
+            return {
+                messageId: opts.target.messageId,
+                swipeId: opts.target.swipeId,
+            };
+        }
+
+        const chat = this.bridge.getChat();
+        if (!Array.isArray(chat) || chat.length === 0) {
+            return null;
+        }
+        const messageId = chat.length - 1;
+        const swipeId = chat[messageId]?.swipeId ?? 0;
+        if (!Number.isInteger(swipeId) || swipeId < 0) {
+            return null;
+        }
+        return { messageId, swipeId };
     }
 }

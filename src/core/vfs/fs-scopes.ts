@@ -92,6 +92,15 @@ export class ScopedToolGuard implements ToolFsApi {
         });
     }
 
+    async append(path: string, content: string): Promise<void> {
+        const normalized = this.assertCanWrite(path);
+        await this.vfs.appendFile(normalized, content, {
+            target: this.options.target,
+            staged: this.options.staged,
+            source: this.options.source ?? 'tool',
+        });
+    }
+
     async edit(path: string, oldText: string, newText: string): Promise<ToolEditResult> {
         const normalized = this.assertCanWrite(path);
         return await this.vfs.editFile(normalized, oldText, newText, {

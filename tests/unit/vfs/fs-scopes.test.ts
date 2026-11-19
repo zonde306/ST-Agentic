@@ -42,7 +42,8 @@ describe('ScopedToolGuard', () => {
 
         // Allowed writes & edits
         await guard.write('/memory/notes.md', '新增笔记');
-        expect(await guard.read('/memory/notes.md')).toBe('新增笔记');
+        await guard.append('/memory/notes.md', '（追加）');
+        expect(await guard.read('/memory/notes.md')).toBe('新增笔记（追加）');
         const editRes = await guard.edit('/memory/outline.md', '初稿', '终稿');
         expect(editRes.ok).toBe(true);
         expect(await guard.read('/memory/outline.md')).toBe('大纲终稿');
@@ -52,10 +53,11 @@ describe('ScopedToolGuard', () => {
         await expect(guard.read('/secret.md')).rejects.toThrow(/Unauthorized VFS read access.*"\/secret\.md"/);
         await expect(guard.list('/character')).rejects.toThrow(VfsPermissionError);
 
-        // Out-of-scope writes fail with VfsPermissionError diagnostic (even on readable lorebooks!)
+        // Out-of-scope writes & appends fail with VfsPermissionError diagnostic (even on readable lorebooks!)
         await expect(guard.write('/lorebooks/霜烬纪元/银莲花结社档案-5.md', 'hack')).rejects.toThrow(
             /Unauthorized VFS write access/,
         );
+        await expect(guard.append('/output.md', 'hack')).rejects.toThrow(VfsPermissionError);
         await expect(guard.edit('/lorebooks/霜烬纪元/银莲花结社档案-5.md', '银莲花', '金莲花')).rejects.toThrow(
             VfsPermissionError,
         );
@@ -71,6 +73,7 @@ describe('ScopedToolGuard', () => {
 
         await expect(guard.read('/lorebooks/../character/description.md')).rejects.toThrow(VfsInvalidPathError);
         await expect(guard.write('../escape.md', 'bad')).rejects.toThrow(/traversal/i);
+        await expect(guard.append('../escape.md', 'bad')).rejects.toThrow(/traversal/i);
         await expect(guard.edit('/memory/../secret.md', 'a', 'b')).rejects.toThrow(VfsInvalidPathError);
         await expect(guard.list('/lorebooks/..')).rejects.toThrow(VfsInvalidPathError);
         await expect(guard.glob('/lorebooks/../**')).rejects.toThrow(VfsInvalidPathError);

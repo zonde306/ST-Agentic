@@ -255,4 +255,82 @@ describe('ChatDataStore', () => {
         expect(store.get(DATA_NAMESPACES.WORLDINFO, 'World/A/12')?.content).toBe('new override');
         expect(bridge.chat[0].swipeInfo?.[0].wi_overrides?.['World/A']?.['12']?.content).toBe('legacy wi override');
     });
+
+    it('snapshots merged staged buckets deeply and restores them atomically for checkpoint recovery', () => {
+        const bridge = makeChatBridge(3);
+        const store = new ChatDataStore(bridge);
+        const target1 = { messageId: 1, swipeId: 0 };
+        const target2 = { messageId: 2, swipeId: 0 };
+
+        expect(store.snapshotStagedData(target1)).toEqual({});
+        expect(() => store.snapshotStagedData({ messageId: -1, swipeId: 0 })).toThrow(/Invalid MessageTarget/);
+
+        // Stage unbound pre-message entries + target1 entries (target1 overrides unbound on collision)
+        store.stageSet(DATA_NAMESPACES.FILES, 'memory/unbound.md', 'before', 'from-unbound');
+        store.stageSet(DATA_NAMESPACES.FILES, 'memory/shared.md', 'before', 'unbound-version');
+        store.stageSet(DATA_NAMESPACES.FILES, 'memory/shared.md', 'tool', 'target-version', target1);
+        store.stageSet(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, 'vars', '{"hp":80}', target1);
+        store.stageSet(DATA_NAMESPACES.FILES, 'memory/other.md', 'tool', 'keep-other-target', target2);
+
+        const snapshot = store.snapshotStagedData(target1);
+        expect(snapshot).toEqual({
+            files: {
+                'memory/unbound.md': { source: 'before', content: 'from-unbound' },
+                'memory/shared.md': { source: 'tool', content: 'target-version' },
+            },
+            variables: {
+                [VARIABLES_DOC_KEY]: { source: 'vars', content: '{"hp":80}' },
+            },
+        });
+
+        // Mutating snapshot or staging further writes does not corrupt the captured snapshot
+        snapshot.files['memory/shared.md'].content = 'mutated-by-caller';
+        store.stageSet(DATA_NAMESPACES.FILES, 'memory/later.md', 'tool', 'after-snapshot', target1);
+        expect(store.snapshotStagedData(target1).files['memory/shared.md'].content).toBe('target-version');
+
+        // Roll back target1 + simulate fresh store restore from checkpoint snapshot
+        store.rollbackStagedData(target1);
+        store.rollbackStagedData(); // clear unbound
+        expect(store.hasPending(target1)).toBe(false);
+
+        store.restoreStagedData(target1, {
+            files: {
+                'memory/unbound.md': { source: 'before', content: 'from-unbound' },
+                'memory/shared.md': { source: 'tool', content: 'target-version' },
+            },
+            variables: {
+                [VARIABLES_DOC_KEY]: { source: 'vars', content: '{"hp":80}' },
+            },
+        });
+
+        expect(store.hasPending(target1)).toBe(true);
+        expect(store.getPending(DATA_NAMESPACES.FILES, 'memory/unbound.md', { target: target1 })?.content).toBe(
+            'from-unbound',
+        );
+        expect(store.getPending(DATA_NAMESPACES.FILES, 'memory/shared.md', { target: target1 })?.content).toBe(
+            'target-version',
+        );
+        expect(store.getPending(DATA_NAMESPACES.FILES, 'memory/later.md', { target: target1 })).toBeNull();
+        // Other branch staging untouched
+        expect(store.getPending(DATA_NAMESPACES.FILES, 'memory/other.md', { target: target2 })?.content).toBe(
+            'keep-other-target',
+        );
+
+        const committed = store.commitStagedData(target1);
+        expect(committed).toBe(3);
+        expect(store.get(DATA_NAMESPACES.FILES, 'memory/unbound.md', { target: target1 })?.content).toBe(
+            'from-unbound',
+        );
+        expect(store.get(DATA_NAMESPACES.FILES, 'memory/shared.md', { target: target1 })?.content).toBe(
+            'target-version',
+        );
+        expect(store.get(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, { target: target1 })?.content).toBe(
+            '{"hp":80}',
+        );
+
+        // Restoring empty snapshot clears target staged data cleanly
+        store.stageSet(DATA_NAMESPACES.FILES, 'memory/stale.md', 'tool', 'x', target1);
+        store.restoreStagedData(target1, {});
+        expect(store.hasPending(target1)).toBe(false);
+    });
 });

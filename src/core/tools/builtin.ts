@@ -21,6 +21,7 @@ export const BUILTIN_TOOL_NAMES = [
     'search_files',
     'read_file',
     'write_file',
+    'append_file',
     'edit_file',
     'read_variables',
     'patch_variables',
@@ -33,7 +34,7 @@ export const BUILTIN_TOOL_NAMES = [
 
 export type BuiltinToolName = (typeof BUILTIN_TOOL_NAMES)[number];
 
-/** Instantiate all 14 built-in ST-Agentic tool definitions. */
+/** Instantiate all 15 built-in ST-Agentic tool definitions. */
 export function createBuiltinTools(options: VariableToolOptions = {}): ToolDefinition[] {
     return [
         ...createFsTools(),
@@ -43,7 +44,7 @@ export function createBuiltinTools(options: VariableToolOptions = {}): ToolDefin
     ];
 }
 
-/** Create a `ToolRegistry` pre-populated with all 14 built-in tools. */
+/** Create a `ToolRegistry` pre-populated with all 15 built-in tools. */
 export function createBuiltinToolRegistry(options: VariableToolOptions = {}): ToolRegistry {
     return new ToolRegistry(createBuiltinTools(options));
 }
@@ -96,6 +97,7 @@ export function createToolExecutionContext(
 
     const message = new ChatMessageViewAdapter(options.bridge, store, target, signal, {
         staged: options.staged,
+        vfs,
     });
 
     const st: ToolStApi = {

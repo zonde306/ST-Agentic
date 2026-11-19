@@ -594,6 +594,39 @@ function normalizeWIRouterOverrides(raw: unknown): Record<string, WICategory> {
     return result;
 }
 
+const LEGACY_DEFAULT_MAIN_TOOLS: readonly string[] = [
+    'list_dir',
+    'glob_files',
+    'grep_search',
+    'search_files',
+    'read_file',
+    'read_variables',
+    'search_history',
+    'read_history',
+];
+
+const OUTPUT_WRITE_TOOLS: readonly string[] = [
+    'write_file',
+    'append_file',
+    'edit_file',
+];
+
+const LEGACY_DEFAULT_MAIN_WRITE_PERMISSIONS: readonly string[] = [
+    '/memory/**',
+    '/scratch/**',
+];
+
+function hasExactStringSet(actual: readonly string[], expected: readonly string[]): boolean {
+    if (actual.length !== expected.length) {
+        return false;
+    }
+    const actualSet = new Set(actual);
+    if (actualSet.size !== expected.length) {
+        return false;
+    }
+    return expected.every((item) => actualSet.has(item));
+}
+
 /** Normalize an untrusted preset object into a valid `Preset` with a guaranteed main agent. */
 export function normalizePreset(input: unknown, fallbackId: string = DEFAULT_PRESET_ID): Preset {
     const raw = isPlainRecord(input) ? input : {};
@@ -601,6 +634,7 @@ export function normalizePreset(input: unknown, fallbackId: string = DEFAULT_PRE
     const name = sanitizeName(raw.name, id === DEFAULT_PRESET_ID ? 'Default' : id);
 
     const agents: Record<string, AgentProfile> = {};
+    const rawAgentsById: Record<string, Record<string, unknown>> = {};
     if (isPlainRecord(raw.agents)) {
         for (const [agentKey, agentVal] of Object.entries(raw.agents)) {
             if (!isPlainRecord(agentVal)) {
@@ -608,6 +642,7 @@ export function normalizePreset(input: unknown, fallbackId: string = DEFAULT_PRE
             }
             const profile = normalizeAgentProfile(agentVal, sanitizeName(agentKey, DEFAULT_MAIN_AGENT_ID));
             agents[profile.id] = profile;
+            rawAgentsById[profile.id] = agentVal;
         }
     }
 
@@ -638,6 +673,37 @@ export function normalizePreset(input: unknown, fallbackId: string = DEFAULT_PRE
         : [];
 
     const builtinToolSettings = normalizeBuiltinToolSettings(raw.builtinToolSettings);
+
+    const rawMainAgent = rawAgentsById[mainAgentId];
+    if (rawMainAgent && agents[mainAgentId]) {
+        const mainAgent = agents[mainAgentId];
+        const omittedTools = rawMainAgent.enabledTools === undefined;
+        if (omittedTools || hasExactStringSet(mainAgent.enabledTools, LEGACY_DEFAULT_MAIN_TOOLS)) {
+            const toolSet = new Set(mainAgent.enabledTools);
+            for (const tool of OUTPUT_WRITE_TOOLS) {
+                if (builtinToolSettings?.[tool]?.enabled === false) {
+                    continue;
+                }
+                toolSet.add(tool);
+            }
+            mainAgent.enabledTools = Array.from(toolSet);
+        }
+
+        const omittedPermissions =
+            !isPlainRecord(rawMainAgent.permissions)
+            || rawMainAgent.permissions.write === undefined;
+        if (
+            omittedPermissions
+            || hasExactStringSet(mainAgent.permissions.write, LEGACY_DEFAULT_MAIN_WRITE_PERMISSIONS)
+        ) {
+            if (!mainAgent.permissions.write.includes('/output.md')) {
+                mainAgent.permissions = {
+                    read: mainAgent.permissions.read,
+                    write: ['/output.md', ...mainAgent.permissions.write],
+                };
+            }
+        }
+    }
 
     return {
         id,

@@ -13,7 +13,9 @@ import {
     VfsError,
     VfsInvalidPathError,
     type VfsMount,
+    VfsNotFoundError,
     type VfsReadOptions,
+    VfsReadOnlyError,
     type VfsSearchDocument,
     type VfsTargetOptions,
     type VfsWriteOptions,
@@ -26,6 +28,9 @@ import {
     HISTORY_MOUNT,
     HistoryMount,
     HybridMount,
+    OUTPUT_FILE_NAME,
+    OUTPUT_FILE_PATH,
+    OutputMount,
     PERSONA_MOUNT,
     PRESET_MOUNT,
     PresetMount,
@@ -222,6 +227,7 @@ function buildSnippet(content: string, matchedTerms: string[], rawQuery: string 
  *
  * Mounts:
  * - `/` workspace root (`rw`, `files` namespace)
+ * - `/output.md` (`rw`, non-layered per-target host chat message output)
  * - `/state/variables.json` (`rw`, `variables` namespace, aligned with `[InitVar]` / legacy)
  * - `/character/*` (`ro` snapshot + `character-files` overlay)
  * - `/persona/*` (`ro` snapshot + `persona-files` overlay)
@@ -236,6 +242,7 @@ export class VirtualFileSystem {
     public readonly store: ChatDataStore;
 
     private readonly workspaceMount: WorkspaceMount;
+    private readonly outputMount: OutputMount;
     private readonly variablesMount: VariablesMount;
     private readonly characterMount: HybridMount;
     private readonly personaMount: HybridMount;
@@ -256,6 +263,7 @@ export class VirtualFileSystem {
         this.defaultStaged = options.defaultStaged;
 
         this.workspaceMount = new WorkspaceMount(this.store);
+        this.outputMount = new OutputMount(this.bridge);
         this.variablesMount = new VariablesMount(this.bridge, this.store);
         this.characterMount = new HybridMount(
             CHARACTER_MOUNT,
@@ -336,6 +344,10 @@ export class VirtualFileSystem {
             for (const item of workspaceItems) {
                 mergedMap.set(item.name, item);
             }
+            const outputStat = await this.outputMount.stat('', merged);
+            if (outputStat) {
+                mergedMap.set(OUTPUT_FILE_NAME, outputStat);
+            }
             for (const [mountName, mount] of this.namedMounts.entries()) {
                 mergedMap.set(mountName, {
                     path: `/${mountName}`,
@@ -390,6 +402,30 @@ export class VirtualFileSystem {
             throw new VfsError(`Cannot write to directory: ${routed.normalizedPath}`, 'EISDIR', routed.normalizedPath);
         }
         await routed.mount.writeFile(routed.relPath, content, this.mergeWriteOpts(opts));
+    }
+
+    async appendFile(path: string, content: string, opts?: VfsWriteOptions): Promise<void> {
+        const routed = this.route(path);
+        if (routed.isVirtualStateDir || !routed.relPath) {
+            throw new VfsError(`Cannot append to directory: ${routed.normalizedPath}`, 'EISDIR', routed.normalizedPath);
+        }
+        if (!routed.mount.writable) {
+            throw new VfsReadOnlyError(routed.normalizedPath);
+        }
+        const mergedWriteOpts = this.mergeWriteOpts(opts);
+        if (typeof routed.mount.appendFile === 'function') {
+            await routed.mount.appendFile(routed.relPath, content, mergedWriteOpts);
+            return;
+        }
+        let current = '';
+        try {
+            current = await routed.mount.readFile(routed.relPath, this.mergeReadOpts(opts));
+        } catch (error) {
+            if (!(error instanceof VfsNotFoundError)) {
+                throw error;
+            }
+        }
+        await routed.mount.writeFile(routed.relPath, `${current}${content}`, mergedWriteOpts);
     }
 
     async editFile(
@@ -516,6 +552,21 @@ export class VirtualFileSystem {
         return await this.historyMount.deleteInternal(relPath);
     }
 
+    /** Retrieve and clear any buffered `before_turn` `/output.md` content for `target`. */
+    flushPreCreateBuffer(target: MessageTarget): string | undefined {
+        return this.outputMount.flushPreCreateBuffer(target);
+    }
+
+    /** Inspect any buffered `before_turn` `/output.md` content for `target` without clearing it. */
+    peekPreCreateBuffer(target: MessageTarget): string | undefined {
+        return this.outputMount.peekPreCreateBuffer(target);
+    }
+
+    /** Discard all `/output.md` pre-create buffers belonging to messages `>= messageId`. */
+    clearPreCreateBuffersFrom(messageId: number): void {
+        this.outputMount.clearPreCreateBuffersFrom(messageId);
+    }
+
     /** Create a `ScopedToolGuard` enforcing `ScopedPermissions` over this VFS. */
     createScopedGuard(
         permissions: ScopedPermissions,
@@ -548,6 +599,14 @@ export class VirtualFileSystem {
                 mount: this.variablesMount,
                 relPath: VARIABLES_FILE_NAME,
                 normalizedPath: normalized,
+            };
+        }
+
+        if (normalized === OUTPUT_FILE_PATH) {
+            return {
+                mount: this.outputMount,
+                relPath: OUTPUT_FILE_NAME,
+                normalizedPath: OUTPUT_FILE_PATH,
             };
         }
 
@@ -589,6 +648,7 @@ export class VirtualFileSystem {
     private allMounts(): VfsMount[] {
         return [
             this.workspaceMount,
+            this.outputMount,
             this.variablesMount,
             this.characterMount,
             this.personaMount,
@@ -623,6 +683,9 @@ export class VirtualFileSystem {
     private selectMountsForPrefix(prefix: string): VfsMount[] {
         if (prefix === '/') {
             return this.allMounts();
+        }
+        if (prefix === OUTPUT_FILE_PATH) {
+            return [this.outputMount];
         }
         if (prefix === `/${STATE_MOUNT}/${VARIABLES_FILE_NAME}`) {
             return [this.variablesMount];

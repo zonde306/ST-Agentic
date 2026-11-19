@@ -536,6 +536,83 @@ export class ChatDataStore {
     }
 
     /**
+     * Deep-clone all pending staged entries applicable to `target`
+     * (merging unbound pre-message staging with `target`'s branch bucket so
+     * target entries override unbound ones).
+     */
+    snapshotStagedData(target: MessageTarget): NamespaceDataMap {
+        assertValidTarget(target);
+
+        const metadata = this.bridge.getMetadata();
+        const buckets = this.getStagingBuckets(metadata, false);
+        if (!buckets || buckets.size === 0) {
+            return {};
+        }
+
+        const merged: NamespaceDataMap = {};
+        const mergeBucket = (bucket: NamespaceDataMap | undefined) => {
+            if (!bucket) {
+                return;
+            }
+            for (const [ns, entries] of Object.entries(bucket)) {
+                if (!entries || typeof entries !== 'object' || Array.isArray(entries)) {
+                    continue;
+                }
+                for (const [key, entry] of Object.entries(entries)) {
+                    if (!entry || typeof entry !== 'object') {
+                        continue;
+                    }
+                    if (!merged[ns]) {
+                        merged[ns] = {};
+                    }
+                    merged[ns][key] = canonicalClone(entry);
+                }
+            }
+        };
+
+        mergeBucket(buckets.get(UNBOUND_STAGED_KEY));
+        mergeBucket(buckets.get(toBranchKey(target)));
+        return canonicalClone(merged);
+    }
+
+    /**
+     * Restore a previously captured staged snapshot into `target`'s pending bucket
+     * (clearing any stale unbound and target-branch staged buckets first).
+     */
+    restoreStagedData(target: MessageTarget, snapshot: NamespaceDataMap): void {
+        assertValidTarget(target);
+
+        const metadata = this.bridge.getMetadata();
+        const buckets = this.getStagingBuckets(metadata, true);
+        const branchKey = toBranchKey(target);
+
+        buckets.delete(UNBOUND_STAGED_KEY);
+        buckets.delete(branchKey);
+
+        const restored: NamespaceDataMap = {};
+        if (snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot)) {
+            for (const [ns, entries] of Object.entries(snapshot)) {
+                if (!entries || typeof entries !== 'object' || Array.isArray(entries)) {
+                    continue;
+                }
+                for (const [key, entry] of Object.entries(entries)) {
+                    if (!entry || typeof entry !== 'object') {
+                        continue;
+                    }
+                    if (!restored[ns]) {
+                        restored[ns] = {};
+                    }
+                    restored[ns][key] = canonicalClone(entry);
+                }
+            }
+        }
+
+        if (countBucketEntries(restored) > 0) {
+            buckets.set(branchKey, restored);
+        }
+    }
+
+    /**
      * Remove all committed layers and pending staged buckets for messages `>= messageId`
      * across all swipe branches (used on message deletion and regeneration).
      */

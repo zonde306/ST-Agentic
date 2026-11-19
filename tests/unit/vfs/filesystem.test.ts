@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { RawLoreEntry } from '@/core/types';
 import {
+    OUTPUT_FILE_PATH,
+    VfsError,
     VfsInvalidPathError,
     VfsNotFoundError,
     VfsReadOnlyError,
@@ -251,5 +253,80 @@ describe('VirtualFileSystem', () => {
             VfsInvalidPathError,
         );
         await expect(vfs.globFiles('/lorebooks/../**/*.md')).rejects.toBeInstanceOf(VfsInvalidPathError);
+    });
+
+    it('mounts /output.md with strict non-inheritance across floors/swipes, pre-create buffers, and appendFile', async () => {
+        const bridge = createFixtureBridge();
+        const vfs = new VirtualFileSystem({ bridge });
+
+        // Root listDir surfaces output.md alongside mount directories
+        const rootEntries = await vfs.listDir('/');
+        const outputStat = rootEntries.find((e) => e.name === 'output.md');
+        expect(outputStat).toMatchObject({
+            path: OUTPUT_FILE_PATH,
+            name: 'output.md',
+            kind: 'file',
+            writable: true,
+            mount: 'output',
+        });
+
+        // Strict non-layered reads: swipe 0, swipe 1, and non-existent message 2 never inherit from message 1
+        expect(await vfs.readFile('/output.md', { target: { messageId: 1, swipeId: 0 } })).toBe('reply s0');
+        expect(await vfs.readFile('output.md', { target: { messageId: 1, swipeId: 1 } })).toBe('reply s1');
+        expect(await vfs.readFile('/output.md', { target: { messageId: 2, swipeId: 0 } })).toBe('');
+        expect(await vfs.readFile('/output.md', { target: { messageId: 1, swipeId: 5 } })).toBe('');
+
+        // Write, verbatim append (no auto-newline), edit, and delete on exact branch
+        await vfs.writeFile('/output.md', '第一段', { target: { messageId: 1, swipeId: 0 } });
+        await vfs.appendFile('/output.md', '，紧接续写。', { target: { messageId: 1, swipeId: 0 } });
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe('第一段，紧接续写。');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 1 })).toBe('reply s1');
+
+        const editRes = await vfs.editFile('/output.md', '紧接续写', '原地修正', {
+            target: { messageId: 1, swipeId: 0 },
+        });
+        expect(editRes.ok).toBe(true);
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe('第一段，原地修正。');
+
+        expect(await vfs.deleteFile('/output.md', { target: { messageId: 1, swipeId: 0 } })).toBe(true);
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe('');
+
+        // Companion before_turn pre-create buffer when target message doesn't exist yet
+        const preTarget = { messageId: 2, swipeId: 0 };
+        await vfs.writeFile('/output.md', '前置', { target: preTarget });
+        await vfs.appendFile('/output.md', '状态栏', { target: preTarget });
+        expect(vfs.peekPreCreateBuffer(preTarget)).toBe('前置状态栏');
+        expect(await vfs.readFile('/output.md', { target: preTarget })).toBe('前置状态栏');
+        expect(await vfs.editFile('/output.md', '状态栏', '提示卡', { target: preTarget })).toMatchObject({
+            ok: true,
+        });
+        expect(vfs.flushPreCreateBuffer(preTarget)).toBe('前置提示卡');
+        expect(vfs.peekPreCreateBuffer(preTarget)).toBeUndefined();
+
+        // clearPreCreateBuffersFrom prunes >= messageId without touching earlier targets
+        await vfs.writeFile('/output.md', 'buf2', { target: { messageId: 2, swipeId: 0 } });
+        await vfs.writeFile('/output.md', 'buf3', { target: { messageId: 3, swipeId: 0 } });
+        vfs.clearPreCreateBuffersFrom(3);
+        expect(vfs.peekPreCreateBuffer({ messageId: 2, swipeId: 0 })).toBe('buf2');
+        expect(vfs.peekPreCreateBuffer({ messageId: 3, swipeId: 0 })).toBeUndefined();
+
+        // Once host creates message 2, readFile/writeFile sync directly and clear stale pre-create buffer
+        bridge.pushMessage({ name: 'Assistant', isUser: false, mes: 'host created' });
+        expect(await vfs.readFile('/output.md', { target: preTarget })).toBe('host created');
+        expect(vfs.peekPreCreateBuffer(preTarget)).toBeUndefined();
+
+        // Workspace appendFile & read-only mount rejection
+        await vfs.appendFile('/memory/stream.md', 'A');
+        await vfs.appendFile('/memory/stream.md', 'B');
+        expect(await vfs.readFile('/memory/stream.md')).toBe('AB');
+        await expect(vfs.appendFile('/skills/rune-decode.md', 'hack')).rejects.toBeInstanceOf(VfsReadOnlyError);
+
+        // Empty chat without target throws EINVAL on writeFile and returns '' on readFile
+        const emptyVfs = new VirtualFileSystem({ bridge: new MemoryHostBridge() });
+        expect(await emptyVfs.readFile('/output.md')).toBe('');
+        await expect(emptyVfs.writeFile('/output.md', 'x')).rejects.toMatchObject({
+            code: 'EINVAL',
+        });
+        await expect(emptyVfs.writeFile('/output.md', 'x')).rejects.toBeInstanceOf(VfsError);
     });
 });
