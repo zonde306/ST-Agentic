@@ -666,4 +666,122 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
             expect(rect.height).toBeGreaterThanOrEqual(40);
         }
     });
+
+    it('renders <agentic-capsule> status="interrupted", auto_hide retention, >=40x40px resume touch target, and /output.md filter across desktop (1280x800) and mobile (390x844)', async () => {
+        for (const vp of [
+            { label: 'desktop', width: 1280, height: 800, isMobile: false },
+            { label: 'mobile', width: 390, height: 844, isMobile: true },
+        ]) {
+            await page.viewport(vp.width, vp.height);
+            activeHarness = createHarness({ initialTab: 'files', initialOpen: true });
+            await settleLayout(5);
+
+            const { dialog, shadowRoot } = getShellElements();
+
+            // 1. Verify FilesOverridesView displays '输出 (/output.md)' filter pill and renders cleanly
+            const outputFilterBtn = Array.from(shadowRoot.querySelectorAll('button')).find(
+                (btn) => btn.textContent?.trim() === '输出 (/output.md)',
+            ) as HTMLButtonElement | undefined;
+            expect(outputFilterBtn, `${vp.label}: expected 输出 (/output.md) filter pill`).toBeTruthy();
+            expect(isElementVisible(outputFilterBtn!)).toBe(true);
+            outputFilterBtn!.click();
+            await settleLayout(4);
+
+            const outputListItem = Array.from(shadowRoot.querySelectorAll('.ag-list-item')).find(
+                (el) => el.textContent?.includes('/output.md'),
+            ) as HTMLButtonElement | undefined;
+            expect(outputListItem, `${vp.label}: expected /output.md entry under 输出 filter`).toBeTruthy();
+            outputListItem!.click();
+            await settleLayout(4);
+
+            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:files:output_md`);
+            assertInteractiveTargetsAndTypography(shadowRoot, `${vp.label}:files:output_md`);
+            expect(shadowRoot.textContent).toContain('/output.md');
+
+            if (vp.isMobile) {
+                const backBtn = shadowRoot.querySelector('.ag-stack-back-btn') as HTMLButtonElement | null;
+                expect(backBtn, `${vp.label}: expected [← 返回列表] back button`).toBeTruthy();
+                backBtn!.click();
+                await settleLayout(4);
+            }
+
+            // 2. Close <dialog id="agentic-app"> and inspect <agentic-capsule> in status="interrupted"
+            activeHarness.store.closeConsole();
+            await settleLayout(3);
+            expect(dialog.open).toBe(false);
+
+            const onResumeSpy = vi.fn(async () => undefined);
+            activeHarness.store.setBackgroundTasks([]);
+            const baseTrace = activeHarness.store.getSnapshot().traces[0];
+            activeHarness.store.upsertTrace({
+                ...baseTrace,
+                status: 'completed',
+                interruptedReason: undefined,
+            });
+            await activeHarness.store.updateSettings((prev) => ({
+                ...prev,
+                capsulePersistMode: 'auto_hide',
+            }));
+            await settleLayout(3);
+
+            // Baseline: 'done' under auto_hide is hidden
+            expect(activeHarness.capsule.getAttribute('data-hidden')).toBe('true');
+
+            // Interrupted state under auto_hide MUST remain visible
+            activeHarness.store.upsertTrace({
+                ...baseTrace,
+                status: 'interrupted',
+                interruptedReason: 'user_stop',
+            });
+            activeHarness.capsule.setState({
+                canResume: true,
+                onResume: onResumeSpy,
+            });
+            await settleLayout(4);
+
+            expect(activeHarness.capsule.getAttribute('data-hidden')).toBe('false');
+            expect(isElementVisible(activeHarness.capsule)).toBe(true);
+
+            const capShadow = activeHarness.capsule.shadowRoot!;
+            const capShell = capShadow.querySelector('.cap-shell') as HTMLDivElement;
+            expect(capShell.getAttribute('data-status')).toBe('interrupted');
+            expect(
+                capShell.scrollWidth,
+                `${vp.label}: capsule horizontal overflow (${capShell.scrollWidth} > ${capShell.clientWidth})`,
+            ).toBeLessThanOrEqual(capShell.clientWidth + 1);
+
+            const resumeBtn = capShadow.querySelector('[data-action="resume"]') as HTMLButtonElement | null;
+            expect(resumeBtn, `${vp.label}: expected [data-action="resume"] button`).toBeTruthy();
+            expect(resumeBtn!.classList.contains('cap-resume-btn')).toBe(true);
+            expect(resumeBtn!.textContent?.trim()).toBe('↻ 恢复');
+            expect(resumeBtn!.hidden).toBe(false);
+            expect(isElementVisible(resumeBtn!)).toBe(true);
+
+            const resumeRect = resumeBtn!.getBoundingClientRect();
+            expect(
+                resumeRect.width,
+                `${vp.label}: resume button width (${resumeRect.width}px) must be >= 40px`,
+            ).toBeGreaterThanOrEqual(40);
+            expect(
+                resumeRect.height,
+                `${vp.label}: resume button height (${resumeRect.height}px) must be >= 40px`,
+            ).toBeGreaterThanOrEqual(40);
+
+            if (vp.isMobile) {
+                const capSummary = capShadow.querySelector('.cap-summary') as HTMLSpanElement;
+                const capSummaryStyle = window.getComputedStyle(capSummary);
+                expect(capSummaryStyle.whiteSpace).toBe('nowrap');
+                expect(capSummaryStyle.textOverflow).toBe('ellipsis');
+            }
+
+            // Clicking [data-action="resume"] invokes onResume without opening <dialog id="agentic-app">
+            resumeBtn!.click();
+            await settleLayout(3);
+            expect(onResumeSpy).toHaveBeenCalledTimes(1);
+            expect(dialog.open).toBe(false);
+
+            activeHarness.cleanup();
+            activeHarness = null;
+        }
+    });
 });

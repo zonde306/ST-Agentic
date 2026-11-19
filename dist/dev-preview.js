@@ -34,12 +34,12 @@ const DEFAULT_WATERMARK = {
   high: 36000,
   low: 18000
 };
-const DEFAULT_MAIN_AGENT_TOOLS = ['list_dir', 'glob_files', 'grep_search', 'search_files', 'read_file', 'read_variables', 'search_history', 'read_history'];
+const DEFAULT_MAIN_AGENT_TOOLS = ['list_dir', 'glob_files', 'grep_search', 'search_files', 'read_file', 'write_file', 'append_file', 'edit_file', 'read_variables', 'search_history', 'read_history'];
 const DEFAULT_MAIN_AGENT_PERMISSIONS = {
   read: ['/**'],
-  write: ['/memory/**', '/scratch/**']
+  write: ['/output.md', '/memory/**', '/scratch/**']
 };
-const DEFAULT_SYSTEM_BASE_PROMPT = ['You operate on top of a Virtual File System (VFS) mounting /character/, /persona/, /lorebooks/, /skills/, /preset/, /state/variables.json, and /history/.', 'This workspace may represent a single-character roleplay, a multi-character ensemble, or an open world simulation; follow the system rules and core manifest rather than assuming a single fixed persona.', 'Retrieve details on demand via read_file, search_files, grep_search, and list_dir before asserting specific lore, character history, or state values.', 'Treat <lore-hint> entries as literal keyword suggestions and read only the files relevant to the current scene.'].join('\n');
+const DEFAULT_SYSTEM_BASE_PROMPT = ['You operate on top of a Virtual File System (VFS) mounting /output.md, /character/, /persona/, /lorebooks/, /skills/, /preset/, /state/variables.json, and /history/.', 'This workspace may represent a single-character roleplay, a multi-character ensemble, or an open world simulation; follow the system rules and core manifest rather than assuming a single fixed persona.', 'Retrieve details on demand via read_file, search_files, grep_search, and list_dir before asserting specific lore, character history, or state values.', 'Treat <lore-hint> entries as literal keyword suggestions and read only the files relevant to the current scene.', 'Output Protocol: Plain assistant text is strictly internal (for planning, tool reasoning, or review notes) and is NEVER displayed to the user.', 'Write your complete user-facing response to /output.md via write_file (or chunked append_file). After writing /output.md, review it in-turn for canon consistency, formatting tags, character voice, and state accuracy, fix any errors in-place via edit_file("/output.md", ...), and finish only once /output.md is ready.'].join('\n');
 function createDefaultPromptBlocks() {
   return [{
     id: 'system_base',
@@ -983,6 +983,19 @@ function normalizeWIRouterOverrides(raw) {
   }
   return result;
 }
+const LEGACY_DEFAULT_MAIN_TOOLS = ['list_dir', 'glob_files', 'grep_search', 'search_files', 'read_file', 'read_variables', 'search_history', 'read_history'];
+const OUTPUT_WRITE_TOOLS = ['write_file', 'append_file', 'edit_file'];
+const LEGACY_DEFAULT_MAIN_WRITE_PERMISSIONS = ['/memory/**', '/scratch/**'];
+function hasExactStringSet(actual, expected) {
+  if (actual.length !== expected.length) {
+    return false;
+  }
+  const actualSet = new Set(actual);
+  if (actualSet.size !== expected.length) {
+    return false;
+  }
+  return expected.every(item => actualSet.has(item));
+}
 
 /** Normalize an untrusted preset object into a valid `Preset` with a guaranteed main agent. */
 function normalizePreset(input) {
@@ -991,6 +1004,7 @@ function normalizePreset(input) {
   const id = sanitizeName(raw.id, fallbackId);
   const name = sanitizeName(raw.name, id === _defaults__WEBPACK_IMPORTED_MODULE_1__.DEFAULT_PRESET_ID ? 'Default' : id);
   const agents = {};
+  const rawAgentsById = {};
   if (isPlainRecord(raw.agents)) {
     for (const [agentKey, agentVal] of Object.entries(raw.agents)) {
       if (!isPlainRecord(agentVal)) {
@@ -998,6 +1012,7 @@ function normalizePreset(input) {
       }
       const profile = normalizeAgentProfile(agentVal, sanitizeName(agentKey, _defaults__WEBPACK_IMPORTED_MODULE_1__.DEFAULT_MAIN_AGENT_ID));
       agents[profile.id] = profile;
+      rawAgentsById[profile.id] = agentVal;
     }
   }
   let mainAgentId = sanitizeName(raw.mainAgentId, _defaults__WEBPACK_IMPORTED_MODULE_1__.DEFAULT_MAIN_AGENT_ID);
@@ -1013,6 +1028,30 @@ function normalizePreset(input) {
   const regexRules = Array.isArray(raw.regexRules) ? raw.regexRules.filter(isPlainRecord).map((r, idx) => normalizeRegexRule(r, `regex_${idx + 1}`, `Regex ${idx + 1}`)) : [];
   const customTools = Array.isArray(raw.customTools) ? raw.customTools.filter(isPlainRecord).map((tool, idx) => normalizeCustomToolConfig(tool, `tool_${idx + 1}`)) : [];
   const builtinToolSettings = normalizeBuiltinToolSettings(raw.builtinToolSettings);
+  const rawMainAgent = rawAgentsById[mainAgentId];
+  if (rawMainAgent && agents[mainAgentId]) {
+    const mainAgent = agents[mainAgentId];
+    const omittedTools = rawMainAgent.enabledTools === undefined;
+    if (omittedTools || hasExactStringSet(mainAgent.enabledTools, LEGACY_DEFAULT_MAIN_TOOLS)) {
+      const toolSet = new Set(mainAgent.enabledTools);
+      for (const tool of OUTPUT_WRITE_TOOLS) {
+        if (builtinToolSettings?.[tool]?.enabled === false) {
+          continue;
+        }
+        toolSet.add(tool);
+      }
+      mainAgent.enabledTools = Array.from(toolSet);
+    }
+    const omittedPermissions = !isPlainRecord(rawMainAgent.permissions) || rawMainAgent.permissions.write === undefined;
+    if (omittedPermissions || hasExactStringSet(mainAgent.permissions.write, LEGACY_DEFAULT_MAIN_WRITE_PERMISSIONS)) {
+      if (!mainAgent.permissions.write.includes('/output.md')) {
+        mainAgent.permissions = {
+          read: mainAgent.permissions.read,
+          write: ['/output.md', ...mainAgent.permissions.write]
+        };
+      }
+    }
+  }
   return {
     id,
     name,
@@ -4316,6 +4355,76 @@ class ChatDataStore {
   }
 
   /**
+   * Deep-clone all pending staged entries applicable to `target`
+   * (merging unbound pre-message staging with `target`'s branch bucket so
+   * target entries override unbound ones).
+   */
+  snapshotStagedData(target) {
+    assertValidTarget(target);
+    const metadata = this.bridge.getMetadata();
+    const buckets = this.getStagingBuckets(metadata, false);
+    if (!buckets || buckets.size === 0) {
+      return {};
+    }
+    const merged = {};
+    const mergeBucket = bucket => {
+      if (!bucket) {
+        return;
+      }
+      for (const [ns, entries] of Object.entries(bucket)) {
+        if (!entries || typeof entries !== 'object' || Array.isArray(entries)) {
+          continue;
+        }
+        for (const [key, entry] of Object.entries(entries)) {
+          if (!entry || typeof entry !== 'object') {
+            continue;
+          }
+          if (!merged[ns]) {
+            merged[ns] = {};
+          }
+          merged[ns][key] = (0,_core_utils__WEBPACK_IMPORTED_MODULE_1__.canonicalClone)(entry);
+        }
+      }
+    };
+    mergeBucket(buckets.get(UNBOUND_STAGED_KEY));
+    mergeBucket(buckets.get((0,_core_types__WEBPACK_IMPORTED_MODULE_0__.toBranchKey)(target)));
+    return (0,_core_utils__WEBPACK_IMPORTED_MODULE_1__.canonicalClone)(merged);
+  }
+
+  /**
+   * Restore a previously captured staged snapshot into `target`'s pending bucket
+   * (clearing any stale unbound and target-branch staged buckets first).
+   */
+  restoreStagedData(target, snapshot) {
+    assertValidTarget(target);
+    const metadata = this.bridge.getMetadata();
+    const buckets = this.getStagingBuckets(metadata, true);
+    const branchKey = (0,_core_types__WEBPACK_IMPORTED_MODULE_0__.toBranchKey)(target);
+    buckets.delete(UNBOUND_STAGED_KEY);
+    buckets.delete(branchKey);
+    const restored = {};
+    if (snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot)) {
+      for (const [ns, entries] of Object.entries(snapshot)) {
+        if (!entries || typeof entries !== 'object' || Array.isArray(entries)) {
+          continue;
+        }
+        for (const [key, entry] of Object.entries(entries)) {
+          if (!entry || typeof entry !== 'object') {
+            continue;
+          }
+          if (!restored[ns]) {
+            restored[ns] = {};
+          }
+          restored[ns][key] = (0,_core_utils__WEBPACK_IMPORTED_MODULE_1__.canonicalClone)(entry);
+        }
+      }
+    }
+    if (countBucketEntries(restored) > 0) {
+      buckets.set(branchKey, restored);
+    }
+  }
+
+  /**
    * Remove all committed layers and pending staged buckets for messages `>= messageId`
    * across all swipe branches (used on message deletion and regeneration).
    */
@@ -5512,14 +5621,14 @@ __webpack_require__.r(__webpack_exports__);
 
 
 
-const BUILTIN_TOOL_NAMES = ['list_dir', 'glob_files', 'grep_search', 'search_files', 'read_file', 'write_file', 'edit_file', 'read_variables', 'patch_variables', 'search_history', 'read_history', 'append_reply_view', 'replace_reply_view', 'attach_media'];
-/** Instantiate all 14 built-in ST-Agentic tool definitions. */
+const BUILTIN_TOOL_NAMES = ['list_dir', 'glob_files', 'grep_search', 'search_files', 'read_file', 'write_file', 'append_file', 'edit_file', 'read_variables', 'patch_variables', 'search_history', 'read_history', 'append_reply_view', 'replace_reply_view', 'attach_media'];
+/** Instantiate all 15 built-in ST-Agentic tool definitions. */
 function createBuiltinTools() {
   let options = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
   return [...(0,_fs_tools__WEBPACK_IMPORTED_MODULE_2__.createFsTools)(), ...(0,_vars_tools__WEBPACK_IMPORTED_MODULE_7__.createVariableTools)(options), ...(0,_history_tools__WEBPACK_IMPORTED_MODULE_3__.createHistoryTools)(), ...(0,_message_tools__WEBPACK_IMPORTED_MODULE_4__.createMessageTools)()];
 }
 
-/** Create a `ToolRegistry` pre-populated with all 14 built-in tools. */
+/** Create a `ToolRegistry` pre-populated with all 15 built-in tools. */
 function createBuiltinToolRegistry() {
   let options = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
   return new _registry__WEBPACK_IMPORTED_MODULE_5__.ToolRegistry(createBuiltinTools(options));
@@ -5556,7 +5665,8 @@ function createToolExecutionContext(options) {
     getSchema: options.getVariableSchema
   });
   const message = new _message_tools__WEBPACK_IMPORTED_MODULE_4__.ChatMessageViewAdapter(options.bridge, store, target, signal, {
-    staged: options.staged
+    staged: options.staged,
+    vfs
   });
   const st = {
     async slash(cmd) {
@@ -5852,8 +5962,12 @@ const READ_FILE_SCHEMA = zod__WEBPACK_IMPORTED_MODULE_1__.object({
   end_line: zod__WEBPACK_IMPORTED_MODULE_1__.number().int().min(1).optional().describe('Optional 1-based inclusive end line for partial reads.')
 });
 const WRITE_FILE_SCHEMA = zod__WEBPACK_IMPORTED_MODULE_1__.object({
-  path: zod__WEBPACK_IMPORTED_MODULE_1__.string().min(1).describe('Target VFS path, e.g. "/memory/notes.md", "/global/prefs.md", or "/lorebooks/<book>/<entry>.md".'),
+  path: zod__WEBPACK_IMPORTED_MODULE_1__.string().min(1).describe('Target VFS path, e.g. "/output.md", "/memory/notes.md", "/global/prefs.md", or "/lorebooks/<book>/<entry>.md".'),
   content: zod__WEBPACK_IMPORTED_MODULE_1__.string().describe('Full replacement content to write to the file.')
+});
+const APPEND_FILE_SCHEMA = zod__WEBPACK_IMPORTED_MODULE_1__.object({
+  content: zod__WEBPACK_IMPORTED_MODULE_1__.string().describe('Content to append verbatim to the end of the target file.'),
+  path: zod__WEBPACK_IMPORTED_MODULE_1__.string().min(1).describe('Writable VFS file path (e.g. "/output.md" or "/memory/notes.md").')
 });
 const EDIT_FILE_SCHEMA = zod__WEBPACK_IMPORTED_MODULE_1__.object({
   path: zod__WEBPACK_IMPORTED_MODULE_1__.string().min(1).describe('VFS file path to edit.'),
@@ -5861,7 +5975,7 @@ const EDIT_FILE_SCHEMA = zod__WEBPACK_IMPORTED_MODULE_1__.object({
   replace: zod__WEBPACK_IMPORTED_MODULE_1__.string().describe('Replacement text. Use an empty string "" to delete the matched snippet.')
 });
 
-/** Create the 7 built-in VFS tools backed by `ctx.fs` (`ScopedToolGuard`). */
+/** Create the 8 built-in VFS tools backed by `ctx.fs` (`ScopedToolGuard`). */
 function createFsTools() {
   const listDirTool = {
     name: 'list_dir',
@@ -5982,7 +6096,7 @@ function createFsTools() {
           const raw = await ctx.fs.read(normalizedPath);
           content = hasRange ? (0,_core_vfs__WEBPACK_IMPORTED_MODULE_3__.sliceLines)(raw, args.start_line, args.end_line) : raw;
         }
-        if (ctx.readSet && !hasRange) {
+        if (ctx.readSet && !hasRange && normalizedPath !== _core_vfs__WEBPACK_IMPORTED_MODULE_3__.OUTPUT_FILE_PATH) {
           const hashable = extractHashableBody(normalizedPath, content);
           const digest = await (0,_core_utils__WEBPACK_IMPORTED_MODULE_2__.hashText)(hashable);
           ctx.readSet.set(normalizedPath, digest);
@@ -6007,6 +6121,39 @@ function createFsTools() {
           ok: true,
           path: normalizedPath,
           bytes: (0,_core_vfs__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(args.content),
+          target: ctx.target
+        });
+      } catch (error) {
+        return formatFsError(error, ctx.signal);
+      }
+    }
+  };
+  const appendFileTool = {
+    name: 'append_file',
+    description: 'Append content verbatim to the end of a writable VFS file bound to the current causal branch target (e.g. "/output.md" or "/memory/notes.md").',
+    parameters: APPEND_FILE_SCHEMA,
+    source: 'builtin',
+    async execute(args, ctx) {
+      (0,_script_sandbox__WEBPACK_IMPORTED_MODULE_4__.throwIfAborted)(ctx.signal);
+      try {
+        const normalizedPath = (0,_core_utils__WEBPACK_IMPORTED_MODULE_2__.normalizeVfsPath)(args.path);
+        if (typeof ctx.fs.append === 'function') {
+          await ctx.fs.append(normalizedPath, args.content);
+        } else {
+          let existing = '';
+          try {
+            existing = await ctx.fs.read(normalizedPath);
+          } catch (error) {
+            if (!(error instanceof _core_vfs__WEBPACK_IMPORTED_MODULE_3__.VfsError && error.code === 'ENOENT') && !/not found|missing|enoent/i.test(error?.message ?? '')) {
+              throw error;
+            }
+          }
+          await ctx.fs.write(normalizedPath, `${existing}${args.content}`);
+        }
+        return JSON.stringify({
+          ok: true,
+          path: normalizedPath,
+          appendedBytes: (0,_core_vfs__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(args.content),
           target: ctx.target
         });
       } catch (error) {
@@ -6042,7 +6189,7 @@ function createFsTools() {
       }
     }
   };
-  return [listDirTool, globFilesTool, grepSearchTool, searchFilesTool, readFileTool, writeFileTool, editFileTool];
+  return [listDirTool, globFilesTool, grepSearchTool, searchFilesTool, readFileTool, writeFileTool, appendFileTool, editFileTool];
 }
 
 /***/ },
@@ -6297,7 +6444,7 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   createMessageTools: () => (/* binding */ createMessageTools)
 /* harmony export */ });
 /* harmony import */ var zod__WEBPACK_IMPORTED_MODULE_0__ = /*#__PURE__*/__webpack_require__(/*! zod */ "./node_modules/zod/v4/classic/schemas.js");
-/* harmony import */ var _core_store__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! @/core/store */ "./src/core/store/index.ts");
+/* harmony import */ var _core_vfs__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! @/core/vfs */ "./src/core/vfs/index.ts");
 /* harmony import */ var _script_sandbox__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ./script-sandbox */ "./src/core/tools/script-sandbox.ts");
 
 
@@ -6313,41 +6460,41 @@ function assertValidMessageTarget(target) {
 }
 /**
  * `ToolMessageApi` adapter strictly bound to a frozen `MessageTarget` and `AbortSignal`.
- * Writes display overrides exclusively into `ChatDataStore`'s non-layered `message`
- * namespace (preserving raw chat history and Prefix KV Cache) and notifies `HostBridge`.
+ * Reads and writes `/output.md` (real host `chat[messageId]` / `swipes[swipeId]` via VFS
+ * or `HostBridge.readChatMessage`/`writeChatMessage`) and triggers `refreshMessageView`.
  */
 class ChatMessageViewAdapter {
-  constructor(bridge, store, target, signal) {
+  constructor(bridge, _store, target, signal) {
     let options = arguments.length > 4 && arguments[4] !== undefined ? arguments[4] : {};
     this.bridge = bridge;
-    this.store = store;
     this.signal = signal;
     this.target = {
       messageId: target.messageId,
       swipeId: target.swipeId
     };
     this.staged = options.staged === true;
+    this.vfs = options.vfs;
   }
   async appendView(text) {
     ;(0,_script_sandbox__WEBPACK_IMPORTED_MODULE_2__.throwIfAborted)(this.signal);
     const boundTarget = assertValidMessageTarget(this.target);
-    const existing = this.store.get(_core_store__WEBPACK_IMPORTED_MODULE_1__.DATA_NAMESPACES.MESSAGE, _core_store__WEBPACK_IMPORTED_MODULE_1__.MESSAGE_OVERRIDE_KEY, {
-      target: boundTarget,
-      includeStaged: this.staged
-    });
-    let baseText;
-    if (existing) {
-      baseText = existing.content;
-    } else {
-      const msg = this.bridge.getChat()[boundTarget.messageId];
-      baseText = msg?.swipes?.[boundTarget.swipeId] ?? msg?.mes ?? '';
-    }
-    const nextText = !baseText ? text : baseText.endsWith('\n') || text.startsWith('\n') ? `${baseText}${text}` : `${baseText}\n${text}`;
-    (0,_script_sandbox__WEBPACK_IMPORTED_MODULE_2__.throwIfAborted)(this.signal);
-    this.store.set(_core_store__WEBPACK_IMPORTED_MODULE_1__.DATA_NAMESPACES.MESSAGE, _core_store__WEBPACK_IMPORTED_MODULE_1__.MESSAGE_OVERRIDE_KEY, 'append_reply_view', nextText, {
+    const baseText = this.vfs ? await this.vfs.readFile(_core_vfs__WEBPACK_IMPORTED_MODULE_1__.OUTPUT_FILE_PATH, {
       target: boundTarget,
       staged: this.staged
-    });
+    }) : this.bridge.readChatMessage(boundTarget) ?? '';
+    const nextText = !baseText ? text : baseText.endsWith('\n') || text.startsWith('\n') ? `${baseText}${text}` : `${baseText}\n${text}`;
+    (0,_script_sandbox__WEBPACK_IMPORTED_MODULE_2__.throwIfAborted)(this.signal);
+    if (this.vfs) {
+      await this.vfs.writeFile(_core_vfs__WEBPACK_IMPORTED_MODULE_1__.OUTPUT_FILE_PATH, nextText, {
+        target: boundTarget,
+        staged: this.staged,
+        source: 'append_reply_view'
+      });
+    } else {
+      await this.bridge.writeChatMessage(boundTarget, nextText, {
+        emitEvent: false
+      });
+    }
     await this.bridge.refreshMessageView({
       ...boundTarget
     });
@@ -6356,10 +6503,17 @@ class ChatMessageViewAdapter {
   async replaceView(text) {
     ;(0,_script_sandbox__WEBPACK_IMPORTED_MODULE_2__.throwIfAborted)(this.signal);
     const boundTarget = assertValidMessageTarget(this.target);
-    this.store.set(_core_store__WEBPACK_IMPORTED_MODULE_1__.DATA_NAMESPACES.MESSAGE, _core_store__WEBPACK_IMPORTED_MODULE_1__.MESSAGE_OVERRIDE_KEY, 'replace_reply_view', text, {
-      target: boundTarget,
-      staged: this.staged
-    });
+    if (this.vfs) {
+      await this.vfs.writeFile(_core_vfs__WEBPACK_IMPORTED_MODULE_1__.OUTPUT_FILE_PATH, text, {
+        target: boundTarget,
+        staged: this.staged,
+        source: 'replace_reply_view'
+      });
+    } else {
+      await this.bridge.writeChatMessage(boundTarget, text, {
+        emitEvent: false
+      });
+    }
     await this.bridge.refreshMessageView({
       ...boundTarget
     });
@@ -8528,6 +8682,7 @@ function buildSnippet(content, matchedTerms) {
  *
  * Mounts:
  * - `/` workspace root (`rw`, `files` namespace)
+ * - `/output.md` (`rw`, non-layered per-target host chat message output)
  * - `/state/variables.json` (`rw`, `variables` namespace, aligned with `[InitVar]` / legacy)
  * - `/character/*` (`ro` snapshot + `character-files` overlay)
  * - `/persona/*` (`ro` snapshot + `persona-files` overlay)
@@ -8544,6 +8699,7 @@ class VirtualFileSystem {
     this.defaultTarget = options.defaultTarget;
     this.defaultStaged = options.defaultStaged;
     this.workspaceMount = new _fs_mounts__WEBPACK_IMPORTED_MODULE_5__.WorkspaceMount(this.store);
+    this.outputMount = new _fs_mounts__WEBPACK_IMPORTED_MODULE_5__.OutputMount(this.bridge);
     this.variablesMount = new _fs_mounts__WEBPACK_IMPORTED_MODULE_5__.VariablesMount(this.bridge, this.store);
     this.characterMount = new _fs_mounts__WEBPACK_IMPORTED_MODULE_5__.HybridMount(_fs_mounts__WEBPACK_IMPORTED_MODULE_5__.CHARACTER_MOUNT, () => (0,_fs_mounts__WEBPACK_IMPORTED_MODULE_5__.characterSnapshot)(this.bridge), this.store, 'character-files', () => this.bridge.getActiveIdentity().characterAvatar || 'default');
     this.personaMount = new _fs_mounts__WEBPACK_IMPORTED_MODULE_5__.HybridMount(_fs_mounts__WEBPACK_IMPORTED_MODULE_5__.PERSONA_MOUNT, () => (0,_fs_mounts__WEBPACK_IMPORTED_MODULE_5__.personaSnapshot)(this.bridge), this.store, 'persona-files', () => this.bridge.getActiveIdentity().personaAvatar || 'default');
@@ -8601,6 +8757,10 @@ class VirtualFileSystem {
       for (const item of workspaceItems) {
         mergedMap.set(item.name, item);
       }
+      const outputStat = await this.outputMount.stat('', merged);
+      if (outputStat) {
+        mergedMap.set(_fs_mounts__WEBPACK_IMPORTED_MODULE_5__.OUTPUT_FILE_NAME, outputStat);
+      }
       for (const [mountName, mount] of this.namedMounts.entries()) {
         mergedMap.set(mountName, {
           path: `/${mountName}`,
@@ -8651,6 +8811,29 @@ class VirtualFileSystem {
       throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsError(`Cannot write to directory: ${routed.normalizedPath}`, 'EISDIR', routed.normalizedPath);
     }
     await routed.mount.writeFile(routed.relPath, content, this.mergeWriteOpts(opts));
+  }
+  async appendFile(path, content, opts) {
+    const routed = this.route(path);
+    if (routed.isVirtualStateDir || !routed.relPath) {
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsError(`Cannot append to directory: ${routed.normalizedPath}`, 'EISDIR', routed.normalizedPath);
+    }
+    if (!routed.mount.writable) {
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsReadOnlyError(routed.normalizedPath);
+    }
+    const mergedWriteOpts = this.mergeWriteOpts(opts);
+    if (typeof routed.mount.appendFile === 'function') {
+      await routed.mount.appendFile(routed.relPath, content, mergedWriteOpts);
+      return;
+    }
+    let current = '';
+    try {
+      current = await routed.mount.readFile(routed.relPath, this.mergeReadOpts(opts));
+    } catch (error) {
+      if (!(error instanceof _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsNotFoundError)) {
+        throw error;
+      }
+    }
+    await routed.mount.writeFile(routed.relPath, `${current}${content}`, mergedWriteOpts);
   }
   async editFile(path, oldText, newText, opts) {
     const routed = this.route(path);
@@ -8757,6 +8940,21 @@ class VirtualFileSystem {
     return await this.historyMount.deleteInternal(relPath);
   }
 
+  /** Retrieve and clear any buffered `before_turn` `/output.md` content for `target`. */
+  flushPreCreateBuffer(target) {
+    return this.outputMount.flushPreCreateBuffer(target);
+  }
+
+  /** Inspect any buffered `before_turn` `/output.md` content for `target` without clearing it. */
+  peekPreCreateBuffer(target) {
+    return this.outputMount.peekPreCreateBuffer(target);
+  }
+
+  /** Discard all `/output.md` pre-create buffers belonging to messages `>= messageId`. */
+  clearPreCreateBuffersFrom(messageId) {
+    this.outputMount.clearPreCreateBuffersFrom(messageId);
+  }
+
   /** Create a `ScopedToolGuard` enforcing `ScopedPermissions` over this VFS. */
   createScopedGuard(permissions, opts) {
     return new _fs_scopes__WEBPACK_IMPORTED_MODULE_7__.ScopedToolGuard(this, permissions, {
@@ -8781,6 +8979,13 @@ class VirtualFileSystem {
         mount: this.variablesMount,
         relPath: _fs_mounts__WEBPACK_IMPORTED_MODULE_5__.VARIABLES_FILE_NAME,
         normalizedPath: normalized
+      };
+    }
+    if (normalized === _fs_mounts__WEBPACK_IMPORTED_MODULE_5__.OUTPUT_FILE_PATH) {
+      return {
+        mount: this.outputMount,
+        relPath: _fs_mounts__WEBPACK_IMPORTED_MODULE_5__.OUTPUT_FILE_NAME,
+        normalizedPath: _fs_mounts__WEBPACK_IMPORTED_MODULE_5__.OUTPUT_FILE_PATH
       };
     }
     if (normalized === `/${_fs_mounts__WEBPACK_IMPORTED_MODULE_5__.STATE_MOUNT}`) {
@@ -8815,7 +9020,7 @@ class VirtualFileSystem {
     };
   }
   allMounts() {
-    return [this.workspaceMount, this.variablesMount, this.characterMount, this.personaMount, this.worldInfoMount, this.skillsMount, this.presetMount, this.globalMount, this.historyMount];
+    return [this.workspaceMount, this.outputMount, this.variablesMount, this.characterMount, this.personaMount, this.worldInfoMount, this.skillsMount, this.presetMount, this.globalMount, this.historyMount];
   }
   async collectAllFileStats(opts) {
     const lists = await Promise.all(this.allMounts().map(m => m.listFiles(opts)));
@@ -8834,6 +9039,9 @@ class VirtualFileSystem {
   selectMountsForPrefix(prefix) {
     if (prefix === '/') {
       return this.allMounts();
+    }
+    if (prefix === _fs_mounts__WEBPACK_IMPORTED_MODULE_5__.OUTPUT_FILE_PATH) {
+      return [this.outputMount];
     }
     if (prefix === `/${_fs_mounts__WEBPACK_IMPORTED_MODULE_5__.STATE_MOUNT}/${_fs_mounts__WEBPACK_IMPORTED_MODULE_5__.VARIABLES_FILE_NAME}`) {
       return [this.variablesMount];
@@ -8985,7 +9193,10 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   HISTORY_MOUNT: () => (/* binding */ HISTORY_MOUNT),
 /* harmony export */   HistoryMount: () => (/* binding */ HistoryMount),
 /* harmony export */   HybridMount: () => (/* binding */ HybridMount),
+/* harmony export */   OUTPUT_FILE_NAME: () => (/* binding */ OUTPUT_FILE_NAME),
+/* harmony export */   OUTPUT_FILE_PATH: () => (/* binding */ OUTPUT_FILE_PATH),
 /* harmony export */   OVERLAY_WRITES: () => (/* binding */ OVERLAY_WRITES),
+/* harmony export */   OutputMount: () => (/* binding */ OutputMount),
 /* harmony export */   PERSONA_MOUNT: () => (/* binding */ PERSONA_MOUNT),
 /* harmony export */   PRESET_MOUNT: () => (/* binding */ PRESET_MOUNT),
 /* harmony export */   PresetMount: () => (/* binding */ PresetMount),
@@ -8999,9 +9210,11 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony import */ var core_js_modules_es_array_includes_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! core-js/modules/es.array.includes.js */ "./node_modules/core-js/modules/es.array.includes.js");
 /* harmony import */ var core_js_modules_es_array_includes_js__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(core_js_modules_es_array_includes_js__WEBPACK_IMPORTED_MODULE_0__);
 /* harmony import */ var _core_store__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! @/core/store */ "./src/core/store/index.ts");
-/* harmony import */ var _core_utils__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! @/core/utils */ "./src/core/utils/index.ts");
-/* harmony import */ var _fs_base__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! ./fs-base */ "./src/core/vfs/fs-base.ts");
-/* harmony import */ var _fs_worldinfo__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(/*! ./fs-worldinfo */ "./src/core/vfs/fs-worldinfo.ts");
+/* harmony import */ var _core_types__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! @/core/types */ "./src/core/types/index.ts");
+/* harmony import */ var _core_utils__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! @/core/utils */ "./src/core/utils/index.ts");
+/* harmony import */ var _fs_base__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(/*! ./fs-base */ "./src/core/vfs/fs-base.ts");
+/* harmony import */ var _fs_worldinfo__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(/*! ./fs-worldinfo */ "./src/core/vfs/fs-worldinfo.ts");
+
 
 
 
@@ -9014,6 +9227,8 @@ const PRESET_MOUNT = 'preset';
 const HISTORY_MOUNT = 'history';
 const STATE_MOUNT = 'state';
 const VARIABLES_FILE_NAME = 'variables.json';
+const OUTPUT_FILE_NAME = 'output.md';
+const OUTPUT_FILE_PATH = '/output.md';
 const GLOBAL_VFS_EXTENSION_KEY = 'agentic_global_files';
 const AGENTIC_HISTORY_KEY = 'agentic_history';
 
@@ -9047,7 +9262,7 @@ async function characterSnapshot(bridge) {
       continue;
     }
     const mapped = CHARACTER_FIELD_FILE_MAP[key];
-    const fileName = mapped ?? (key.endsWith('.md') ? (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sanitizeFileName)(key) : `${(0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sanitizeFileName)(key)}.md`);
+    const fileName = mapped ?? (key.endsWith('.md') ? (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sanitizeFileName)(key) : `${(0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sanitizeFileName)(key)}.md`);
     if (!files.has(fileName)) {
       files.set(fileName, value);
     }
@@ -9132,13 +9347,13 @@ function listDirFromFlatMap(entries, relDir, mountPrefix, mountName, writable) {
       path: `${basePrefix}/${fileName}`,
       name: fileName,
       kind: 'file',
-      size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(info.content),
+      size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.utf8ByteLength)(info.content),
       writable,
       mount: mountName,
       source: info.source
     });
   }
-  return (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sortStats)(stats);
+  return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sortStats)(stats);
 }
 function hasDirectoryPrefix(keys, relDir) {
   if (!relDir) {
@@ -9178,9 +9393,9 @@ class WorkspaceMount {
     if (entry) {
       return {
         path: `/${clean}`,
-        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(`/${clean}`),
+        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(`/${clean}`),
         kind: 'file',
-        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(entry.content),
+        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.utf8ByteLength)(entry.content),
         writable: true,
         mount: this.mountName,
         source: entry.source
@@ -9190,7 +9405,7 @@ class WorkspaceMount {
     if (hasDirectoryPrefix(snapshot.keys(), clean)) {
       return {
         path: `/${clean}`,
-        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(`/${clean}`),
+        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(`/${clean}`),
         kind: 'directory',
         size: 0,
         writable: true,
@@ -9208,15 +9423,15 @@ class WorkspaceMount {
     const clean = relPath.replace(/^\/+/, '');
     const entry = this.readStored(clean, opts);
     if (!entry) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsNotFoundError(`/${clean}`);
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsNotFoundError(`/${clean}`);
     }
-    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sliceLines)(entry.content, opts.startLine, opts.endLine);
+    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sliceLines)(entry.content, opts.startLine, opts.endLine);
   }
   async writeFile(relPath, content) {
     let opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
     const clean = relPath.replace(/^\/+/, '');
     if (!clean) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsError('Cannot overwrite root directory "/"', 'EISDIR', '/');
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsError('Cannot overwrite root directory "/"', 'EISDIR', '/');
     }
     const existing = this.readStored(clean, opts);
     if (existing && existing.content === content) {
@@ -9226,6 +9441,16 @@ class WorkspaceMount {
       target: opts.target,
       staged: opts.staged
     });
+  }
+  async appendFile(relPath, content) {
+    let opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+    const clean = relPath.replace(/^\/+/, '');
+    if (!clean) {
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsError('Cannot append to root directory "/"', 'EISDIR', '/');
+    }
+    const existing = this.readStored(clean, opts);
+    const nextContent = `${existing?.content ?? ''}${content}`;
+    await this.writeFile(clean, nextContent, opts);
   }
   async editFile(relPath, oldText, newText) {
     let opts = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : {};
@@ -9277,15 +9502,15 @@ class WorkspaceMount {
       const fullPath = `/${key}`;
       stats.push({
         path: fullPath,
-        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(fullPath),
+        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(fullPath),
         kind: 'file',
-        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(info.content),
+        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.utf8ByteLength)(info.content),
         writable: true,
         mount: this.mountName,
         source: info.source
       });
     }
-    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sortStats)(stats);
+    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sortStats)(stats);
   }
   async collectSearchDocs(opts) {
     const snapshot = this.snapshotMap(opts);
@@ -9294,7 +9519,7 @@ class WorkspaceMount {
       const fullPath = `/${key}`;
       docs.push({
         path: fullPath,
-        title: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(fullPath),
+        title: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(fullPath),
         content: info.content
       });
     }
@@ -9355,7 +9580,7 @@ class VariablesMount {
   }
   async writeVariables(vars) {
     let opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
-    const serialized = JSON.stringify((0,_core_utils__WEBPACK_IMPORTED_MODULE_2__.canonicalClone)(vars), null, 2);
+    const serialized = JSON.stringify((0,_core_utils__WEBPACK_IMPORTED_MODULE_3__.canonicalClone)(vars), null, 2);
     this.store.set(_core_store__WEBPACK_IMPORTED_MODULE_1__.DATA_NAMESPACES.VARIABLES, _core_store__WEBPACK_IMPORTED_MODULE_1__.VARIABLES_DOC_KEY, opts.source ?? 'vfs-vars', serialized, {
       target: opts.target,
       staged: opts.staged
@@ -9381,7 +9606,7 @@ class VariablesMount {
       path: this.canonicalPath,
       name: VARIABLES_FILE_NAME,
       kind: 'file',
-      size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(content),
+      size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.utf8ByteLength)(content),
       writable: true,
       mount: STATE_MOUNT,
       source: stored?.source ?? 'initvar'
@@ -9397,24 +9622,24 @@ class VariablesMount {
   async readFile(relPath) {
     let opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
     if (relPath !== VARIABLES_FILE_NAME) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsNotFoundError(`/${STATE_MOUNT}/${relPath}`);
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsNotFoundError(`/${STATE_MOUNT}/${relPath}`);
     }
     const content = await this.readSerialized(opts);
-    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sliceLines)(content, opts.startLine, opts.endLine);
+    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sliceLines)(content, opts.startLine, opts.endLine);
   }
   async writeFile(relPath, content) {
     let opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
     if (relPath !== VARIABLES_FILE_NAME) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsNotFoundError(`/${STATE_MOUNT}/${relPath}`);
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsNotFoundError(`/${STATE_MOUNT}/${relPath}`);
     }
     let parsed;
     try {
       parsed = JSON.parse(content);
     } catch (error) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsError(`Invalid JSON for ${this.canonicalPath}: ${error.message}`, 'EINVAL', this.canonicalPath);
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsError(`Invalid JSON for ${this.canonicalPath}: ${error.message}`, 'EINVAL', this.canonicalPath);
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsError(`${this.canonicalPath} must contain a JSON object`, 'EINVAL', this.canonicalPath);
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsError(`${this.canonicalPath} must contain a JSON object`, 'EINVAL', this.canonicalPath);
     }
     await this.writeVariables(parsed, opts);
   }
@@ -9503,7 +9728,7 @@ class VariablesMount {
       try {
         const parsed = JSON.parse(stored.content);
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          return JSON.stringify((0,_core_utils__WEBPACK_IMPORTED_MODULE_2__.canonicalClone)(parsed), null, 2);
+          return JSON.stringify((0,_core_utils__WEBPACK_IMPORTED_MODULE_3__.canonicalClone)(parsed), null, 2);
         }
       } catch {
         return stored.content;
@@ -9511,13 +9736,13 @@ class VariablesMount {
       return stored.content;
     }
     const books = await this.bridge.listEnabledLorebooks();
-    const initVars = (0,_fs_worldinfo__WEBPACK_IMPORTED_MODULE_4__.parseInitVarEntries)(books);
+    const initVars = (0,_fs_worldinfo__WEBPACK_IMPORTED_MODULE_5__.parseInitVarEntries)(books);
     const metaVars = this.store.getLegacyMetadataVariables();
     const merged = {
       ...initVars,
       ...(metaVars ?? {})
     };
-    return JSON.stringify((0,_core_utils__WEBPACK_IMPORTED_MODULE_2__.canonicalClone)(merged), null, 2);
+    return JSON.stringify((0,_core_utils__WEBPACK_IMPORTED_MODULE_3__.canonicalClone)(merged), null, 2);
   }
 }
 
@@ -9556,7 +9781,7 @@ class HybridMount {
       path: `/${this.mountName}/${relPath}`,
       name: relPath,
       kind: 'file',
-      size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(info.content),
+      size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.utf8ByteLength)(info.content),
       writable: info.writable,
       mount: this.mountName,
       source: info.source
@@ -9573,15 +9798,15 @@ class HybridMount {
     const files = await this.snapshot(opts);
     const info = files.get(relPath);
     if (!info) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsNotFoundError(`/${this.mountName}/${relPath}`);
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsNotFoundError(`/${this.mountName}/${relPath}`);
     }
-    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sliceLines)(info.content, opts.startLine, opts.endLine);
+    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sliceLines)(info.content, opts.startLine, opts.endLine);
   }
   async writeFile(relPath, content) {
     let opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
     const fullPath = `/${this.mountName}/${relPath}`;
     if (!(await this.canWrite(relPath))) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsReadOnlyError(fullPath, this.rejectionMessage(relPath));
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsReadOnlyError(fullPath, this.rejectionMessage(relPath));
     }
     this.store.set(this.namespace, this.scopedKey(relPath), opts.source ?? 'vfs', content, {
       target: opts.target,
@@ -9592,7 +9817,7 @@ class HybridMount {
     let opts = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : {};
     const fullPath = `/${this.mountName}/${relPath}`;
     if (!(await this.canWrite(relPath))) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsReadOnlyError(fullPath, this.rejectionMessage(relPath));
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsReadOnlyError(fullPath, this.rejectionMessage(relPath));
     }
     const current = this.readOverlayEntry(relPath, opts)?.content;
     if (current === undefined) {
@@ -9623,7 +9848,7 @@ class HybridMount {
     let opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
     const fullPath = `/${this.mountName}/${relPath}`;
     if (!(await this.canWrite(relPath))) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsReadOnlyError(fullPath, this.rejectionMessage(relPath));
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsReadOnlyError(fullPath, this.rejectionMessage(relPath));
     }
     return this.store.erase(this.namespace, this.scopedKey(relPath), opts.source ?? 'vfs-delete', {
       target: opts.target,
@@ -9638,13 +9863,13 @@ class HybridMount {
         path: `/${this.mountName}/${name}`,
         name,
         kind: 'file',
-        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(info.content),
+        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.utf8ByteLength)(info.content),
         writable: info.writable,
         mount: this.mountName,
         source: info.source
       });
     }
-    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sortStats)(stats);
+    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sortStats)(stats);
   }
   async collectSearchDocs(opts) {
     const files = await this.snapshot(opts);
@@ -9748,9 +9973,9 @@ class PresetMount {
     if (content !== undefined) {
       return {
         path: `/${PRESET_MOUNT}/${relPath}`,
-        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(`/${relPath}`),
+        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(`/${relPath}`),
         kind: 'file',
-        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(content),
+        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.utf8ByteLength)(content),
         writable: false,
         mount: PRESET_MOUNT,
         source: 'preset'
@@ -9759,7 +9984,7 @@ class PresetMount {
     if (hasDirectoryPrefix(map.keys(), relPath)) {
       return {
         path: `/${PRESET_MOUNT}/${relPath}`,
-        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(`/${relPath}`),
+        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(`/${relPath}`),
         kind: 'directory',
         size: 0,
         writable: false,
@@ -9782,18 +10007,18 @@ class PresetMount {
     let opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
     const content = this.normalizedFiles().get(relPath);
     if (content === undefined) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsNotFoundError(`/${PRESET_MOUNT}/${relPath}`);
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsNotFoundError(`/${PRESET_MOUNT}/${relPath}`);
     }
-    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sliceLines)(content, opts.startLine, opts.endLine);
+    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sliceLines)(content, opts.startLine, opts.endLine);
   }
   async writeFile(relPath) {
-    throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsReadOnlyError(`/${PRESET_MOUNT}/${relPath}`);
+    throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsReadOnlyError(`/${PRESET_MOUNT}/${relPath}`);
   }
   async editFile(relPath) {
-    throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsReadOnlyError(`/${PRESET_MOUNT}/${relPath}`);
+    throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsReadOnlyError(`/${PRESET_MOUNT}/${relPath}`);
   }
   async deleteFile(relPath) {
-    throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsReadOnlyError(`/${PRESET_MOUNT}/${relPath}`);
+    throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsReadOnlyError(`/${PRESET_MOUNT}/${relPath}`);
   }
   async listFiles() {
     const stats = [];
@@ -9801,15 +10026,15 @@ class PresetMount {
       const fullPath = `/${PRESET_MOUNT}/${relPath}`;
       stats.push({
         path: fullPath,
-        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(fullPath),
+        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(fullPath),
         kind: 'file',
-        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(content),
+        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.utf8ByteLength)(content),
         writable: false,
         mount: PRESET_MOUNT,
         source: 'preset'
       });
     }
-    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sortStats)(stats);
+    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sortStats)(stats);
   }
   async collectSearchDocs() {
     const docs = [];
@@ -9817,7 +10042,7 @@ class PresetMount {
       const fullPath = `/${PRESET_MOUNT}/${relPath}`;
       docs.push({
         path: fullPath,
-        title: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(fullPath),
+        title: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(fullPath),
         content
       });
     }
@@ -9864,9 +10089,9 @@ class GlobalMount {
       const content = data[relPath];
       return {
         path: `/${GLOBAL_MOUNT}/${relPath}`,
-        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(`/${relPath}`),
+        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(`/${relPath}`),
         kind: 'file',
-        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(content),
+        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.utf8ByteLength)(content),
         writable: true,
         mount: GLOBAL_MOUNT,
         source: 'global'
@@ -9875,7 +10100,7 @@ class GlobalMount {
     if (hasDirectoryPrefix(Object.keys(data), relPath)) {
       return {
         path: `/${GLOBAL_MOUNT}/${relPath}`,
-        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(`/${relPath}`),
+        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(`/${relPath}`),
         kind: 'directory',
         size: 0,
         writable: true,
@@ -9899,13 +10124,13 @@ class GlobalMount {
     let opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
     const data = await this.loadAll();
     if (!Object.hasOwn(data, relPath)) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsNotFoundError(`/${GLOBAL_MOUNT}/${relPath}`);
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsNotFoundError(`/${GLOBAL_MOUNT}/${relPath}`);
     }
-    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sliceLines)(data[relPath], opts.startLine, opts.endLine);
+    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sliceLines)(data[relPath], opts.startLine, opts.endLine);
   }
   async writeFile(relPath, content) {
     if (!relPath) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsError('Cannot write to /global directory', 'EISDIR', `/${GLOBAL_MOUNT}`);
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsError('Cannot write to /global directory', 'EISDIR', `/${GLOBAL_MOUNT}`);
     }
     await this.enqueueMutation(async () => {
       const data = await this.loadAll();
@@ -9959,15 +10184,15 @@ class GlobalMount {
       const fullPath = `/${GLOBAL_MOUNT}/${relPath}`;
       stats.push({
         path: fullPath,
-        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(fullPath),
+        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(fullPath),
         kind: 'file',
-        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(content),
+        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.utf8ByteLength)(content),
         writable: true,
         mount: GLOBAL_MOUNT,
         source: 'global'
       });
     }
-    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sortStats)(stats);
+    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sortStats)(stats);
   }
   async collectSearchDocs() {
     const data = await this.loadAll();
@@ -9976,7 +10201,7 @@ class GlobalMount {
       const fullPath = `/${GLOBAL_MOUNT}/${relPath}`;
       docs.push({
         path: fullPath,
-        title: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(fullPath),
+        title: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(fullPath),
         content
       });
     }
@@ -10017,7 +10242,7 @@ class HistoryMount {
   async writeInternal(relPath, content) {
     const clean = relPath.replace(/^\/+/, '');
     if (!clean) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsError('Invalid /history target path', 'EINVAL', `/${HISTORY_MOUNT}`);
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsError('Invalid /history target path', 'EINVAL', `/${HISTORY_MOUNT}`);
     }
     const map = this.getHistoryRecord(true);
     map[clean] = content;
@@ -10050,9 +10275,9 @@ class HistoryMount {
     if (Object.hasOwn(map, relPath)) {
       return {
         path: `/${HISTORY_MOUNT}/${relPath}`,
-        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(`/${relPath}`),
+        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(`/${relPath}`),
         kind: 'file',
-        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(map[relPath]),
+        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.utf8ByteLength)(map[relPath]),
         writable: false,
         mount: HISTORY_MOUNT,
         source: 'compaction'
@@ -10061,7 +10286,7 @@ class HistoryMount {
     if (hasDirectoryPrefix(Object.keys(map), relPath)) {
       return {
         path: `/${HISTORY_MOUNT}/${relPath}`,
-        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(`/${relPath}`),
+        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(`/${relPath}`),
         kind: 'directory',
         size: 0,
         writable: false,
@@ -10085,18 +10310,18 @@ class HistoryMount {
     let opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
     const map = this.getHistoryRecord(false);
     if (!map || !Object.hasOwn(map, relPath)) {
-      throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsNotFoundError(`/${HISTORY_MOUNT}/${relPath}`);
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsNotFoundError(`/${HISTORY_MOUNT}/${relPath}`);
     }
-    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sliceLines)(map[relPath], opts.startLine, opts.endLine);
+    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sliceLines)(map[relPath], opts.startLine, opts.endLine);
   }
   async writeFile(relPath) {
-    throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsReadOnlyError(`/${HISTORY_MOUNT}/${relPath}`, `/${HISTORY_MOUNT} is read-only for agents; only internal watermark compaction may write archived history.`);
+    throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsReadOnlyError(`/${HISTORY_MOUNT}/${relPath}`, `/${HISTORY_MOUNT} is read-only for agents; only internal watermark compaction may write archived history.`);
   }
   async editFile(relPath) {
-    throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsReadOnlyError(`/${HISTORY_MOUNT}/${relPath}`, `/${HISTORY_MOUNT} is read-only for agents.`);
+    throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsReadOnlyError(`/${HISTORY_MOUNT}/${relPath}`, `/${HISTORY_MOUNT} is read-only for agents.`);
   }
   async deleteFile(relPath) {
-    throw new _fs_base__WEBPACK_IMPORTED_MODULE_3__.VfsReadOnlyError(`/${HISTORY_MOUNT}/${relPath}`, `/${HISTORY_MOUNT} is read-only for agents.`);
+    throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsReadOnlyError(`/${HISTORY_MOUNT}/${relPath}`, `/${HISTORY_MOUNT} is read-only for agents.`);
   }
   async listFiles() {
     const map = this.getHistoryRecord(false) ?? {};
@@ -10105,15 +10330,15 @@ class HistoryMount {
       const fullPath = `/${HISTORY_MOUNT}/${relPath}`;
       stats.push({
         path: fullPath,
-        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(fullPath),
+        name: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(fullPath),
         kind: 'file',
-        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.utf8ByteLength)(content),
+        size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.utf8ByteLength)(content),
         writable: false,
         mount: HISTORY_MOUNT,
         source: 'compaction'
       });
     }
-    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.sortStats)(stats);
+    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sortStats)(stats);
   }
   async collectSearchDocs() {
     const map = this.getHistoryRecord(false) ?? {};
@@ -10122,7 +10347,7 @@ class HistoryMount {
       const fullPath = `/${HISTORY_MOUNT}/${relPath}`;
       docs.push({
         path: fullPath,
-        title: (0,_fs_base__WEBPACK_IMPORTED_MODULE_3__.basenameOf)(fullPath),
+        title: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.basenameOf)(fullPath),
         content
       });
     }
@@ -10140,6 +10365,204 @@ class HistoryMount {
     const created = {};
     metadata[AGENTIC_HISTORY_KEY] = created;
     return created;
+  }
+}
+
+/**
+ * `/output.md` — non-layered per-`(messageId, swipeId)` output mount backed directly
+ * by `HostBridge.readChatMessage` / `writeChatMessage`, with a `preCreateBuffers`
+ * map for companion-mode `before_turn` writes before the host creates the AI bubble.
+ */
+class OutputMount {
+  mountName = 'output';
+  writable = true;
+  preCreateBuffers = (() => new Map())();
+  constructor(bridge) {
+    this.bridge = bridge;
+  }
+  async stat(relPath, opts) {
+    if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
+      return null;
+    }
+    const target = this.resolveTarget(opts);
+    if (!target) {
+      return null;
+    }
+    const hostContent = this.bridge.readChatMessage(target);
+    const current = hostContent ?? this.preCreateBuffers.get((0,_core_types__WEBPACK_IMPORTED_MODULE_2__.toBranchKey)(target)) ?? '';
+    return {
+      path: OUTPUT_FILE_PATH,
+      name: OUTPUT_FILE_NAME,
+      kind: 'file',
+      size: (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.utf8ByteLength)(current),
+      writable: true,
+      mount: this.mountName
+    };
+  }
+  async listDir(relPath, opts) {
+    if (relPath !== '') {
+      return [];
+    }
+    const entry = await this.stat(OUTPUT_FILE_NAME, opts);
+    return entry ? [entry] : [];
+  }
+  async readFile(relPath) {
+    let opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+    if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsNotFoundError(`/${relPath}`);
+    }
+    const target = this.resolveTarget(opts);
+    if (!target) {
+      return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sliceLines)('', opts.startLine, opts.endLine);
+    }
+    const branchKey = (0,_core_types__WEBPACK_IMPORTED_MODULE_2__.toBranchKey)(target);
+    const raw = this.bridge.readChatMessage(target);
+    if (raw !== null) {
+      this.preCreateBuffers.delete(branchKey);
+      return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sliceLines)(raw, opts.startLine, opts.endLine);
+    }
+    const buffered = this.preCreateBuffers.get(branchKey) ?? '';
+    return (0,_fs_base__WEBPACK_IMPORTED_MODULE_4__.sliceLines)(buffered, opts.startLine, opts.endLine);
+  }
+  async writeFile(relPath, content) {
+    let opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+    if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsNotFoundError(`/${relPath}`);
+    }
+    const target = this.resolveTarget(opts);
+    if (!target) {
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsError('No target message available for /output.md', 'EINVAL', OUTPUT_FILE_PATH);
+    }
+    const branchKey = (0,_core_types__WEBPACK_IMPORTED_MODULE_2__.toBranchKey)(target);
+    if (this.bridge.readChatMessage(target) !== null) {
+      this.preCreateBuffers.delete(branchKey);
+      await this.bridge.writeChatMessage(target, content, {
+        emitEvent: false
+      });
+    } else {
+      this.preCreateBuffers.set(branchKey, content);
+    }
+  }
+  async appendFile(relPath, content) {
+    let opts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+    if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
+      throw new _fs_base__WEBPACK_IMPORTED_MODULE_4__.VfsNotFoundError(`/${relPath}`);
+    }
+    const current = await this.readFile(relPath, opts);
+    await this.writeFile(relPath, `${current}${content}`, opts);
+  }
+  async editFile(relPath, oldText, newText) {
+    let opts = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : {};
+    if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
+      return {
+        ok: false,
+        path: `/${relPath}`,
+        message: `File not found: /${relPath}`
+      };
+    }
+    const current = await this.readFile(relPath, opts);
+    if (!oldText || !current.includes(oldText)) {
+      return {
+        ok: false,
+        path: OUTPUT_FILE_PATH,
+        message: `Target text not found in ${OUTPUT_FILE_PATH}`
+      };
+    }
+    const updated = current.replace(oldText, newText);
+    if (updated !== current) {
+      await this.writeFile(relPath, updated, opts);
+    }
+    return {
+      ok: true,
+      path: OUTPUT_FILE_PATH,
+      message: `Edited ${OUTPUT_FILE_PATH}`
+    };
+  }
+  async deleteFile(relPath) {
+    let opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+    if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
+      return false;
+    }
+    const target = this.resolveTarget(opts);
+    if (!target) {
+      return false;
+    }
+    this.preCreateBuffers.delete((0,_core_types__WEBPACK_IMPORTED_MODULE_2__.toBranchKey)(target));
+    if (this.bridge.readChatMessage(target) !== null) {
+      await this.bridge.writeChatMessage(target, '', {
+        emitEvent: false
+      });
+    }
+    return true;
+  }
+  async listFiles(opts) {
+    const entry = await this.stat(OUTPUT_FILE_NAME, opts);
+    return entry ? [entry] : [];
+  }
+  async collectSearchDocs(opts) {
+    const target = this.resolveTarget(opts);
+    if (!target) {
+      return [];
+    }
+    const hostContent = this.bridge.readChatMessage(target);
+    const current = hostContent ?? this.preCreateBuffers.get((0,_core_types__WEBPACK_IMPORTED_MODULE_2__.toBranchKey)(target)) ?? '';
+    if (!current) {
+      return [];
+    }
+    return [{
+      path: OUTPUT_FILE_PATH,
+      title: OUTPUT_FILE_NAME,
+      content: current
+    }];
+  }
+
+  /** Retrieve and clear any buffered `before_turn` output for `target`. */
+  flushPreCreateBuffer(target) {
+    const key = (0,_core_types__WEBPACK_IMPORTED_MODULE_2__.toBranchKey)(target);
+    const buffered = this.preCreateBuffers.get(key);
+    if (buffered !== undefined) {
+      this.preCreateBuffers.delete(key);
+    }
+    return buffered;
+  }
+
+  /** Inspect any buffered `before_turn` output for `target` without clearing it. */
+  peekPreCreateBuffer(target) {
+    return this.preCreateBuffers.get((0,_core_types__WEBPACK_IMPORTED_MODULE_2__.toBranchKey)(target));
+  }
+
+  /** Discard all pre-create buffers belonging to messages `>= messageId`. */
+  clearPreCreateBuffersFrom(messageId) {
+    if (!Number.isInteger(messageId) || messageId < 0) {
+      return;
+    }
+    for (const key of Array.from(this.preCreateBuffers.keys())) {
+      const parsed = (0,_core_types__WEBPACK_IMPORTED_MODULE_2__.parseBranchKey)(key);
+      if (parsed && parsed.messageId >= messageId) {
+        this.preCreateBuffers.delete(key);
+      }
+    }
+  }
+  resolveTarget(opts) {
+    if (opts?.target && Number.isInteger(opts.target.messageId) && opts.target.messageId >= 0 && Number.isInteger(opts.target.swipeId) && opts.target.swipeId >= 0) {
+      return {
+        messageId: opts.target.messageId,
+        swipeId: opts.target.swipeId
+      };
+    }
+    const chat = this.bridge.getChat();
+    if (!Array.isArray(chat) || chat.length === 0) {
+      return null;
+    }
+    const messageId = chat.length - 1;
+    const swipeId = chat[messageId]?.swipeId ?? 0;
+    if (!Number.isInteger(swipeId) || swipeId < 0) {
+      return null;
+    }
+    return {
+      messageId,
+      swipeId
+    };
   }
 }
 
@@ -10219,6 +10642,14 @@ class ScopedToolGuard {
   async write(path, content) {
     const normalized = this.assertCanWrite(path);
     await this.vfs.writeFile(normalized, content, {
+      target: this.options.target,
+      staged: this.options.staged,
+      source: this.options.source ?? 'tool'
+    });
+  }
+  async append(path, content) {
+    const normalized = this.assertCanWrite(path);
+    await this.vfs.appendFile(normalized, content, {
       target: this.options.target,
       staged: this.options.staged,
       source: this.options.source ?? 'tool'
@@ -11240,7 +11671,10 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */   HistoryMount: () => (/* reexport safe */ _fs_mounts__WEBPACK_IMPORTED_MODULE_2__.HistoryMount),
 /* harmony export */   HybridMount: () => (/* reexport safe */ _fs_mounts__WEBPACK_IMPORTED_MODULE_2__.HybridMount),
 /* harmony export */   LOREBOOK_MOUNT: () => (/* reexport safe */ _fs_worldinfo__WEBPACK_IMPORTED_MODULE_1__.LOREBOOK_MOUNT),
+/* harmony export */   OUTPUT_FILE_NAME: () => (/* reexport safe */ _fs_mounts__WEBPACK_IMPORTED_MODULE_2__.OUTPUT_FILE_NAME),
+/* harmony export */   OUTPUT_FILE_PATH: () => (/* reexport safe */ _fs_mounts__WEBPACK_IMPORTED_MODULE_2__.OUTPUT_FILE_PATH),
 /* harmony export */   OVERLAY_WRITES: () => (/* reexport safe */ _fs_mounts__WEBPACK_IMPORTED_MODULE_2__.OVERLAY_WRITES),
+/* harmony export */   OutputMount: () => (/* reexport safe */ _fs_mounts__WEBPACK_IMPORTED_MODULE_2__.OutputMount),
 /* harmony export */   PERSONA_MOUNT: () => (/* reexport safe */ _fs_mounts__WEBPACK_IMPORTED_MODULE_2__.PERSONA_MOUNT),
 /* harmony export */   PRESET_MOUNT: () => (/* reexport safe */ _fs_mounts__WEBPACK_IMPORTED_MODULE_2__.PRESET_MOUNT),
 /* harmony export */   PresetMount: () => (/* reexport safe */ _fs_mounts__WEBPACK_IMPORTED_MODULE_2__.PresetMount),
@@ -11310,7 +11744,7 @@ __webpack_require__.r(__webpack_exports__);
 /* harmony export */ });
 /* harmony import */ var _ui_store__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! @/ui/store */ "./src/ui/store/index.ts");
 
-const CAPSULE_OBSERVED_ATTRIBUTES = ['message-id', 'swipe-id', 'position', 'persist-mode', 'theme', 'data-theme', 'status', 'summary', 'step-count', 'cache-hit-rate', 'current-step', 'task-id', 'task-label', 'error-message'];
+const CAPSULE_OBSERVED_ATTRIBUTES = ['message-id', 'swipe-id', 'position', 'persist-mode', 'theme', 'data-theme', 'status', 'summary', 'step-count', 'cache-hit-rate', 'current-step', 'task-id', 'task-label', 'error-message', 'interrupted-reason', 'can-resume'];
 const CAPSULE_STYLES = `
 :host {
     all: initial;
@@ -11391,6 +11825,10 @@ const CAPSULE_STYLES = `
     border-color: color-mix(in srgb, var(--cap-error) 55%, var(--cap-border));
 }
 
+.cap-shell[data-status="interrupted"] {
+    border-color: color-mix(in srgb, var(--cap-warning) 60%, var(--cap-border));
+}
+
 .cap-shell[data-status="retrieving"],
 .cap-shell[data-status="streaming"],
 .cap-shell[data-status="background-running"] {
@@ -11423,7 +11861,8 @@ const CAPSULE_STYLES = `
 
 .cap-open-btn:focus-visible,
 .cap-badge-btn:focus-visible,
-.cap-cancel-btn:focus-visible {
+.cap-cancel-btn:focus-visible,
+.cap-resume-btn:focus-visible {
     outline: 2px solid var(--cap-primary);
     outline-offset: -2px;
 }
@@ -11440,6 +11879,10 @@ const CAPSULE_STYLES = `
 
 .cap-shell[data-status="done"] .cap-indicator {
     color: var(--cap-success);
+}
+
+.cap-shell[data-status="interrupted"] .cap-indicator {
+    color: var(--cap-warning);
 }
 
 .cap-shell[data-status="error"] .cap-indicator {
@@ -11591,6 +12034,40 @@ const CAPSULE_STYLES = `
     color: var(--cap-error);
 }
 
+.cap-resume-btn {
+    flex-shrink: 0;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0 10px;
+    margin: 0;
+    border: none;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--cap-warning) 18%, transparent);
+    color: var(--cap-warning);
+    font: inherit;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color 0.15s, opacity 0.15s;
+}
+
+.cap-resume-btn[hidden] {
+    display: none;
+}
+
+.cap-resume-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--cap-warning) 28%, transparent);
+}
+
+.cap-resume-btn:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
 @media (max-width: 767px) {
     .cap-badges {
         display: none;
@@ -11620,6 +12097,24 @@ function createStatusIconSvg(status) {
   svg.setAttribute('stroke-linecap', 'round');
   svg.setAttribute('stroke-linejoin', 'round');
   svg.setAttribute('aria-hidden', 'true');
+  if (status === 'interrupted') {
+    const circle = document.createElementNS(ns, 'circle');
+    circle.setAttribute('cx', '12');
+    circle.setAttribute('cy', '12');
+    circle.setAttribute('r', '9');
+    const l1 = document.createElementNS(ns, 'line');
+    l1.setAttribute('x1', '10');
+    l1.setAttribute('y1', '9');
+    l1.setAttribute('x2', '10');
+    l1.setAttribute('y2', '15');
+    const l2 = document.createElementNS(ns, 'line');
+    l2.setAttribute('x1', '14');
+    l2.setAttribute('y1', '9');
+    l2.setAttribute('x2', '14');
+    l2.setAttribute('y2', '15');
+    svg.append(circle, l1, l2);
+    return svg;
+  }
   if (status === 'error') {
     const tri = document.createElementNS(ns, 'path');
     tri.setAttribute('d', 'm21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z');
@@ -11662,6 +12157,19 @@ function buildDefaultSummary(state) {
       return hitText ? `缓存命中 ${hitText} · 流式输出中` : '主叙事流式生成中...';
     case 'background-running':
       return state.stepCount > 0 && hitText ? `${state.stepCount} 步 · 缓存 ${hitText} · 后台运行中` : '后台触发任务执行中...';
+    case 'interrupted':
+      switch (state.interruptedReason) {
+        case 'user_stop':
+          return '已暂停 · 可恢复';
+        case 'length':
+          return '输出截断 · 可续写';
+        case 'empty_output':
+          return '未写入 /output.md · 可重试';
+        case 'error':
+          return '连接中断 · 可恢复';
+        default:
+          return '已暂停 · 可恢复';
+      }
     case 'error':
       return state.errorMessage?.trim() || '生成或后台任务发生错误';
     case 'done':
@@ -11705,12 +12213,14 @@ class AgenticCapsuleElement extends BaseHTMLElement {
   _store = null;
   _storeUnsubscribe = null;
   _timerId = null;
+  _resumePending = false;
   _shadow = null;
   _shellEl = null;
   _openBtnEl = null;
   _indicatorEl = null;
   _summaryEl = null;
   _badgesEl = null;
+  _resumeBtnEl = null;
   _tasksEl = null;
   constructor() {
     super();
@@ -11763,7 +12273,7 @@ class AgenticCapsuleElement extends BaseHTMLElement {
         }
         break;
       case 'status':
-        if (val === 'idle' || val === 'retrieving' || val === 'streaming' || val === 'done' || val === 'background-running' || val === 'error') {
+        if (val === 'idle' || val === 'retrieving' || val === 'streaming' || val === 'done' || val === 'background-running' || val === 'interrupted' || val === 'error') {
           this._state.status = val;
         }
         break;
@@ -11795,6 +12305,22 @@ class AgenticCapsuleElement extends BaseHTMLElement {
         break;
       case 'error-message':
         this._state.errorMessage = val || undefined;
+        break;
+      case 'interrupted-reason':
+        if (val === 'user_stop' || val === 'length' || val === 'error' || val === 'empty_output') {
+          this._state.interruptedReason = val;
+        } else if (!val) {
+          this._state.interruptedReason = undefined;
+        }
+        break;
+      case 'can-resume':
+        if (val === 'false' || val === '0') {
+          this._state.canResume = false;
+        } else if (val === 'true' || val === '1' || newValue === '') {
+          this._state.canResume = true;
+        } else if (newValue === null) {
+          this._state.canResume = undefined;
+        }
         break;
     }
     this.render();
@@ -11900,6 +12426,22 @@ class AgenticCapsuleElement extends BaseHTMLElement {
       backgroundTasks: value
     });
   }
+  get interruptedReason() {
+    return this._state.interruptedReason;
+  }
+  set interruptedReason(value) {
+    this.setState({
+      interruptedReason: value
+    });
+  }
+  get canResume() {
+    return this._state.canResume;
+  }
+  set canResume(value) {
+    this.setState({
+      canResume: value
+    });
+  }
 
   /**
    * Bind this capsule to an `AppStore` for reactive theme/position/persistMode/task sync
@@ -11924,10 +12466,14 @@ class AgenticCapsuleElement extends BaseHTMLElement {
       if (mainTrace) {
         if (mainTrace.status === 'error') {
           derivedStatus = 'error';
+        } else if (mainTrace.status === 'interrupted') {
+          derivedStatus = 'interrupted';
         } else if (hasActiveTasks) {
           derivedStatus = 'background-running';
         } else if (mainTrace.status === 'completed') {
           derivedStatus = 'done';
+        } else if (mainTrace.status === 'running' && (this._state.status === 'interrupted' || this._state.status === 'idle')) {
+          derivedStatus = 'streaming';
         }
       } else if (hasActiveTasks) {
         derivedStatus = 'background-running';
@@ -11938,7 +12484,8 @@ class AgenticCapsuleElement extends BaseHTMLElement {
         persistMode: snap.settings.capsulePersistMode,
         backgroundTasks: matchingTasks,
         status: derivedStatus,
-        errorMessage: mainTrace?.status === 'error' ? mainTrace.error ?? this._state.errorMessage : this._state.errorMessage,
+        interruptedReason: mainTrace?.status === 'interrupted' ? mainTrace.interruptedReason ?? this._state.interruptedReason : mainTrace?.status === 'completed' || mainTrace?.status === 'running' ? undefined : this._state.interruptedReason,
+        errorMessage: mainTrace?.status === 'error' || mainTrace?.status === 'interrupted' ? mainTrace.error ?? this._state.errorMessage : mainTrace?.status === 'completed' || mainTrace?.status === 'running' ? undefined : this._state.errorMessage,
         stepCount: mainTrace ? mainTrace.toolSteps.length : this._state.stepCount,
         cacheHitRate: mainTrace ? mainTrace.usage.cacheHitRate ?? (mainTrace.usage.inputTokens > 0 ? mainTrace.usage.cachedTokens / mainTrace.usage.inputTokens : undefined) : this._state.cacheHitRate
       });
@@ -12019,16 +12566,29 @@ class AgenticCapsuleElement extends BaseHTMLElement {
     });
     const badges = document.createElement('div');
     badges.className = 'cap-badges';
+    const resumeBtn = document.createElement('button');
+    resumeBtn.type = 'button';
+    resumeBtn.className = 'cap-resume-btn';
+    resumeBtn.setAttribute('data-action', 'resume');
+    resumeBtn.setAttribute('aria-label', '恢复生成 /output.md');
+    resumeBtn.title = '从中断点继续生成 /output.md';
+    resumeBtn.textContent = '↻ 恢复';
+    resumeBtn.hidden = true;
+    resumeBtn.addEventListener('click', event => {
+      event.stopPropagation();
+      void this.handleResume();
+    });
     const tasks = document.createElement('div');
     tasks.className = 'cap-tasks';
     tasks.style.display = 'contents';
-    shell.append(openBtn, badges, tasks);
+    shell.append(openBtn, badges, resumeBtn, tasks);
     shadow.append(styleEl, shell);
     this._shellEl = shell;
     this._openBtnEl = openBtn;
     this._indicatorEl = indicator;
     this._summaryEl = summary;
     this._badgesEl = badges;
+    this._resumeBtnEl = resumeBtn;
     this._tasksEl = tasks;
   }
   handleOpenConsole(tab, deepLink) {
@@ -12088,6 +12648,52 @@ class AgenticCapsuleElement extends BaseHTMLElement {
     this.render();
     this.syncTicker();
   }
+  async handleResume() {
+    if (this._resumePending || this._state.status !== 'interrupted' || this._state.canResume === false) {
+      return;
+    }
+    const target = {
+      messageId: this._state.messageId,
+      swipeId: this._state.swipeId
+    };
+    const reason = this._state.interruptedReason;
+    this._resumePending = true;
+    if (this._resumeBtnEl) {
+      this._resumeBtnEl.disabled = true;
+    }
+    try {
+      if (typeof CustomEvent !== 'undefined') {
+        this.dispatchEvent(new CustomEvent('agentic-capsule-resume', {
+          bubbles: true,
+          composed: true,
+          detail: {
+            messageId: target.messageId,
+            swipeId: target.swipeId,
+            reason
+          }
+        }));
+      }
+      if (this._state.onResume) {
+        await this._state.onResume();
+      } else {
+        const store = this.resolveStore();
+        if (store?.services.resumeTurn) {
+          await store.services.resumeTurn(target);
+        } else if (store) {
+          await store.resumeTurn(target);
+        }
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      this.resolveStore()?.pushToast(`恢复生成失败：${msg}`, 'error');
+    } finally {
+      this._resumePending = false;
+      if (this._resumeBtnEl) {
+        this._resumeBtnEl.disabled = false;
+      }
+      this.render();
+    }
+  }
   syncTicker() {
     const hasActive = this.getActiveBackgroundTasks().length > 0;
     if (hasActive && this.isConnected) {
@@ -12121,11 +12727,11 @@ class AgenticCapsuleElement extends BaseHTMLElement {
     });
   }
   render() {
-    if (!this._shellEl || !this._indicatorEl || !this._summaryEl || !this._badgesEl || !this._tasksEl || !this._openBtnEl) {
+    if (!this._shellEl || !this._indicatorEl || !this._summaryEl || !this._badgesEl || !this._resumeBtnEl || !this._tasksEl || !this._openBtnEl) {
       return;
     }
     const activeTasks = this.getActiveBackgroundTasks();
-    const isActive = activeTasks.length > 0 || this._state.status === 'retrieving' || this._state.status === 'streaming' || this._state.status === 'background-running' || this._state.status === 'error';
+    const isActive = activeTasks.length > 0 || this._state.status === 'retrieving' || this._state.status === 'streaming' || this._state.status === 'background-running' || this._state.status === 'interrupted' || this._state.status === 'error';
     const shouldHide = this._state.persistMode === 'auto_hide' && !isActive;
     this.setAttribute('data-hidden', shouldHide ? 'true' : 'false');
     const resolvedTheme = this.resolveTheme();
@@ -12146,7 +12752,13 @@ class AgenticCapsuleElement extends BaseHTMLElement {
     // Summary text (single-line truncated via CSS ellipsis)
     const summaryText = buildDefaultSummary(this._state);
     this._summaryEl.textContent = summaryText;
-    this._openBtnEl.title = `#${this._state.messageId}#${this._state.swipeId} · ${summaryText}`;
+    const detailSuffix = this._state.status === 'interrupted' && this._state.errorMessage?.trim() ? ` (${this._state.errorMessage.trim()})` : '';
+    this._openBtnEl.title = `#${this._state.messageId}#${this._state.swipeId} · ${summaryText}${detailSuffix}`;
+
+    // Dedicated resume action button when interrupted
+    const showResume = this._state.status === 'interrupted' && this._state.canResume !== false;
+    this._resumeBtnEl.hidden = !showResume;
+    this._resumeBtnEl.disabled = this._resumePending;
 
     // Quick badges (optional)
     this._badgesEl.replaceChildren();
@@ -14715,13 +15327,13 @@ const CATEGORY_FILTERS = [{
   label: 'WI覆写'
 }, {
   id: 'message',
-  label: '展示层'
+  label: '输出 (/output.md)'
 }];
 function inferLanguageHint(item) {
   if (item.category === 'variables' || item.path.endsWith('.json')) {
     return 'json';
   }
-  if (item.path.endsWith('.md')) {
+  if (item.category === 'message' || item.path === '/output.md' || item.path.endsWith('/output.md') || item.path.endsWith('.md')) {
     return 'markdown';
   }
   if (item.path.endsWith('.js') || item.path.endsWith('.ts')) {
@@ -14858,7 +15470,7 @@ function FilesOverridesView(_ref) {
     if (deepLink.filePath) {
       setCategoryFilter('all');
       consumedDeepLinkFileRef.current = null;
-      const matched = items.find(item => matchDeepLinkItem(item, deepLink.filePath));
+      const matched = items.find(item => matchDeepLinkItem(item, deepLink.filePath) && (deepLink.messageId === undefined || item.target.messageId === deepLink.messageId) && (deepLink.swipeId === undefined || item.target.swipeId === deepLink.swipeId)) ?? items.find(item => matchDeepLinkItem(item, deepLink.filePath));
       if (matched) {
         consumedDeepLinkFileRef.current = deepLink.filePath;
         setSelectedId(matched.id);
@@ -14880,7 +15492,7 @@ function FilesOverridesView(_ref) {
     if (!deepLink.filePath || items.length === 0 || consumedDeepLinkFileRef.current === deepLink.filePath) {
       return;
     }
-    const matched = items.find(item => matchDeepLinkItem(item, deepLink.filePath));
+    const matched = items.find(item => matchDeepLinkItem(item, deepLink.filePath) && (deepLink.messageId === undefined || item.target.messageId === deepLink.messageId) && (deepLink.swipeId === undefined || item.target.swipeId === deepLink.swipeId)) ?? items.find(item => matchDeepLinkItem(item, deepLink.filePath));
     if (matched) {
       consumedDeepLinkFileRef.current = deepLink.filePath;
       if (selectedIdRef.current !== matched.id) {
@@ -14889,7 +15501,7 @@ function FilesOverridesView(_ref) {
       }
       setDetailOpen(true);
     }
-  }, [deepLink.filePath, items]);
+  }, [deepLink.filePath, deepLink.messageId, deepLink.swipeId, items]);
   const filteredItems = (0,preact_hooks__WEBPACK_IMPORTED_MODULE_2__.useMemo)(() => {
     const query = searchQuery.trim().toLowerCase();
     return items.filter(item => {
@@ -15296,7 +15908,7 @@ function FilesOverridesView(_ref) {
     onDetailOpenChange: setDetailOpen,
     detailTitle: selectedItem?.path ?? '文件详情',
     emptyDetailTitle: "\u9009\u62E9\u5DE6\u4FA7\u6587\u4EF6\u6216\u8986\u5199\u6761\u76EE",
-    emptyDetailDescription: "\u652F\u6301\u5DE5\u4F5C\u533A\u6587\u4EF6\u3001/state/variables.json\u3001\u4E16\u754C\u4E66\u8986\u5199\u53CA\u6D88\u606F\u5C55\u793A\u5C42\u7684\u7F16\u8F91\u4E0E Diff \u5BF9\u6BD4\u3002",
+    emptyDetailDescription: "\u652F\u6301\u5DE5\u4F5C\u533A\u6587\u4EF6\u3001/state/variables.json\u3001\u4E16\u754C\u4E66\u8986\u5199\u53CA /output.md \u6D88\u606F\u8F93\u51FA\u7684\u7F16\u8F91\u4E0E Diff \u5BF9\u6BD4\u3002",
     master: masterPane,
     detail: detailPane
   });
@@ -16312,7 +16924,7 @@ function getCategoryLabel(category) {
     case 'worldinfo':
       return 'WI覆写';
     case 'message':
-      return '展示层';
+      return '输出 (/output.md)';
   }
 }
 function getCategoryTone(category) {
@@ -16350,6 +16962,11 @@ function getRunStatusMeta(status) {
       return {
         label: '运行中',
         tone: 'primary'
+      };
+    case 'interrupted':
+      return {
+        label: '已中断',
+        tone: 'warning'
       };
     case 'aborted':
       return {
@@ -19043,6 +19660,7 @@ class AppStore {
   listeners = (() => new Set())();
   toastTimers = (() => new Map())();
   toastCounter = 0;
+  resumedEventCount = 0;
   constructor() {
     let options = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
     const usingCustomServices = Boolean(options.services);
@@ -19306,6 +19924,18 @@ class AppStore {
     await this.services.rerunAfterTurn(resolved);
     this.pushToast(`已重新派发楼层 #${resolved.messageId}#${resolved.swipeId} 的后置触发任务`, 'primary');
   }
+  async resumeTurn(target) {
+    const resolved = target ?? this.state.activeTarget;
+    if (!this.services.resumeTurn) {
+      this.pushToast('当前运行时不支持断点恢复', 'warning');
+      return;
+    }
+    const prevEventCount = this.resumedEventCount;
+    await this.services.resumeTurn(resolved);
+    if (this.resumedEventCount === prevEventCount) {
+      this.pushToast(`已恢复 #${resolved.messageId}#${resolved.swipeId} 的 /output.md 生成`, 'success');
+    }
+  }
   pushToast(message) {
     let tone = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 'primary';
     let durationMs = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : 2800;
@@ -19356,11 +19986,88 @@ class AppStore {
       activeModal: null
     });
   }
+  findMatchingTraceIndex(event) {
+    if (event.runId) {
+      const byRunId = this.state.traces.findIndex(item => item.runId === event.runId);
+      if (byRunId >= 0) {
+        return byRunId;
+      }
+    }
+    const phase = event.phase ?? 'main_turn';
+    return this.state.traces.findIndex(item => item.target.messageId === event.target.messageId && item.target.swipeId === event.target.swipeId && item.phase === phase);
+  }
   handleGenerationEvent(event) {
     if (event.kind === 'trace_recorded' && event.trace) {
       this.upsertTrace(event.trace);
-    } else if (event.kind === 'background_task_updated' && event.task) {
+      return;
+    }
+    if (event.kind === 'background_task_updated' && event.task) {
       this.upsertBackgroundTask(event.task);
+      return;
+    }
+    if (event.kind === 'output_preview' && event.outputPreview !== undefined) {
+      const idx = this.findMatchingTraceIndex(event);
+      if (idx >= 0) {
+        const existing = this.state.traces[idx];
+        if (existing.outputPreview !== event.outputPreview) {
+          const nextTraces = [...this.state.traces];
+          nextTraces[idx] = {
+            ...existing,
+            outputPreview: event.outputPreview
+          };
+          this.setState({
+            traces: nextTraces
+          });
+        }
+      }
+      return;
+    }
+    if (event.kind === 'turn_interrupted') {
+      if (event.trace) {
+        this.upsertTrace(event.trace);
+        return;
+      }
+      const idx = this.findMatchingTraceIndex(event);
+      if (idx >= 0) {
+        const existing = this.state.traces[idx];
+        const nextTraces = [...this.state.traces];
+        nextTraces[idx] = {
+          ...existing,
+          status: 'interrupted',
+          interruptedReason: event.interruptedReason ?? existing.interruptedReason,
+          error: event.error ?? existing.error,
+          outputPreview: event.outputPreview ?? existing.outputPreview,
+          endedAt: event.timestamp || Date.now()
+        };
+        this.setState({
+          traces: nextTraces
+        });
+      }
+      return;
+    }
+    if (event.kind === 'turn_resumed') {
+      this.resumedEventCount += 1;
+      if (event.trace) {
+        this.upsertTrace(event.trace);
+      } else {
+        const idx = this.findMatchingTraceIndex(event);
+        if (idx >= 0) {
+          const existing = this.state.traces[idx];
+          if (existing.status === 'interrupted') {
+            const nextTraces = [...this.state.traces];
+            nextTraces[idx] = {
+              ...existing,
+              status: 'running',
+              interruptedReason: undefined,
+              error: undefined
+            };
+            this.setState({
+              traces: nextTraces
+            });
+          }
+        }
+      }
+      this.pushToast(`已恢复 #${event.target.messageId}#${event.target.swipeId} 的 /output.md 生成`, 'success');
     }
   }
   dispose() {
@@ -19535,9 +20242,10 @@ function createMockSettings() {
       high: 36000,
       low: 18000
     },
+    enabledTools: [..._core_config__WEBPACK_IMPORTED_MODULE_0__.DEFAULT_MAIN_AGENT_TOOLS],
     permissions: {
       read: ['/**'],
-      write: ['/memory/**', '/scratch/**']
+      write: ['/output.md', '/memory/**', '/scratch/**']
     },
     promptBlocks: [{
       id: 'b1',
@@ -20032,19 +20740,19 @@ function createInitialMockFiles() {
     overridden: true,
     writable: true
   }, {
-    id: 'f_mes_12',
+    id: 'output:12#0',
     category: 'message',
-    namespace: 'message',
-    path: 'message://12#0 (展示层覆写)',
-    key: '',
+    namespace: 'files',
+    path: '/output.md',
+    key: '/output.md',
     target: {
       messageId: 12,
       swipeId: 0
     },
-    layerLabel: '#12#0 (UI Only)',
-    source: '@@append_output',
-    content: '<details><summary>📊 当前状态快照（不进入模型缓存前缀）</summary>\n灵力：84/100 | 林婉儿好感：62 | 地点：听竹小筑\n</details>',
-    baseContent: '',
+    layerLabel: 'L12#0',
+    source: 'tool:write_file',
+    content: '夜风穿过竹梢，石井边缘那道极浅的银莲花刻痕在月色下泛起冷光……\n\n<details><summary>📊 当前状态快照（不进入模型缓存前缀）</summary>\n灵力：84/100 | 林婉儿好感：62 | 地点：听竹小筑\n</details>',
+    baseContent: '夜风穿过竹梢，石井边缘那道极浅的银莲花刻痕在月色下泛起冷光……',
     overridden: true,
     writable: true
   }];
@@ -20155,6 +20863,16 @@ function createMockUIServices() {
   let settingsSnapshot = createMockSettings();
   let files = createInitialMockFiles();
   const traces = createMockTraces();
+  const eventListeners = new Set();
+  const emitEvent = event => {
+    eventListeners.forEach(listener => {
+      try {
+        listener(event);
+      } catch {
+        // Keep mock event dispatch fault-tolerant.
+      }
+    });
+  };
   let watermarks = [{
     agentId: 'main',
     agentName: '主叙事 Agent',
@@ -20213,7 +20931,7 @@ function createMockUIServices() {
         messageId: 12,
         swipeId: 0
       };
-      const existingIdx = files.findIndex(f => f.namespace === input.namespace && f.key === input.key);
+      const existingIdx = files.findIndex(f => f.namespace === input.namespace && f.key === input.key && (f.path !== '/output.md' || f.target.messageId === target.messageId && f.target.swipeId === target.swipeId));
       if (existingIdx >= 0) {
         const updated = {
           ...files[existingIdx],
@@ -20227,15 +20945,15 @@ function createMockUIServices() {
           ...updated
         };
       }
-      const category = input.namespace === 'variables' ? 'variables' : input.namespace === 'worldinfo' ? 'worldinfo' : input.namespace === 'message' ? 'message' : 'workspace';
+      const category = input.path === '/output.md' ? 'message' : input.namespace === 'variables' ? 'variables' : input.namespace === 'worldinfo' ? 'worldinfo' : input.namespace === 'message' ? 'message' : 'workspace';
       const created = {
-        id: `f_${Date.now()}`,
+        id: input.path === '/output.md' ? `output:${target.messageId}#${target.swipeId}` : `f_${Date.now()}`,
         category,
         namespace: input.namespace,
         path: input.path,
         key: input.key,
         target,
-        layerLabel: `#${target.messageId}#${target.swipeId}`,
+        layerLabel: `L${target.messageId}#${target.swipeId}`,
         source: 'user-edit',
         content: input.content,
         baseContent: '',
@@ -20248,8 +20966,9 @@ function createMockUIServices() {
       };
     },
     async deleteFileOrOverride(input) {
+      const target = input.target;
       files = files.map(f => {
-        if (f.namespace === input.namespace && f.key === input.key) {
+        if (f.namespace === input.namespace && f.key === input.key && (!target || f.path !== '/output.md' || f.target.messageId === target.messageId && f.target.swipeId === target.swipeId)) {
           return {
             ...f,
             content: f.baseContent ?? '',
@@ -20327,6 +21046,50 @@ function createMockUIServices() {
     },
     async rerunAfterTurn() {
       // Mock hook: real runtime dispatches TriggerPipeline.runPhase('after_turn')
+    },
+    async resumeTurn(target) {
+      const now = Date.now();
+      let updatedTrace;
+      for (let i = 0; i < traces.length; i += 1) {
+        const trace = traces[i];
+        if (trace.target.messageId === target.messageId && trace.target.swipeId === target.swipeId && trace.phase === 'main_turn' && trace.status === 'interrupted') {
+          updatedTrace = {
+            ...trace,
+            status: 'completed',
+            interruptedReason: undefined,
+            error: undefined,
+            endedAt: now
+          };
+          traces[i] = updatedTrace;
+          break;
+        }
+      }
+      options.onToast?.(`已恢复 #${target.messageId}#${target.swipeId} 的 /output.md 生成`, 'success');
+      emitEvent({
+        kind: 'turn_resumed',
+        target: {
+          ...target
+        },
+        timestamp: now,
+        phase: 'main_turn',
+        ...(updatedTrace ? {
+          runId: updatedTrace.runId
+        } : {})
+      });
+      if (updatedTrace) {
+        emitEvent({
+          kind: 'trace_recorded',
+          target: {
+            ...target
+          },
+          timestamp: now,
+          phase: 'main_turn',
+          runId: updatedTrace.runId,
+          trace: {
+            ...updatedTrace
+          }
+        });
+      }
     },
     async cancelBackgroundTask() {
       // Mock hook: real runtime aborts the task's AbortController
@@ -20479,7 +21242,13 @@ function createMockUIServices() {
         isHollowCard: true
       };
     },
-    getHostLuminance: options.getHostLuminance
+    getHostLuminance: options.getHostLuminance,
+    subscribeEvents(listener) {
+      eventListeners.add(listener);
+      return () => {
+        eventListeners.delete(listener);
+      };
+    }
   };
 }
 

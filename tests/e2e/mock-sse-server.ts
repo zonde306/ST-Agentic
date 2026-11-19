@@ -709,3 +709,304 @@ export class MockOpenAISseServer {
         }
     }
 }
+
+/** Options for building streamed tool-call SSE mock scenarios. */
+export interface MockToolCallScenarioOptions {
+    callId?: string;
+    toolCallIndex?: number;
+    reasoning?: string;
+    content?: string;
+    delayMs?: number;
+    cachedTokens?: number;
+    finishReason?: 'tool_calls' | 'stop' | 'length';
+    waitGateBeforeFirstChunk?: () => Promise<void>;
+    waitGateBeforeClose?: () => Promise<void>;
+    splitAt?: number;
+}
+
+/** Options for building partial/unclosed tool-call SSE chunks for interruption or truncation tests. */
+export interface MockPartialToolCallScenarioOptions {
+    callId?: string;
+    toolCallIndex?: number;
+    reasoning?: string;
+    delayMs?: number;
+    cachedTokens?: number;
+    finishReason?: 'length' | 'stop' | 'tool_calls';
+    keepOpenUntilAborted?: boolean;
+    waitGateBeforeFirstChunk?: () => Promise<void>;
+    waitGateBeforeTail?: () => Promise<void>;
+    trailingArgs?: string;
+    splitAt?: number;
+}
+
+let mockToolCallSeq = 1;
+
+function nextMockCallId(prefix: string): string {
+    const id = `call_${prefix}_${mockToolCallSeq}`;
+    mockToolCallSeq += 1;
+    return id;
+}
+
+/** Build a streamed tool-call `MockScenario` splitting JSON arguments across incremental SSE deltas. */
+export function makeStreamedToolCallScenario(
+    toolName: string,
+    args: Record<string, unknown> | string,
+    options: MockToolCallScenarioOptions = {},
+): MockScenario {
+    const rawArgs = typeof args === 'string' ? args : JSON.stringify(args);
+    const defaultSplit =
+        options.waitGateBeforeClose && rawArgs.endsWith('"}') && rawArgs.length > 2
+            ? rawArgs.length - 2
+            : Math.max(1, Math.floor(rawArgs.length / 2));
+    const splitAt = Math.max(1, Math.min(rawArgs.length - 1, options.splitAt ?? defaultSplit));
+    const partA = rawArgs.slice(0, splitAt);
+    const partB = rawArgs.slice(splitAt);
+    const callId = options.callId ?? nextMockCallId(toolName);
+    const index = options.toolCallIndex ?? 0;
+    const delayMs = options.delayMs ?? 10;
+
+    const chunks: MockSseChunk[] = [];
+    if (options.reasoning) {
+        chunks.push({
+            reasoningContent: options.reasoning,
+            delayMs,
+            ...(options.waitGateBeforeFirstChunk ? { waitGate: options.waitGateBeforeFirstChunk } : {}),
+        });
+    }
+    if (options.content) {
+        chunks.push({
+            content: options.content,
+            delayMs,
+            ...(!options.reasoning && options.waitGateBeforeFirstChunk
+                ? { waitGate: options.waitGateBeforeFirstChunk }
+                : {}),
+        });
+    }
+
+    chunks.push({
+        toolCalls: [
+            {
+                index,
+                id: callId,
+                type: 'function',
+                function: {
+                    name: toolName,
+                    arguments: partA,
+                },
+            },
+        ],
+        delayMs,
+        ...(!options.reasoning && !options.content && options.waitGateBeforeFirstChunk
+            ? { waitGate: options.waitGateBeforeFirstChunk }
+            : {}),
+    });
+
+    if (partB.length > 0 || options.waitGateBeforeClose) {
+        chunks.push({
+            ...(partB.length > 0
+                ? {
+                      toolCalls: [
+                          {
+                              index,
+                              function: {
+                                  arguments: partB,
+                              },
+                          },
+                      ],
+                  }
+                : {}),
+            ...(options.waitGateBeforeClose ? { waitGate: options.waitGateBeforeClose } : {}),
+            finishReason: options.finishReason ?? 'tool_calls',
+            delayMs,
+        });
+    } else {
+        chunks[chunks.length - 1].finishReason = options.finishReason ?? 'tool_calls';
+    }
+
+    return {
+        chunks,
+        usage: {
+            prompt_tokens: 240,
+            completion_tokens: 32,
+            total_tokens: 272,
+            prompt_tokens_details: {
+                cached_tokens: options.cachedTokens ?? 180,
+            },
+        },
+    };
+}
+
+/** Build a streaming `write_file` SSE scenario (defaulting to `/output.md` or custom path). */
+export function makeWriteFileScenario(
+    path: string,
+    content: string,
+    options: MockToolCallScenarioOptions & { keyOrder?: 'path_first' | 'content_first' } = {},
+): MockScenario {
+    const payload =
+        options.keyOrder === 'content_first'
+            ? { content, path }
+            : { path, content };
+    return makeStreamedToolCallScenario('write_file', payload, options);
+}
+
+/** Build a streaming `append_file` SSE scenario. */
+export function makeAppendFileScenario(
+    path: string,
+    content: string,
+    options: MockToolCallScenarioOptions = {},
+): MockScenario {
+    return makeStreamedToolCallScenario('append_file', { content, path }, options);
+}
+
+/** Build a streaming `edit_file` SSE scenario. */
+export function makeEditFileScenario(
+    path: string,
+    search: string,
+    replace: string,
+    options: MockToolCallScenarioOptions = {},
+): MockScenario {
+    return makeStreamedToolCallScenario('edit_file', { path, search, replace }, options);
+}
+
+/**
+ * Build a partial/unclosed tool-call SSE scenario for testing live preview salvage
+ * on `#mes_stop` abort or `finish_reason: "length"` truncation.
+ */
+export function makePartialToolCallScenario(
+    toolName: string,
+    partialArgsPrefix: string,
+    options: MockPartialToolCallScenarioOptions = {},
+): MockScenario {
+    const splitAt = Math.max(
+        1,
+        Math.min(
+            Math.max(1, partialArgsPrefix.length - 1),
+            options.splitAt ?? Math.floor(partialArgsPrefix.length / 2),
+        ),
+    );
+    const partA = partialArgsPrefix.slice(0, splitAt);
+    const partB = partialArgsPrefix.slice(splitAt);
+    const callId = options.callId ?? nextMockCallId(`${toolName}_partial`);
+    const index = options.toolCallIndex ?? 0;
+    const delayMs = options.delayMs ?? 10;
+    const isKeepOpen = Boolean(options.keepOpenUntilAborted);
+
+    const chunks: MockSseChunk[] = [];
+    if (options.reasoning) {
+        chunks.push({
+            reasoningContent: options.reasoning,
+            delayMs,
+            ...(options.waitGateBeforeFirstChunk ? { waitGate: options.waitGateBeforeFirstChunk } : {}),
+        });
+    }
+
+    chunks.push({
+        toolCalls: [
+            {
+                index,
+                id: callId,
+                type: 'function',
+                function: {
+                    name: toolName,
+                    arguments: partA,
+                },
+            },
+        ],
+        delayMs,
+        ...(!options.reasoning && options.waitGateBeforeFirstChunk
+            ? { waitGate: options.waitGateBeforeFirstChunk }
+            : {}),
+    });
+
+    if (partB.length > 0) {
+        chunks.push({
+            toolCalls: [
+                {
+                    index,
+                    function: {
+                        arguments: partB,
+                    },
+                },
+            ],
+            delayMs,
+            ...(!isKeepOpen && !options.waitGateBeforeTail
+                ? { finishReason: options.finishReason ?? 'length' }
+                : {}),
+        });
+    } else if (!isKeepOpen && !options.waitGateBeforeTail) {
+        chunks[chunks.length - 1].finishReason = options.finishReason ?? 'length';
+    }
+
+    if (options.waitGateBeforeTail || options.trailingArgs !== undefined) {
+        chunks.push({
+            ...(options.waitGateBeforeTail ? { waitGate: options.waitGateBeforeTail } : {}),
+            ...(options.trailingArgs !== undefined
+                ? {
+                      toolCalls: [
+                          {
+                              index,
+                              function: {
+                                  arguments: options.trailingArgs,
+                              },
+                          },
+                      ],
+                  }
+                : {}),
+            ...(!isKeepOpen ? { finishReason: options.finishReason ?? 'length' } : {}),
+        });
+    }
+
+    return {
+        chunks,
+        ...(isKeepOpen ? { keepOpenUntilAborted: true } : {}),
+        ...(!isKeepOpen ? { finishReason: options.finishReason ?? 'length' } : {}),
+        usage: {
+            prompt_tokens: 240,
+            completion_tokens: 24,
+            total_tokens: 264,
+            prompt_tokens_details: {
+                cached_tokens: options.cachedTokens ?? 180,
+            },
+        },
+    };
+}
+
+/** Build a non-streaming tool-call `MockScenario` (for `after_turn` trigger executions). */
+export function makeNonStreamToolCallScenario(
+    toolCalls: Array<{
+        id?: string;
+        name: string;
+        arguments: Record<string, unknown> | string;
+    }>,
+    options: {
+        content?: string;
+        finishReason?: 'tool_calls' | 'stop' | 'length';
+        waitGate?: () => Promise<void>;
+        cachedTokens?: number;
+    } = {},
+): MockScenario {
+    return {
+        nonStreamContent: options.content ?? '',
+        nonStreamToolCalls: toolCalls.map((tc) => ({
+            id: tc.id ?? nextMockCallId(tc.name),
+            type: 'function',
+            function: {
+                name: tc.name,
+                arguments:
+                    typeof tc.arguments === 'string'
+                        ? tc.arguments
+                        : JSON.stringify(tc.arguments),
+            },
+        })),
+        finishReason: options.finishReason ?? 'tool_calls',
+        ...(options.waitGate ? { waitGate: options.waitGate } : {}),
+        usage: {
+            prompt_tokens: 180,
+            completion_tokens: 28,
+            total_tokens: 208,
+            prompt_tokens_details: {
+                cached_tokens: options.cachedTokens ?? 120,
+            },
+        },
+    };
+}

@@ -8,8 +8,15 @@ import { chromium, type Browser, type BrowserContext, type Locator, type Page } 
 import { stringify as stringifyYaml } from 'yaml';
 import {
     createMockGate,
+    makeAppendFileScenario,
+    makeEditFileScenario,
+    makeNonStreamToolCallScenario,
+    makePartialToolCallScenario,
+    makeStreamedToolCallScenario,
+    makeWriteFileScenario,
     MockOpenAISseServer,
     type MockScenario,
+    type MockToolCallScenarioOptions,
     type RecordedLlmRequest,
 } from './mock-sse-server';
 
@@ -54,6 +61,7 @@ interface AgenticWindowBridge {
         getContext?: () => {
             characterId?: string | number;
             groupId?: string | null;
+            chat?: Array<{ mes?: string; is_user?: boolean; swipe_id?: number; swipes?: string[] }>;
         };
     };
     this_chid?: number;
@@ -145,6 +153,11 @@ async function prepareIsolatedStWorkspace(
         }
     }
 
+    const stWebpackCache = path.join(ST_ROOT, 'data', '_webpack');
+    if (fs.existsSync(stWebpackCache)) {
+        await fsp.cp(stWebpackCache, path.join(dataRoot, '_webpack'), { recursive: true });
+    }
+
     const defaultSettingsPath = path.join(ST_ROOT, 'default', 'content', 'settings.json');
     const rawSettings = await fsp.readFile(defaultSettingsPath, 'utf-8');
     const settings = JSON.parse(rawSettings) as Record<string, unknown>;
@@ -158,10 +171,22 @@ async function prepareIsolatedStWorkspace(
             ? (settings.power_user as Record<string, unknown>)
             : {};
 
+    const thirdPartyDir = path.join(ST_ROOT, 'public', 'scripts', 'extensions', 'third-party');
+    const disabledExtensions: string[] = [];
+    if (fs.existsSync(thirdPartyDir)) {
+        for (const entry of fs.readdirSync(thirdPartyDir, { withFileTypes: true })) {
+            if (entry.isDirectory() && entry.name !== 'ST-Agentic') {
+                disabledExtensions.push(`third-party/${entry.name}`);
+            }
+        }
+    }
+
     settings.firstRun = false;
     settings.main_api = 'openai';
     settings.active_character = 'default_Seraphina.png';
-    settings.extension_settings = {};
+    settings.extension_settings = {
+        disabledExtensions,
+    };
     settings.power_user = {
         ...existingPowerUser,
         auto_connect: true,
@@ -231,7 +256,7 @@ async function startIsolatedSillyTavern(params: {
     proc.stderr?.on('data', recordLog);
 
     const baseUrl = `http://127.0.0.1:${params.port}`;
-    const deadline = Date.now() + 75000;
+    const deadline = Date.now() + 120000;
 
     while (Date.now() < deadline) {
         if (proc.exitCode !== null) {
@@ -250,6 +275,7 @@ async function startIsolatedSillyTavern(params: {
         await new Promise((resolve) => setTimeout(resolve, 250));
     }
 
+    await stopChildProcessTree(proc);
     throw new Error(`Timed out waiting for SillyTavern server on ${baseUrl}:\n${logs.join('')}`);
 }
 
@@ -297,58 +323,122 @@ async function stopChildProcessTree(proc: ChildProcess | undefined): Promise<voi
     }
 }
 
-/** Build a tool-call SSE scenario followed by text or delayed execution. */
+/** Build a streamed `patch_variables` tool-call SSE scenario. */
 function makePatchVariablesScenario(
     mergePayload: Record<string, unknown>,
     options: { callId?: string; reasoning?: string; cachedTokens?: number } = {},
 ): MockScenario {
-    const jsonArgs = JSON.stringify({ json_merge: mergePayload });
-    const splitAt = Math.max(1, Math.floor(jsonArgs.length / 2));
-    const partA = jsonArgs.slice(0, splitAt);
-    const partB = jsonArgs.slice(splitAt);
-    const callId = options.callId ?? `call_patch_${Date.now()}`;
+    return makeStreamedToolCallScenario(
+        'patch_variables',
+        { json_merge: mergePayload },
+        {
+            callId: options.callId,
+            reasoning: options.reasoning,
+            cachedTokens: options.cachedTokens,
+        },
+    );
+}
 
+/** Build a streamed `write_file({ path: '/output.md', content })` SSE scenario. */
+function makeWriteOutputScenario(
+    content: string,
+    options: MockToolCallScenarioOptions & { keyOrder?: 'path_first' | 'content_first' } = {},
+): MockScenario {
+    return makeWriteFileScenario('/output.md', content, options);
+}
+
+/** Build a streamed `append_file({ path: '/output.md', content })` SSE scenario. */
+function makeAppendOutputScenario(
+    content: string,
+    options: MockToolCallScenarioOptions = {},
+): MockScenario {
+    return makeAppendFileScenario('/output.md', content, options);
+}
+
+/** Build a streamed `edit_file({ path: '/output.md', search, replace })` SSE scenario. */
+function makeEditOutputScenario(
+    search: string,
+    replace: string,
+    options: MockToolCallScenarioOptions = {},
+): MockScenario {
+    return makeEditFileScenario('/output.md', search, replace, options);
+}
+
+/** Build the final plain-text internal review completion round for `main_turn`. */
+function makeMainTurnFinishScenario(
+    internalSummary = 'Internal review passed.',
+    options: { cachedTokens?: number; delayMs?: number } = {},
+): MockScenario {
     return {
-        chunks: [
-            ...(options.reasoning
-                ? [{ reasoningContent: options.reasoning, delayMs: 10 }]
-                : []),
-            {
-                toolCalls: [
-                    {
-                        index: 0,
-                        id: callId,
-                        type: 'function',
-                        function: {
-                            name: 'patch_variables',
-                            arguments: partA,
-                        },
-                    },
-                ],
-                delayMs: 10,
-            },
-            {
-                toolCalls: [
-                    {
-                        index: 0,
-                        function: {
-                            arguments: partB,
-                        },
-                    },
-                ],
-                finishReason: 'tool_calls',
-                delayMs: 10,
-            },
-        ],
+        chunks: [{ content: internalSummary, delayMs: options.delayMs ?? 5 }],
+        finishReason: 'stop',
         usage: {
-            prompt_tokens: 240,
-            completion_tokens: 32,
-            total_tokens: 272,
+            prompt_tokens: 280,
+            completion_tokens: 16,
+            total_tokens: 296,
             prompt_tokens_details: {
-                cached_tokens: options.cachedTokens ?? 180,
+                cached_tokens: options.cachedTokens ?? 220,
             },
         },
     };
+}
+
+/** Read a specific message entry directly from SillyTavern's live `chat` context. */
+async function readHostChatMessage(
+    targetPage: Page,
+    mesId?: number,
+): Promise<{ mesId: number; mes: string; swipeId: number; swipes: string[] }> {
+    return await targetPage.evaluate((explicitId) => {
+        const win = window as unknown as AgenticWindowBridge;
+        const chatList = win.SillyTavern?.getContext?.()?.chat ?? win.chat ?? [];
+        const resolvedId =
+            typeof explicitId === 'number'
+                ? explicitId
+                : Number(document.querySelector('#chat .mes:last-of-type')?.getAttribute('mesid') ?? chatList.length - 1);
+        const msg = chatList[resolvedId];
+        return {
+            mesId: resolvedId,
+            mes: typeof msg?.mes === 'string' ? msg.mes : '',
+            swipeId: typeof msg?.swipe_id === 'number' ? msg.swipe_id : 0,
+            swipes: Array.isArray(msg?.swipes) ? msg.swipes.map((s) => String(s ?? '')) : [],
+        };
+    }, mesId);
+}
+
+/** Wait until `#send_but` is visible/enabled and `#mes_stop` is hidden. */
+async function waitForSendButtonUnlocked(targetPage: Page, timeoutMs = 10000): Promise<void> {
+    await targetPage.waitForFunction(
+        () => {
+            const sendBtn = document.querySelector('#send_but') as HTMLElement | null;
+            const stopBtn = document.querySelector('#mes_stop') as HTMLElement | null;
+            return (
+                sendBtn !== null
+                && !sendBtn.classList.contains('displayNone')
+                && getComputedStyle(sendBtn).display !== 'none'
+                && sendBtn.getAttribute('disabled') === null
+                && (!stopBtn || getComputedStyle(stopBtn).display === 'none')
+            );
+        },
+        undefined,
+        { timeout: timeoutMs },
+    );
+}
+
+/** Wait until the last `.mes` `<agentic-capsule>` reaches `expectedStatus`. */
+async function waitForLastCapsuleStatus(
+    targetPage: Page,
+    expectedStatus: string,
+    timeoutMs = 15000,
+): Promise<void> {
+    await targetPage.waitForFunction(
+        (status) => {
+            const cap = document.querySelector('#chat .mes:last-of-type agentic-capsule');
+            const current = cap?.shadowRoot?.querySelector('.cap-shell')?.getAttribute('data-status');
+            return current === status;
+        },
+        expectedStatus,
+        { timeout: timeoutMs },
+    );
 }
 
 /** Wait until `locator.innerText()` includes `expected` or throw a clear timeout message. */
@@ -470,21 +560,58 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
         );
     }
 
-    /** Ensure #extensions_settings drawer and ST-Agentic inline panel are expanded. */
+    /** Ensure #extensions_settings drawer and ST-Agentic inline panel are expanded and centered in view. */
     async function ensureAgenticExtCardVisible(targetPage: Page): Promise<Locator> {
+        await targetPage.evaluate(() => {
+            document.querySelectorAll('#toast-container .toast').forEach((el) => {
+                el.remove();
+            });
+        });
+
         const card = targetPage.locator('#extensions_settings [data-agentic-settings-mount]');
-        if (!(await card.locator('.ag-ext-open-btn').isVisible().catch(() => false))) {
-            const extBlock = targetPage.locator('#rm_extensions_block');
-            if (!(await extBlock.isVisible().catch(() => false))) {
-                await targetPage.locator('#extensions-settings-button .drawer-toggle').click();
-                await extBlock.waitFor({ state: 'visible', timeout: 10000 });
+        const extBlock = targetPage.locator('#rm_extensions_block');
+        const extIcon = targetPage.locator('#extensions-settings-button .drawer-icon');
+        const openBtn = card.locator('.ag-ext-open-btn');
+        const takeoverBtn = card.locator('.ag-ext-mode-btn[data-mode="takeover"]');
+
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+            const hasOpenDrawer = await extBlock
+                .evaluate((el) => el.classList.contains('openDrawer'))
+                .catch(() => false);
+            if (!hasOpenDrawer) {
+                await extIcon.click();
+                await targetPage
+                    .waitForFunction(
+                        () =>
+                            document.querySelector('#rm_extensions_block')?.classList.contains('openDrawer')
+                            ?? false,
+                        undefined,
+                        { timeout: 4000 },
+                    )
+                    .catch(() => undefined);
             }
-            const toggle = card.locator('.inline-drawer-toggle').first();
-            if (await toggle.isVisible().catch(() => false)) {
-                await toggle.click();
+
+            if (await openBtn.isVisible().catch(() => false)) {
+                await card.evaluate((el) => {
+                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+                });
+                await targetPage.waitForTimeout(150);
+                const stillOpen = await extBlock
+                    .evaluate((el) => el.classList.contains('openDrawer'))
+                    .catch(() => false);
+                if (stillOpen && (await takeoverBtn.isVisible().catch(() => false))) {
+                    return card;
+                }
             }
+            await targetPage.waitForTimeout(200);
         }
-        await card.locator('.ag-ext-open-btn').waitFor({ state: 'visible', timeout: 10000 });
+
+        await openBtn.waitFor({ state: 'visible', timeout: 10000 });
+        await card.evaluate((el) => {
+            el.scrollIntoView({ block: 'center', inline: 'nearest' });
+        });
+        await targetPage.waitForTimeout(150);
+        await takeoverBtn.waitFor({ state: 'visible', timeout: 5000 });
         return card;
     }
 
@@ -541,7 +668,7 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
         page = await context.newPage();
 
         page.on('pageerror', (err) => {
-            pageErrors.push(`pageerror: ${err.message}`);
+            pageErrors.push(`pageerror: ${err.stack ?? err.message}`);
         });
         page.on('console', (msg) => {
             if (msg.type() === 'error') {
@@ -554,7 +681,7 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
 
         await page.goto(stBaseUrl, { waitUntil: 'domcontentloaded' });
         await waitForStAndAgenticReady(page);
-    }, 90000);
+    }, 150000);
 
     afterEach(async () => {
         if (page && !page.isClosed()) {
@@ -586,7 +713,7 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
         }
     }, 30000);
 
-    it('Path 1: takeover mode streams tool calls, <agentic-capsule>, and detached after_turn while #send_but is unlocked', async () => {
+    it('Path 1: takeover mode streams /output.md tool calls, <agentic-capsule>, and detached after_turn while #send_but is unlocked', async () => {
         if (!mockServer) {
             throw new Error('MockOpenAISseServer was not initialized');
         }
@@ -622,7 +749,7 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
 
         await closeConsoleIfOpen(page);
 
-        // 2. Script Round 1 (tool call), Round 2 (gated streamed text), Round 3 (gated detached after_turn).
+        // 2. Script Round 1 (patch_variables), Round 2 (gated streamed write_file /output.md), Round 3 (completion), Round 4 (gated detached after_turn).
         mockServer.clearRequests();
         const round2Gate = createMockGate();
         const afterTurnGate = createMockGate();
@@ -633,23 +760,18 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
                     { mood: 'excited', gold: 125, branch: 'swipe0' },
                     { callId: 'call_p1_vars', reasoning: 'Checking variables before response.', cachedTokens: 150 },
                 ),
-                {
-                    chunks: [
-                        { waitGate: () => round2Gate.promise, content: '<think>Deliberating quietly. </think>', delayMs: 5 },
-                        { content: 'Hello adventurer, ', delayMs: 15 },
-                        { content: 'Path 1 reply!', delayMs: 15 },
-                    ],
-                    usage: {
-                        prompt_tokens: 300,
-                        completion_tokens: 24,
-                        total_tokens: 324,
-                        prompt_tokens_details: { cached_tokens: 210 },
-                    },
-                },
+                makeWriteOutputScenario('Hello adventurer, Path 1 reply!', {
+                    callId: 'call_p1_output',
+                    reasoning: 'Deliberating quietly.',
+                    cachedTokens: 210,
+                    waitGateBeforeFirstChunk: () => round2Gate.promise,
+                }),
+                makeMainTurnFinishScenario('Path 1 internal review summary.'),
                 {
                     chunks: [
                         { waitGate: () => afterTurnGate.promise, content: 'Background after_turn done.', delayMs: 5 },
                     ],
+                    nonStreamContent: 'Background after_turn done.',
                 },
             ]);
 
@@ -691,9 +813,9 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
 
             round2Gate.release();
 
-            // 4. Wait until after_turn request hits server while held open by afterTurnGate.
+            // 4. Wait until detached after_turn request hits server while held open by afterTurnGate.
             await mockServer.waitForRequest(
-                () => mockServer!.requests.filter((r) => r.origin === 'browser').length >= 3,
+                () => mockServer!.requests.filter((r) => r.origin === 'browser').length >= 4,
                 15000,
             );
 
@@ -703,6 +825,11 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
                 10000,
             );
             expect(mesTextRaw).not.toContain('<think>');
+            expect(mesTextRaw).not.toContain('Path 1 internal review summary.');
+
+            const chatMsg = await readHostChatMessage(page);
+            expect(chatMsg.mes).toBe('Hello adventurer, Path 1 reply!');
+            expect(chatMsg.swipes[0]).toBe('Hello adventurer, Path 1 reply!');
 
             await page.waitForFunction(
                 () => {
@@ -716,33 +843,11 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
             );
 
             // Verify #send_but unlocks cleanly while detached after_turn background task is STILL running!
-            await page.waitForFunction(
-                () => {
-                    const sendBtn = document.querySelector('#send_but') as HTMLElement | null;
-                    const stopBtn = document.querySelector('#mes_stop') as HTMLElement | null;
-                    return (
-                        sendBtn !== null
-                        && !sendBtn.classList.contains('displayNone')
-                        && getComputedStyle(sendBtn).display !== 'none'
-                        && sendBtn.getAttribute('disabled') === null
-                        && (!stopBtn || getComputedStyle(stopBtn).display === 'none')
-                    );
-                },
-                undefined,
-                { timeout: 5000 },
-            );
+            await waitForSendButtonUnlocked(page, 5000);
 
             // 5. Release after_turn and verify capsule reaches 'done' and causal variables landed.
             afterTurnGate.release();
-            await page.waitForFunction(
-                () => {
-                    const cap = document.querySelector('#chat .mes:last-of-type agentic-capsule');
-                    const status = cap?.shadowRoot?.querySelector('.cap-shell')?.getAttribute('data-status');
-                    return status === 'done';
-                },
-                undefined,
-                { timeout: 15000 },
-            );
+            await waitForLastCapsuleStatus(page, 'done', 15000);
 
             const resolvedVars = await page.evaluate(async () => {
                 const win = window as unknown as AgenticWindowBridge;
@@ -795,10 +900,11 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
         );
         expect(targetMesId).toBeGreaterThanOrEqual(1);
 
-        // 1. Trigger Swipe right -> creates swipeId = 1 with distinct causal variables.
+        // 1. Trigger Swipe right -> creates swipeId = 1 via write_file('/output.md') with distinct causal variables.
         mockServer.enqueue([
             makePatchVariablesScenario({ gold: 999, branch: 'swipe1', swipeOnlyKey: 'from-swipe-1' }),
-            { chunks: [{ content: 'Swipe One Branch Reply.' }] },
+            makeWriteOutputScenario('Swipe One Branch Reply.'),
+            makeMainTurnFinishScenario('Swipe 1 internal check passed.'),
         ]);
 
         const lastMes = page.locator('#chat .mes').last();
@@ -806,6 +912,8 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
         await lastMes.locator('.swipe_right').click();
 
         await waitForLocatorText(lastMes.locator('.mes_text'), 'Swipe One Branch Reply.', 15000);
+        await waitForLastCapsuleStatus(page, 'done', 15000);
+        await waitForSendButtonUnlocked(page, 10000);
         await page.waitForFunction(
             (id) => {
                 const mesEl = document.querySelector(`#chat .mes[mesid="${id}"]`);
@@ -820,6 +928,10 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
             targetMesId,
             { timeout: 10000 },
         );
+
+        const swipe1HostMsg = await readHostChatMessage(page, targetMesId);
+        expect(swipe1HostMsg.mes).toBe('Swipe One Branch Reply.');
+        expect(swipe1HostMsg.swipes[1]).toBe('Swipe One Branch Reply.');
 
         const swipe1Vars = await page.evaluate(async (id) => {
             const win = window as unknown as AgenticWindowBridge;
@@ -837,7 +949,7 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
         await waitForLocatorText(dialog.locator('.ag-card-body').last(), 'from-swipe-1', 5000);
         await closeConsoleIfOpen(page);
 
-        // 2. Switch left back to swipeId = 0 -> verify DOM and zero leakage from swipeId = 1.
+        // 2. Switch left back to swipeId = 0 -> verify DOM, window.chat, and zero leakage from swipeId = 1.
         await lastMes.hover();
         await lastMes.locator('.swipe_left').click();
 
@@ -846,6 +958,8 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
             'Hello adventurer, Path 1 reply!',
             10000,
         );
+        const swipe0HostMsg = await readHostChatMessage(page, targetMesId);
+        expect(swipe0HostMsg.mes).toBe('Hello adventurer, Path 1 reply!');
         const swipe0Vars = await page.evaluate(async (id) => {
             const win = window as unknown as AgenticWindowBridge;
             return (await win.Agentic?.vfs?.readVariables({ target: { messageId: id, swipeId: 0 } })) ?? {};
@@ -871,13 +985,21 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
 
         mockServer.enqueue([
             makePatchVariablesScenario({ gold: 555, branch: 'regen0' }),
-            { chunks: [{ content: 'Regenerated Clean Reply.' }] },
+            makeWriteOutputScenario('Regenerated Clean Reply.'),
+            makeMainTurnFinishScenario('Regen internal check passed.'),
         ]);
 
         await page.locator('#options_button').click();
         await page.locator('#option_regenerate').click();
 
         await waitForLocatorText(lastMes.locator('.mes_text'), 'Regenerated Clean Reply.', 15000);
+        await waitForLastCapsuleStatus(page, 'done', 15000);
+        await waitForSendButtonUnlocked(page, 10000);
+        const regenHostMsg = await readHostChatMessage(page, targetMesId);
+        expect(regenHostMsg.mes).toBe('Regenerated Clean Reply.');
+        expect(regenHostMsg.swipes[0]).toBe('Regenerated Clean Reply.');
+        expect(regenHostMsg.mes).not.toContain('Regen internal check passed.');
+
         const regen0Vars = await page.evaluate(async (id) => {
             const win = window as unknown as AgenticWindowBridge;
             return (await win.Agentic?.vfs?.readVariables({ target: { messageId: id, swipeId: 0 } })) ?? {};
@@ -893,7 +1015,7 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
         expect(swipe1AfterRegen.swipeOnlyKey).toBeUndefined();
     });
 
-    it('Path 3: #mes_stop aborts slow SSE stream cleanly, preserves safe partial text, and unlocks #send_but', async () => {
+    it('Path 3: #mes_stop aborts partial write_file(/output.md) SSE stream, salvages to chat[last].mes, sets capsule interrupted, and unlocks #send_but', async () => {
         if (!mockServer) {
             throw new Error('MockOpenAISseServer was not initialized');
         }
@@ -902,13 +1024,19 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
 
         const slowGate = createMockGate();
         try {
-            mockServer.enqueue({
-                chunks: [
-                    { content: 'Partial streamed prefix before cancel. ', delayMs: 10 },
-                    { waitGate: () => slowGate.promise, content: 'UNEXPECTED_TAIL_AFTER_ABORT' },
-                ],
-                keepOpenUntilAborted: true,
-            });
+            mockServer.enqueue(
+                makePartialToolCallScenario(
+                    'write_file',
+                    '{"path":"/output.md","content":"Partial streamed prefix before cancel. ',
+                    {
+                        callId: 'call_p3_partial',
+                        delayMs: 10,
+                        keepOpenUntilAborted: true,
+                        waitGateBeforeTail: () => slowGate.promise,
+                        trailingArgs: 'UNEXPECTED_TAIL_AFTER_ABORT"}',
+                    },
+                ),
+            );
 
             await sendChatText(page, 'Trigger slow stream to cancel');
 
@@ -929,36 +1057,334 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
             await slowReq.waitForAbort();
             expect(slowReq.aborted).toBe(true);
 
-            // Verify #send_but unlocks cleanly without deadlock.
-            await page.waitForFunction(
-                () => {
-                    const sendBtn = document.querySelector('#send_but') as HTMLElement | null;
-                    const stopBtn = document.querySelector('#mes_stop') as HTMLElement | null;
-                    return (
-                        Boolean(sendBtn)
-                        && !sendBtn?.classList.contains('displayNone')
-                        && sendBtn?.getAttribute('disabled') === null
-                        && (!stopBtn || getComputedStyle(stopBtn).display === 'none')
-                    );
-                },
-                undefined,
-                { timeout: 10000 },
-            );
+            // Verify #send_but unlocks cleanly without deadlock and capsule enters 'interrupted'.
+            await waitForSendButtonUnlocked(page, 10000);
+            await waitForLastCapsuleStatus(page, 'interrupted', 10000);
+            await lastMes.locator('agentic-capsule [data-action="resume"]').waitFor({
+                state: 'visible',
+                timeout: 5000,
+            });
 
             const textAfterStop = await lastMes.locator('.mes_text').innerText();
             expect(textAfterStop).toContain('Partial streamed prefix before cancel.');
             expect(textAfterStop).not.toContain('UNEXPECTED_TAIL_AFTER_ABORT');
 
-            // Verify subsequent turn succeeds cleanly without UI deadlock.
-            mockServer.enqueue({ chunks: [{ content: 'Post-abort recovery succeeded.' }] });
+            const salvagedChatMsg = await readHostChatMessage(page);
+            expect(salvagedChatMsg.mes).toBe('Partial streamed prefix before cancel. ');
+            expect(salvagedChatMsg.swipes[salvagedChatMsg.swipeId]).toBe(
+                'Partial streamed prefix before cancel. ',
+            );
+
+            // Verify subsequent turn succeeds cleanly via /output.md without UI deadlock.
+            mockServer.enqueue([
+                makeWriteOutputScenario('Post-abort recovery succeeded.'),
+                makeMainTurnFinishScenario('Post-abort review passed.'),
+            ]);
             await sendChatText(page, 'Verify recovery after stop');
             await waitForLocatorText(
                 page.locator('#chat .mes').last().locator('.mes_text'),
                 'Post-abort recovery succeeded.',
                 15000,
             );
+            await waitForLastCapsuleStatus(page, 'done', 10000);
+            await waitForSendButtonUnlocked(page, 10000);
+            const recoveryMsg = await readHostChatMessage(page);
+            expect(recoveryMsg.mes).toBe('Post-abort recovery succeeded.');
         } finally {
             slowGate.release();
+        }
+    });
+
+    it('Path A: streams /output.md without "..." placeholder pollution, edits in-turn via edit_file, and hides internal review summary', async () => {
+        if (!mockServer) {
+            throw new Error('MockOpenAISseServer was not initialized');
+        }
+        mockServer.clearRequests();
+        mockServer.clearScenarios();
+
+        const round1CloseGate = createMockGate();
+        try {
+            mockServer.enqueue([
+                makeWriteOutputScenario('Draft with TYPO_TOKEN.', {
+                    callId: 'call_pa_write',
+                    delayMs: 10,
+                    waitGateBeforeClose: () => round1CloseGate.promise,
+                }),
+                makeEditOutputScenario('TYPO_TOKEN', 'FIXED_TOKEN', {
+                    callId: 'call_pa_edit',
+                    delayMs: 10,
+                }),
+                makeMainTurnFinishScenario('Internal review passed.'),
+            ]);
+
+            await sendChatText(page, 'Run Path A streaming output and in-turn edit review');
+
+            const lastMes = page.locator('#chat .mes').last();
+
+            // 1. While Round 1 write_file is mid-stream, live .mes_text shows draft and chat[last].mes has zero '...' pollution.
+            await waitForLocatorText(lastMes.locator('.mes_text'), 'Draft with TYPO_TOKEN.', 10000);
+            const chatMidStream = await readHostChatMessage(page);
+            expect(chatMidStream.mes).toBe('');
+            expect(chatMidStream.mes).not.toBe('...');
+
+            // 2. Release Round 1 close -> Round 2 edit_file fixes TYPO_TOKEN -> Round 3 internal summary stays off-screen.
+            round1CloseGate.release();
+
+            await waitForLastCapsuleStatus(page, 'done', 15000);
+            await waitForSendButtonUnlocked(page, 10000);
+
+            const browserReqs = mockServer.requests.filter((r) => r.origin === 'browser');
+            expect(
+                browserReqs.length,
+                `Expected 3 requests in Path A, got ${browserReqs.length}: ${JSON.stringify(
+                    browserReqs.map((r) => ({
+                        id: r.id,
+                        stream: r.stream,
+                        msgCount: Array.isArray(r.body.messages) ? r.body.messages.length : 0,
+                        lastMsg: Array.isArray(r.body.messages)
+                            ? r.body.messages[r.body.messages.length - 1]
+                            : null,
+                    })),
+                )}`,
+            ).toBe(3);
+
+            const finalDomText = (await lastMes.locator('.mes_text').innerText()).trim();
+            expect(finalDomText).toBe('Draft with FIXED_TOKEN.');
+            expect(finalDomText).not.toContain('Internal review passed.');
+            expect(finalDomText).not.toContain('TYPO_TOKEN');
+
+            const finalChatMsg = await readHostChatMessage(page);
+            expect(finalChatMsg.mes).toBe('Draft with FIXED_TOKEN.');
+            expect(finalChatMsg.swipes[finalChatMsg.swipeId]).toBe('Draft with FIXED_TOKEN.');
+            expect(finalChatMsg.mes).not.toContain('Internal review passed.');
+            expect(finalChatMsg.mes).not.toContain('...');
+        } finally {
+            round1CloseGate.release();
+        }
+    });
+
+    it('Path B: salvages mid-stream interruption, resumes via [data-action="resume"] with KV prefix invariance, and applies after_turn edit_file directly to ST chat', async () => {
+        if (!mockServer) {
+            throw new Error('MockOpenAISseServer was not initialized');
+        }
+        mockServer.clearRequests();
+        mockServer.clearScenarios();
+
+        const tempAgentId = 'ag_path_b_editor';
+        const tempTriggerId = 'tr_path_b_edit_output';
+
+        // Enable a temporary ephemeral after_turn Edit trigger targeting /output.md just for Path B.
+        const enableSavePromise = page.waitForResponse(
+            (res) => res.url().includes('/api/settings/save') && res.request().method() === 'POST' && res.ok(),
+            { timeout: 12000 },
+        );
+        await page.evaluate(
+            async ({ agentId, triggerId }) => {
+                const win = window as unknown as AgenticWindowBridge;
+                await win.Agentic?.uiStore?.updateSettings((prev) => {
+                    const presets = { ...(prev.presets as Record<string, Record<string, unknown>>) };
+                    const presetId = String(prev.currentPresetId ?? '');
+                    const preset = presets[presetId];
+                    if (!preset) {
+                        return prev;
+                    }
+                    const agents = { ...((preset.agents as Record<string, unknown>) ?? {}) };
+                    agents[agentId] = {
+                        id: agentId,
+                        name: 'Path B Output Editor',
+                        connectionId: 'inherit',
+                        sessionMode: 'ephemeral',
+                        ephemeralWindowSize: 4,
+                        promptBlocks: [
+                            {
+                                id: 'system_base',
+                                name: 'Edit Output Base',
+                                role: 'system',
+                                placement: 'prefix',
+                                content: 'Inspect /output.md and apply surgical edit_file fixes.',
+                                enabled: true,
+                            },
+                        ],
+                        enabledTools: ['read_file', 'edit_file', 'append_file', 'write_file'],
+                        permissions: {
+                            read: ['/**'],
+                            write: ['/output.md'],
+                        },
+                        maxToolRounds: 4,
+                    };
+                    const triggers = [
+                        ...((preset.triggers as Array<{ id: string }>) ?? []).filter(
+                            (t) => t.id !== triggerId,
+                        ),
+                        {
+                            id: triggerId,
+                            label: 'Path B After-Turn Direct Edit',
+                            source: 'preset',
+                            phase: 'after_turn',
+                            order: 1,
+                            barrier: 'self',
+                            agentProfileId: agentId,
+                            kind: 'agent',
+                            decorator: '@@replace_output',
+                            targetPath: '/output.md',
+                            condition: { type: 'always' },
+                            instructionTemplate:
+                                'Replace "Part 2 resumed." with "Part 2 edited by trigger." in /output.md via edit_file.',
+                            enabled: true,
+                        },
+                    ];
+                    presets[presetId] = {
+                        ...preset,
+                        agents,
+                        triggers,
+                    };
+                    return { ...prev, presets };
+                });
+            },
+            { agentId: tempAgentId, triggerId: tempTriggerId },
+        );
+        await enableSavePromise;
+
+        try {
+            mockServer.enqueue([
+                // Hop 1 Round 1: truncated partial write_file('/output.md') arguments
+                makePartialToolCallScenario(
+                    'write_file',
+                    '{"path":"/output.md","content":"Part 1 before stop. ',
+                    {
+                        callId: 'call_pb_trunc',
+                        delayMs: 10,
+                        finishReason: 'length',
+                    },
+                ),
+                // Hop 2 Resumed Round 1: append_file('/output.md', 'Part 2 resumed.')
+                makeAppendOutputScenario('Part 2 resumed.', {
+                    callId: 'call_pb_append',
+                    delayMs: 10,
+                }),
+                // Hop 2 Resumed Round 2: plain internal review completion
+                makeMainTurnFinishScenario('Review done.'),
+                // Hop 2 after_turn Edit trigger Round 1 (non-streaming): edit_file('/output.md', ...)
+                makeNonStreamToolCallScenario([
+                    {
+                        id: 'call_pb_after_edit',
+                        name: 'edit_file',
+                        arguments: {
+                            path: '/output.md',
+                            search: 'Part 2 resumed.',
+                            replace: 'Part 2 edited by trigger.',
+                        },
+                    },
+                ]),
+                // Hop 2 after_turn Edit trigger Round 2 (non-streaming): finish
+                {
+                    nonStreamContent: 'After-turn direct edit applied.',
+                    finishReason: 'stop',
+                },
+            ]);
+
+            await sendChatText(page, 'Start Path B interrupted output and resume');
+
+            const lastMes = page.locator('#chat .mes').last();
+            await waitForLastCapsuleStatus(page, 'interrupted', 15000);
+            await waitForSendButtonUnlocked(page, 10000);
+
+            const resumeBtn = lastMes.locator('agentic-capsule [data-action="resume"]');
+            await resumeBtn.waitFor({ state: 'visible', timeout: 5000 });
+            expect(await resumeBtn.evaluate((el) => el.classList.contains('cap-resume-btn'))).toBe(true);
+
+            // Verify salvaged prefix is visible in DOM & stored in window.chat[last].mes
+            await waitForLocatorText(lastMes.locator('.mes_text'), 'Part 1 before stop.', 10000);
+            const interruptedChatMsg = await readHostChatMessage(page);
+            expect(interruptedChatMsg.mes).toBe('Part 1 before stop. ');
+            expect(interruptedChatMsg.swipes[interruptedChatMsg.swipeId]).toBe('Part 1 before stop. ');
+
+            const browserReqsBeforeResume = mockServer.requests.filter((r) => r.origin === 'browser');
+            expect(browserReqsBeforeResume).toHaveLength(1);
+            const hop1Req = browserReqsBeforeResume[0];
+
+            // Click [↻ 恢复] on the capsule to resume seamlessly
+            await resumeBtn.click();
+
+            await mockServer.waitForRequest(
+                () => mockServer!.requests.filter((r) => r.origin === 'browser').length >= 5,
+                15000,
+            );
+            await waitForLastCapsuleStatus(page, 'done', 15000);
+            await waitForSendButtonUnlocked(page, 10000);
+
+            const allBrowserReqs = mockServer.requests.filter((r) => r.origin === 'browser');
+            expect(allBrowserReqs).toHaveLength(5);
+
+            // Verify 100% Prefix KV Cache Invariance on the resumed request before [System Recovery]
+            const resumedReq = allBrowserReqs[1];
+            const hop1Msgs = hop1Req.body.messages as unknown[];
+            const resumedMsgs = resumedReq.body.messages as Array<{ role?: string; content?: unknown }>;
+            expect(resumedMsgs.length).toBe(hop1Msgs.length + 1);
+            expect(resumedMsgs.slice(0, hop1Msgs.length)).toEqual(hop1Msgs);
+            expect(resumedReq.body.tools).toEqual(hop1Req.body.tools);
+            expect(resumedMsgs[hop1Msgs.length]?.role).toBe('user');
+            expect(String(resumedMsgs[hop1Msgs.length]?.content ?? '')).toContain('[System Recovery]');
+            expect(String(resumedMsgs[hop1Msgs.length]?.content ?? '')).toContain('Part 1 before stop. ');
+
+            // Verify after_turn Edit trigger ran edit_file('/output.md') and updated ST chat directly
+            const triggerRound2Msgs = allBrowserReqs[4].body.messages as Array<{ role?: string; content?: unknown }>;
+            const editToolResultMsg = triggerRound2Msgs.find((m) => m.role === 'tool');
+            expect(String(editToolResultMsg?.content ?? '')).toContain('"ok":true');
+            expect(String(editToolResultMsg?.content ?? '')).toContain('/output.md');
+
+            await waitForLocatorText(
+                lastMes.locator('.mes_text'),
+                'Part 1 before stop. Part 2 edited by trigger.',
+                10000,
+            );
+            const finalDomText = (await lastMes.locator('.mes_text').innerText()).trim();
+            expect(finalDomText).toBe('Part 1 before stop. Part 2 edited by trigger.');
+            expect(finalDomText).not.toContain('Review done.');
+            expect(finalDomText).not.toContain('After-turn direct edit applied.');
+
+            const finalChatMsg = await readHostChatMessage(page);
+            expect(finalChatMsg.mes).toBe('Part 1 before stop. Part 2 edited by trigger.');
+            expect(finalChatMsg.swipes[finalChatMsg.swipeId]).toBe(
+                'Part 1 before stop. Part 2 edited by trigger.',
+            );
+        } finally {
+            // Clean up temporary trigger and agent profile before Paths 4 & 5.
+            const cleanupSavePromise = page
+                .waitForResponse(
+                    (res) =>
+                        res.url().includes('/api/settings/save')
+                        && res.request().method() === 'POST'
+                        && res.ok(),
+                    { timeout: 12000 },
+                )
+                .catch(() => undefined);
+            await page.evaluate(
+                async ({ agentId, triggerId }) => {
+                    const win = window as unknown as AgenticWindowBridge;
+                    await win.Agentic?.uiStore?.updateSettings((prev) => {
+                        const presets = { ...(prev.presets as Record<string, Record<string, unknown>>) };
+                        const presetId = String(prev.currentPresetId ?? '');
+                        const preset = presets[presetId];
+                        if (!preset) {
+                            return prev;
+                        }
+                        const agents = { ...((preset.agents as Record<string, unknown>) ?? {}) };
+                        delete agents[agentId];
+                        const triggers = ((preset.triggers as Array<{ id: string }>) ?? []).filter(
+                            (t) => t.id !== triggerId,
+                        );
+                        presets[presetId] = {
+                            ...preset,
+                            agents,
+                            triggers,
+                        };
+                        return { ...prev, presets };
+                    });
+                },
+                { agentId: tempAgentId, triggerId: tempTriggerId },
+            );
+            await cleanupSavePromise;
         }
     });
 
