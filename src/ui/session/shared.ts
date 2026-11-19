@@ -148,7 +148,7 @@ export function getCategoryLabel(category: FileOverrideCategory): string {
         case 'worldinfo':
             return 'WI覆写';
         case 'message':
-            return '展示层';
+            return '输出 (/output.md)';
     }
 }
 

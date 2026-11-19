@@ -3,6 +3,7 @@ import type {
     CapsulePersistMode,
     CapsulePosition,
     ConsoleTabId,
+    InterruptedReason,
     MessageTarget,
     ThemeMode,
 } from '@/core/types';
@@ -20,6 +21,7 @@ export type CapsuleStatus =
     | 'streaming'
     | 'done'
     | 'background-running'
+    | 'interrupted'
     | 'error';
 
 export interface CapsuleBadgeItem {
@@ -42,12 +44,15 @@ export interface AgenticCapsuleData {
     cacheHitRate?: number;
     currentStep?: string;
     errorMessage?: string;
+    interruptedReason?: InterruptedReason;
+    canResume?: boolean;
     taskId?: string;
     taskLabel?: string;
     badges: CapsuleBadgeItem[];
     backgroundTasks: BackgroundTaskStatus[];
     onOpenConsole?: (tab: ConsoleTabId, deepLink: DeepLinkState) => void;
     onCancelTask?: (taskId: string) => void | Promise<void>;
+    onResume?: () => void | Promise<void>;
 }
 
 const CAPSULE_OBSERVED_ATTRIBUTES = [
@@ -65,6 +70,8 @@ const CAPSULE_OBSERVED_ATTRIBUTES = [
     'task-id',
     'task-label',
     'error-message',
+    'interrupted-reason',
+    'can-resume',
 ] as const;
 
 const CAPSULE_STYLES = `
@@ -147,6 +154,10 @@ const CAPSULE_STYLES = `
     border-color: color-mix(in srgb, var(--cap-error) 55%, var(--cap-border));
 }
 
+.cap-shell[data-status="interrupted"] {
+    border-color: color-mix(in srgb, var(--cap-warning) 60%, var(--cap-border));
+}
+
 .cap-shell[data-status="retrieving"],
 .cap-shell[data-status="streaming"],
 .cap-shell[data-status="background-running"] {
@@ -179,7 +190,8 @@ const CAPSULE_STYLES = `
 
 .cap-open-btn:focus-visible,
 .cap-badge-btn:focus-visible,
-.cap-cancel-btn:focus-visible {
+.cap-cancel-btn:focus-visible,
+.cap-resume-btn:focus-visible {
     outline: 2px solid var(--cap-primary);
     outline-offset: -2px;
 }
@@ -196,6 +208,10 @@ const CAPSULE_STYLES = `
 
 .cap-shell[data-status="done"] .cap-indicator {
     color: var(--cap-success);
+}
+
+.cap-shell[data-status="interrupted"] .cap-indicator {
+    color: var(--cap-warning);
 }
 
 .cap-shell[data-status="error"] .cap-indicator {
@@ -347,6 +363,40 @@ const CAPSULE_STYLES = `
     color: var(--cap-error);
 }
 
+.cap-resume-btn {
+    flex-shrink: 0;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0 10px;
+    margin: 0;
+    border: none;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--cap-warning) 18%, transparent);
+    color: var(--cap-warning);
+    font: inherit;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color 0.15s, opacity 0.15s;
+}
+
+.cap-resume-btn[hidden] {
+    display: none;
+}
+
+.cap-resume-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--cap-warning) 28%, transparent);
+}
+
+.cap-resume-btn:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
 @media (max-width: 767px) {
     .cap-badges {
         display: none;
@@ -378,6 +428,25 @@ function createStatusIconSvg(status: CapsuleStatus): SVGSVGElement {
     svg.setAttribute('stroke-linecap', 'round');
     svg.setAttribute('stroke-linejoin', 'round');
     svg.setAttribute('aria-hidden', 'true');
+
+    if (status === 'interrupted') {
+        const circle = document.createElementNS(ns, 'circle');
+        circle.setAttribute('cx', '12');
+        circle.setAttribute('cy', '12');
+        circle.setAttribute('r', '9');
+        const l1 = document.createElementNS(ns, 'line');
+        l1.setAttribute('x1', '10');
+        l1.setAttribute('y1', '9');
+        l1.setAttribute('x2', '10');
+        l1.setAttribute('y2', '15');
+        const l2 = document.createElementNS(ns, 'line');
+        l2.setAttribute('x1', '14');
+        l2.setAttribute('y1', '9');
+        l2.setAttribute('x2', '14');
+        l2.setAttribute('y2', '15');
+        svg.append(circle, l1, l2);
+        return svg;
+    }
 
     if (status === 'error') {
         const tri = document.createElementNS(ns, 'path');
@@ -429,6 +498,19 @@ function buildDefaultSummary(state: AgenticCapsuleData): string {
             return state.stepCount > 0 && hitText
                 ? `${state.stepCount} 步 · 缓存 ${hitText} · 后台运行中`
                 : '后台触发任务执行中...';
+        case 'interrupted':
+            switch (state.interruptedReason) {
+                case 'user_stop':
+                    return '已暂停 · 可恢复';
+                case 'length':
+                    return '输出截断 · 可续写';
+                case 'empty_output':
+                    return '未写入 /output.md · 可重试';
+                case 'error':
+                    return '连接中断 · 可恢复';
+                default:
+                    return '已暂停 · 可恢复';
+            }
         case 'error':
             return state.errorMessage?.trim() || '生成或后台任务发生错误';
         case 'done': {
@@ -476,12 +558,14 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
     private _store: AppStore | null = null;
     private _storeUnsubscribe: (() => void) | null = null;
     private _timerId: ReturnType<typeof setInterval> | null = null;
+    private _resumePending = false;
     private _shadow: ShadowRoot | null = null;
     private _shellEl: HTMLDivElement | null = null;
     private _openBtnEl: HTMLButtonElement | null = null;
     private _indicatorEl: HTMLSpanElement | null = null;
     private _summaryEl: HTMLSpanElement | null = null;
     private _badgesEl: HTMLDivElement | null = null;
+    private _resumeBtnEl: HTMLButtonElement | null = null;
     private _tasksEl: HTMLDivElement | null = null;
 
     constructor() {
@@ -544,6 +628,7 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
                     || val === 'streaming'
                     || val === 'done'
                     || val === 'background-running'
+                    || val === 'interrupted'
                     || val === 'error'
                 ) {
                     this._state.status = val;
@@ -575,6 +660,27 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
                 break;
             case 'error-message':
                 this._state.errorMessage = val || undefined;
+                break;
+            case 'interrupted-reason':
+                if (
+                    val === 'user_stop'
+                    || val === 'length'
+                    || val === 'error'
+                    || val === 'empty_output'
+                ) {
+                    this._state.interruptedReason = val;
+                } else if (!val) {
+                    this._state.interruptedReason = undefined;
+                }
+                break;
+            case 'can-resume':
+                if (val === 'false' || val === '0') {
+                    this._state.canResume = false;
+                } else if (val === 'true' || val === '1' || newValue === '') {
+                    this._state.canResume = true;
+                } else if (newValue === null) {
+                    this._state.canResume = undefined;
+                }
                 break;
         }
         this.render();
@@ -675,6 +781,20 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
         this.setState({ backgroundTasks: value });
     }
 
+    get interruptedReason(): InterruptedReason | undefined {
+        return this._state.interruptedReason;
+    }
+    set interruptedReason(value: InterruptedReason | undefined) {
+        this.setState({ interruptedReason: value });
+    }
+
+    get canResume(): boolean | undefined {
+        return this._state.canResume;
+    }
+    set canResume(value: boolean | undefined) {
+        this.setState({ canResume: value });
+    }
+
     /**
      * Bind this capsule to an `AppStore` for reactive theme/position/persistMode/task sync
      * and one-click deep linking into `<dialog id="agentic-app">`.
@@ -710,10 +830,17 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
             if (mainTrace) {
                 if (mainTrace.status === 'error') {
                     derivedStatus = 'error';
+                } else if (mainTrace.status === 'interrupted') {
+                    derivedStatus = 'interrupted';
                 } else if (hasActiveTasks) {
                     derivedStatus = 'background-running';
                 } else if (mainTrace.status === 'completed') {
                     derivedStatus = 'done';
+                } else if (
+                    mainTrace.status === 'running'
+                    && (this._state.status === 'interrupted' || this._state.status === 'idle')
+                ) {
+                    derivedStatus = 'streaming';
                 }
             } else if (hasActiveTasks) {
                 derivedStatus = 'background-running';
@@ -725,7 +852,18 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
                 persistMode: snap.settings.capsulePersistMode,
                 backgroundTasks: matchingTasks,
                 status: derivedStatus,
-                errorMessage: mainTrace?.status === 'error' ? (mainTrace.error ?? this._state.errorMessage) : this._state.errorMessage,
+                interruptedReason:
+                    mainTrace?.status === 'interrupted'
+                        ? (mainTrace.interruptedReason ?? this._state.interruptedReason)
+                        : mainTrace?.status === 'completed' || mainTrace?.status === 'running'
+                            ? undefined
+                            : this._state.interruptedReason,
+                errorMessage:
+                    mainTrace?.status === 'error' || mainTrace?.status === 'interrupted'
+                        ? (mainTrace.error ?? this._state.errorMessage)
+                        : mainTrace?.status === 'completed' || mainTrace?.status === 'running'
+                            ? undefined
+                            : this._state.errorMessage,
                 stepCount: mainTrace ? mainTrace.toolSteps.length : this._state.stepCount,
                 cacheHitRate: mainTrace
                     ? mainTrace.usage.cacheHitRate
@@ -828,11 +966,24 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
         const badges = document.createElement('div');
         badges.className = 'cap-badges';
 
+        const resumeBtn = document.createElement('button');
+        resumeBtn.type = 'button';
+        resumeBtn.className = 'cap-resume-btn';
+        resumeBtn.setAttribute('data-action', 'resume');
+        resumeBtn.setAttribute('aria-label', '恢复生成 /output.md');
+        resumeBtn.title = '从中断点继续生成 /output.md';
+        resumeBtn.textContent = '↻ 恢复';
+        resumeBtn.hidden = true;
+        resumeBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            void this.handleResume();
+        });
+
         const tasks = document.createElement('div');
         tasks.className = 'cap-tasks';
         tasks.style.display = 'contents';
 
-        shell.append(openBtn, badges, tasks);
+        shell.append(openBtn, badges, resumeBtn, tasks);
         shadow.append(styleEl, shell);
 
         this._shellEl = shell;
@@ -840,6 +991,7 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
         this._indicatorEl = indicator;
         this._summaryEl = summary;
         this._badgesEl = badges;
+        this._resumeBtnEl = resumeBtn;
         this._tasksEl = tasks;
     }
 
@@ -908,6 +1060,63 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
         this.syncTicker();
     }
 
+    private async handleResume(): Promise<void> {
+        if (
+            this._resumePending
+            || this._state.status !== 'interrupted'
+            || this._state.canResume === false
+        ) {
+            return;
+        }
+
+        const target: MessageTarget = {
+            messageId: this._state.messageId,
+            swipeId: this._state.swipeId,
+        };
+        const reason = this._state.interruptedReason;
+
+        this._resumePending = true;
+        if (this._resumeBtnEl) {
+            this._resumeBtnEl.disabled = true;
+        }
+
+        try {
+            if (typeof CustomEvent !== 'undefined') {
+                this.dispatchEvent(
+                    new CustomEvent('agentic-capsule-resume', {
+                        bubbles: true,
+                        composed: true,
+                        detail: {
+                            messageId: target.messageId,
+                            swipeId: target.swipeId,
+                            reason,
+                        },
+                    }),
+                );
+            }
+
+            if (this._state.onResume) {
+                await this._state.onResume();
+            } else {
+                const store = this.resolveStore();
+                if (store?.services.resumeTurn) {
+                    await store.services.resumeTurn(target);
+                } else if (store) {
+                    await store.resumeTurn(target);
+                }
+            }
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            this.resolveStore()?.pushToast(`恢复生成失败：${msg}`, 'error');
+        } finally {
+            this._resumePending = false;
+            if (this._resumeBtnEl) {
+                this._resumeBtnEl.disabled = false;
+            }
+            this.render();
+        }
+    }
+
     private syncTicker(): void {
         const hasActive = this.getActiveBackgroundTasks().length > 0;
         if (hasActive && this.isConnected) {
@@ -949,6 +1158,7 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
             || !this._indicatorEl
             || !this._summaryEl
             || !this._badgesEl
+            || !this._resumeBtnEl
             || !this._tasksEl
             || !this._openBtnEl
         ) {
@@ -961,6 +1171,7 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
             || this._state.status === 'retrieving'
             || this._state.status === 'streaming'
             || this._state.status === 'background-running'
+            || this._state.status === 'interrupted'
             || this._state.status === 'error';
 
         const shouldHide = this._state.persistMode === 'auto_hide' && !isActive;
@@ -988,7 +1199,17 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
         // Summary text (single-line truncated via CSS ellipsis)
         const summaryText = buildDefaultSummary(this._state);
         this._summaryEl.textContent = summaryText;
-        this._openBtnEl.title = `#${this._state.messageId}#${this._state.swipeId} · ${summaryText}`;
+        const detailSuffix =
+            this._state.status === 'interrupted' && this._state.errorMessage?.trim()
+                ? ` (${this._state.errorMessage.trim()})`
+                : '';
+        this._openBtnEl.title = `#${this._state.messageId}#${this._state.swipeId} · ${summaryText}${detailSuffix}`;
+
+        // Dedicated resume action button when interrupted
+        const showResume =
+            this._state.status === 'interrupted' && this._state.canResume !== false;
+        this._resumeBtnEl.hidden = !showResume;
+        this._resumeBtnEl.disabled = this._resumePending;
 
         // Quick badges (optional)
         this._badgesEl.replaceChildren();

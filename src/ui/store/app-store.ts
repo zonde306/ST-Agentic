@@ -179,6 +179,7 @@ export interface AgenticUIServices {
     listTraces(filter?: { messageId?: number; swipeId?: number }): Promise<AgentRunTrace[]>;
     clearTraces?(): Promise<void>;
     rerunAfterTurn(target?: MessageTarget): Promise<void>;
+    resumeTurn?(target: MessageTarget): Promise<void>;
     cancelBackgroundTask(taskId: string): Promise<void>;
 
     // Settings, Preset Import/Export & Migration (Header / View 4-9)
@@ -386,6 +387,7 @@ export class AppStore {
     private readonly customLuminanceReader?: () => ResolvedTheme;
     private unsubscribeEvents?: () => void;
     private toastCounter = 0;
+    private resumedEventCount = 0;
 
     constructor(options: AppStoreOptions = {}) {
         const usingCustomServices = Boolean(options.services);
@@ -665,6 +667,22 @@ export class AppStore {
         );
     }
 
+    async resumeTurn(target?: MessageTarget): Promise<void> {
+        const resolved = target ?? this.state.activeTarget;
+        if (!this.services.resumeTurn) {
+            this.pushToast('当前运行时不支持断点恢复', 'warning');
+            return;
+        }
+        const prevEventCount = this.resumedEventCount;
+        await this.services.resumeTurn(resolved);
+        if (this.resumedEventCount === prevEventCount) {
+            this.pushToast(
+                `已恢复 #${resolved.messageId}#${resolved.swipeId} 的 /output.md 生成`,
+                'success',
+            );
+        }
+    }
+
     pushToast(message: string, tone: ToastTone = 'primary', durationMs = 2800): string {
         this.toastCounter += 1;
         const id = `toast_${Date.now()}_${this.toastCounter}`;
@@ -713,11 +731,91 @@ export class AppStore {
         this.setState({ activeModal: null });
     }
 
+    private findMatchingTraceIndex(event: GenerationEventPayload): number {
+        if (event.runId) {
+            const byRunId = this.state.traces.findIndex((item) => item.runId === event.runId);
+            if (byRunId >= 0) {
+                return byRunId;
+            }
+        }
+        const phase = event.phase ?? 'main_turn';
+        return this.state.traces.findIndex(
+            (item) =>
+                item.target.messageId === event.target.messageId
+                && item.target.swipeId === event.target.swipeId
+                && item.phase === phase,
+        );
+    }
+
     private handleGenerationEvent(event: GenerationEventPayload): void {
         if (event.kind === 'trace_recorded' && event.trace) {
             this.upsertTrace(event.trace);
-        } else if (event.kind === 'background_task_updated' && event.task) {
+            return;
+        }
+        if (event.kind === 'background_task_updated' && event.task) {
             this.upsertBackgroundTask(event.task);
+            return;
+        }
+        if (event.kind === 'output_preview' && event.outputPreview !== undefined) {
+            const idx = this.findMatchingTraceIndex(event);
+            if (idx >= 0) {
+                const existing = this.state.traces[idx];
+                if (existing.outputPreview !== event.outputPreview) {
+                    const nextTraces = [...this.state.traces];
+                    nextTraces[idx] = {
+                        ...existing,
+                        outputPreview: event.outputPreview,
+                    };
+                    this.setState({ traces: nextTraces });
+                }
+            }
+            return;
+        }
+        if (event.kind === 'turn_interrupted') {
+            if (event.trace) {
+                this.upsertTrace(event.trace);
+                return;
+            }
+            const idx = this.findMatchingTraceIndex(event);
+            if (idx >= 0) {
+                const existing = this.state.traces[idx];
+                const nextTraces = [...this.state.traces];
+                nextTraces[idx] = {
+                    ...existing,
+                    status: 'interrupted',
+                    interruptedReason: event.interruptedReason ?? existing.interruptedReason,
+                    error: event.error ?? existing.error,
+                    outputPreview: event.outputPreview ?? existing.outputPreview,
+                    endedAt: event.timestamp || Date.now(),
+                };
+                this.setState({ traces: nextTraces });
+            }
+            return;
+        }
+        if (event.kind === 'turn_resumed') {
+            this.resumedEventCount += 1;
+            if (event.trace) {
+                this.upsertTrace(event.trace);
+            } else {
+                const idx = this.findMatchingTraceIndex(event);
+                if (idx >= 0) {
+                    const existing = this.state.traces[idx];
+                    if (existing.status === 'interrupted') {
+                        const nextTraces = [...this.state.traces];
+                        nextTraces[idx] = {
+                            ...existing,
+                            status: 'running',
+                            interruptedReason: undefined,
+                            error: undefined,
+                        };
+                        this.setState({ traces: nextTraces });
+                    }
+                }
+            }
+            this.pushToast(
+                `已恢复 #${event.target.messageId}#${event.target.swipeId} 的 /output.md 生成`,
+                'success',
+            );
         }
     }
 

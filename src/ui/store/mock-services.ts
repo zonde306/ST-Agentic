@@ -1,4 +1,5 @@
 import {
+    DEFAULT_MAIN_AGENT_TOOLS,
     createDefaultConnection,
     createDefaultMainAgent,
     createDefaultPreset,
@@ -22,6 +23,7 @@ import type {
     ClassifiedLoreEntry,
     CompactionReport,
     CustomToolConfig,
+    GenerationEventPayload,
     MessageTarget,
     Settings,
     WICategory,
@@ -35,6 +37,7 @@ import type {
     ImportPresetResult,
     ResolvedTheme,
     StorageOverview,
+    ToastTone,
     ToolTestResult,
 } from './app-store';
 
@@ -89,7 +92,8 @@ export function createMockSettings(): Settings {
         connectionId: 'inherit',
         sessionMode: 'persistent',
         watermark: { high: 36000, low: 18000 },
-        permissions: { read: ['/**'], write: ['/memory/**', '/scratch/**'] },
+        enabledTools: [...DEFAULT_MAIN_AGENT_TOOLS],
+        permissions: { read: ['/**'], write: ['/output.md', '/memory/**', '/scratch/**'] },
         promptBlocks: [
             {
                 id: 'b1',
@@ -575,17 +579,18 @@ function createInitialMockFiles(): FileOverrideItem[] {
             writable: true,
         },
         {
-            id: 'f_mes_12',
+            id: 'output:12#0',
             category: 'message',
-            namespace: 'message',
-            path: 'message://12#0 (展示层覆写)',
-            key: '',
+            namespace: 'files',
+            path: '/output.md',
+            key: '/output.md',
             target: { messageId: 12, swipeId: 0 },
-            layerLabel: '#12#0 (UI Only)',
-            source: '@@append_output',
+            layerLabel: 'L12#0',
+            source: 'tool:write_file',
             content:
-                '<details><summary>📊 当前状态快照（不进入模型缓存前缀）</summary>\n灵力：84/100 | 林婉儿好感：62 | 地点：听竹小筑\n</details>',
-            baseContent: '',
+                '夜风穿过竹梢，石井边缘那道极浅的银莲花刻痕在月色下泛起冷光……\n\n<details><summary>📊 当前状态快照（不进入模型缓存前缀）</summary>\n灵力：84/100 | 林婉儿好感：62 | 地点：听竹小筑\n</details>',
+            baseContent:
+                '夜风穿过竹梢，石井边缘那道极浅的银莲花刻痕在月色下泛起冷光……',
             overridden: true,
             writable: true,
         },
@@ -696,12 +701,23 @@ function createInitialMockLore(): ClassifiedLoreEntry[] {
 
 export interface MockUIServicesOptions {
     getHostLuminance?: () => ResolvedTheme;
+    onToast?: (message: string, tone: ToastTone) => void;
 }
 
 export function createMockUIServices(options: MockUIServicesOptions = {}): AgenticUIServices {
     let settingsSnapshot = createMockSettings();
     let files = createInitialMockFiles();
     const traces = createMockTraces();
+    const eventListeners = new Set<(event: GenerationEventPayload) => void>();
+    const emitEvent = (event: GenerationEventPayload) => {
+        eventListeners.forEach((listener) => {
+            try {
+                listener(event);
+            } catch {
+                // Keep mock event dispatch fault-tolerant.
+            }
+        });
+    };
     let watermarks: AgentWatermarkStatus[] = [
         {
             agentId: 'main',
@@ -762,7 +778,11 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
         async saveFileOrOverride(input) {
             const target = input.target ?? { messageId: 12, swipeId: 0 };
             const existingIdx = files.findIndex(
-                (f) => f.namespace === input.namespace && f.key === input.key,
+                (f) =>
+                    f.namespace === input.namespace
+                    && f.key === input.key
+                    && (f.path !== '/output.md'
+                        || (f.target.messageId === target.messageId && f.target.swipeId === target.swipeId)),
             );
             if (existingIdx >= 0) {
                 const updated: FileOverrideItem = {
@@ -776,21 +796,23 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
                 return { ...updated };
             }
             const category =
-                input.namespace === 'variables'
-                    ? 'variables'
-                    : input.namespace === 'worldinfo'
-                        ? 'worldinfo'
-                        : input.namespace === 'message'
-                            ? 'message'
-                            : 'workspace';
+                input.path === '/output.md'
+                    ? 'message'
+                    : input.namespace === 'variables'
+                        ? 'variables'
+                        : input.namespace === 'worldinfo'
+                            ? 'worldinfo'
+                            : input.namespace === 'message'
+                                ? 'message'
+                                : 'workspace';
             const created: FileOverrideItem = {
-                id: `f_${Date.now()}`,
+                id: input.path === '/output.md' ? `output:${target.messageId}#${target.swipeId}` : `f_${Date.now()}`,
                 category,
                 namespace: input.namespace,
                 path: input.path,
                 key: input.key,
                 target,
-                layerLabel: `#${target.messageId}#${target.swipeId}`,
+                layerLabel: `L${target.messageId}#${target.swipeId}`,
                 source: 'user-edit',
                 content: input.content,
                 baseContent: '',
@@ -802,8 +824,15 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
         },
 
         async deleteFileOrOverride(input) {
+            const target = input.target;
             files = files.map((f) => {
-                if (f.namespace === input.namespace && f.key === input.key) {
+                if (
+                    f.namespace === input.namespace
+                    && f.key === input.key
+                    && (!target
+                        || f.path !== '/output.md'
+                        || (f.target.messageId === target.messageId && f.target.swipeId === target.swipeId))
+                ) {
                     return {
                         ...f,
                         content: f.baseContent ?? '',
@@ -884,6 +913,52 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
 
         async rerunAfterTurn() {
             // Mock hook: real runtime dispatches TriggerPipeline.runPhase('after_turn')
+        },
+
+        async resumeTurn(target: MessageTarget) {
+            const now = Date.now();
+            let updatedTrace: AgentRunTrace | undefined;
+            for (let i = 0; i < traces.length; i += 1) {
+                const trace = traces[i];
+                if (
+                    trace.target.messageId === target.messageId
+                    && trace.target.swipeId === target.swipeId
+                    && trace.phase === 'main_turn'
+                    && trace.status === 'interrupted'
+                ) {
+                    updatedTrace = {
+                        ...trace,
+                        status: 'completed',
+                        interruptedReason: undefined,
+                        error: undefined,
+                        endedAt: now,
+                    };
+                    traces[i] = updatedTrace;
+                    break;
+                }
+            }
+
+            options.onToast?.(
+                `已恢复 #${target.messageId}#${target.swipeId} 的 /output.md 生成`,
+                'success',
+            );
+            emitEvent({
+                kind: 'turn_resumed',
+                target: { ...target },
+                timestamp: now,
+                phase: 'main_turn',
+                ...(updatedTrace ? { runId: updatedTrace.runId } : {}),
+            });
+            if (updatedTrace) {
+                emitEvent({
+                    kind: 'trace_recorded',
+                    target: { ...target },
+                    timestamp: now,
+                    phase: 'main_turn',
+                    runId: updatedTrace.runId,
+                    trace: { ...updatedTrace },
+                });
+            }
         },
 
         async cancelBackgroundTask() {
@@ -1064,5 +1139,12 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
         },
 
         getHostLuminance: options.getHostLuminance,
+
+        subscribeEvents(listener) {
+            eventListeners.add(listener);
+            return () => {
+                eventListeners.delete(listener);
+            };
+        },
     };
 }

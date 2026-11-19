@@ -43,7 +43,7 @@ const CATEGORY_FILTERS: readonly { id: CategoryFilter; label: string }[] = [
     { id: 'workspace', label: '工作区' },
     { id: 'variables', label: '变量' },
     { id: 'worldinfo', label: 'WI覆写' },
-    { id: 'message', label: '展示层' },
+    { id: 'message', label: '输出 (/output.md)' },
 ];
 
 function inferLanguageHint(
@@ -52,7 +52,12 @@ function inferLanguageHint(
     if (item.category === 'variables' || item.path.endsWith('.json')) {
         return 'json';
     }
-    if (item.path.endsWith('.md')) {
+    if (
+        item.category === 'message'
+        || item.path === '/output.md'
+        || item.path.endsWith('/output.md')
+        || item.path.endsWith('.md')
+    ) {
         return 'markdown';
     }
     if (item.path.endsWith('.js') || item.path.endsWith('.ts')) {
@@ -194,7 +199,14 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
         if (deepLink.filePath) {
             setCategoryFilter('all');
             consumedDeepLinkFileRef.current = null;
-            const matched = items.find((item) => matchDeepLinkItem(item, deepLink.filePath!));
+            const matched =
+                items.find(
+                    (item) =>
+                        matchDeepLinkItem(item, deepLink.filePath!)
+                        && (deepLink.messageId === undefined || item.target.messageId === deepLink.messageId)
+                        && (deepLink.swipeId === undefined || item.target.swipeId === deepLink.swipeId),
+                )
+                ?? items.find((item) => matchDeepLinkItem(item, deepLink.filePath!));
             if (matched) {
                 consumedDeepLinkFileRef.current = deepLink.filePath;
                 setSelectedId(matched.id);
@@ -220,7 +232,14 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
         ) {
             return;
         }
-        const matched = items.find((item) => matchDeepLinkItem(item, deepLink.filePath!));
+        const matched =
+            items.find(
+                (item) =>
+                    matchDeepLinkItem(item, deepLink.filePath!)
+                    && (deepLink.messageId === undefined || item.target.messageId === deepLink.messageId)
+                    && (deepLink.swipeId === undefined || item.target.swipeId === deepLink.swipeId),
+            )
+            ?? items.find((item) => matchDeepLinkItem(item, deepLink.filePath!));
         if (matched) {
             consumedDeepLinkFileRef.current = deepLink.filePath;
             if (selectedIdRef.current !== matched.id) {
@@ -229,7 +248,7 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
             }
             setDetailOpen(true);
         }
-    }, [deepLink.filePath, items]);
+    }, [deepLink.filePath, deepLink.messageId, deepLink.swipeId, items]);
 
     const filteredItems = useMemo(() => {
         const query = searchQuery.trim().toLowerCase();
@@ -662,7 +681,7 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
             onDetailOpenChange={setDetailOpen}
             detailTitle={selectedItem?.path ?? '文件详情'}
             emptyDetailTitle="选择左侧文件或覆写条目"
-            emptyDetailDescription="支持工作区文件、/state/variables.json、世界书覆写及消息展示层的编辑与 Diff 对比。"
+            emptyDetailDescription="支持工作区文件、/state/variables.json、世界书覆写及 /output.md 消息输出的编辑与 Diff 对比。"
             master={masterPane}
             detail={detailPane}
         />
