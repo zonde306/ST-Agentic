@@ -113,9 +113,14 @@ export interface RawLoreEntry {
     role: number;
 }
 
+export interface WriteChatMessageOptions {
+    /** 流式阶段或内部暂存设为 false；后置触发器或独立编辑完结时可设为 true 触发 MESSAGE_UPDATED */
+    emitEvent?: boolean;
+}
+
 /** 宿主防腐接口：core/ 模块只通过此接口访问聊天状态、资产与 ST 服务 */
 export interface HostBridge {
-    // 1. 会话与消息读写
+    // 1. 会话与消息读写（直读写 ST 原生 chat[messageId].swipes[swipeId] / mes，取代影子展示层）
     getChat(): ChatMessageSnapshot[];
     getMetadata(): Record<string, unknown>;
     saveChatDebounced(): void;
@@ -125,6 +130,12 @@ export interface HostBridge {
         characterAvatar: string;
         personaAvatar: string;
     };
+    readChatMessage(target: MessageTarget): string | null;
+    writeChatMessage(
+        target: MessageTarget,
+        content: string,
+        options?: WriteChatMessageOptions,
+    ): Promise<void>;
 
     // 2. 角色、人设与世界书资产读取
     getCharacterFields(): Record<string, string>;
@@ -237,6 +248,7 @@ L ├────/────┴───●──────────/─�
 | 挂载路径 | 底层数据源 | 读写权限 | 回滚与持久化语义 |
 | :--- | :--- | :--- | :--- |
 | `/`（工作区根） | `ChatDataStore` (`files` 命名空间) | `rw` | 随 `(messageId, swipeId)` 分层写入，Swipe 切页自动回滚 |
+| `/output.md` | `OutputMount`（经 `HostBridge.readChatMessage` / `writeChatMessage` 直连真实 ST 消息；伴生模式 `before_turn` 支持内存 `preCreateBuffers` 预缓冲） | `rw` | 严格绑定单楼层 `(messageId, swipeId)` **非继承**读写，彻底取代 `DATA_NAMESPACES.MESSAGE` 影子覆写；不写入持久化线程 `Read-Set`；配套 15 个内置工具中的 `write_file` / `append_file` / `edit_file` 与流式参数预览 |
 | `/state/variables.json` | 变量桥接树（对齐 ST / `[InitVar]` 变量） | `rw` | 随 `(messageId, swipeId)` 分层写入，兼容旧版读写与 `patch_variables` |
 | `/character/*` | 角色卡字段只读快照 + `character-files` 层叠 | `ro` / 局部 `rw` | 沿用快照覆写机制（跳过空字段与 `first_mes`） |
 | `/persona/*` | 当前人设快照 + `persona-files` 层叠 | `ro` / 局部 `rw` | 同上 |
@@ -245,6 +257,8 @@ L ├────/────┴───●──────────/─�
 | `/preset/*` | 随当前 Preset 携带的参考文档 | `ro` | 随预设导入导出 |
 | `/global/*` | 扩展全局持久存储 | `rw` | 跨聊天共享持久化（偏好、通用知识库） |
 | `/history/chunk-*.md` | 分块压缩归档对话 | `ro` | 只读归档，配套 `search_history` 与 `read_history` |
+
+> **15 个内置工具与 `/output.md` 强制输出规范**：内置工具集包含 `list_dir`、`glob_files`、`grep_search`、`search_files`、`read_file`、`write_file`、`append_file`、`edit_file`、`read_variables`、`patch_variables`、`search_history`、`read_history`、`append_reply_view`、`replace_reply_view`、`attach_media`。其中 `append_file` 支持长章节分段追加与断点续写；主叙事 Agent（`main_turn`）必须通过文件工具写/修 `/output.md`，普通 `assistant.content` 仅记录在 `TrajectoryStore` 与日志中而不上屏。`read_file('/output.md')` 豁免写入跨轮 `Read-Set`。
 
 ### 4.2 针对“空壳角色卡 + 万物皆 WI”的四类语义自动分流
 
@@ -388,7 +402,7 @@ export interface TriggerRule {
 | :--- | :--- | :--- |
 | `@@replace` / `@@replace_diff` / `@@replace_search` (`*_before`) | 编译为指向该 WI 条目路径 `/lorebooks/<book>/<slug>-<uid>.md` 的单文件授权（`read` + `edit_file`/`write_file`）Agent 任务；原条目的提示说明作为指令 | 不再要求 LLM 盲写脆弱的 Git Diff 行号；锚点未命中时工具当场报错，模型多一轮局部微调即可自愈 |
 | `@@variables_json` / `yaml` / `jsonpatch` + `@@json_schema` / `@@zod_schema` (`*_before`) | 编译为授权操作 `/state/variables.json` 的 `read_variables` / `patch_variables` 任务，自动把 Zod/JSON Schema 嵌入工具校验 | 违反字段类型或枚举约束时直接通过 `tool_result` 指明错处，原地纠偏无需整次重试 |
-| `@@append_output*` / `@@replace_output*` | 编译为授予 `append_reply_view` / `replace_reply_view` 工具的任务 | 只改写 `ChatDataStore` 的 `message` 显示层覆写并刷新 UI DOM，**绝不污染主 Agent 轨迹中的原始回复文本与缓存** |
+| `@@append_output*` / `@@replace_output*`（及 `@@trigger target=/output.md`） | 绑定目标路径 `/output.md`，授予 `read_file` / `edit_file` / `write_file` / `append_file` / `read_variables` 权限（兼容保留直连 `/output.md` 的 `append_reply_view` / `replace_reply_view`）；`@@append_output_ejs*` / `@@replace_output_ejs*` 亦经 `ChatMessageViewAdapter` 直连 `/output.md` | 通过 `OutputMount` / `HostBridge.writeChatMessage` 直接读写目标 `(messageId, swipeId)` 的真实 ST 消息并瞬态重绘 `.mes_text`（不再写入 `DATA_NAMESPACES.MESSAGE` 影子覆写）。由于主 Agent 轨迹独立保存于 `TrajectoryStore`，直改 ST 消息 **0 破坏 Prefix KV Cache**，且锚点失败时可在同一触发轮内重读 `/output.md` 自愈 |
 | `@@evaluate_ejs` / `@@evaluate_ejs_before` | 若检测到 `EjsTemplate` 可用，编译为 0 Token 的沙箱脚本任务（向 EJS 注入 `fs`/`vars` 助手）；不可用时跳过提示 | 零模型消耗，保持确定性脚本顺序 |
 | `@@agent <name>` | 注册为可供主 Agent 或其他 Agent 随时调用的 Sub-Agent Tool（独立上下文检索后仅向父级返回摘要结论） | 保护主 Agent 上下文不被大量中间搜索结果污染 |
 | `@@skill` | 挂载至 `/skills/<name>.md`，维持显式激活语义 | 与原有技能工作流保持一致 |
@@ -403,7 +417,7 @@ export interface TriggerRule {
 1. **默认不合并原则**：后台任务生态横跨变量结算、摘要、大纲、伏笔追踪、重要信息表格、NAI/ComfyUI 生图、TTS 语音、视频生成等完全异构的任务，适合的模型规格和 Prompt 结构截然不同。因此系统**默认 1 个触发器对应 1 次独立的 Agent Run**（各持久 Agent 自己保有前缀缓存，拆开跑同样高缓存命中率且互不稀释注意力），仅在显式配置相同 `@@group` 时才打包合并。
 2. **三级并发屏障（`BarrierPolicy`）与楼层锚定**：
    - **`'turn'`（跨轮强屏障 —— 变量更新、状态表格等默认）**：主生成完成后立即解锁用户输入体验；仅当用户发送下一轮请求且上一轮 `turn` 任务仍在跑时，下一轮在进入 `before_turn` 前自动 `await` 其落盘完成，严防读到过期变量。
-   - **`'self'`（自身队列串行 —— 摘要、大纲、伏笔等默认）**：**完全不阻塞下一轮主对话的立即发送与生成**；同时保证同一 `agentProfileId`（或共享写入目标文件）的任务通过 FIFO 串行锁排队执行，避免多轮并发读写同一份大纲/摘要文件导致覆盖冲突。
+   - **`'self'`（自身队列串行 —— 摘要、大纲、伏笔与同楼 Edit 触发器默认）**：**完全不阻塞下一轮主对话的立即发送与生成**；同时通过 `BarrierCoordinator.buildSelfQueueKeys` 对同一 `agentProfileId` 或共享写入路径生成 FIFO 串行锁。针对 `/output.md` 目标，锁键精细化为楼层坐标键 **`path:/output.md@${messageId}#${swipeId}`**——保证同一楼层同页多个 Edit 触发器严格串行（后者必读前者写回的最新 ST 消息），同时不同楼层间的后台 Edit 任务完全并发隔离、互不互锁。
    - **`'none'`（完全脱离后台 —— NAI/ComfyUI 生图、TTS、视频等默认）**：创建完全独立的楼层级 `AbortController`，彻底不阻塞任何后续轮次。
    - **防串楼铁律**：所有 `after_turn` 任务在启动瞬间即冻结其锚点 `target: { messageId, swipeId }`。即便用户已经往后聊了三四轮，该任务调用工具挂载插图、音频或写回文件时，永远精确落回锚定楼层并只局部重绘该楼层 DOM。仅当用户针对**该目标楼层**执行 Swipe（切离或删除该页）或点击该任务的独立 `[×]` 取消钮时，才会触发对应的 `AbortSignal`。
 
@@ -560,23 +574,24 @@ export interface RegexRule {
 
 | 动作类型 | 聊天数组与 DOM 处理 | 持久轨迹指针 & 暂存层行为 | 在途后台任务处理 |
 | :--- | :--- | :--- | :--- |
-| **`normal`** | 用户消息已由 ST 上屏；0ms 立即创建助手流式占位气泡 | 等待前序未完 `barrier: 'turn'` 任务 -> 跑 `before_turn` -> 从上一楼末尾追加 `main_turn` | 上一楼 `self` / `none` 任务继续独立跑，不阻塞 |
-| **`swipe`** | 切换到新分配的 `swipeId` 槽位并 0ms 置入流式占位 | 中止当前楼旧页关联的任务，清除旧页未提交暂存；将各持久 Agent 轨迹指针回拨至 `messageId - 1` 结束检查点再跑新分支 | 取消归属被切走旧 `swipeId` 的一切在途异步任务 |
-| **`regenerate`** | 末条 AI 消息已由 ST 删掉；0ms 新建占位重绘 | 彻底清除该楼层所有暂存/已提交层，回拨持久轨迹指针至末条用户消息前，完整重跑 | 中止归属原末楼的一切在途后台任务 |
-| **`continue`** | 保留现有末楼文本末尾继续流式追加（`rAF` 节流刷新） | **跳过 `before_turn`**，在当前 `(messageId, swipeId)` 轨迹末尾追加一条内部续写指令，跑完后更新该分支检查点与展示层 | 保留已完成的媒体/数据，完成后运行针对续写内容的 `after_turn` |
+| **`normal`** | 用户消息已由 ST 上屏；0ms 创建占位气泡时 `msg.mes` 与 `swipes[0]` 置为空串 `""`（仅在未定稿且正文与思考均空时在 DOM 视觉呈现 `'...'`），随后通过 `IncrementalOutputStreamExtractor` 实时预览 `/output.md` | 等待前序未完 `barrier: 'turn'` 任务 -> 跑 `before_turn` -> 从上一楼末尾追加 `main_turn`（强制写 `/output.md`，支持轮内 Review + `edit_file` 修错，普通 `assistant.content` 仅入轨迹与日志） | 上一楼 `self` / `none` 任务继续独立跑，不阻塞 |
+| **`swipe`** | 切换到新分配的 `swipeId` 槽位，初始化 `swipes[swipeId] = ""` 与 `msg.mes = ""`（DOM 视觉呈 `'...'`） | 中止当前楼旧页关联的任务，清除旧页未提交暂存与 `InterruptedTurnCheckpoint`；将各持久 Agent 轨迹指针回拨至 `messageId - 1` 结束检查点再跑新分支 | 取消归属被切走旧 `swipeId` 的一切在途异步任务 |
+| **`regenerate`** | 末条 AI 消息已由 ST 删掉；0ms 新建空串占位重绘 | 彻底清除该楼层所有暂存/已提交层、`preCreateBuffers` 与 `InterruptedTurnCheckpoint`，回拨持久轨迹指针至末条用户消息前，完整重跑 | 中止归属原末楼的一切在途后台任务 |
+| **`continue`** | 保留现有末楼原文，在当前气泡原地流式更新（`StreamRenderer.bindExisting` / `continue`） | **跳过 `before_turn`**；若检测到 `trajectoryStore.getInterruptedCheckpoint(target)`，自动委托 `resumeTurn(target)`（原样复用 `completedTurnMessages` 与 `Read-Set`/`stagedSnapshot`，尾部追加 `[System Recovery]` 指令接力续写 `/output.md`）；无断点时则在分支轨迹末尾追加常规续写指令引导补全 `/output.md` | 若为断点恢复，完成后立即提交暂存并补派 `after_turn`；常规续写则保留已有媒体/数据并运行针对续写内容的 `after_turn` |
 
 ### 8.3 原生聊天 UI 零替代、流式渲染与 `<agentic-capsule>` 挂载
 
 - **100% 保留 ST 原生聊天 UI 与插件兼容性**：`ST-Agentic` **绝不替代** SillyTavern 内置的 `#chat` 与 `.mes` DOM 结构。所有消息依然通过原生 `addOneMessage()` / `messageFormatting()` 创建与更新，完整保留原生头像、`.mes_buttons`（编辑/删除/翻译/朗读）、Swipe 左右翻页箭头及 `MESSAGE_RECEIVED` / `CHARACTER_MESSAGE_RENDERED` 事件，确保局部正则前端面板、TTS、QR 快捷回复等大量依赖原生聊天 DOM 的第三方扩展零影响运行。
-- **告别工具调用期“黑屏假死”**：点击发送瞬间，原生聊天气泡立即占位渲染；大模型处于工具检索轮时气泡胶囊即可呈现进度反馈，一旦开始生成自然语言正文，通过 `requestAnimationFrame` 合帧节流刷入 `.mes_text`（同步支持流式 `<think>` / `reasoning` 折叠块展示与第 7.3 节 `display` 正则美化）。
-- **两段式精准中断**：
-  - `before_turn` 或 `main_turn` 运行期间，点击 ST 原生停止按钮（`#mes_stop`）立即通过 `AbortSignal` 中止主生成，保留已流出的半截正文（如有），回滚未落盘的工具暂存写入并解锁输入；
+- **告别工具调用期“黑屏假死”与 `/output.md` 流式解包上屏**：点击发送瞬间，原生聊天气泡立即占位渲染（存储层 `msg.mes` 与 `swipes` 保持 `""` 避免污染 `read_file('/output.md')`，仅 DOM 视觉显示 `'...'`）；大模型处于工具检索轮时气泡胶囊呈现进度反馈；调用 `write_file` / `append_file` 写入 `/output.md` 时，由 `IncrementalOutputStreamExtractor` 状态机（支持 `"path"`/`"content"` 任意键序、完整 JSON 转义及 UTF-16 代理对）实时解码正文并触发 `output_preview`，经 `StreamRenderer.setOutputPreview` + `requestAnimationFrame` 合帧节流刷入原生 `.mes_text`（同步支持流式 `<think>` / `reasoning` 折叠块与第 7.3 节瞬态 `display` 正则美化，绝不将展示正则结果写回源码）。
+- **全场景可恢复中断与两段式解除锁定**：
+  - `main_turn` 运行期间遭遇 `#mes_stop`（`user_stop`）、`finish_reason === 'length'`（`length`）、接口/网络错误（`error`）或自愈重试后仍未写入 `/output.md`（`empty_output`）时：`AgentRunner` 立即从 `IncrementalOutputStreamExtractor.getSalvageableOutput()` 抢救已解码半截正文落盘 `/output.md`（保留暂存写入不执行 `rollbackStagedData`），将 `completedTurnMessages`、`readSetSnapshot` 与 `stagedSnapshot` 写入 `InterruptedTurnCheckpoint` 并随 `chat_metadata.agentic_trajectories` 持久化；拦截器调用 `StreamRenderer.markInterrupted` 保存消息并解锁输入，将胶囊切为琥珀色 `'interrupted'` 状态与 `[↻ 恢复]` 按钮。点击 `[↻ 恢复]`（`services.resumeTurn` -> `resumeTakeoverTurn` -> `StreamRenderer.bindExisting` -> `orchestrator.resumeTurn`）或 ST 原生 Continue 即可在原气泡就地 100% 命中前序 KV Cache 接力恢复（支持跨页面刷新重载恢复与多次截断无限接力）；仅在彻底 0 产出中断时执行静默回滚。
   - 主正文完成后，哪怕仍有耗时的 `after_turn`（生图/视频）在后台跑，**ST 主发送框完全解锁可继续打字聊天**；用户若想单独取消某个慢任务，直接点击气泡胶囊里的独立 `[×]` 按钮即可。
-- **无侵入状态胶囊 `<agentic-capsule>`**：封装为独立的 **Shadow DOM 自定义元素**，仅挂载在原生 `[mesid="N"] > .mes_block` 内且位于 `.mes_text` **外部**（支持配置置于正文上方或下方，以及任务结束后保留微缩摘要条或自动隐藏），彻底免受全局气泡美化 CSS 挤压，也不干扰正文脚本。点击胶囊本体可直接唤起大一统控制台 `<dialog>` 并定位过滤至该 `messageId` 的生成日志或文件 Diff：
+- **无侵入状态胶囊 `<agentic-capsule>`**：封装为独立的 **Shadow DOM 自定义元素**，仅挂载在原生 `[mesid="N"] > .mes_block` 内且位于 `.mes_text` **外部**（支持配置置于正文上方或下方，以及任务结束后保留微缩摘要条或自动隐藏），彻底免受全局气泡美化 CSS 挤压，也不干扰正文脚本。点击胶囊本体可直接唤起大一统控制台 `<dialog>` 并定位过滤至该 `messageId` 的生成日志或 `/output.md` Diff：
 
 ```text
 [检索中]  ⚡ 正在读取 /lorebooks/world/银莲花-12.md (第 2 步) ...
-[流式中]  ▾ 已检索 2 份档案 · 缓存命中 95%                  （下方原生 .mes_text 流式吐字）
+[流式中]  ▾ 已检索 2 份档案 · 缓存命中 95%                  （下方原生 .mes_text 流式解包 /output.md）
+[已中断]  ⏸ 输出截断 · 可续写              [↻ 恢复]         （保留半截 /output.md 与断点检查点）
 [已结束]  ✦ 2步 · 缓存95% · [✓变量] [🎨插图生成中 12s ×]     （点击打开控制台定位该楼）
 ```
 

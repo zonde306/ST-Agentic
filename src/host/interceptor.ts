@@ -9,12 +9,17 @@ import {
 import { eventSource, event_types } from '@st/scripts/events.js';
 import { selected_group } from '@st/scripts/group-chats.js';
 
-import type { GenerationAction, PipelineOrchestrator } from '@/core/triggers';
-import type { Settings, ToolStepLog } from '@/core/types';
+import {
+    type GenerationAction,
+    type PipelineOrchestrator,
+    type RunTurnResult,
+    TurnInterruptedError,
+} from '@/core/triggers';
+import type { MessageTarget, Settings, ToolStepLog } from '@/core/types';
 import type { AppStore } from '@/ui/store';
 
 import type { STHostBridge } from './st-bridge';
-import { StreamRenderer } from './stream-renderer';
+import { StreamRenderer, type StreamRendererDependencies } from './stream-renderer';
 
 const TAKEOVER_ACTIONS = new Set<GenerationAction>([
     'normal',
@@ -42,6 +47,7 @@ export interface AgenticInterceptorHandle {
     interceptor: STGenerateInterceptor;
     isTakeoverActive(): boolean;
     abortActiveTakeover(reason?: string): boolean;
+    resumeTakeoverTurn(target: MessageTarget): Promise<void>;
     dispose(): void;
 }
 
@@ -137,6 +143,176 @@ export function createAgenticInterceptor(
         eventSource.on(event_types.GENERATION_STOPPED, onGenerationStopped);
     }
 
+    const createRendererDeps = (): StreamRendererDependencies => ({
+        getSettings,
+        getStore: () => orchestrator.store,
+        getAppStore,
+        substituteMacros: (text, overrides) => bridge.substituteMacros(text, overrides),
+        identity: bridge.getActiveIdentity(),
+    });
+
+    const finalizeTurnSession = async (
+        activeRenderer: StreamRenderer,
+        result: RunTurnResult,
+    ): Promise<void> => {
+        const backgroundHandles = result.afterTurnTasks ?? [];
+        await activeRenderer.finalize({
+            finalText: result.content,
+            reasoningText: result.reasoningContent,
+            hasBackgroundTasks: backgroundHandles.length > 0,
+            stepCount: result.mainRun.rounds,
+            cacheHitRate: resolveCacheHitRate(result.mainRun.usage),
+        });
+
+        if (backgroundHandles.length > 0) {
+            let remaining = backgroundHandles.length;
+            for (const handle of backgroundHandles) {
+                void handle.promise.finally(() => {
+                    remaining = Math.max(0, remaining - 1);
+                    activeRenderer.updateBackgroundStatus(remaining);
+                });
+            }
+        }
+    };
+
+    const handleTurnSessionError = async (
+        error: unknown,
+        controller: AbortController,
+        renderer: StreamRenderer | undefined,
+        failurePrefix: string,
+    ): Promise<void> => {
+        if (error instanceof TurnInterruptedError) {
+            if (renderer) {
+                await renderer.markInterrupted({
+                    reason: error.reason,
+                    errorMessage: error.causeError,
+                    currentOutput: error.salvagedOutput,
+                    stepCount: error.trace.toolSteps.length,
+                    cacheHitRate: resolveCacheHitRate(error.trace.usage),
+                    onResume: () => resumeTakeoverTurn(renderer.target),
+                });
+            }
+            if (error.reason === 'error') {
+                const detail = error.causeError ?? error.message;
+                getAppStore?.()?.pushToast(
+                    `生成因错误中断（已保存断点，可点击恢复）：${detail}`,
+                    'warning',
+                );
+            }
+            return;
+        }
+
+        if (renderer) {
+            orchestrator.store.rollbackStagedData(renderer.target);
+        }
+        if (isAbortError(error, controller.signal)) {
+            await renderer?.abort({ wasUserStop: true, reason: 'Stopped by user' });
+        } else {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`[ST-Agentic] ${failurePrefix}:`, error);
+            getAppStore?.()?.pushToast(`${failurePrefix}: ${message}`, 'error');
+            await renderer?.abort({ errorMessage: message });
+        }
+    };
+
+    const releaseSession = (session: ActiveTakeoverSession): void => {
+        session.releaseGuard();
+        if (activeSession === session) {
+            activeSession = null;
+        }
+        if (typeof setExternalAbortController === 'function') {
+            setExternalAbortController(undefined);
+        }
+        if (typeof activateSendButtons === 'function') {
+            activateSendButtons();
+        }
+        if (typeof showSwipeButtons === 'function') {
+            showSwipeButtons();
+        }
+    };
+
+    const resumeTakeoverTurn = async (target: MessageTarget): Promise<void> => {
+        if (activeSession) {
+            getAppStore?.()?.pushToast('当前已有生成任务正在运行，请等待或停止后再恢复。', 'warning');
+            return;
+        }
+        if (
+            !Array.isArray(chat)
+            || !Number.isInteger(target.messageId)
+            || target.messageId < 0
+            || target.messageId >= chat.length
+            || !chat[target.messageId]
+        ) {
+            getAppStore?.()?.pushToast('无法恢复：目标消息不存在。', 'error');
+            return;
+        }
+
+        const controller = new AbortController();
+        const releaseGuard = createGenerationUiGuard();
+        const session: ActiveTakeoverSession = {
+            controller,
+            releaseGuard,
+        };
+        activeSession = session;
+
+        if (typeof setExternalAbortController === 'function') {
+            setExternalAbortController(controller);
+        }
+
+        let renderer: StreamRenderer | undefined;
+
+        try {
+            if (typeof deactivateSendButtons === 'function') {
+                deactivateSendButtons();
+            }
+            if (typeof hideSwipeButtons === 'function') {
+                hideSwipeButtons();
+            }
+
+            const activeRenderer = StreamRenderer.bindExisting(target, createRendererDeps());
+            renderer = activeRenderer;
+            session.renderer = activeRenderer;
+
+            if (controller.signal.aborted) {
+                await activeRenderer.abort({ wasUserStop: true, reason: 'Stopped before resume' });
+                return;
+            }
+
+            activeRenderer.setRetrievingStatus('Resuming turn');
+            getAppStore?.()?.setActiveTarget(target);
+
+            const result = await orchestrator.resumeTurn({
+                target,
+                signal: controller.signal,
+                stream: true,
+                onOutputPreview: (preview) => activeRenderer.setOutputPreview(preview),
+                onReasoningDelta: (delta) => activeRenderer.appendReasoningDelta(delta),
+                onToolStart: (step: ToolStepLog) => activeRenderer.onToolStart(step.toolName),
+                onToolComplete: (step: ToolStepLog) => activeRenderer.onToolComplete(step.toolName),
+            });
+
+            if (controller.signal.aborted) {
+                orchestrator.store.rollbackStagedData(target);
+                await activeRenderer.abort({
+                    wasUserStop: true,
+                    reason: 'Generation stopped',
+                });
+                return;
+            }
+
+            await finalizeTurnSession(activeRenderer, result);
+        } catch (error) {
+            await handleTurnSessionError(
+                error,
+                controller,
+                renderer,
+                'Takeover resume failed',
+            );
+        } finally {
+            releaseSession(session);
+        }
+    };
+
     const executeTakeoverTurn = async (
         action: GenerationAction,
         session: ActiveTakeoverSession,
@@ -156,14 +332,8 @@ export function createAgenticInterceptor(
                 hideSwipeButtons();
             }
 
-            const identity = bridge.getActiveIdentity();
-            const activeRenderer = StreamRenderer.beginPlaceholder(action, {
-                getSettings,
-                getStore: () => orchestrator.store,
-                getAppStore,
-                substituteMacros: (text, overrides) => bridge.substituteMacros(text, overrides),
-                identity,
-            });
+            const rendererDeps = createRendererDeps();
+            const activeRenderer = StreamRenderer.beginPlaceholder(action, rendererDeps);
             renderer = activeRenderer;
             session.renderer = activeRenderer;
 
@@ -188,7 +358,7 @@ export function createAgenticInterceptor(
             const userName =
                 action === 'normal' && prevMsg?.is_user && typeof prevMsg.name === 'string'
                     ? prevMsg.name
-                    : identity.userName;
+                    : rendererDeps.identity.userName;
 
             const result = await orchestrator.runTurn({
                 action,
@@ -201,6 +371,7 @@ export function createAgenticInterceptor(
                 signal: controller.signal,
                 stream: true,
                 onTextDelta: (delta) => activeRenderer.appendTextDelta(delta),
+                onOutputPreview: (preview) => activeRenderer.setOutputPreview(preview),
                 onReasoningDelta: (delta) => activeRenderer.appendReasoningDelta(delta),
                 onToolStart: (step: ToolStepLog) => activeRenderer.onToolStart(step.toolName),
                 onToolComplete: (step: ToolStepLog) => activeRenderer.onToolComplete(step.toolName),
@@ -215,50 +386,16 @@ export function createAgenticInterceptor(
                 return;
             }
 
-            const backgroundHandles = result.afterTurnTasks ?? [];
-            await activeRenderer.finalize({
-                finalText: result.content,
-                reasoningText: result.reasoningContent,
-                hasBackgroundTasks: backgroundHandles.length > 0,
-                stepCount: result.mainRun.rounds,
-                cacheHitRate: resolveCacheHitRate(result.mainRun.usage),
-            });
-
-            if (backgroundHandles.length > 0) {
-                let remaining = backgroundHandles.length;
-                for (const handle of backgroundHandles) {
-                    void handle.promise.finally(() => {
-                        remaining = Math.max(0, remaining - 1);
-                        activeRenderer.updateBackgroundStatus(remaining);
-                    });
-                }
-            }
+            await finalizeTurnSession(activeRenderer, result);
         } catch (error) {
-            if (renderer) {
-                orchestrator.store.rollbackStagedData(renderer.target);
-            }
-            if (isAbortError(error, controller.signal)) {
-                await renderer?.abort({ wasUserStop: true, reason: 'Stopped by user' });
-            } else {
-                const message = error instanceof Error ? error.message : String(error);
-                console.error('[ST-Agentic] Takeover generation failed:', error);
-                getAppStore?.()?.pushToast(`Generation failed: ${message}`, 'error');
-                await renderer?.abort({ errorMessage: message });
-            }
+            await handleTurnSessionError(
+                error,
+                controller,
+                renderer,
+                'Takeover generation failed',
+            );
         } finally {
-            session.releaseGuard();
-            if (activeSession === session) {
-                activeSession = null;
-            }
-            if (typeof setExternalAbortController === 'function') {
-                setExternalAbortController(undefined);
-            }
-            if (typeof activateSendButtons === 'function') {
-                activateSendButtons();
-            }
-            if (typeof showSwipeButtons === 'function') {
-                showSwipeButtons();
-            }
+            releaseSession(session);
         }
     };
 
@@ -315,6 +452,7 @@ export function createAgenticInterceptor(
         interceptor,
         isTakeoverActive: () => activeSession !== null,
         abortActiveTakeover,
+        resumeTakeoverTurn,
         dispose() {
             abortActiveTakeover('Interceptor disposed');
             if (

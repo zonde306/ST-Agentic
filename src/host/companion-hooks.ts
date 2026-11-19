@@ -16,7 +16,6 @@ import { DecoratorParser } from '@/core/lore';
 import {
     ChatDataStore,
     DATA_NAMESPACES,
-    MESSAGE_OVERRIDE_KEY,
     VARIABLES_DOC_KEY,
     worldInfoKey,
 } from '@/core/store';
@@ -27,7 +26,12 @@ import {
 } from '@/core/triggers';
 import type { MessageTarget, RawLoreEntry, Settings, TriggerRule } from '@/core/types';
 import { normalizeVfsPath } from '@/core/utils';
-import { GLOBAL_VFS_EXTENSION_KEY, unescapeAt } from '@/core/vfs';
+import {
+    GLOBAL_VFS_EXTENSION_KEY,
+    OUTPUT_FILE_PATH,
+    unescapeAt,
+    type VirtualFileSystem,
+} from '@/core/vfs';
 import {
     AgenticCapsuleElement,
     placeAgenticCapsule,
@@ -249,6 +253,7 @@ function buildSyncVfsReader(
     bridge: STHostBridge,
     store: ChatDataStore,
     getSettings: () => Settings | undefined,
+    vfs?: VirtualFileSystem,
 ): (rawPath: string, target?: MessageTarget) => string {
     return (rawPath: string, targetOverride?: MessageTarget): string => {
         const settings = getSettings();
@@ -262,6 +267,10 @@ function buildSyncVfsReader(
         }
 
         const target = targetOverride ?? getLatestMessageTarget();
+        if (normalized === OUTPUT_FILE_PATH) {
+            return bridge.readChatMessage(target) ?? vfs?.peekPreCreateBuffer(target) ?? '';
+        }
+
         const rel = normalized.startsWith('/') ? normalized.slice(1) : normalized;
 
         if (rel === 'vars' || rel.startsWith('vars/')) {
@@ -357,15 +366,9 @@ function buildSyncVfsReader(
             ) {
                 return '';
             }
-            const msg = chat[messageId] as { mes?: unknown; swipe_id?: unknown };
+            const msg = chat[messageId] as { swipe_id?: unknown };
             const msgSwipe = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
-            const override = readNamespaceEntrySync(
-                store,
-                DATA_NAMESPACES.MESSAGE,
-                MESSAGE_OVERRIDE_KEY,
-                { messageId, swipeId: msgSwipe },
-            );
-            return override ?? (typeof msg.mes === 'string' ? msg.mes : '');
+            return bridge.readChatMessage({ messageId, swipeId: msgSwipe }) ?? '';
         }
 
         // Default fallback: try /chat/ namespace directly for shorthand paths.
@@ -509,7 +512,12 @@ function unregisterFileMacro(): void {
  */
 export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHooksHandle {
     const { bridge, orchestrator, getSettings, getAppStore, isTakeoverActive } = options;
-    const resolveVfsFileSync = buildSyncVfsReader(bridge, orchestrator.store, getSettings);
+    const resolveVfsFileSync = buildSyncVfsReader(
+        bridge,
+        orchestrator.store,
+        getSettings,
+        orchestrator.vfs,
+    );
     bridge.setFileMacroResolver((path) => resolveVfsFileSync(path));
 
     // Register {{file::path}} macro for SillyTavern's experimental MacroEngine.
@@ -703,7 +711,27 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
 
         await orchestrator.store.commitStagedData(target);
         syncVariablesToChatMetadata(orchestrator.store, target);
-        await bridge.refreshMessageView(target);
+
+        const bufferedOutput = orchestrator.vfs.flushPreCreateBuffer(target);
+        if (bufferedOutput !== undefined) {
+            const currentText = bridge.readChatMessage(target) ?? '';
+            const nextText = !currentText
+                ? bufferedOutput
+                : !bufferedOutput
+                  ? currentText
+                  : currentText.includes(bufferedOutput)
+                    ? currentText
+                    : currentText.endsWith('\n') || bufferedOutput.startsWith('\n')
+                      ? `${currentText}${bufferedOutput}`
+                      : `${currentText}\n${bufferedOutput}`;
+            if (nextText !== currentText) {
+                await bridge.writeChatMessage(target, nextText, { emitEvent: false });
+            } else {
+                await bridge.refreshMessageView(target);
+            }
+        } else {
+            await bridge.refreshMessageView(target);
+        }
 
         const capsule = mountCompanionCapsule(messageId, target, settings, getAppStore);
         capsule?.setState({
@@ -752,6 +780,7 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         if (pendingCompanionTurn) {
             pendingCompanionTurn.controller.abort('Generation stopped');
             orchestrator.store.rollbackStagedData(pendingCompanionTurn.target);
+            orchestrator.vfs.flushPreCreateBuffer(pendingCompanionTurn.target);
             pendingCompanionTurn = null;
         }
     };
@@ -777,6 +806,15 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         }
         orchestrator.barrierCoordinator.abortFromMessage(messageId, 'Message deleted');
         orchestrator.store.pruneFromMessage(messageId);
+        orchestrator.vfs.clearPreCreateBuffersFrom(messageId);
+        const prevInterrupted = orchestrator.trajectoryStore.listInterruptedCheckpoints().size;
+        const removedCheckpoints = orchestrator.trajectoryStore.pruneFromMessage(messageId);
+        if (
+            removedCheckpoints > 0
+            || orchestrator.trajectoryStore.listInterruptedCheckpoints().size !== prevInterrupted
+        ) {
+            orchestrator.trajectoryStore.saveToHost(bridge);
+        }
     };
 
     const onMessageSwipeDeleted = (payload: unknown) => {
@@ -788,11 +826,20 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
             const target: MessageTarget = { messageId: raw.messageId, swipeId: raw.swipeId };
             orchestrator.barrierCoordinator.abortTarget(target, 'Swipe deleted');
             orchestrator.store.pruneSwipe(target);
+            const prevInterrupted = orchestrator.trajectoryStore.listInterruptedCheckpoints().size;
+            const removedCheckpoints = orchestrator.trajectoryStore.pruneSwipe(target);
+            if (
+                removedCheckpoints > 0
+                || orchestrator.trajectoryStore.listInterruptedCheckpoints().size !== prevInterrupted
+            ) {
+                orchestrator.trajectoryStore.saveToHost(bridge);
+            }
         }
     };
 
     const onChatChanged = () => {
         onGenerationStopped();
+        orchestrator.vfs.clearPreCreateBuffersFrom(0);
     };
 
     const registrations: Array<[string, (...args: unknown[]) => unknown]> = [

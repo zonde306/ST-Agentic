@@ -24,10 +24,11 @@ import { getMessageTimeStamp } from '@st/scripts/RossAscends-mods.js';
 import type { HostIdentity } from '@/core/bridge';
 import { resolveActivePreset } from '@/core/config';
 import { applyRegexRules } from '@/core/regex';
-import { ChatDataStore, DATA_NAMESPACES, MESSAGE_OVERRIDE_KEY } from '@/core/store';
+import type { ChatDataStore } from '@/core/store';
 import type { GenerationAction } from '@/core/triggers';
 import type {
     CapsulePosition,
+    InterruptedReason,
     MessageTarget,
     RegexRule,
     Settings,
@@ -61,9 +62,31 @@ export interface StreamSessionAbortOptions {
     wasUserStop?: boolean;
 }
 
+export interface StreamSessionInterruptedOptions {
+    reason: InterruptedReason;
+    errorMessage?: string;
+    currentOutput: string;
+    stepCount?: number;
+    cacheHitRate?: number;
+    onResume?: () => void | Promise<void>;
+}
+
 interface ExtractedDisplayParts {
     visibleText: string;
     reasoningText: string;
+}
+
+function formatInterruptedSummary(reason: InterruptedReason): string {
+    switch (reason) {
+        case 'user_stop':
+            return '已暂停 · 可恢复';
+        case 'length':
+            return '输出截断 · 可续写';
+        case 'empty_output':
+            return '未写入 /output.md · 可重试';
+        case 'error':
+            return '连接中断 · 可恢复';
+    }
 }
 
 function getReasoningMarkers(): { prefix: string; suffix: string } {
@@ -138,7 +161,7 @@ function splitStreamingReasoning(rawText: string, explicitReasoning: string): Ex
         .join('\n\n');
 
     return {
-        visibleText: visible.trimStart(),
+        visibleText: blocks.length > 0 ? visible.trimStart() : visible,
         reasoningText: combinedReasoning,
     };
 }
@@ -200,6 +223,8 @@ export class StreamRenderer {
     private readonly startedAt = Date.now();
 
     private currentRoundText = '';
+    private outputPreviewText = '';
+    private hasOutputPreview = false;
     private explicitReasoningText = '';
     private pendingToolReset = false;
     private reasoningStartMs?: number;
@@ -253,14 +278,26 @@ export class StreamRenderer {
             const messageId = chatList.length - 1;
             const msg = chatList[messageId] as Record<string, unknown>;
             const swipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
-            const existingContent = typeof msg.mes === 'string' ? msg.mes : '';
-            return new StreamRenderer(
+            const swipes = Array.isArray(msg.swipes) ? (msg.swipes as unknown[]) : undefined;
+            const swipeRaw =
+                swipes && swipeId >= 0 && swipeId < swipes.length ? swipes[swipeId] : undefined;
+            const existingContent =
+                typeof swipeRaw === 'string'
+                    ? swipeRaw
+                    : typeof msg.mes === 'string'
+                      ? msg.mes
+                      : '';
+            const renderer = new StreamRenderer(
                 deps,
                 { messageId, swipeId },
                 action,
                 false,
                 existingContent,
             );
+            if (!existingContent) {
+                renderer.renderToDom(msg, '', '', false, false);
+            }
+            return renderer;
         }
 
         if (action === 'swipe' && chatList.length > 0) {
@@ -283,7 +320,12 @@ export class StreamRenderer {
                     ? explicitPreviousSwipeId
                     : Math.max(0, targetSwipeId - 1);
 
-            const prevMes = typeof msg.mes === 'string' ? msg.mes : '';
+            const prevMes =
+                typeof swipes[prevSwipeId] === 'string'
+                    ? swipes[prevSwipeId]
+                    : typeof msg.mes === 'string'
+                      ? msg.mes
+                      : '';
             const prevInfo = swipeInfo[prevSwipeId]
                 ? { ...swipeInfo[prevSwipeId] }
                 : undefined;
@@ -295,7 +337,7 @@ export class StreamRenderer {
                 swipeInfo.push({});
             }
 
-            swipes[targetSwipeId] = '...';
+            swipes[targetSwipeId] = '';
             swipeInfo[targetSwipeId] = {
                 send_date: typeof getMessageTimeStamp === 'function' ? getMessageTimeStamp() : Date.now(),
                 gen_started: new Date().toISOString(),
@@ -304,7 +346,7 @@ export class StreamRenderer {
                     model: modelTag,
                 },
             };
-            msg.mes = '...';
+            msg.mes = '';
             msg.swipe_id = targetSwipeId;
 
             if (typeof updateMessageBlock === 'function') {
@@ -313,6 +355,7 @@ export class StreamRenderer {
                     messageId,
                     {
                         ...msg,
+                        mes: '',
                         extra: {
                             ...((msg.extra as Record<string, unknown> | undefined) ?? {}),
                             display_text: '...',
@@ -328,7 +371,7 @@ export class StreamRenderer {
                 updateSwipeCounter(messageId);
             }
 
-            return new StreamRenderer(
+            const renderer = new StreamRenderer(
                 deps,
                 { messageId, swipeId: targetSwipeId },
                 action,
@@ -338,6 +381,10 @@ export class StreamRenderer {
                 prevMes,
                 prevInfo,
             );
+            if (typeof updateMessageBlock !== 'function') {
+                renderer.renderToDom(msg, '', '', false, false);
+            }
+            return renderer;
         }
 
         // 'normal' or 'regenerate': append new native assistant message + placeholder DOM at 0ms.
@@ -352,8 +399,8 @@ export class StreamRenderer {
             is_user: false,
             is_system: false,
             send_date: timestamp,
-            mes: '...',
-            swipes: ['...'],
+            mes: '',
+            swipes: [''],
             swipe_id: 0,
             swipe_info: [
                 {
@@ -374,13 +421,53 @@ export class StreamRenderer {
             });
         }
 
-        return new StreamRenderer(
+        const renderer = new StreamRenderer(
             deps,
             { messageId, swipeId: 0 },
             action,
             true,
             '',
         );
+        renderer.renderToDom(placeholder, '', '', false, false);
+        return renderer;
+    }
+
+    /**
+     * Bind to an existing SillyTavern message & swipe in-place (for interrupted checkpoint resume)
+     * without pushing a new message or incrementing `swipe_id`.
+     */
+    static bindExisting(
+        target: MessageTarget,
+        deps: StreamRendererDependencies,
+    ): StreamRenderer {
+        const chatList = Array.isArray(chat) ? chat : [];
+        const msg =
+            target.messageId >= 0 && target.messageId < chatList.length
+                ? (chatList[target.messageId] as Record<string, unknown> | undefined)
+                : undefined;
+        const swipes = msg && Array.isArray(msg.swipes) ? (msg.swipes as unknown[]) : undefined;
+        const swipeRaw =
+            swipes && target.swipeId >= 0 && target.swipeId < swipes.length
+                ? swipes[target.swipeId]
+                : undefined;
+        const existingContent =
+            typeof swipeRaw === 'string'
+                ? swipeRaw
+                : typeof msg?.mes === 'string'
+                  ? msg.mes
+                  : '';
+
+        const renderer = new StreamRenderer(
+            deps,
+            { messageId: target.messageId, swipeId: target.swipeId },
+            'continue',
+            false,
+            existingContent,
+        );
+        if (msg && !existingContent) {
+            renderer.renderToDom(msg, '', '', false, false);
+        }
+        return renderer;
     }
 
     /** Update `<agentic-capsule>` state during `before_turn` retrieval. */
@@ -393,6 +480,21 @@ export class StreamRenderer {
             currentStep: stepLabel,
             stepCount: this.stepCount,
         });
+    }
+
+    /** Push an incremental full `/output.md` preview extracted from streaming tool arguments. */
+    setOutputPreview(fullPreviewText: string): void {
+        if (this.finalized) {
+            return;
+        }
+        this.outputPreviewText = fullPreviewText;
+        this.hasOutputPreview = true;
+        this.capsuleEl?.setState({
+            status: 'streaming',
+            currentStep: 'Writing /output.md',
+            stepCount: this.stepCount,
+        });
+        this.scheduleFlush();
     }
 
     /** Push an incremental model text chunk and schedule a `requestAnimationFrame` DOM update. */
@@ -450,6 +552,26 @@ export class StreamRenderer {
         if (this.finalized) {
             return;
         }
+        if (
+            toolName === 'write_file'
+            || toolName === 'append_file'
+            || toolName === 'edit_file'
+            || toolName === 'append_reply_view'
+            || toolName === 'replace_reply_view'
+        ) {
+            const msg = this.getChatMessage();
+            if (msg) {
+                const swipes = Array.isArray(msg.swipes) ? (msg.swipes as unknown[]) : undefined;
+                const latest =
+                    swipes && this.target.swipeId >= 0 && this.target.swipeId < swipes.length
+                        ? swipes[this.target.swipeId]
+                        : msg.mes;
+                if (typeof latest === 'string' && latest.length > 0) {
+                    this.outputPreviewText = latest;
+                    this.hasOutputPreview = true;
+                }
+            }
+        }
         this.capsuleEl?.setState({
             status: 'retrieving',
             currentStep: `Finished: ${toolName}`,
@@ -475,8 +597,11 @@ export class StreamRenderer {
         }
     }
 
-    /** Return streamed raw text captured so far (plus `existingContent` for `continue`). */
+    /** Return streamed raw text captured so far (or full `/output.md` preview when active). */
     getAccumulatedText(): string {
+        if (this.hasOutputPreview) {
+            return this.outputPreviewText;
+        }
         if (this.action === 'continue') {
             return `${this.existingContent}${this.currentRoundText}`;
         }
@@ -496,17 +621,22 @@ export class StreamRenderer {
 
         const msg = this.getChatMessage();
         if (msg) {
+            const explicitTrimmed = this.explicitReasoningText.trim();
+            const finalReasoningTrimmed = (options.reasoningText ?? '').trim();
+            const mergedReasoning = !explicitTrimmed
+                ? finalReasoningTrimmed
+                : !finalReasoningTrimmed || explicitTrimmed.endsWith(finalReasoningTrimmed)
+                  ? explicitTrimmed
+                  : `${explicitTrimmed}\n\n${finalReasoningTrimmed}`;
+
             const { visibleText, reasoningText } = splitStreamingReasoning(
                 options.finalText,
-                [this.explicitReasoningText, options.reasoningText ?? '']
-                    .map((s) => s.trim())
-                    .filter(Boolean)
-                    .join('\n\n'),
+                mergedReasoning,
             );
 
             msg.mes = visibleText;
             this.commitSwipeAndMetadata(msg, visibleText, reasoningText);
-            this.renderToDom(msg, visibleText, reasoningText, true);
+            this.renderToDom(msg, visibleText, reasoningText, true, true);
 
             if (typeof syncMesToSwipe === 'function') {
                 syncMesToSwipe();
@@ -548,9 +678,70 @@ export class StreamRenderer {
             currentStep: options.hasBackgroundTasks ? 'Background tasks running' : '',
             stepCount: options.stepCount ?? this.stepCount,
             ...(options.cacheHitRate !== undefined ? { cacheHitRate: options.cacheHitRate } : {}),
+            canResume: false,
+            interruptedReason: undefined,
             errorMessage: '',
+            onResume: undefined,
         });
         this.detachStoreListener();
+    }
+
+    /**
+     * Persist salvaged `/output.md` content, render final DOM state, and switch `<agentic-capsule>`
+     * to `'interrupted'` with an interactive resume callback.
+     */
+    async markInterrupted(options: StreamSessionInterruptedOptions): Promise<void> {
+        if (this.finalized) {
+            return;
+        }
+        this.finalized = true;
+        this.cancelScheduledFlush();
+
+        const msg = this.getChatMessage();
+        if (msg) {
+            const { visibleText, reasoningText } = splitStreamingReasoning(
+                options.currentOutput,
+                this.explicitReasoningText,
+            );
+            const activeSwipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
+
+            this.commitSwipeAndMetadata(msg, visibleText, reasoningText);
+            if (activeSwipeId === this.target.swipeId) {
+                msg.mes = visibleText;
+                this.renderToDom(msg, visibleText, reasoningText, true, true);
+                if (typeof syncMesToSwipe === 'function') {
+                    syncMesToSwipe();
+                }
+            }
+
+            if (typeof refreshSwipeButtons === 'function') {
+                refreshSwipeButtons();
+            } else if (typeof showSwipeButtons === 'function') {
+                showSwipeButtons();
+            }
+
+            if (typeof saveChatConditional === 'function') {
+                await saveChatConditional();
+            } else {
+                saveChatDebounced();
+            }
+        }
+
+        if (typeof scrollChatToBottom === 'function') {
+            scrollChatToBottom();
+        }
+
+        this.capsuleEl?.setState({
+            status: 'interrupted',
+            canResume: true,
+            interruptedReason: options.reason,
+            summary: formatInterruptedSummary(options.reason),
+            currentStep: '',
+            errorMessage: options.errorMessage ?? '',
+            stepCount: options.stepCount ?? this.stepCount,
+            ...(options.cacheHitRate !== undefined ? { cacheHitRate: options.cacheHitRate } : {}),
+            ...(options.onResume ? { onResume: options.onResume } : {}),
+        });
     }
 
     /**
@@ -564,22 +755,24 @@ export class StreamRenderer {
         this.finalized = true;
         this.cancelScheduledFlush();
 
-        const partialRaw = this.currentRoundText;
+        const partialRaw = this.hasOutputPreview ? this.outputPreviewText : this.currentRoundText;
         const hasPartialText = partialRaw.trim().length > 0;
         const msg = this.getChatMessage();
 
         if (this.action === 'continue') {
             if (msg) {
-                const combined = hasPartialText
-                    ? `${this.existingContent}${partialRaw}`
-                    : this.existingContent;
+                const combined = this.hasOutputPreview
+                    ? partialRaw
+                    : hasPartialText
+                      ? `${this.existingContent}${partialRaw}`
+                      : this.existingContent;
                 const { visibleText, reasoningText } = splitStreamingReasoning(
                     combined,
                     this.explicitReasoningText,
                 );
                 msg.mes = visibleText;
                 this.commitSwipeAndMetadata(msg, visibleText, reasoningText);
-                this.renderToDom(msg, visibleText, reasoningText, true);
+                this.renderToDom(msg, visibleText, reasoningText, true, true);
                 if (typeof saveChatConditional === 'function') {
                     await saveChatConditional();
                 } else {
@@ -593,7 +786,7 @@ export class StreamRenderer {
             );
             msg.mes = visibleText;
             this.commitSwipeAndMetadata(msg, visibleText, reasoningText);
-            this.renderToDom(msg, visibleText, reasoningText, true);
+            this.renderToDom(msg, visibleText, reasoningText, true, true);
             if (typeof syncMesToSwipe === 'function') {
                 syncMesToSwipe();
             }
@@ -679,7 +872,11 @@ export class StreamRenderer {
             status: 'retrieving',
             currentStep: 'Starting turn',
             stepCount: 0,
+            canResume: false,
+            interruptedReason: undefined,
+            summary: '',
             errorMessage: '',
+            onResume: undefined,
         });
         this.capsuleEl = capsule;
     }
@@ -732,9 +929,8 @@ export class StreamRenderer {
             rawCombined,
             this.explicitReasoningText,
         );
-        const shownText = visibleText.length > 0 ? visibleText : '...';
         this.commitReasoningFields(msg, reasoningText);
-        this.renderToDom(msg, shownText, reasoningText, false);
+        this.renderToDom(msg, visibleText, reasoningText, false, false);
     }
 
     private commitReasoningFields(msg: Record<string, unknown>, reasoningText: string): void {
@@ -794,21 +990,16 @@ export class StreamRenderer {
         visibleText: string,
         reasoningText: string,
         addCopyButtons: boolean,
+        isFinal: boolean = true,
     ): void {
         const mesElement = getMesElement(this.target.messageId);
         if (!mesElement) {
             return;
         }
 
-        const store = this.deps.getStore();
-        const override = store
-            ? store.getPending(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, {
-                  target: this.target,
-              }) ?? store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target: this.target })
-            : null;
         const baseDisplayText =
-            typeof override?.content === 'string' && override.content.length > 0
-                ? override.content
+            !isFinal && !visibleText && !reasoningText
+                ? '...'
                 : visibleText;
 
         const displayRules = collectDisplayRules(this.deps.getSettings());
@@ -896,6 +1087,7 @@ export class StreamRenderer {
                 typeof (msg.extra as Record<string, unknown> | undefined)?.reasoning === 'string'
                     ? String((msg.extra as Record<string, unknown>).reasoning)
                     : '',
+                true,
                 true,
             );
         }

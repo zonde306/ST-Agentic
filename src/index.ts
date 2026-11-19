@@ -36,7 +36,6 @@ import {
     DATA_NAMESPACES,
     DataCompactor,
     invalidateHeadIndex,
-    MESSAGE_OVERRIDE_KEY,
     VARIABLES_DOC_KEY,
     worldInfoKey,
 } from '@/core/store';
@@ -71,7 +70,7 @@ import type {
     WICategory,
 } from '@/core/types';
 import { canonicalClone, canonicalStringify, initXxHash } from '@/core/utils';
-import { VirtualFileSystem } from '@/core/vfs';
+import { OUTPUT_FILE_PATH, VirtualFileSystem } from '@/core/vfs';
 import type { AgenticPublicApi } from '@/globals';
 import { setupCompanionHooks } from '@/host/companion-hooks';
 import { evaluateOptionalEjs } from '@/host/ejs-adapter';
@@ -83,6 +82,7 @@ import {
     setupEmbedCard,
 } from '@/host/embed-card';
 import {
+    type AgenticInterceptorHandle,
     createAgenticInterceptor,
     type STGenerateInterceptor,
 } from '@/host/interceptor';
@@ -93,8 +93,10 @@ import {
 } from '@/host/st-bridge';
 import { IframeJsSandbox, SandboxLifecycleManager } from '@/sandbox';
 import {
+    type AgenticCapsuleElement,
     mountExtensionsMenuItems,
     mountExtensionsSettingsCard,
+    placeAgenticCapsule,
     registerAgenticCapsuleElement,
 } from '@/ui/capsule';
 import { registerSessionViews } from '@/ui/session';
@@ -279,25 +281,7 @@ function parseJsonObjectSafe(rawText: string): Record<string, unknown> {
 }
 
 function hydrateTrajectoryStore(targetStore: TrajectoryStore, sourceStore: TrajectoryStore): void {
-    for (const id of targetStore.listAgentIds()) {
-        targetStore.clearThread(id);
-    }
-    for (const agentId of sourceStore.listAgentIds()) {
-        const frozenPrefix = sourceStore.getFrozenPrefix(agentId);
-        if (frozenPrefix) {
-            targetStore.setFrozenPrefix(frozenPrefix, agentId);
-        }
-        targetStore.applyCompaction(
-            {
-                compactedMessages: sourceStore.getMessages(agentId),
-                archivedUpToChunk: sourceStore.getArchivedUpToChunk(agentId),
-                compactionHeaderCount: sourceStore.getCompactionHeaderCount(agentId),
-                turnEndCounts: sourceStore.getTurnEndCounts(agentId),
-            },
-            agentId,
-        );
-        targetStore.setReadSet(sourceStore.getReadSet(agentId), agentId);
-    }
+    targetStore.replaceFrom(sourceStore);
 }
 
 function createEjsVfsHelpers(
@@ -408,6 +392,7 @@ interface RuntimeServicesDeps {
     setSettings: (next: Settings, persistDebounced?: boolean) => Settings;
     syncTools: () => Promise<void>;
     getAppStore: () => AppStore | undefined;
+    getInterceptorHandle: () => AgenticInterceptorHandle | undefined;
     isSuppressingSave: () => boolean;
 }
 
@@ -430,6 +415,7 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
         setSettings,
         syncTools,
         getAppStore,
+        getInterceptorHandle,
         isSuppressingSave,
     } = deps;
 
@@ -527,6 +513,9 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
         const seenFileKeys = new Set<string>();
         for (const row of fileRows) {
             const cleanKey = row.key.replace(/^\/+/, '');
+            if (cleanKey === 'output.md') {
+                continue;
+            }
             seenFileKeys.add(cleanKey);
             const presetBase = presetFileMap.get(cleanKey);
             items.push({
@@ -630,49 +619,35 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             });
         }
 
-        // 4. Message display overrides
+        // 4. Message outputs (/output.md mapped directly to host chat messages)
         const chatMessages = bridge.getChat();
-        const msgRows = store.scan(DATA_NAMESPACES.MESSAGE, {
-            depth: 50,
-            includeHidden: true,
-            includeStaged: true,
-        });
-        const seenMsgKeys = new Set<string>();
-        for (const row of msgRows) {
-            const branchKey = `${row.messageId}:${row.swipeId}`;
-            seenMsgKeys.add(branchKey);
-            const rawMsg = chatMessages[row.messageId];
-            items.push({
-                id: `message:${branchKey}`,
-                category: 'message',
-                namespace: DATA_NAMESPACES.MESSAGE,
-                path: `message://${row.messageId}#${row.swipeId} (展示层覆写)`,
-                key: MESSAGE_OVERRIDE_KEY,
-                target: { messageId: row.messageId, swipeId: row.swipeId },
-                layerLabel: formatLayerLabel(row.messageId, row.swipeId),
-                source: row.entry.source,
-                content: row.entry.content,
-                baseContent: rawMsg?.mes ?? '',
-                overridden: true,
-                writable: true,
-            });
+        const messageIndices = new Set<number>();
+        const windowStart = Math.max(0, chatMessages.length - 50);
+        for (let i = chatMessages.length - 1; i >= windowStart; i -= 1) {
+            messageIndices.add(i);
+        }
+        if (target.messageId >= 0 && target.messageId < chatMessages.length) {
+            messageIndices.add(target.messageId);
         }
 
-        const activeBranchKey = `${target.messageId}:${target.swipeId}`;
-        if (chatMessages[target.messageId] && !seenMsgKeys.has(activeBranchKey)) {
-            const rawMsg = chatMessages[target.messageId];
-            const originalText = rawMsg?.mes ?? '';
+        const sortedMessageIndices = Array.from(messageIndices).sort((a, b) => b - a);
+        for (const i of sortedMessageIndices) {
+            const rawMsg = chatMessages[i];
+            if (!rawMsg || rawMsg.isSystem) {
+                continue;
+            }
+            const sw = i === target.messageId ? target.swipeId : (rawMsg.swipeId ?? 0);
+            const msgTarget: MessageTarget = { messageId: i, swipeId: sw };
             items.push({
-                id: `message:${activeBranchKey}`,
+                id: `output:${i}#${sw}`,
                 category: 'message',
-                namespace: DATA_NAMESPACES.MESSAGE,
-                path: `message://${target.messageId}#${target.swipeId} (展示层覆写)`,
-                key: MESSAGE_OVERRIDE_KEY,
-                target,
-                layerLabel: formatLayerLabel(target.messageId, target.swipeId),
+                namespace: DATA_NAMESPACES.FILES,
+                path: OUTPUT_FILE_PATH,
+                key: 'output.md',
+                target: msgTarget,
+                layerLabel: formatLayerLabel(i, sw),
                 source: 'chat',
-                content: originalText,
-                baseContent: originalText,
+                content: bridge.readChatMessage(msgTarget) ?? '',
                 overridden: false,
                 writable: true,
             });
@@ -692,10 +667,21 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
         if (namespace === DATA_NAMESPACES.VARIABLES) {
             return VARIABLES_DOC_KEY;
         }
-        if (namespace === DATA_NAMESPACES.MESSAGE) {
-            return MESSAGE_OVERRIDE_KEY;
-        }
         return key;
+    };
+
+    const isOutputOverrideTarget = (input: {
+        path: string;
+        namespace: DataNamespace;
+        key: string;
+        category?: string;
+    }): boolean => {
+        const cleanKey = input.key.replace(/^\/+/, '').trim();
+        return (
+            input.category === 'message'
+            || input.path.trim() === OUTPUT_FILE_PATH
+            || cleanKey === 'output.md'
+        );
     };
 
     return {
@@ -703,12 +689,44 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
 
         async saveFileOrOverride(input): Promise<FileOverrideItem> {
             const target = resolveTarget(input.target);
+            if (isOutputOverrideTarget(input)) {
+                await vfs.writeFile(OUTPUT_FILE_PATH, input.content, {
+                    target,
+                    staged: false,
+                    source: 'ui-edit',
+                });
+                await bridge.refreshMessageView(target);
+                await saveMetadata();
+
+                const refreshed = await listFilesAndOverrides(target);
+                const matched = refreshed.find(
+                    (item) =>
+                        item.category === 'message'
+                        && item.path === OUTPUT_FILE_PATH
+                        && item.target.messageId === target.messageId
+                        && item.target.swipeId === target.swipeId,
+                );
+                if (matched) {
+                    return matched;
+                }
+                return {
+                    id: `output:${target.messageId}#${target.swipeId}`,
+                    category: 'message',
+                    namespace: DATA_NAMESPACES.FILES,
+                    path: OUTPUT_FILE_PATH,
+                    key: 'output.md',
+                    target,
+                    layerLabel: formatLayerLabel(target.messageId, target.swipeId),
+                    source: 'chat',
+                    content: input.content,
+                    overridden: false,
+                    writable: true,
+                };
+            }
+
             const cleanKey = normalizeKeyForNamespace(input.namespace, input.key, input.path);
 
             store.set(input.namespace, cleanKey, 'ui-edit', input.content, { target });
-            if (input.namespace === DATA_NAMESPACES.MESSAGE) {
-                await bridge.refreshMessageView(target);
-            }
             await saveMetadata();
 
             const refreshed = await listFilesAndOverrides(target);
@@ -729,9 +747,7 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                         ? 'variables'
                         : input.namespace === DATA_NAMESPACES.WORLDINFO
                             ? 'worldinfo'
-                            : input.namespace === DATA_NAMESPACES.MESSAGE
-                                ? 'message'
-                                : 'workspace',
+                            : 'workspace',
                 namespace: input.namespace,
                 path: input.path,
                 key: cleanKey,
@@ -746,6 +762,17 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
 
         async deleteFileOrOverride(input): Promise<void> {
             const target = resolveTarget(input.target);
+            if (isOutputOverrideTarget(input)) {
+                await vfs.deleteFile(OUTPUT_FILE_PATH, {
+                    target,
+                    staged: false,
+                    source: 'ui-delete',
+                });
+                await bridge.refreshMessageView(target);
+                await saveMetadata();
+                return;
+            }
+
             const cleanKey = normalizeKeyForNamespace(input.namespace, input.key, input.path);
 
             const removed = store.remove(input.namespace, cleanKey, target);
@@ -756,9 +783,6 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                 store.erase(DATA_NAMESPACES.FILES, cleanKey, 'ui-delete', { target });
             }
 
-            if (input.namespace === DATA_NAMESPACES.MESSAGE) {
-                await bridge.refreshMessageView(target);
-            }
             await saveMetadata();
         },
 
@@ -876,6 +900,15 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             if (storeUi) {
                 await storeUi.refreshTraces();
             }
+        },
+
+        async resumeTurn(targetInput: MessageTarget): Promise<void> {
+            const target = resolveValidTarget(targetInput);
+            const handle = getInterceptorHandle();
+            if (!handle) {
+                throw new Error('Agentic interceptor is not initialized.');
+            }
+            await handle.resumeTakeoverTurn(target);
         },
 
         async cancelBackgroundTask(taskId: string): Promise<void> {
@@ -1319,6 +1352,7 @@ jQuery(async () => {
             vfs?: VirtualFileSystem;
             store?: ChatDataStore;
             appStore?: AppStore;
+            interceptorHandle?: AgenticInterceptorHandle;
         } = {};
 
         const bridge = new STHostBridge({
@@ -1517,6 +1551,7 @@ jQuery(async () => {
             setSettings: updateSettingsState,
             syncTools: syncCustomAndLoreTools,
             getAppStore: () => runtimeRefs.appStore,
+            getInterceptorHandle: () => runtimeRefs.interceptorHandle,
             isSuppressingSave: () => suppressNextSave,
         });
 
@@ -1556,6 +1591,7 @@ jQuery(async () => {
             getAppStore: () => appStore,
             registerGlobal: true,
         });
+        runtimeRefs.interceptorHandle = interceptorHandle;
         activeRealInterceptor = interceptorHandle.interceptor;
 
         setupCompanionHooks({
@@ -1572,9 +1608,15 @@ jQuery(async () => {
             dataStore: store,
         });
 
-        // Persist persistent agent trajectories whenever a turn trace completes.
+        // Persist persistent agent trajectories and interrupted checkpoints whenever turn/trace events fire.
         traceLogger.subscribe((event) => {
-            if (event.kind === 'trace_recorded' && trajectoryStore.listAgentIds().length > 0) {
+            if (
+                (event.kind === 'trace_recorded'
+                    || event.kind === 'turn_interrupted'
+                    || event.kind === 'turn_completed')
+                && (trajectoryStore.listAgentIds().length > 0
+                    || trajectoryStore.listInterruptedCheckpoints().size > 0)
+            ) {
                 trajectoryStore.saveToHost(bridge);
             }
         });
@@ -1616,6 +1658,108 @@ jQuery(async () => {
             appStore?.setActiveTarget(resolveValidTarget());
         };
 
+        const rehydrateMessageCapsules = (explicitMessageId?: number): void => {
+            if (typeof document === 'undefined' || !Array.isArray(chat) || chat.length === 0) {
+                return;
+            }
+
+            const indices: number[] =
+                explicitMessageId !== undefined
+                    ? Number.isInteger(explicitMessageId)
+                      && explicitMessageId >= 0
+                      && explicitMessageId < chat.length
+                        ? [explicitMessageId]
+                        : []
+                    : chat.map((_, idx) => idx);
+
+            const hasTargetCheckpoint = (target: MessageTarget): boolean =>
+                trajectoryStore
+                    .listAgentIds()
+                    .some((agentId) => trajectoryStore.getCheckpoint(target, agentId) !== undefined);
+
+            for (const messageId of indices) {
+                const rawMsg = chat[messageId] as
+                    | { is_user?: unknown; is_system?: unknown; swipe_id?: unknown }
+                    | undefined;
+                if (!rawMsg || rawMsg.is_user || rawMsg.is_system) {
+                    continue;
+                }
+
+                const mesElement = document.querySelector<HTMLElement>(
+                    `#chat .mes[mesid="${messageId}"]`,
+                );
+                if (!mesElement) {
+                    continue;
+                }
+
+                const swipeId =
+                    typeof rawMsg.swipe_id === 'number'
+                    && Number.isInteger(rawMsg.swipe_id)
+                    && rawMsg.swipe_id >= 0
+                        ? rawMsg.swipe_id
+                        : 0;
+                const msgTarget: MessageTarget = { messageId, swipeId };
+
+                const interruptedCp = trajectoryStore.getInterruptedCheckpoint(msgTarget);
+                const existingCapsule =
+                    mesElement.querySelector<AgenticCapsuleElement>('agentic-capsule');
+
+                if (interruptedCp) {
+                    const capsule =
+                        existingCapsule
+                        ?? (document.createElement('agentic-capsule') as AgenticCapsuleElement);
+                    placeAgenticCapsule(
+                        mesElement,
+                        capsule,
+                        currentSettings.capsulePosition ?? 'bottom',
+                    );
+                    capsule.connectStore(appStore, msgTarget);
+                    capsule.setState({
+                        status: 'interrupted',
+                        canResume: true,
+                        interruptedReason: interruptedCp.reason,
+                        summary: '',
+                        errorMessage: interruptedCp.errorMessage ?? '',
+                        onResume: () => uiServices.resumeTurn?.(msgTarget),
+                    });
+                    continue;
+                }
+
+                if (existingCapsule) {
+                    const hasCheckpoint = hasTargetCheckpoint(msgTarget);
+                    existingCapsule.setState({
+                        status: hasCheckpoint ? 'done' : 'idle',
+                        canResume: false,
+                        interruptedReason: undefined,
+                        errorMessage: '',
+                        summary: '',
+                        onResume: undefined,
+                    });
+                    existingCapsule.connectStore(appStore, msgTarget);
+                } else if (currentSettings.runMode !== 'off' && hasTargetCheckpoint(msgTarget)) {
+                    const capsule = document.createElement(
+                        'agentic-capsule',
+                    ) as AgenticCapsuleElement;
+                    placeAgenticCapsule(
+                        mesElement,
+                        capsule,
+                        currentSettings.capsulePosition ?? 'bottom',
+                    );
+                    capsule.setState({
+                        status: 'done',
+                        canResume: false,
+                        interruptedReason: undefined,
+                        errorMessage: '',
+                        summary: '',
+                        onResume: undefined,
+                    });
+                    capsule.connectStore(appStore, msgTarget);
+                }
+            }
+        };
+
+        rehydrateMessageCapsules();
+
         const handleChatChanged = async (): Promise<void> => {
             sandboxLifecycle.disposeAll();
             invalidateHeadIndex();
@@ -1623,6 +1767,7 @@ jQuery(async () => {
             syncActiveTargetFromChat();
             appStore?.setTraces(traceLogger.listTraces());
             appStore?.setBackgroundTasks(barrierCoordinator.listTasks());
+            rehydrateMessageCapsules();
             await syncCustomAndLoreTools();
             await runAutoStorageCompactionIfNeeded();
         };
@@ -1670,8 +1815,10 @@ jQuery(async () => {
             appStore?.setTraces(traceLogger.listTraces());
         });
         eventSource.on(event_types.MESSAGE_SWIPED, (messageId: unknown) => {
-            syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
+            const resolvedMsgId = typeof messageId === 'number' ? messageId : undefined;
+            syncActiveTargetFromChat(resolvedMsgId);
             appStore?.setTraces(traceLogger.listTraces());
+            rehydrateMessageCapsules(resolvedMsgId);
         });
         eventSource.on(event_types.MESSAGE_RECEIVED, (messageId: unknown) => {
             syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
@@ -1682,6 +1829,7 @@ jQuery(async () => {
         eventSource.on(event_types.APP_READY, () => {
             hostMounts.sync();
             syncActiveTargetFromChat();
+            rehydrateMessageCapsules();
         });
         eventSource.on(event_types.EXTENSIONS_FIRST_LOAD, () => {
             hostMounts.sync();

@@ -1,9 +1,11 @@
 import {
+    addCopyToCodeBlocks,
     appendMediaToMessage,
     characters,
     chat,
     chat_metadata,
     getCharacterCardFields,
+    messageFormatting,
     name1,
     name2,
     saveChatDebounced,
@@ -30,7 +32,7 @@ import {
 import type { HostBridge, HostIdentity, WriteChatMessageOptions } from '@/core/bridge';
 import { resolveActivePreset } from '@/core/config';
 import { applyRegexRules } from '@/core/regex';
-import { ChatDataStore, DATA_NAMESPACES, MESSAGE_OVERRIDE_KEY } from '@/core/store';
+import type { ChatDataStore } from '@/core/store';
 import type {
     ChatMessageSnapshot,
     MediaAttachment,
@@ -248,6 +250,11 @@ export class STHostBridge implements HostBridge {
         this.getStoreFn = () => store;
     }
 
+    /** Retrieve the attached `ChatDataStore`, if configured. */
+    getStore(): ChatDataStore | undefined {
+        return this.getStoreFn?.();
+    }
+
     /** Attach a reactive settings getter after bridge construction. */
     setSettingsGetter(getter: () => Settings | undefined): void {
         this.getSettingsFn = getter;
@@ -358,7 +365,7 @@ export class STHostBridge implements HostBridge {
         const activeSwipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
         if (activeSwipeId === target.swipeId) {
             msg.mes = content;
-            await this.refreshMessageView(target);
+            this.renderDisplayView(target.messageId, msg, content);
         }
 
         saveChatDebounced();
@@ -649,44 +656,56 @@ export class STHostBridge implements HostBridge {
             return;
         }
 
-        const store = this.getStoreFn?.();
-        const overrideEntry = store
-            ? store.getPending(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target }) ??
-              store.get(DATA_NAMESPACES.MESSAGE, MESSAGE_OVERRIDE_KEY, { target })
-            : null;
-
+        const swipes = Array.isArray(msg.swipes) ? (msg.swipes as unknown[]) : undefined;
+        const swipeRaw =
+            swipes && target.swipeId >= 0 && target.swipeId < swipes.length
+                ? swipes[target.swipeId]
+                : undefined;
         const baseText =
-            typeof overrideEntry?.content === 'string'
-                ? overrideEntry.content
+            typeof swipeRaw === 'string'
+                ? swipeRaw
                 : typeof msg.mes === 'string'
                   ? msg.mes
                   : '';
 
+        this.renderDisplayView(target.messageId, msg, baseText);
+    }
+
+    /**
+     * Render raw markdown into `.mes_text` with transient `display`-stage regexes and macros.
+     * Never writes transformed HTML/display text back to `msg.mes` or `msg.swipes`.
+     */
+    private renderDisplayView(
+        messageId: number,
+        msg: Record<string, unknown>,
+        rawText: string,
+    ): void {
         const settings = this.getSettingsFn?.();
         const regexRules = collectDisplayRegexRules(settings);
         const sender = msg.is_user ? 'user' : 'assistant';
         const displayText =
             regexRules.length > 0
                 ? this.substituteMacros(
-                      applyRegexRules(baseText, regexRules, {
+                      applyRegexRules(rawText, regexRules, {
                           stage: 'display',
                           sender,
                       }),
                   )
-                : baseText;
+                : rawText;
 
         if (typeof document === 'undefined') {
             return;
         }
 
         const mesElement = document.querySelector<HTMLElement>(
-            `#chat .mes[mesid="${target.messageId}"]`,
+            `#chat .mes[mesid="${messageId}"]`,
         );
         if (!mesElement) {
             return;
         }
 
         const rawMesSnapshot = msg.mes;
+        let updatedViaBlock = false;
         if (typeof updateMessageBlock === 'function') {
             const displayProxy = {
                 ...msg,
@@ -696,13 +715,34 @@ export class STHostBridge implements HostBridge {
                     display_text: displayText,
                 },
             };
-            updateMessageBlock(target.messageId, displayProxy, { rerenderMessage: true });
+            updateMessageBlock(messageId, displayProxy, { rerenderMessage: true });
+            updatedViaBlock = true;
             if (msg.mes !== rawMesSnapshot) {
                 msg.mes = rawMesSnapshot;
             }
+        } else if (typeof messageFormatting === 'function') {
+            const mesTextEl = mesElement.querySelector<HTMLElement>('.mes_text');
+            if (mesTextEl) {
+                mesTextEl.innerHTML = messageFormatting(
+                    displayText,
+                    typeof msg.name === 'string' ? msg.name : '',
+                    Boolean(msg.is_system),
+                    Boolean(msg.is_user),
+                    messageId,
+                );
+            }
         }
+
         if (typeof updateReasoningUI === 'function') {
             updateReasoningUI(mesElement);
+        }
+        if (typeof addCopyToCodeBlocks === 'function') {
+            const hasUncopiedCodeBlock = Array.from(
+                mesElement.querySelectorAll('pre code'),
+            ).some((codeEl) => !codeEl.querySelector('.code-copy'));
+            if (!updatedViaBlock || hasUncopiedCodeBlock) {
+                addCopyToCodeBlocks(mesElement);
+            }
         }
     }
 
