@@ -5,6 +5,7 @@ import type {
     LLMStreamChunk,
     LLMTransport,
     ToolExecutionContext,
+    ToolSideGenApi,
 } from '@/core/bridge';
 import {
     createDefaultMainAgent,
@@ -160,6 +161,7 @@ export interface AgentRunnerDependencies {
     tailRadar?: TailRadar;
     traceLogger?: TraceLogger;
     sandbox?: ScriptSandbox;
+    sideGen?: ToolSideGenApi;
     maxDelegationDepth?: number;
 }
 
@@ -468,6 +470,7 @@ export class AgentRunner {
     private readonly settingsProvider: () => Settings;
     private readonly regexProvider?: RegexPipeline | (() => RegexSource | undefined);
     private readonly sandbox?: ScriptSandbox;
+    private readonly sideGen?: ToolSideGenApi;
     private readonly maxDelegationDepth: number;
     private runSequence = 0;
 
@@ -482,6 +485,7 @@ export class AgentRunner {
                     : () => createDefaultSettings();
         this.regexProvider = deps.regexPipeline;
         this.sandbox = deps.sandbox;
+        this.sideGen = deps.sideGen;
         this.maxDelegationDepth = Math.max(0, deps.maxDelegationDepth ?? 1);
 
         this.store = deps.store ?? deps.vfs?.store ?? new ChatDataStore(deps.bridge);
@@ -663,6 +667,7 @@ export class AgentRunner {
             bridge: this.bridge,
             vfs: this.vfs,
             store: this.store,
+            ...(this.sideGen ? { sideGen: this.sideGen } : {}),
             target,
             signal,
             permissions,
@@ -881,6 +886,7 @@ export class AgentRunner {
                 signal,
             };
 
+            const isMainTurnRoot = input.phase === 'main_turn' && delegationDepth === 0;
             let currentAssembled = input.resumeMessages !== undefined
                 ? this.contextAssembler.assemble({
                     ...baseAssembleInput,
@@ -900,7 +906,13 @@ export class AgentRunner {
                     runTailRadar: input.runTailRadar ?? (input.phase === 'main_turn'),
                     target,
                     tailRadar: this.tailRadar,
+                    ...(isMainTurnRoot ? { vfs: this.vfs } : {}),
                 });
+
+            const consumedSideBriefPaths =
+                input.resumeMessages === undefined && isMainTurnRoot
+                    ? [...currentAssembled.consumedSideBriefPaths]
+                    : [];
 
             // Sync read-time overrides into TailRadar if needed (already handled by loreReadEvaluator.getOverride).
             void loreOverrides;
@@ -1005,6 +1017,18 @@ export class AgentRunner {
                         }
 
                         finalContent = currentOutput;
+                    }
+
+                    if (consumedSideBriefPaths.length > 0) {
+                        await this.vfs.markSideCluesConsumed(
+                            consumedSideBriefPaths,
+                            target.messageId + 1,
+                            {
+                                target,
+                                staged,
+                                source: `agent:${agent.id}`,
+                            },
+                        );
                     }
 
                     if (agent.sessionMode === 'persistent') {

@@ -5,7 +5,7 @@ import {
     type SubAgentDescriptor,
     TurnInterruptedError,
 } from '@/core/agents';
-import type { HostBridge, LLMTransport, ToolExecutionContext } from '@/core/bridge';
+import type { HostBridge, LLMTransport, ToolExecutionContext, ToolSideGenApi } from '@/core/bridge';
 import {
     createDefaultMainAgent,
     createDefaultSettings,
@@ -88,6 +88,7 @@ export interface PipelineOrchestratorDependencies {
     tailRadar?: TailRadar;
     regexPipeline?: RegexPipeline | (() => RegexPipeline | readonly RegexRule[] | undefined);
     sandbox?: ScriptSandbox;
+    sideGen?: ToolSideGenApi;
     summarizeChunk?: ChunkSummarizer;
     compactionOptions?: Partial<CompactionOptions>;
 }
@@ -231,6 +232,7 @@ export class PipelineOrchestrator {
         | RegexPipeline
         | (() => RegexPipeline | readonly RegexRule[] | undefined);
     private readonly sandbox?: ScriptSandbox;
+    private readonly sideGen?: ToolSideGenApi;
     private readonly summarizeChunk?: ChunkSummarizer;
     private readonly compactionOptions: Partial<CompactionOptions>;
 
@@ -245,6 +247,7 @@ export class PipelineOrchestrator {
                     : () => createDefaultSettings();
         this.regexProvider = deps.regexPipeline;
         this.sandbox = deps.sandbox;
+        this.sideGen = deps.sideGen;
         this.summarizeChunk = deps.summarizeChunk;
         this.compactionOptions = deps.compactionOptions ? { ...deps.compactionOptions } : {};
 
@@ -321,6 +324,7 @@ export class PipelineOrchestrator {
                 tailRadar: this.tailRadar,
                 traceLogger: this.traceLogger,
                 sandbox: this.sandbox,
+                ...(this.sideGen ? { sideGen: this.sideGen } : {}),
             });
     }
 
@@ -376,7 +380,7 @@ export class PipelineOrchestrator {
             } else if (input.action === 'regenerate') {
                 this.barrierCoordinator.abortFromMessage(target.messageId, 'Regenerated');
                 this.store.pruneFromMessage(target.messageId);
-                this.trajectoryStore.pruneFromMessage(target.messageId);
+                this.pruneMainlineTrajectoriesFromMessage(target.messageId);
             } else if (input.action === 'continue') {
                 this.restoreTrajectoriesForBranch(target);
             }
@@ -871,6 +875,7 @@ export class PipelineOrchestrator {
                     bridge: this.bridge,
                     vfs: this.vfs,
                     store: this.store,
+                    ...(this.sideGen ? { sideGen: this.sideGen } : {}),
                     target: context.target,
                     signal: context.signal,
                     permissions: { read: ['/**'], write: [] },
@@ -1302,6 +1307,7 @@ export class PipelineOrchestrator {
             bridge: this.bridge,
             vfs: this.vfs,
             store: this.store,
+            ...(this.sideGen ? { sideGen: this.sideGen } : {}),
             target: ctx.target,
             signal: ctx.signal,
             permissions,
@@ -1503,17 +1509,33 @@ export class PipelineOrchestrator {
         return raw;
     }
 
+    private isMainlineThreadId(agentId: string): boolean {
+        return !agentId.startsWith('side:') && !agentId.startsWith('assistant:');
+    }
+
+    private pruneMainlineTrajectoriesFromMessage(messageId: number): void {
+        for (const agentId of this.trajectoryStore.listAgentIds()) {
+            if (this.isMainlineThreadId(agentId)) {
+                this.trajectoryStore.pruneFromMessage(messageId, agentId);
+            }
+        }
+    }
+
     private restoreTrajectoriesBeforeMessage(messageId: number): void {
         const chat = this.bridge.getChat();
         const swipeLookup = (msgId: number) => chat[msgId]?.swipeId ?? 0;
         for (const agentId of this.trajectoryStore.listAgentIds()) {
-            this.trajectoryStore.restoreBeforeMessage(messageId, agentId, swipeLookup);
+            if (this.isMainlineThreadId(agentId)) {
+                this.trajectoryStore.restoreBeforeMessage(messageId, agentId, swipeLookup);
+            }
         }
     }
 
     private restoreTrajectoriesForBranch(target: MessageTarget): void {
         for (const agentId of this.trajectoryStore.listAgentIds()) {
-            this.trajectoryStore.restoreBranch(target, agentId);
+            if (this.isMainlineThreadId(agentId)) {
+                this.trajectoryStore.restoreBranch(target, agentId);
+            }
         }
     }
 

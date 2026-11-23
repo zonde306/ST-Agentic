@@ -1,5 +1,12 @@
 import { AgentRunner } from '@/core/agents';
 import {
+    AssistantRunner,
+    AssistantSessionStore,
+    UndoStore,
+    createChatMetadataUndoAdapter,
+} from '@/core/assistant';
+import type { ToolSideGenApi } from '@/core/bridge';
+import {
     createDefaultSettings,
     exportPreset,
     importConnections,
@@ -31,6 +38,7 @@ import {
     migrateFromCustomGeneration,
 } from '@/core/migration';
 import { RegexPipeline } from '@/core/regex';
+import { SideGenService } from '@/core/sidegen';
 import {
     ChatDataStore,
     DATA_NAMESPACES,
@@ -71,8 +79,8 @@ import type {
 } from '@/core/types';
 import { canonicalClone, canonicalStringify, initXxHash } from '@/core/utils';
 import { OUTPUT_FILE_PATH, VirtualFileSystem } from '@/core/vfs';
-import type { AgenticPublicApi } from '@/globals';
-import { setupCompanionHooks } from '@/host/companion-hooks';
+import type { AgenticAssistantPublicApi, AgenticPublicApi } from '@/globals';
+import { type CompanionHooksHandle, setupCompanionHooks } from '@/host/companion-hooks';
 import { evaluateOptionalEjs } from '@/host/ejs-adapter';
 import {
     embedFilesToCard,
@@ -86,12 +94,14 @@ import {
     createAgenticInterceptor,
     type STGenerateInterceptor,
 } from '@/host/interceptor';
+import { registerSideGenSlashCommands } from '@/host/sidegen-slash';
 import { executeStSlashCommand } from '@/host/slash-bridge';
 import {
     DEFAULT_EXTENSION_SETTINGS_KEY,
     STHostBridge,
 } from '@/host/st-bridge';
 import { IframeJsSandbox, SandboxLifecycleManager } from '@/sandbox';
+import { registerAssistantView } from '@/ui/assistant';
 import {
     type AgenticCapsuleElement,
     mountExtensionsMenuItems,
@@ -101,6 +111,7 @@ import {
 } from '@/ui/capsule';
 import { registerSessionViews } from '@/ui/session';
 import { mountAgenticAppShell } from '@/ui/shell';
+import { registerSideGenView } from '@/ui/sidegen';
 import {
     AppStore,
     type AgenticUIServices,
@@ -379,6 +390,7 @@ interface RuntimeServicesDeps {
     store: ChatDataStore;
     dataCompactor: DataCompactor;
     vfs: VirtualFileSystem;
+    sideGen: ToolSideGenApi;
     traceLogger: TraceLogger;
     sandbox: IframeJsSandbox;
     toolRegistry: ToolRegistry;
@@ -402,6 +414,7 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
         store,
         dataCompactor,
         vfs,
+        sideGen,
         traceLogger,
         sandbox,
         toolRegistry,
@@ -1132,6 +1145,7 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                     bridge,
                     vfs,
                     store,
+                    sideGen,
                     target,
                     signal: AbortSignal.timeout(15_000),
                     staged: false,
@@ -1353,6 +1367,7 @@ jQuery(async () => {
             store?: ChatDataStore;
             appStore?: AppStore;
             interceptorHandle?: AgenticInterceptorHandle;
+            companionHooksHandle?: CompanionHooksHandle;
         } = {};
 
         const bridge = new STHostBridge({
@@ -1479,11 +1494,149 @@ jQuery(async () => {
 
         const contextAssembler = new ContextAssembler();
         const watermarkCompactor = new WatermarkCompactor({ vfs, bridge });
+        const resolveConnectionById = (connectionId: string): ApiConnection | undefined =>
+            currentSettings.connections[connectionId]
+            ?? currentSettings.connections[currentSettings.currentConnectionId];
+
         const transport = new FetchLLMTransport({
             connections: currentSettings.connections,
-            resolveConnection: (connectionId) =>
-                currentSettings.connections[connectionId]
-                ?? currentSettings.connections[currentSettings.currentConnectionId],
+            resolveConnection: resolveConnectionById,
+        });
+
+        const scheduleSideGenUiRefresh = (target?: MessageTarget): void => {
+            const uiStore = runtimeRefs.appStore;
+            if (!uiStore) {
+                return;
+            }
+            void uiStore.refreshSideGenState(target).catch(() => {});
+        };
+
+        const sideGenService = new SideGenService({
+            bridge,
+            transport,
+            trajectoryStore,
+            dataStore: store,
+            vfs,
+            getDefaultConnectionId: () => currentSettings.currentConnectionId,
+            resolveConnection: resolveConnectionById,
+            defaultDelivery: currentSettings.offMainline?.defaultDelivery,
+            onTrace: (trace) => {
+                traceLogger.recordTrace(trace, true);
+            },
+        });
+
+        const sideGenApi: ToolSideGenApi = {
+            async runOnce(opts) {
+                const result = await sideGenService.runOnce(opts);
+                if (result.bridgedPath) {
+                    scheduleSideGenUiRefresh();
+                }
+                return result;
+            },
+            async createSession(opts) {
+                const info = await sideGenService.createSession(opts);
+                scheduleSideGenUiRefresh();
+                return info;
+            },
+            async send(sessionId, prompt, opts) {
+                const result = await sideGenService.send(sessionId, prompt, opts);
+                scheduleSideGenUiRefresh();
+                return result;
+            },
+            getSession: (sessionId) => sideGenService.getSession(sessionId),
+            listSessions: (filter) => sideGenService.listSessions(filter),
+            getTranscript: (sessionId) => sideGenService.getTranscript(sessionId),
+            async compactSession(sessionId) {
+                const result = await sideGenService.compactSession(sessionId);
+                scheduleSideGenUiRefresh();
+                return result;
+            },
+            async deleteSession(sessionId) {
+                const deleted = await sideGenService.deleteSession(sessionId);
+                if (deleted) {
+                    scheduleSideGenUiRefresh();
+                }
+                return deleted;
+            },
+            clues: {
+                async write(input) {
+                    const doc = await sideGenService.clues.write(input);
+                    scheduleSideGenUiRefresh(input.target);
+                    return doc;
+                },
+                read: (path, target) => sideGenService.clues.read(path, target),
+                list: (target) => sideGenService.clues.list(target),
+                async updateDelivery(path, delivery, target) {
+                    const updated = await sideGenService.clues.updateDelivery(path, delivery, target);
+                    scheduleSideGenUiRefresh(target);
+                    return updated;
+                },
+                async updateStatus(path, status, target) {
+                    const updated = await sideGenService.clues.updateStatus(path, status, target);
+                    scheduleSideGenUiRefresh(target);
+                    return updated;
+                },
+                async delete(path, target) {
+                    const deleted = await sideGenService.clues.delete(path, target);
+                    if (deleted) {
+                        scheduleSideGenUiRefresh(target);
+                    }
+                    return deleted;
+                },
+                async exportToWorldInfo(path, options) {
+                    const exported = await sideGenService.clues.exportToWorldInfo(path, options);
+                    scheduleSideGenUiRefresh();
+                    return exported;
+                },
+            },
+        };
+
+        const undoStore = new UndoStore({
+            persistence: createChatMetadataUndoAdapter(
+                () => bridge.getMetadata(),
+                () => bridge.saveChatDebounced(),
+            ),
+        });
+        await undoStore.load();
+
+        const assistantSessionStore = new AssistantSessionStore({
+            bridge,
+            trajectoryStore,
+            persistenceMode: 'metadata',
+        });
+
+        const assistantRunner = new AssistantRunner({
+            bridge,
+            transport,
+            store,
+            vfs,
+            trajectoryStore,
+            sessionStore: assistantSessionStore,
+            undoStore,
+            traceLogger,
+            settings: () => currentSettings,
+            resolveConnection: resolveConnectionById,
+            getActiveTarget: () => resolveValidTarget(runtimeRefs.appStore?.getSnapshot().activeTarget),
+            getStatusSnapshot: () => {
+                const activePreset = resolveActivePreset(currentSettings);
+                const mainAgentId = activePreset.mainAgentId;
+                const activeTarget = resolveValidTarget(
+                    runtimeRefs.appStore?.getSnapshot().activeTarget,
+                );
+                return {
+                    runMode: currentSettings.runMode,
+                    currentPresetId: currentSettings.currentPresetId,
+                    activePresetName: activePreset.name,
+                    currentConnectionId: currentSettings.currentConnectionId,
+                    activeTarget,
+                    mainlineTokens: watermarkCompactor.estimateCurrentTokens(trajectoryStore, {
+                        agentId: mainAgentId,
+                    }),
+                    archivedChunks: trajectoryStore.getArchivedUpToChunk(mainAgentId),
+                    traceCount: traceLogger.listTraces().length,
+                    sideSessionCount: sideGenService.sessionStore.listSessions().length,
+                };
+            },
         });
 
         const agentRunner = new AgentRunner({
@@ -1500,6 +1653,7 @@ jQuery(async () => {
             tailRadar,
             traceLogger,
             sandbox,
+            sideGen: sideGenApi,
         });
 
         const barrierCoordinator = new BarrierCoordinator({ traceLogger });
@@ -1522,12 +1676,16 @@ jQuery(async () => {
             tailRadar,
             regexPipeline,
             sandbox,
+            sideGen: sideGenApi,
         });
 
         const updateSettingsState = (next: Settings, persistDebounced = true): Settings => {
             currentSettings = persistAgenticSettings(next, persistDebounced);
             regexPipeline.setRules(resolveActivePreset(currentSettings).regexRules);
             transport.setConnections(currentSettings.connections);
+            if (currentSettings.runMode !== 'companion') {
+                runtimeRefs.companionHooksHandle?.clearSideBridgePrompt();
+            }
             return currentSettings;
         };
 
@@ -1538,6 +1696,7 @@ jQuery(async () => {
             store,
             dataCompactor,
             vfs,
+            sideGen: sideGenApi,
             traceLogger,
             sandbox,
             toolRegistry,
@@ -1563,18 +1722,27 @@ jQuery(async () => {
             initialBackgroundTasks: barrierCoordinator.listTasks(),
             initialTarget: resolveValidTarget(),
             services: uiServices,
+            assistantRuntime: assistantRunner,
+            sideGenRuntime: sideGenApi,
             getHostLuminance: () => bridge.getHostLuminance(),
         });
         runtimeRefs.appStore = appStore;
+        appStore.setAssistantRuntime(assistantRunner);
+        appStore.setSideGenRuntime(sideGenApi);
         setDefaultAppStore(appStore);
 
-        // Register all Studio/Session views and Shadow DOM custom element before mounting UI shells.
+        // Register all Off-Mainline/Studio/Session views and Shadow DOM custom element before mounting UI shells.
+        registerAssistantView();
+        registerSideGenView();
         registerSessionViews();
         registerStudioViews();
         registerAgenticCapsuleElement();
 
         mountAgenticAppShell({ store: appStore });
         const hostMounts = setupHostUiContainers(appStore);
+
+        void appStore.refreshAssistantState().catch(() => {});
+        void appStore.refreshSideGenState().catch(() => {});
 
         if (initial.migrationReport) {
             appStore.pushToast(
@@ -1594,18 +1762,41 @@ jQuery(async () => {
         runtimeRefs.interceptorHandle = interceptorHandle;
         activeRealInterceptor = interceptorHandle.interceptor;
 
-        setupCompanionHooks({
+        const companionHooksHandle = setupCompanionHooks({
             bridge,
             orchestrator,
+            tailRadar,
             getSettings: () => currentSettings,
             getAppStore: () => appStore,
             isTakeoverActive: () => interceptorHandle.isTakeoverActive(),
+        });
+        runtimeRefs.companionHooksHandle = companionHooksHandle;
+
+        let sideGenLifecycleController = new AbortController();
+        const rotateSideGenLifecycleAbort = (reason: string): void => {
+            const prev = sideGenLifecycleController;
+            sideGenLifecycleController = new AbortController();
+            if (!prev.signal.aborted) {
+                prev.abort(reason);
+            }
+        };
+
+        const sideGenSlashHandle = registerSideGenSlashCommands({
+            getSideGen: () => sideGenApi,
+            getAbortSignal: () => sideGenLifecycleController.signal,
         });
 
         setupEmbedCard({
             store: appStore,
             bridge,
             dataStore: store,
+        });
+
+        // Persist assistant trajectory updates whenever AssistantRunner notifies subscribers.
+        const unsubscribeAssistantPersist = assistantRunner.subscribe(() => {
+            if (trajectoryStore.listAgentIds().length > 0) {
+                trajectoryStore.saveToHost(bridge);
+            }
         });
 
         // Persist persistent agent trajectories and interrupted checkpoints whenever turn/trace events fire.
@@ -1618,6 +1809,9 @@ jQuery(async () => {
                     || trajectoryStore.listInterruptedCheckpoints().size > 0)
             ) {
                 trajectoryStore.saveToHost(bridge);
+            }
+            if (event.kind === 'turn_completed') {
+                scheduleSideGenUiRefresh(event.target);
             }
         });
 
@@ -1675,6 +1869,7 @@ jQuery(async () => {
             const hasTargetCheckpoint = (target: MessageTarget): boolean =>
                 trajectoryStore
                     .listAgentIds()
+                    .filter((id) => !id.startsWith('side:') && !id.startsWith('assistant:'))
                     .some((agentId) => trajectoryStore.getCheckpoint(target, agentId) !== undefined);
 
             for (const messageId of indices) {
@@ -1761,12 +1956,23 @@ jQuery(async () => {
         rehydrateMessageCapsules();
 
         const handleChatChanged = async (): Promise<void> => {
+            assistantRunner.abort();
+            rotateSideGenLifecycleAbort('chat_changed');
+            sideGenService.abortAll('chat_changed');
             sandboxLifecycle.disposeAll();
             invalidateHeadIndex();
             hydrateTrajectoryStore(trajectoryStore, TrajectoryStore.loadFromHost(bridge));
+            sideGenService.onChatChanged({ reloadTrajectory: false });
+            await undoStore.load();
+            await assistantRunner.sessionStore.load();
             syncActiveTargetFromChat();
             appStore?.setTraces(traceLogger.listTraces());
             appStore?.setBackgroundTasks(barrierCoordinator.listTasks());
+            await appStore?.refreshAssistantState();
+            await appStore?.refreshSideGenState();
+            if (currentSettings.runMode !== 'companion') {
+                companionHooksHandle.clearSideBridgePrompt();
+            }
             rehydrateMessageCapsules();
             await syncCustomAndLoreTools();
             await runAutoStorageCompactionIfNeeded();
@@ -1810,32 +2016,118 @@ jQuery(async () => {
         eventSource.on(event_types.WORLDINFO_SETTINGS_UPDATED, () => {
             void syncCustomAndLoreTools();
         });
-        eventSource.on(event_types.MESSAGE_DELETED, () => {
+        eventSource.on(event_types.MESSAGE_DELETED, (messageId: unknown) => {
+            const resolvedMsgId =
+                typeof messageId === 'number' && Number.isInteger(messageId) && messageId >= 0
+                    ? messageId
+                    : undefined;
+            rotateSideGenLifecycleAbort('messages_pruned');
+            if (resolvedMsgId !== undefined) {
+                sideGenService.onMessagesPruned(resolvedMsgId);
+            } else {
+                sideGenService.abortAll('messages_pruned');
+            }
             syncActiveTargetFromChat();
             appStore?.setTraces(traceLogger.listTraces());
+            scheduleSideGenUiRefresh();
         });
         eventSource.on(event_types.MESSAGE_SWIPED, (messageId: unknown) => {
             const resolvedMsgId = typeof messageId === 'number' ? messageId : undefined;
             syncActiveTargetFromChat(resolvedMsgId);
+            const nextAnchor = appStore.getSnapshot().activeTarget;
+            rotateSideGenLifecycleAbort('branch_changed');
+            sideGenService.onBranchChanged(nextAnchor);
             appStore?.setTraces(traceLogger.listTraces());
             rehydrateMessageCapsules(resolvedMsgId);
+            scheduleSideGenUiRefresh(nextAnchor);
         });
+        if (event_types.MESSAGE_SWIPE_DELETED) {
+            eventSource.on(event_types.MESSAGE_SWIPE_DELETED, () => {
+                syncActiveTargetFromChat();
+                const nextAnchor = appStore.getSnapshot().activeTarget;
+                rotateSideGenLifecycleAbort('branch_changed');
+                sideGenService.onBranchChanged(nextAnchor, { pruneSiblings: false });
+                scheduleSideGenUiRefresh(nextAnchor);
+            });
+        }
         eventSource.on(event_types.MESSAGE_RECEIVED, (messageId: unknown) => {
             syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
+            scheduleSideGenUiRefresh();
         });
         eventSource.on(event_types.MESSAGE_UPDATED, (messageId: unknown) => {
             syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
+            scheduleSideGenUiRefresh();
         });
+        if (event_types.MESSAGE_EDITED) {
+            eventSource.on(event_types.MESSAGE_EDITED, (messageId: unknown) => {
+                syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
+                scheduleSideGenUiRefresh();
+            });
+        }
+        if (event_types.GENERATION_STOPPED) {
+            eventSource.on(event_types.GENERATION_STOPPED, () => {
+                rotateSideGenLifecycleAbort('generation_stopped');
+                sideGenService.abortAll('generation_stopped');
+                assistantRunner.abort();
+            });
+        }
         eventSource.on(event_types.APP_READY, () => {
             hostMounts.sync();
             syncActiveTargetFromChat();
             rehydrateMessageCapsules();
+            scheduleSideGenUiRefresh();
         });
         eventSource.on(event_types.EXTENSIONS_FIRST_LOAD, () => {
             hostMounts.sync();
         });
 
+        let runtimeDisposed = false;
+        const disposeOffMainlineAndHost = (): void => {
+            if (runtimeDisposed) {
+                return;
+            }
+            runtimeDisposed = true;
+            assistantRunner.abort();
+            rotateSideGenLifecycleAbort('unload');
+            sideGenService.abortAll('unload');
+            unsubscribeAssistantPersist();
+            companionHooksHandle.clearSideBridgePrompt();
+            companionHooksHandle.dispose();
+            sideGenSlashHandle.dispose();
+            interceptorHandle.dispose();
+            hostMounts.dispose();
+            sandboxLifecycle.disposeAll();
+        };
+
+        if (typeof window !== 'undefined') {
+            window.addEventListener('beforeunload', disposeOffMainlineAndHost, { once: true });
+            window.addEventListener('pagehide', disposeOffMainlineAndHost, { once: true });
+        }
+
         await runAutoStorageCompactionIfNeeded();
+
+        const publicAssistantApi: AgenticAssistantPublicApi = {
+            open: (sessionId?: string) => {
+                appStore.openConsole(
+                    'assistant',
+                    sessionId ? { assistantSessionId: sessionId } : undefined,
+                );
+            },
+            listSessions: () => assistantRunner.listSessions(),
+            getSession: (sessionId: string) => assistantRunner.getSession(sessionId),
+            createSession: (opts) => assistantRunner.createSession(opts),
+            updateSession: (sessionId, patch) => assistantRunner.updateSessionConfig(sessionId, patch),
+            deleteSession: (sessionId) => assistantRunner.deleteSession(sessionId),
+            send: (sessionId, prompt, opts) => assistantRunner.sendPrompt(sessionId, prompt, opts),
+            decideApproval: (approvalId, decision, feedback) =>
+                assistantRunner.decideApproval(approvalId, decision, feedback),
+            retryApproval: (approvalId, feedback) =>
+                assistantRunner.retryApproval(approvalId, feedback),
+            undo: (undoId) => assistantRunner.undo(undoId),
+            listPendingApprovals: (sessionId) => assistantRunner.listApprovals(sessionId),
+            listUndoHistory: (sessionId) => assistantRunner.listUndoRecords(sessionId),
+            abort: (sessionId) => assistantRunner.abort(sessionId),
+        };
 
         const publicApi: AgenticPublicApi = {
             version: AGENTIC_VERSION,
@@ -1850,6 +2142,8 @@ jQuery(async () => {
             rerunAfterTurn: async (target) => {
                 await uiServices.rerunAfterTurn(target);
             },
+            sideGen: sideGenApi,
+            assistant: publicAssistantApi,
             vfs,
             store,
             traces: traceLogger,
@@ -1868,7 +2162,7 @@ jQuery(async () => {
     }
 });
 
-export type { AgenticPublicApi };
+export type { AgenticAssistantPublicApi, AgenticPublicApi };
 export default {
     version: AGENTIC_VERSION,
     getApi: (): AgenticPublicApi | undefined => globalThis.Agentic,

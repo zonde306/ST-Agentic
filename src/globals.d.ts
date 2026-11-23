@@ -3,16 +3,53 @@
 /// <reference types="lodash" />
 /// <reference types="toastr" />
 
+import type {
+    AssistantSendOptions,
+    AssistantSessionPatch,
+    CreateAssistantSessionOptions,
+    UndoRevertResult,
+} from '@/core/assistant';
+import type { ToolSideGenApi } from '@/core/bridge';
 import type { TraceLogger } from '@/core/logger';
 import type { ChatDataStore } from '@/core/store';
 import type { PipelineOrchestrator, RunTurnInput, RunTurnResult } from '@/core/triggers';
-import type { ConsoleTabId, DeepLinkState, MessageTarget, Settings } from '@/core/types';
+import type {
+    AssistantMessage,
+    AssistantSession,
+    ConsoleTabId,
+    DeepLinkState,
+    MessageTarget,
+    PendingApproval,
+    Settings,
+    UndoRecord,
+} from '@/core/types';
 import type { VirtualFileSystem } from '@/core/vfs';
 import type { EjsTemplateGlobal } from '@/host/ejs-adapter';
 import type { STGenerateInterceptor } from '@/host/interceptor';
 import type { STHostBridge } from '@/host/st-bridge';
 import type { IframeJsSandbox } from '@/sandbox';
 import type { AppStore } from '@/ui/store';
+
+/** Public off-mainline Assistant control & read handle exposed on `globalThis.Agentic.assistant`. */
+export interface AgenticAssistantPublicApi {
+    open(sessionId?: string): void;
+    listSessions(): AssistantSession[];
+    getSession(sessionId: string): AssistantSession | null;
+    createSession(opts?: CreateAssistantSessionOptions): Promise<AssistantSession>;
+    updateSession(sessionId: string, patch: AssistantSessionPatch): Promise<AssistantSession | null>;
+    deleteSession(sessionId: string): Promise<boolean>;
+    send(sessionId: string, prompt: string, opts?: AssistantSendOptions): Promise<AssistantMessage>;
+    decideApproval(
+        approvalId: string,
+        decision: 'approve' | 'reject',
+        feedback?: string,
+    ): Promise<PendingApproval | null>;
+    retryApproval(approvalId: string, feedback?: string): Promise<PendingApproval | null>;
+    undo(undoId: string): Promise<UndoRevertResult>;
+    listPendingApprovals(sessionId?: string): PendingApproval[];
+    listUndoHistory(sessionId?: string): UndoRecord[];
+    abort(sessionId?: string): void;
+}
 
 /** Public runtime scripting API exposed on `globalThis.Agentic`. */
 export interface AgenticPublicApi {
@@ -22,6 +59,8 @@ export interface AgenticPublicApi {
     closeConsole(): void;
     runTurn(input: RunTurnInput): Promise<RunTurnResult>;
     rerunAfterTurn(target?: MessageTarget): Promise<void>;
+    readonly sideGen: ToolSideGenApi;
+    readonly assistant: AgenticAssistantPublicApi;
     readonly vfs: VirtualFileSystem;
     readonly store: ChatDataStore;
     readonly traces: TraceLogger;
