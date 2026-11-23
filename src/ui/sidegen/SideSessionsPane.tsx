@@ -320,12 +320,12 @@ export function SideSessionsPane({ store }: SideSessionsPaneProps) {
                         description="线外持久会话复用独立 TrajectoryStore（线程键 side:<id>），0 占用主线上下文，并可配置 autoBridge 自动沉淀到 /side/* 线索。"
                         action={
                             <Button
-                                variant="primary"
+                                variant="secondary"
                                 size="sm"
                                 icon={<IconPlus size={14} />}
                                 onClick={openCreateModal}
                             >
-                                + 新建线外会话
+                                新建线外会话
                             </Button>
                         }
                     />

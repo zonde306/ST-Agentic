@@ -19,6 +19,9 @@ import {
     IconFilter,
     IconFolder,
     IconGitBranch,
+    IconLayers,
+    IconMaximize,
+    IconMinimize,
     IconMonitor,
     IconMoon,
     IconPlug,
@@ -54,7 +57,7 @@ function TabIcon({ tabId }: { tabId: ConsoleTabId }) {
                     viewBox="0 0 24 24"
                     fill="none"
                     stroke="currentColor"
-                    strokeWidth={1.9}
+                    strokeWidth={1.8}
                     strokeLinecap="round"
                     strokeLinejoin="round"
                     class="ag-icon"
@@ -74,7 +77,7 @@ function TabIcon({ tabId }: { tabId: ConsoleTabId }) {
                     viewBox="0 0 24 24"
                     fill="none"
                     stroke="currentColor"
-                    strokeWidth={1.9}
+                    strokeWidth={1.8}
                     strokeLinecap="round"
                     strokeLinejoin="round"
                     class="ag-icon"
@@ -101,7 +104,7 @@ function TabIcon({ tabId }: { tabId: ConsoleTabId }) {
                     viewBox="0 0 24 24"
                     fill="none"
                     stroke="currentColor"
-                    strokeWidth={1.9}
+                    strokeWidth={1.8}
                     strokeLinecap="round"
                     strokeLinejoin="round"
                     class="ag-icon"
@@ -347,15 +350,15 @@ function AgenticShellContent() {
                             }}
                         >
                             <span class="ag-brand-logo" aria-hidden="true">
-                                <IconBolt size={17} />
+                                <IconBolt size={15} />
                             </span>
                             <span class="ag-brand-title">ST-Agentic</span>
-                            <span class="ag-isolation-pill">Shadow DOM 隔离</span>
                         </div>
 
                         <div class="ag-header-controls">
                             <SegmentedControl<RunMode>
                                 ariaLabel="运行模式"
+                                className="ag-runmode"
                                 value={runMode}
                                 options={runModeOptions}
                                 onChange={(mode) => {
@@ -364,51 +367,63 @@ function AgenticShellContent() {
                             />
 
                             <div class="ag-header-select-wrap">
-                                <SelectInput
-                                    ariaLabel="主 API 连接"
-                                    className="ag-header-select"
-                                    value={settings.currentConnectionId}
-                                    options={connectionOptions}
-                                    onChange={(id) => {
-                                        void store.setCurrentConnection(id);
-                                    }}
-                                />
-                                <SelectInput
-                                    ariaLabel="当前预设"
-                                    className="ag-header-select"
-                                    value={settings.currentPresetId}
-                                    options={presetOptions}
-                                    onChange={(id) => {
-                                        void store.setCurrentPreset(id);
-                                    }}
-                                />
+                                <label class="ag-ctx-select" title="主 API 连接">
+                                    <span class="ag-ctx-select-icon" aria-hidden="true">
+                                        <IconPlug size={15} />
+                                    </span>
+                                    <SelectInput
+                                        ariaLabel="主 API 连接"
+                                        className="ag-header-select"
+                                        value={settings.currentConnectionId}
+                                        options={connectionOptions}
+                                        onChange={(id) => {
+                                            void store.setCurrentConnection(id);
+                                        }}
+                                    />
+                                </label>
+                                <label class="ag-ctx-select" title="当前预设">
+                                    <span class="ag-ctx-select-icon" aria-hidden="true">
+                                        <IconLayers size={15} />
+                                    </span>
+                                    <SelectInput
+                                        ariaLabel="当前预设"
+                                        className="ag-header-select"
+                                        value={settings.currentPresetId}
+                                        options={presetOptions}
+                                        onChange={(id) => {
+                                            void store.setCurrentPreset(id);
+                                        }}
+                                    />
+                                </label>
                             </div>
 
                             <div class="ag-header-actions">
                                 <Button
-                                    variant="secondary"
+                                    variant="ghost"
+                                    size="sm"
+                                    className="ag-header-import-btn"
+                                    ariaLabel="导入、导出与角色卡嵌入"
+                                    title="导入、导出与角色卡嵌入"
+                                    icon={<IconUpload size={16} />}
+                                    onClick={() => store.openModal({ kind: 'import_manager' })}
+                                >
+                                    导入
+                                </Button>
+
+                                <span class="ag-header-divider" aria-hidden="true" />
+
+                                <Button
+                                    variant="ghost"
                                     size="sm"
                                     ariaLabel={`切换主题（当前：${themeModeLabel(themeMode)}）`}
-                                    title={`主题模式：${themeModeLabel(themeMode)}（点击切换 深色 / 浅色 / 自动）`}
+                                    title={`主题：${themeModeLabel(themeMode)}（点击切换 深色 / 浅色 / 自动）`}
                                     icon={<ThemeModeIcon mode={themeMode} />}
                                     onClick={() => {
                                         void store.setThemeMode(
                                             nextThemeMode(store.getSnapshot().themeMode),
                                         );
                                     }}
-                                >
-                                    {themeModeLabel(themeMode)}
-                                </Button>
-
-                                <Button
-                                    variant="secondary"
-                                    size="sm"
-                                    ariaLabel="导入、导出与角色卡嵌入"
-                                    icon={<IconUpload size={15} />}
-                                    onClick={() => store.openModal({ kind: 'import_manager' })}
-                                >
-                                    导入 / 嵌卡
-                                </Button>
+                                />
 
                                 {!isMobile ? (
                                     <Button
@@ -417,12 +432,9 @@ function AgenticShellContent() {
                                         ariaLabel={isMaximized ? '还原窗口' : '网页全屏'}
                                         title={isMaximized ? '还原窗口' : '网页全屏'}
                                         className="ag-window-toggle-btn"
+                                        icon={isMaximized ? <IconMinimize size={16} /> : <IconMaximize size={16} />}
                                         onClick={() => store.toggleMaximized()}
-                                    >
-                                        <span aria-hidden="true" style={{ fontSize: '15px', lineHeight: 1 }}>
-                                            {isMaximized ? '🪟' : '🖥️'}
-                                        </span>
-                                    </Button>
+                                    />
                                 ) : null}
 
                                 <Button
@@ -492,6 +504,7 @@ function AgenticShellContent() {
                                         data-tab-id={tab.id}
                                         class={isActive ? 'ag-nav-item ag-nav-item-active' : 'ag-nav-item'}
                                         aria-current={isActive ? 'page' : undefined}
+                                        title={`${tab.label} · ${tab.description}`}
                                         onClick={() => store.setActiveTab(tab.id)}
                                     >
                                         <span class="ag-nav-item-icon">
@@ -512,7 +525,6 @@ function AgenticShellContent() {
                                                     </span>
                                                 ) : null}
                                             </span>
-                                            <span class="ag-nav-item-desc">{tab.description}</span>
                                         </span>
                                     </button>
                                 );
@@ -632,6 +644,12 @@ export function AgenticAppShell({ store: propStore }: AgenticAppShellProps) {
                     }
                 } else {
                     dialog.setAttribute('open', '');
+                }
+                // Move initial focus to the dialog container instead of the first button.
+                try {
+                    dialog.focus({ preventScroll: true });
+                } catch {
+                    // Ignore focus failures in non-interactive environments.
                 }
             }
         } else if (dialog.open || dialog.hasAttribute('open')) {
@@ -761,6 +779,9 @@ export function AgenticAppShell({ store: propStore }: AgenticAppShellProps) {
         <dialog
             id="agentic-app"
             ref={dialogRef}
+            // Focusable container: on open we focus the dialog itself so the first header
+            // control does not receive a programmatic `:focus-visible` ring.
+            tabIndex={-1}
             data-maximized={isMaximized ? 'true' : 'false'}
             onClick={(event) => {
                 if (event.target === dialogRef.current) {

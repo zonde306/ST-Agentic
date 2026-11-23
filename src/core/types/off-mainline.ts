@@ -1,4 +1,4 @@
-import type { MessageTarget, RawLoreEntry } from './messages';
+import type { CanonicalMessage, MessageTarget, RawLoreEntry } from './messages';
 
 // ============================================================================
 // Assistant Subsystem Domain Contracts (§3 & §5.1)
@@ -165,6 +165,38 @@ export interface AssistantCompactionNotice {
     timestamp: number;
 }
 
+export type AssistantErrorCode =
+    | 'context_overflow'
+    | 'network'
+    | 'empty_response'
+    | 'max_tool_rounds'
+    | 'length'
+    | 'user_stop'
+    | 'generic';
+
+export interface AssistantRetryStatus {
+    attempt: number;
+    maxAttempts: number;
+    reason: string;
+    delayMs: number;
+}
+
+export interface AssistantInterruptedCheckpoint {
+    messageId: string;
+    reason: Exclude<AssistantErrorCode, 'context_overflow'>;
+    errorMessage?: string;
+    /** Completed canonical messages in this turn (user + completed assistant(toolCalls) -> tool pairs). */
+    inFlightMessages: CanonicalMessage[];
+    /** Prefix of bubble content already committed into `inFlightMessages` across prior continuations. */
+    bubbleBaseContent?: string;
+    /** Unsaved partial assistant text generated in the interrupted round (clean, without `[Error]` suffix). */
+    partialContent?: string;
+    partialThink?: string;
+    target?: MessageTarget;
+    roundsCompleted: number;
+    createdAt: number;
+}
+
 export interface AssistantMessage {
     id: string;
     role: 'user' | 'assistant';
@@ -176,8 +208,11 @@ export interface AssistantMessage {
     fileRefs?: string[];
     usage?: AssistantMessageUsage;
     interrupted?: boolean;
+    canContinue?: boolean;
+    retryStatus?: AssistantRetryStatus;
+    errorMessage?: string;
     compactionNotice?: AssistantCompactionNotice;
-    errorCode?: 'context_overflow' | 'generic';
+    errorCode?: AssistantErrorCode;
     timestamp: number;
 }
 
@@ -191,6 +226,7 @@ export interface AssistantSession {
     connectionId: string; // 'inherit' | connection.id
     updatedAt: number;
     messages: AssistantMessage[];
+    interruptedCheckpoint?: AssistantInterruptedCheckpoint;
 }
 
 export type ChatEditSyncTrajectory = 'none' | 'rewrite' | 'fork';

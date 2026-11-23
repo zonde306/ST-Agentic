@@ -468,12 +468,12 @@ export function CluesManagerPane({ store, isMobile }: CluesManagerPaneProps) {
                     }
                     action={
                         <Button
-                            variant="primary"
+                            variant="secondary"
                             size="sm"
                             icon={<IconPlus size={14} />}
                             onClick={openCreateModal}
                         >
-                            + 新建线索
+                            新建线索
                         </Button>
                     }
                 />

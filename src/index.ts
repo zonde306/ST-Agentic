@@ -2220,6 +2220,8 @@ jQuery(async () => {
                 assistantRunner.retractMessage(sessionId, messageId),
             regenerateLastMessage: (sessionId, opts) =>
                 assistantRunner.regenerateLastMessage(sessionId, opts),
+            continueLastMessage: (sessionId, opts) =>
+                assistantRunner.continueLastMessage(sessionId, opts),
             decideApproval: (approvalId, decision, feedback) =>
                 assistantRunner.decideApproval(approvalId, decision, feedback),
             retryApproval: (approvalId, feedback) =>

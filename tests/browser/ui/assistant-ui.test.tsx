@@ -4,6 +4,7 @@ import { page, userEvent } from 'vitest/browser';
 import type {
     AssistantAttachment,
     AssistantMessage,
+    AssistantRetryStatus,
     AssistantSession,
     PendingApproval,
     UndoRecord,
@@ -172,6 +173,7 @@ interface MockAssistantController {
     editAndResendMessageSpy: Mock<(...args: unknown[]) => void>;
     retractMessageSpy: Mock<(...args: unknown[]) => void>;
     regenerateLastMessageSpy: Mock<(...args: unknown[]) => void>;
+    continueLastMessageSpy: Mock<(...args: unknown[]) => void>;
     abortSpy: Mock<(...args: unknown[]) => void>;
     decideApprovalSpy: Mock<(...args: unknown[]) => void>;
     retryApprovalSpy: Mock<(...args: unknown[]) => void>;
@@ -180,6 +182,7 @@ interface MockAssistantController {
     lastSendOptions: {
         attachments?: AssistantAttachment[];
         onDelta?: (delta: string) => void;
+        onRetry?: (status: AssistantRetryStatus) => void;
         onUpdate?: (session: AssistantSession) => void;
         signal?: AbortSignal;
     } | null;
@@ -266,6 +269,7 @@ function createMockAssistantRuntime(options: {
         editAndResendMessageSpy: vi.fn(),
         retractMessageSpy: vi.fn(),
         regenerateLastMessageSpy: vi.fn(),
+        continueLastMessageSpy: vi.fn(),
         abortSpy: vi.fn(),
         decideApprovalSpy: vi.fn(),
         retryApprovalSpy: vi.fn(),
@@ -478,6 +482,61 @@ function createMockAssistantRuntime(options: {
                 timestamp: Date.now(),
             };
             target.messages.push(reply);
+            return reply;
+        },
+        continueLastMessage: async (sessionId, sendOpts) => {
+            controller.continueLastMessageSpy(sessionId, sendOpts);
+            controller.lastSendOptions = sendOpts ?? null;
+            const target = controller.sessions.find((s) => s.id === sessionId);
+            if (!target) {
+                throw new Error(`Session not found: ${sessionId}`);
+            }
+
+            if (controller.nextSendDeferred) {
+                const deferred = controller.nextSendDeferred;
+                controller.nextSendDeferred = null;
+                sendOpts?.onUpdate?.(structuredClone(target));
+                const resolved = await deferred.promise;
+                if (resolved && resolved.role === 'assistant') {
+                    const idx = target.messages.findIndex((m) => m.id === resolved.id);
+                    if (idx >= 0) {
+                        target.messages[idx] = structuredClone(resolved);
+                    } else {
+                        target.messages.push(structuredClone(resolved));
+                    }
+                    delete target.interruptedCheckpoint;
+                    target.updatedAt = Date.now();
+                    sendOpts?.onUpdate?.(structuredClone(target));
+                }
+                return resolved;
+            }
+
+            const lastMsg = target.messages[target.messages.length - 1];
+            if (lastMsg && lastMsg.role === 'assistant') {
+                const base = lastMsg.content.startsWith('[Error] ')
+                    ? ''
+                    : lastMsg.content.replace(/\n\n\[Error\] [\s\S]*$/, '');
+                lastMsg.content = `${base}${base ? '\n\n' : ''}继续完成后的最终答复。`;
+                delete lastMsg.interrupted;
+                delete lastMsg.errorCode;
+                delete lastMsg.errorMessage;
+                delete lastMsg.canContinue;
+                delete lastMsg.retryStatus;
+                delete target.interruptedCheckpoint;
+                target.updatedAt = Date.now();
+                sendOpts?.onUpdate?.(structuredClone(target));
+                return structuredClone(lastMsg);
+            }
+
+            const reply: AssistantMessage = {
+                id: `ast_cont_${Date.now()}`,
+                role: 'assistant',
+                content: '继续执行完成。',
+                timestamp: Date.now(),
+            };
+            target.messages.push(reply);
+            target.updatedAt = Date.now();
+            sendOpts?.onUpdate?.(structuredClone(target));
             return reply;
         },
         abort: (sessionId) => {
@@ -1932,5 +1991,289 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
         expect(
             shell.shadowRoot.querySelector('[data-assistant-session-title="true"]')?.textContent,
         ).toBe('移动端新标题');
+    });
+
+    it('renders live auto-retry banner, inline continue recovery cards across interrupted reasons, invokes continueLastMessage(), and passes mobile compliance', async () => {
+        await page.viewport(1280, 800);
+
+        const retrySession: AssistantSession = {
+            id: 'ast_retry_ui',
+            title: '自动重试与手动继续测试',
+            mode: 'chat',
+            stAdminEnabled: false,
+            autoApproveAuthor: false,
+            connectionId: 'inherit',
+            updatedAt: 1732329000000,
+            messages: [
+                {
+                    id: 'u_net',
+                    role: 'user',
+                    content: '请帮我分析日志',
+                    timestamp: 1732328990000,
+                },
+                {
+                    id: 'a_net',
+                    role: 'assistant',
+                    content: '前段分析已完成。\n\n[Error] SSE connection dropped',
+                    interrupted: true,
+                    errorCode: 'network',
+                    canContinue: true,
+                    toolCalls: [
+                        {
+                            id: 'tc_net_1',
+                            name: 'list_dir',
+                            scopeLabel: 'VFS: /',
+                            status: 'ok',
+                            durationMs: 2,
+                            argsSummary: '{"path":"/"}',
+                            resultSummary: '["character"]',
+                        },
+                    ],
+                    timestamp: 1732329000000,
+                },
+            ],
+        };
+
+        const cappedSession: AssistantSession = {
+            id: 'ast_capped_ui',
+            title: '轮次上限会话',
+            mode: 'chat',
+            stAdminEnabled: false,
+            autoApproveAuthor: false,
+            connectionId: 'inherit',
+            updatedAt: 1732328500000,
+            messages: [
+                {
+                    id: 'u_cap',
+                    role: 'user',
+                    content: '读取全量世界书',
+                    timestamp: 1732328490000,
+                },
+                {
+                    id: 'a_cap',
+                    role: 'assistant',
+                    content: '',
+                    interrupted: true,
+                    errorCode: 'max_tool_rounds',
+                    canContinue: true,
+                    timestamp: 1732328500000,
+                },
+            ],
+        };
+
+        const legacyEmptyToolsSession: AssistantSession = {
+            id: 'ast_legacy_empty_ui',
+            title: '旧版工具后空回复会话',
+            mode: 'chat',
+            stAdminEnabled: false,
+            autoApproveAuthor: false,
+            connectionId: 'inherit',
+            updatedAt: 1732328400000,
+            messages: [
+                {
+                    id: 'u_leg',
+                    role: 'user',
+                    content: '查一下描述文件',
+                    timestamp: 1732328390000,
+                },
+                {
+                    id: 'a_leg',
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'tc_leg_1',
+                            name: 'read_file',
+                            scopeLabel: 'VFS: /character/description.md',
+                            status: 'ok',
+                            durationMs: 1,
+                            argsSummary: '{"path":"/character/description.md"}',
+                            resultSummary: '描述文本',
+                        },
+                    ],
+                    timestamp: 1732328400000,
+                },
+            ],
+        };
+
+        const overflowSession: AssistantSession = {
+            id: 'ast_overflow_ui',
+            title: '上下文超限会话',
+            mode: 'chat',
+            stAdminEnabled: false,
+            autoApproveAuthor: false,
+            connectionId: 'inherit',
+            updatedAt: 1732328300000,
+            messages: [
+                {
+                    id: 'u_ovf',
+                    role: 'user',
+                    content: '超长对话',
+                    timestamp: 1732328290000,
+                },
+                {
+                    id: 'a_ovf',
+                    role: 'assistant',
+                    content: '[Error] prompt is too long: 210000 tokens > 200000 maximum',
+                    interrupted: true,
+                    errorCode: 'context_overflow',
+                    timestamp: 1732328300000,
+                },
+            ],
+        };
+
+        const pendingApprovalSession: AssistantSession = {
+            id: 'ast_pending_ui',
+            title: '待审批会话',
+            mode: 'author',
+            stAdminEnabled: false,
+            autoApproveAuthor: false,
+            connectionId: 'inherit',
+            updatedAt: 1732328200000,
+            messages: [
+                {
+                    id: 'u_pend',
+                    role: 'user',
+                    content: '更新规则',
+                    timestamp: 1732328190000,
+                },
+                {
+                    id: 'a_pend',
+                    role: 'assistant',
+                    content: '',
+                    approvalIds: [SAMPLE_PENDING_AUTHOR_APPROVAL.id],
+                    timestamp: 1732328200000,
+                },
+            ],
+        };
+
+        const pendingApproval = {
+            ...structuredClone(SAMPLE_PENDING_AUTHOR_APPROVAL),
+            sessionId: pendingApprovalSession.id,
+            messageId: 'a_pend',
+        };
+
+        const runtime = createMockAssistantRuntime({
+            sessions: [
+                retrySession,
+                cappedSession,
+                legacyEmptyToolsSession,
+                overflowSession,
+                pendingApprovalSession,
+            ],
+            approvals: [pendingApproval],
+        });
+        activeHarness = mountAssistantHarness({
+            runtime,
+            initialSessionId: retrySession.id,
+        });
+        await settleLayout(5);
+
+        const shell = getShellElements();
+        const { shadowRoot } = shell;
+
+        // 1. Network interrupted bubble shows [data-assistant-continue-bar] + footer label
+        const netContinueBar = shadowRoot.querySelector(
+            '[data-assistant-continue-bar="a_net"]',
+        ) as HTMLDivElement;
+        expect(netContinueBar).toBeTruthy();
+        expect(netContinueBar.getAttribute('data-tone')).toBe('warning');
+        expect(netContinueBar.textContent).toContain('网络波动或连接中断');
+        expect(shadowRoot.textContent).toContain('网络中断');
+
+        // 2. max_tool_rounds session shows '继续执行' (SVG play icon + label)
+        activeHarness.store.openAssistantSession(cappedSession.id);
+        await settleLayout(4);
+        const capBar = shadowRoot.querySelector(
+            '[data-assistant-continue-bar="a_cap"]',
+        ) as HTMLDivElement;
+        expect(capBar).toBeTruthy();
+        expect(capBar.getAttribute('data-tone')).toBe('neutral');
+        expect(
+            capBar.querySelector('[data-continue-action="continue"]')?.textContent?.trim(),
+        ).toBe('继续执行');
+
+        // 3. Legacy empty-after-tools bubble (no interrupted flag) also shows continue bar
+        activeHarness.store.openAssistantSession(legacyEmptyToolsSession.id);
+        await settleLayout(4);
+        expect(
+            shadowRoot.querySelector('[data-assistant-continue-bar="a_leg"]'),
+        ).toBeTruthy();
+
+        // 4. context_overflow must NOT render continue bar (keeps overflow escape UI)
+        activeHarness.store.openAssistantSession(overflowSession.id);
+        await settleLayout(4);
+        expect(shadowRoot.querySelector('[data-assistant-continue-bar="a_ovf"]')).toBeNull();
+        expect(shadowRoot.querySelector('[data-assistant-overflow-escape="a_ovf"]')).toBeTruthy();
+
+        // 5. Pending approval message must NOT render continue bar
+        activeHarness.store.openAssistantSession(pendingApprovalSession.id);
+        await settleLayout(4);
+        expect(shadowRoot.querySelector('[data-assistant-continue-bar="a_pend"]')).toBeNull();
+
+        // 6. Switch back to retrySession -> test mobile viewport (390x844) compliance while continue bar is visible
+        activeHarness.store.openAssistantSession(retrySession.id);
+        await page.viewport(390, 844);
+        await settleLayout(5);
+        assertNoHorizontalOverflow(shell.dialog, shadowRoot, 'mobile:continue-bar-visible');
+        assertTouchTargetsAndTypography(shadowRoot, 'mobile:continue-bar-visible');
+
+        // 7. Click Continue -> live retry banner renders while streaming, then resolves cleanly
+        await page.viewport(1280, 800);
+        await settleLayout(3);
+        const deferred = createDeferred<AssistantMessage | void>();
+        activeHarness.runtime.nextSendDeferred = deferred;
+
+        const continueBtn = shadowRoot.querySelector(
+            '[data-assistant-continue-bar="a_net"] [data-continue-action="continue"]',
+        ) as HTMLButtonElement;
+        expect(continueBtn).toBeTruthy();
+        continueBtn.click();
+        await settleLayout(4);
+
+        expect(activeHarness.runtime.continueLastMessageSpy).toHaveBeenCalledTimes(1);
+        expect(activeHarness.runtime.continueLastMessageSpy).toHaveBeenCalledWith(
+            retrySession.id,
+            expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
+
+        // Simulate live auto-retry status update on streaming bubble
+        const liveSession = structuredClone(activeHarness.runtime.sessions[0]);
+        liveSession.messages[1] = {
+            ...liveSession.messages[1],
+            content: '前段分析已完成。',
+            interrupted: false,
+            canContinue: false,
+            retryStatus: {
+                attempt: 1,
+                maxAttempts: 2,
+                reason: '502 Bad Gateway',
+                delayMs: 1000,
+            },
+        };
+        activeHarness.runtime.lastSendOptions?.onUpdate?.(liveSession);
+        await settleLayout(4);
+
+        const retryBanner = shadowRoot.querySelector(
+            '[data-assistant-retry-banner="a_net"]',
+        ) as HTMLDivElement;
+        expect(retryBanner).toBeTruthy();
+        expect(retryBanner.textContent).toContain('自动重试 (1/2)');
+        expect(retryBanner.textContent).toContain('502 Bad Gateway');
+        expect(shadowRoot.textContent).toContain('自动重试 1/2...');
+
+        deferred.resolve({
+            ...liveSession.messages[1],
+            content: '前段分析已完成。\n\n继续完成后的最终答复。',
+            retryStatus: undefined,
+            interrupted: undefined,
+            errorCode: undefined,
+            canContinue: undefined,
+        });
+        await settleLayout(5);
+
+        expect(shadowRoot.querySelector('[data-assistant-retry-banner="a_net"]')).toBeNull();
+        expect(shadowRoot.querySelector('[data-assistant-continue-bar="a_net"]')).toBeNull();
+        expect(shadowRoot.textContent).toContain('继续完成后的最终答复。');
     });
 });

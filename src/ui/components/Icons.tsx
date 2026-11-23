@@ -19,7 +19,7 @@ function SvgIcon({
             viewBox="0 0 24 24"
             fill="none"
             stroke="currentColor"
-            strokeWidth={1.9}
+            strokeWidth={1.8}
             strokeLinecap="round"
             strokeLinejoin="round"
             class={className ? `ag-icon ${className}` : 'ag-icon'}
@@ -328,6 +328,57 @@ export function IconKeyboard(props: IconProps) {
         <SvgIcon {...props}>
             <rect x="2" y="4" width="20" height="14" rx="2" />
             <path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M8 12h.01M12 12h.01M16 12h.01M7 15h10" />
+        </SvgIcon>
+    );
+}
+
+export function IconMaximize(props: IconProps) {
+    return (
+        <SvgIcon {...props}>
+            <path d="M15 3h6v6" />
+            <path d="M9 21H3v-6" />
+            <path d="M21 3l-7 7" />
+            <path d="M3 21l7-7" />
+        </SvgIcon>
+    );
+}
+
+export function IconMinimize(props: IconProps) {
+    return (
+        <SvgIcon {...props}>
+            <path d="M4 14h6v6" />
+            <path d="M20 10h-6V4" />
+            <path d="M14 10l7-7" />
+            <path d="M3 21l7-7" />
+        </SvgIcon>
+    );
+}
+
+export function IconMore(props: IconProps) {
+    return (
+        <SvgIcon {...props}>
+            <circle cx="5" cy="12" r="1" />
+            <circle cx="12" cy="12" r="1" />
+            <circle cx="19" cy="12" r="1" />
+        </SvgIcon>
+    );
+}
+
+export function IconLayers(props: IconProps) {
+    return (
+        <SvgIcon {...props}>
+            <path d="m12 2 9 5-9 5-9-5 9-5Z" />
+            <path d="m3 12 9 5 9-5" />
+            <path d="m3 17 9 5 9-5" />
+        </SvgIcon>
+    );
+}
+
+export function IconCreditCard(props: IconProps) {
+    return (
+        <SvgIcon {...props}>
+            <rect x="2" y="5" width="20" height="14" rx="2" />
+            <path d="M2 10h20" />
         </SvgIcon>
     );
 }

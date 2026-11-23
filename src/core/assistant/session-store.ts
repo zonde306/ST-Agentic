@@ -12,6 +12,7 @@ import type {
     AssistantCompactOptions,
     AssistantCompactReport,
     AssistantCompactionNotice,
+    AssistantInterruptedCheckpoint,
     AssistantMessage,
     AssistantMode,
     AssistantSession,
@@ -1061,6 +1062,7 @@ export class AssistantSessionStore {
             return null;
         }
         session.messages = [];
+        delete session.interruptedCheckpoint;
         session.updatedAt = this.now();
         this.usageAnchors.delete(sessionId);
         this.compactionAnchors.delete(sessionId);
@@ -1070,6 +1072,31 @@ export class AssistantSessionStore {
         this.trajectoryStore.ensureThread(threadId);
         this.persist();
         return cloneSession(session);
+    }
+
+    public setInterruptedCheckpoint(
+        sessionId: string,
+        checkpoint: AssistantInterruptedCheckpoint | undefined,
+    ): void {
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+            return;
+        }
+        if (checkpoint === undefined && session.interruptedCheckpoint === undefined) {
+            return;
+        }
+        if (checkpoint) {
+            session.interruptedCheckpoint = canonicalClone(checkpoint);
+        } else {
+            delete session.interruptedCheckpoint;
+        }
+        session.updatedAt = this.now();
+        this.persist();
+    }
+
+    public getInterruptedCheckpoint(sessionId: string): AssistantInterruptedCheckpoint | null {
+        const cp = this.sessions.get(sessionId)?.interruptedCheckpoint;
+        return cp ? canonicalClone(cp) : null;
     }
 
     public appendMessage(sessionId: string, message: AssistantMessage): AssistantMessage {
@@ -1122,6 +1149,12 @@ export class AssistantSessionStore {
         }
         const removedMessages = session.messages.slice(idx).map((m) => canonicalClone(m));
         session.messages = session.messages.slice(0, idx);
+        if (
+            session.interruptedCheckpoint
+            && session.messages[session.messages.length - 1]?.id !== session.interruptedCheckpoint.messageId
+        ) {
+            delete session.interruptedCheckpoint;
+        }
         session.updatedAt = this.now();
         this.syncTrajectoryToMessages(sessionId);
         this.persist();
@@ -1149,6 +1182,12 @@ export class AssistantSessionStore {
         }
         const removedMessages = session.messages.slice(idx + 1).map((m) => canonicalClone(m));
         session.messages = session.messages.slice(0, idx + 1);
+        if (
+            session.interruptedCheckpoint
+            && session.messages[session.messages.length - 1]?.id !== session.interruptedCheckpoint.messageId
+        ) {
+            delete session.interruptedCheckpoint;
+        }
         session.updatedAt = this.now();
         this.syncTrajectoryToMessages(sessionId);
         this.persist();

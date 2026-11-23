@@ -10,7 +10,7 @@ import type { ApiConnection } from '../types';
 import { ConcurrencyLimiter } from './concurrency-limiter';
 import { createAbortError, isAbortError, isRetryableStatus, LLMTransportError, throwIfAborted } from './errors';
 import { type CompiledModelsRequest, type CompiledPayload, PayloadCompiler } from './payload-compiler';
-import { type RetryOptions, withRetry } from './retry';
+import { type RetryOptions, defaultShouldRetry, delayWithAbort, withRetry } from './retry';
 import { assembleStreamChunks, parseCompletionResponse, parseSSEStream } from './sse-parser';
 
 export type FetchImpl = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
@@ -40,10 +40,41 @@ export interface FetchLLMTransportOptions {
 
 const DEFAULT_RETRY_OPTIONS: Omit<RetryOptions, 'signal'> = {
     maxAttempts: 3,
-    initialDelayMs: 300,
-    maxDelayMs: 10_000,
+    initialDelayMs: 600,
+    maxDelayMs: 12_000,
     backoffFactor: 2,
+    jitterRatio: 0.2,
 };
+
+function computeStreamBackoffDelay(
+    error: unknown,
+    attempt: number,
+    config: Omit<RetryOptions, 'signal'>,
+): number {
+    const initialDelayMs = Math.max(0, config.initialDelayMs ?? 600);
+    const maxDelayMs = Math.max(initialDelayMs, config.maxDelayMs ?? 12_000);
+    const backoffFactor = Math.max(1, config.backoffFactor ?? 2);
+    const jitterRatio = config.jitterRatio ?? 0;
+
+    const expDelay = initialDelayMs * Math.pow(backoffFactor, Math.max(0, attempt - 1));
+    let delay = Math.min(maxDelayMs, Math.max(0, expDelay));
+
+    if (
+        error instanceof LLMTransportError
+        && typeof error.retryAfterMs === 'number'
+        && Number.isFinite(error.retryAfterMs)
+    ) {
+        delay = Math.min(maxDelayMs, Math.max(delay, error.retryAfterMs));
+    }
+
+    if (jitterRatio > 0 && delay > 0) {
+        const clampedJitter = Math.min(1, Math.max(0, jitterRatio));
+        const factor = 1 - clampedJitter + Math.random() * clampedJitter;
+        delay = Math.round(delay * factor);
+    }
+
+    return delay;
+}
 
 function parseRetryAfterMs(headerValue: string | null): number | undefined {
     if (!headerValue) {
@@ -405,41 +436,91 @@ export class FetchLLMTransport implements LLMTransport {
         );
         this.onCompiledPayload?.(compiled, request);
 
+        const retryCfg = this.retryConfig;
+        const maxAttempts =
+            retryCfg === false ? 1 : Math.max(1, Math.floor(retryCfg.maxAttempts ?? 3));
+        const shouldRetry =
+            retryCfg === false ? (() => false) : (retryCfg.shouldRetry ?? defaultShouldRetry);
+
         let release: (() => void) | undefined;
         if (this.useConcurrencyLimiter) {
             const limiter = this.ensureLimiter(connection);
             release = await limiter.acquire(request.signal);
         }
 
+        let hasYieldedObservableChunk = false;
+
         try {
-            const response = await this.executeWithRetry(
-                () => this.performFetch(compiled, request.signal),
-                request.signal,
-            );
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                throwIfAborted(request.signal, 'LLM stream request aborted');
 
-            const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
-            if (contentType.includes('application/json') && !contentType.includes('text/event-stream')) {
-                const text = await readTextWithAbort(response, request.signal);
-                const parsedJson = this.parseJsonOrThrow(text);
-                const result = parseCompletionResponse(parsedJson, compiled.providerFormat, {
-                    parseThinkTags: this.parseThinkTags,
-                });
-                yield* this.responseToChunks(result);
-                return;
+                try {
+                    const response = await this.performFetch(compiled, request.signal);
+                    const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
+                    if (
+                        contentType.includes('application/json')
+                        && !contentType.includes('text/event-stream')
+                    ) {
+                        const text = await readTextWithAbort(response, request.signal);
+                        const parsedJson = this.parseJsonOrThrow(text);
+                        const result = parseCompletionResponse(parsedJson, compiled.providerFormat, {
+                            parseThinkTags: this.parseThinkTags,
+                        });
+                        for (const chunk of this.responseToChunks(result)) {
+                            if (
+                                chunk.type === 'text_delta'
+                                || chunk.type === 'reasoning_delta'
+                                || chunk.type === 'tool_call_delta'
+                            ) {
+                                hasYieldedObservableChunk = true;
+                            }
+                            yield chunk;
+                        }
+                        return;
+                    }
+
+                    if (!response.body) {
+                        throw new LLMTransportError('Streaming response body is empty', {
+                            status: response.status,
+                            retryable: false,
+                        });
+                    }
+
+                    for await (const chunk of parseSSEStream(response.body, {
+                        providerFormat: compiled.providerFormat,
+                        parseThinkTags: this.parseThinkTags,
+                        signal: request.signal,
+                    })) {
+                        if (
+                            chunk.type === 'text_delta'
+                            || chunk.type === 'reasoning_delta'
+                            || chunk.type === 'tool_call_delta'
+                        ) {
+                            hasYieldedObservableChunk = true;
+                        }
+                        yield chunk;
+                    }
+                    return;
+                } catch (error) {
+                    if (request.signal?.aborted || isAbortError(error)) {
+                        throw createAbortError(request.signal, 'LLM stream request aborted');
+                    }
+                    if (
+                        hasYieldedObservableChunk
+                        || retryCfg === false
+                        || attempt >= maxAttempts
+                        || !shouldRetry(error, attempt)
+                    ) {
+                        throw error;
+                    }
+
+                    const delayMs = computeStreamBackoffDelay(error, attempt, retryCfg);
+                    retryCfg.onRetry?.(error, attempt, delayMs);
+                    if (delayMs > 0) {
+                        await delayWithAbort(delayMs, request.signal);
+                    }
+                }
             }
-
-            if (!response.body) {
-                throw new LLMTransportError('Streaming response body is empty', {
-                    status: response.status,
-                    retryable: false,
-                });
-            }
-
-            yield* parseSSEStream(response.body, {
-                providerFormat: compiled.providerFormat,
-                parseThinkTags: this.parseThinkTags,
-                signal: request.signal,
-            });
         } finally {
             release?.();
         }

@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { LLMStreamChunk } from '@/core/bridge';
-import { assembleStreamChunks, parseCompletionResponse, SSEParser } from '@/core/llm';
+import {
+    assembleStreamChunks,
+    LLMTransportError,
+    parseCompletionResponse,
+    parseSSEStream,
+    SSEParser,
+} from '@/core/llm';
 
 function encode(text: string): Uint8Array {
     return new TextEncoder().encode(text);
@@ -210,5 +216,76 @@ describe('SSEParser', () => {
             totalTokens: 1010,
             cacheHitRate: 0.75,
         });
+    });
+
+    it('classifies transient vs permanent inline SSE errors and wraps stream read failures as retryable', async () => {
+        // 1. Transient inline SSE errors (overloaded_error, rate_limit_error, internal_error, server_error) -> retryable: true
+        for (const frame of [
+            'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n',
+            'data: {"error":{"code":"rate_limit_error","message":"Rate limit hit"}}\n\n',
+            'data: {"error":{"type":"internal_error","message":"Internal server error"}}\n\n',
+            'data: {"error":{"type":"server_error","message":"Service temporarily unavailable"}}\n\n',
+        ]) {
+            const p = new SSEParser();
+            let caught: unknown;
+            try {
+                p.feed(frame);
+            } catch (err) {
+                caught = err;
+            }
+            expect(caught).toBeInstanceOf(LLMTransportError);
+            expect((caught as LLMTransportError).retryable).toBe(true);
+        }
+
+        // 2. Permanent inline errors -> retryable: false
+        for (const frame of [
+            'event: error\ndata: {"type":"error","error":{"type":"authentication_error","message":"Invalid API key"}}\n\n',
+            'data: {"error":{"type":"invalid_request_error","message":"Bad request"}}\n\n',
+            'data: {"error":{"code":"invalid_api_key","message":"Bad key"}}\n\n',
+            'data: {"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}\n\n',
+        ]) {
+            const p = new SSEParser();
+            let caught: unknown;
+            try {
+                p.feed(frame);
+            } catch (err) {
+                caught = err;
+            }
+            expect(caught).toBeInstanceOf(LLMTransportError);
+            expect((caught as LLMTransportError).retryable).toBe(false);
+        }
+
+        // 3. ReadableStream non-abort read error -> LLMTransportError(retryable: true, code: 'STREAM_READ_ERROR')
+        const failingStream = new ReadableStream<Uint8Array>({
+            pull() {
+                return Promise.reject(new TypeError('network connection lost'));
+            },
+        });
+        let readErr: unknown;
+        try {
+            for await (const chunk of parseSSEStream(failingStream)) {
+                void chunk;
+            }
+        } catch (err) {
+            readErr = err;
+        }
+        expect(readErr).toBeInstanceOf(LLMTransportError);
+        expect((readErr as LLMTransportError).retryable).toBe(true);
+        expect((readErr as LLMTransportError).code).toBe('STREAM_READ_ERROR');
+
+        // 4. AbortSignal cancellation still propagates as AbortError
+        const controller = new AbortController();
+        const stalledStream = new ReadableStream<Uint8Array>({
+            start() {
+                setTimeout(() => controller.abort(), 10);
+            },
+        });
+        await expect(
+            (async () => {
+                for await (const chunk of parseSSEStream(stalledStream, { signal: controller.signal })) {
+                    void chunk;
+                }
+            })(),
+        ).rejects.toMatchObject({ name: 'AbortError' });
     });
 });

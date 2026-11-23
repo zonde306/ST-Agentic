@@ -1,3 +1,4 @@
+import { registerAssistantView } from './assistant';
 import { registerAgenticCapsuleElement } from './capsule';
 import { registerSessionViews } from './session';
 import { type MountedAgenticShell, mountAgenticAppShell } from './shell';
@@ -9,6 +10,7 @@ import {
     createMockUIServices,
     setDefaultAppStore,
 } from './store';
+import { registerSideGenView } from './sidegen';
 import { registerStudioViews } from './studio';
 
 export interface DevPreviewInstance extends MountedAgenticShell {
@@ -21,6 +23,8 @@ export interface DevPreviewInstance extends MountedAgenticShell {
  */
 export function mountDevPreview(): DevPreviewInstance {
     registerAgenticCapsuleElement();
+    const unregisterAssistant = registerAssistantView();
+    const unregisterSideGen = registerSideGenView();
     const unregisterSession = registerSessionViews();
     const unregisterStudio = registerStudioViews();
 
@@ -63,6 +67,8 @@ export function mountDevPreview(): DevPreviewInstance {
             openBtn?.removeEventListener('click', onOpenClick);
             hostThemeBtn?.removeEventListener('click', onToggleHostTheme);
             mounted.unmount();
+            unregisterAssistant();
+            unregisterSideGen();
             unregisterSession();
             unregisterStudio();
             store.dispose();

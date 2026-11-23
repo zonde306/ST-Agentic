@@ -14,6 +14,7 @@ import type {
     UndoRecord,
 } from '@/core/types';
 import { MarkdownContent } from '@/ui/components';
+import { IconAlertTriangle, IconInfo, IconPlay, IconRefresh } from '@/ui/components/Icons';
 import { AttachedApprovalCard } from './AttachedApprovalCard';
 import {
     formatAssistantTime,
@@ -54,8 +55,65 @@ export interface MessageBubbleProps {
     onSaveAndResendEdit?: (messageId: string, newContent: string) => void | Promise<void>;
     onRetract?: (messageId: string) => void | Promise<void>;
     onRegenerate?: () => void | Promise<void>;
+    canContinue?: boolean;
+    onContinue?: () => void | Promise<void>;
     onCompactAndRetryOverflow?: () => void | Promise<void>;
     onCopy?: (content: string) => void | Promise<void>;
+}
+
+function getContinueHint(message: AssistantMessage): string {
+    switch (message.errorCode) {
+        case 'network':
+            return '网络波动或连接中断，已保留已完成进度，可接着继续生成。';
+        case 'empty_response':
+            return '模型返回了空响应，可继续生成或重新生成。';
+        case 'max_tool_rounds':
+            return '已达到单轮最大工具调用次数，已完成的工具结果已保留。';
+        case 'length':
+            return '输出达到长度上限已截断，可从断点位置接着输出。';
+        case 'user_stop':
+            return '生成已手动中止，可从当前进度继续或重新生成。';
+        case 'generic':
+            return '生成在完成前发生异常中断，可尝试接着继续或重新生成。';
+        default:
+            return '上一轮工具执行后未输出最终回复，可继续生成。';
+    }
+}
+
+/**
+ * Visual tone of the continue/recovery card (design spec §3.11):
+ * failures use `warning`, deliberate pauses / limits use a neutral tone.
+ */
+function getContinueTone(message: AssistantMessage): 'warning' | 'neutral' {
+    switch (message.errorCode) {
+        case 'network':
+        case 'empty_response':
+        case 'generic':
+            return 'warning';
+        default:
+            return 'neutral';
+    }
+}
+
+function getInterruptedStatusLabel(errorCode?: AssistantMessage['errorCode']): string {
+    switch (errorCode) {
+        case 'context_overflow':
+            return '上下文超限已中止';
+        case 'network':
+            return '网络中断';
+        case 'empty_response':
+            return '空响应中断';
+        case 'max_tool_rounds':
+            return '达到轮次上限';
+        case 'length':
+            return '输出截断';
+        case 'user_stop':
+            return '已手动中止';
+        case 'generic':
+            return '异常中断';
+        default:
+            return '已手动中止';
+    }
 }
 
 function formatTokenCountShort(tokens: number): string {
@@ -251,6 +309,8 @@ export function MessageBubble({
     onSaveAndResendEdit,
     onRetract,
     onRegenerate,
+    canContinue = false,
+    onContinue,
     onCompactAndRetryOverflow,
     onCopy,
 }: MessageBubbleProps) {
@@ -649,6 +709,18 @@ export function MessageBubble({
     }
 
     const fileRefs = Array.isArray(message.fileRefs) ? message.fileRefs : [];
+    const hasPendingApprovals = approvals.some((a) => a.status === 'pending');
+    const showContinueBar = Boolean(
+        !isEditing
+        && !isStreaming
+        && _isLastMessage
+        && !hasPendingApprovals
+        && message.errorCode !== 'context_overflow'
+        && (canContinue
+            || message.canContinue
+            || message.interrupted
+            || (!message.content.trim() && toolCalls.length > 0 && approvals.length === 0)),
+    );
 
     return (
         <Fragment>
@@ -733,6 +805,26 @@ export function MessageBubble({
                                         />
                                     ))}
                                 </div>
+                            ) : null}
+                        </div>
+                    ) : null}
+
+                    {isStreaming && message.retryStatus ? (
+                        <div
+                            class="ag-ast-retry-banner"
+                            data-assistant-retry-banner={message.id}
+                        >
+                            <span class="ag-ast-retry-title">
+                                <span class="ag-ast-retry-spin" aria-hidden="true">
+                                    <IconRefresh size={13} />
+                                </span>
+                                <span>
+                                    网络波动，正在自动重试 ({message.retryStatus.attempt}/
+                                    {message.retryStatus.maxAttempts})…
+                                </span>
+                            </span>
+                            {message.retryStatus.reason ? (
+                                <span class="ag-ast-retry-reason">{message.retryStatus.reason}</span>
                             ) : null}
                         </div>
                     ) : null}
@@ -851,21 +943,70 @@ export function MessageBubble({
                         </div>
                     ) : null}
 
+                    {showContinueBar ? (
+                        <div
+                            class="ag-ast-continue-bar"
+                            data-tone={getContinueTone(message)}
+                            data-assistant-continue-bar={message.id}
+                        >
+                            <div class="ag-ast-continue-hint">
+                                <span class="ag-ast-continue-hint-icon" aria-hidden="true">
+                                    {getContinueTone(message) === 'warning' ? (
+                                        <IconAlertTriangle size={14} />
+                                    ) : (
+                                        <IconInfo size={14} />
+                                    )}
+                                </span>
+                                <span>{getContinueHint(message)}</span>
+                            </div>
+                            <div class="ag-ast-continue-actions">
+                                <button
+                                    type="button"
+                                    class="ag-btn ag-btn-primary ag-btn-sm ag-ast-continue-btn"
+                                    data-continue-action="continue"
+                                    disabled={isSessionStreaming || isCompacting}
+                                    onClick={() => void onContinue?.()}
+                                >
+                                    <span class="ag-btn-icon" aria-hidden="true">
+                                        <IconPlay size={14} />
+                                    </span>
+                                    <span class="ag-btn-label">
+                                        {message.errorCode === 'max_tool_rounds' ? '继续执行' : '继续生成'}
+                                    </span>
+                                </button>
+                                {canRegenerate ? (
+                                    <button
+                                        type="button"
+                                        class="ag-btn ag-btn-ghost ag-btn-sm ag-ast-continue-btn"
+                                        data-continue-action="regenerate"
+                                        disabled={isSessionStreaming || isCompacting}
+                                        onClick={() => void onRegenerate?.()}
+                                    >
+                                        <span class="ag-btn-icon" aria-hidden="true">
+                                            <IconRefresh size={14} />
+                                        </span>
+                                        <span class="ag-btn-label">重新生成</span>
+                                    </button>
+                                ) : null}
+                            </div>
+                        </div>
+                    ) : null}
+
                     <div class="ag-ast-bubble-footer">
                         <span>
                             {message.usage
                                 ? `缓存 ${message.usage.cacheRate} · ${message.usage.outputTokens} tok`
                                 : message.interrupted
-                                    ? message.errorCode === 'context_overflow'
-                                        ? '上下文超限已中止'
-                                        : '已手动中止'
+                                    ? getInterruptedStatusLabel(message.errorCode)
                                     : 'Agentic 助手'}
                         </span>
                         <span>
                             {isStreaming
-                                ? '生成中...'
-                                : message.interrupted
-                                    ? '已中止'
+                                ? message.retryStatus
+                                    ? `自动重试 ${message.retryStatus.attempt}/${message.retryStatus.maxAttempts}...`
+                                    : '生成中...'
+                                : message.interrupted && message.usage
+                                    ? getInterruptedStatusLabel(message.errorCode)
                                     : formatAssistantTime(message.timestamp)}
                         </span>
                     </div>
@@ -877,6 +1018,24 @@ export function MessageBubble({
                         data-assistant-msg-actions={message.id}
                     >
                         <div class="ag-ast-msg-actions-inner">
+                            {showContinueBar && onContinue ? (
+                                <button
+                                    type="button"
+                                    class="ag-ast-action-btn"
+                                    data-msg-action="continue"
+                                    title={message.errorCode === 'max_tool_rounds' ? '继续执行' : '继续生成'}
+                                    aria-label={
+                                        message.errorCode === 'max_tool_rounds' ? '继续执行' : '继续生成'
+                                    }
+                                    disabled={isSessionStreaming || isCompacting}
+                                    onClick={() => {
+                                        onCloseActions?.();
+                                        void onContinue();
+                                    }}
+                                >
+                                    ▶
+                                </button>
+                            ) : null}
                             <button
                                 type="button"
                                 class="ag-ast-action-btn"

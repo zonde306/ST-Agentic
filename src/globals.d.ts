@@ -49,6 +49,7 @@ export interface AgenticAssistantPublicApi {
     ): Promise<AssistantMessage>;
     retractMessage(sessionId: string, messageId: string): Promise<AssistantRetractResult | null>;
     regenerateLastMessage(sessionId: string, opts?: AssistantSendOptions): Promise<AssistantMessage>;
+    continueLastMessage(sessionId: string, opts?: AssistantSendOptions): Promise<AssistantMessage>;
     decideApproval(
         approvalId: string,
         decision: 'approve' | 'reject',

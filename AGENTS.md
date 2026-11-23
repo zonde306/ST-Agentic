@@ -14,6 +14,7 @@
 - Architecture & data contracts: `docs/ARCHITECTURE.md`
 - Parallel task board, wave dependencies & exclusive path locks: `docs/TASKS.md`
 - Interactive UI layout & Dark/Light visual reference: follow `docs/ARCHITECTURE.md` §9.
+- UI design system (tokens, components, shell layout, copy & CSS conventions): `docs/UI_DESIGN_SYSTEM.md`.
 
 ## Architectural Red Lines
 

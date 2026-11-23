@@ -15,6 +15,7 @@ import type {
     AssistantCompactReport,
     AssistantMessage,
     AssistantMode,
+    AssistantRetryStatus,
     AssistantSession,
     AssistantSessionTokenStatus,
     BackgroundTaskStatus,
@@ -94,6 +95,7 @@ export interface AssistantRuntimeBridge {
         options?: {
             attachments?: AssistantAttachment[];
             onDelta?: (delta: string) => void;
+            onRetry?: (status: AssistantRetryStatus) => void;
             onUpdate?: (session: AssistantSession) => void;
             signal?: AbortSignal;
         },
@@ -109,6 +111,7 @@ export interface AssistantRuntimeBridge {
         newContent: string,
         options?: {
             onDelta?: (delta: string) => void;
+            onRetry?: (status: AssistantRetryStatus) => void;
             onUpdate?: (session: AssistantSession) => void;
             signal?: AbortSignal;
         },
@@ -126,6 +129,16 @@ export interface AssistantRuntimeBridge {
         sessionId: string,
         options?: {
             onDelta?: (delta: string) => void;
+            onRetry?: (status: AssistantRetryStatus) => void;
+            onUpdate?: (session: AssistantSession) => void;
+            signal?: AbortSignal;
+        },
+    ): Promise<AssistantMessage | AssistantSession | void>;
+    continueLastMessage?(
+        sessionId: string,
+        options?: {
+            onDelta?: (delta: string) => void;
+            onRetry?: (status: AssistantRetryStatus) => void;
             onUpdate?: (session: AssistantSession) => void;
             signal?: AbortSignal;
         },

@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
     AssistantRunner,
+    type AssistantRetryOptions,
     AssistantSessionStore,
     REDACTED_PLACEHOLDER,
     toAssistantThreadId,
 } from '@/core/assistant';
 import { createDefaultSettings } from '@/core/config';
 import { TrajectoryStore } from '@/core/context';
+import { LLMTransportError } from '@/core/llm';
 import { TraceLogger } from '@/core/logger';
+import type { AssistantRetryStatus } from '@/core/types';
 import { AppStore, type AssistantRuntimeBridge } from '@/ui/store/app-store';
 import { canonicalStringify } from '@/core/utils';
 import {
@@ -16,7 +19,14 @@ import {
 } from '../../fixtures/off-mainline-fixtures';
 import { ScriptedLLMTransport, type ScriptedTurnInput } from '../../mocks/scripted-llm';
 
-function createRunnerHarness(turns: ScriptedTurnInput[] = [], extra?: { stream?: boolean }) {
+function createRunnerHarness(
+    turns: ScriptedTurnInput[] = [],
+    extra?: {
+        stream?: boolean;
+        maxToolRounds?: number;
+        autoRetry?: AssistantRetryOptions | false;
+    },
+) {
     const bridge = createOffMainlineTestBridge();
     const transport = new ScriptedLLMTransport(turns);
     const trajectoryStore = new TrajectoryStore();
@@ -37,6 +47,8 @@ function createRunnerHarness(turns: ScriptedTurnInput[] = [], extra?: { stream?:
         traceLogger,
         settings,
         stream: extra?.stream ?? true,
+        ...(extra?.maxToolRounds !== undefined ? { maxToolRounds: extra.maxToolRounds } : {}),
+        ...(extra?.autoRetry !== undefined ? { autoRetry: extra.autoRetry } : {}),
     });
 
     return { bridge, transport, trajectoryStore, traceLogger, settings, runner };
@@ -823,5 +835,337 @@ describe('AssistantRunner & AssistantSessionStore (TS2.1)', () => {
         await runner.undo(autoUndoId);
         expect(bridge.chat).toHaveLength(2);
         expect(bridge.chat[1].mes).toBe(beforeDeleteContent);
+    });
+
+    it('auto-retries mid-stream network errors and empty responses with clean buffer rollback', async () => {
+        const { transport, trajectoryStore, runner } = createRunnerHarness(
+            [
+                // Attempt 1: mid-stream drop after emitting partial text chunk
+                {
+                    content: '半截失败输出',
+                    chunkSize: 6,
+                    error: new LLMTransportError('SSE connection dropped', { retryable: true }),
+                    errorAfterChunks: 1,
+                },
+                // Attempt 2: silent empty response (no toolCalls, empty content)
+                {
+                    content: '',
+                },
+                // Attempt 3: clean complete reply
+                {
+                    content: '最终完整答复内容。',
+                    usage: { inputTokens: 200, cachedTokens: 100, outputTokens: 25 },
+                },
+            ],
+            {
+                stream: true,
+                autoRetry: { maxRetries: 2, initialDelayMs: 5, maxDelayMs: 20, backoffFactor: 2 },
+            },
+        );
+
+        const session = await runner.createSession({ title: '自动重试测试', mode: 'chat' });
+        const retryStatuses: AssistantRetryStatus[] = [];
+        const observedLiveRetryStates: Array<AssistantRetryStatus | undefined> = [];
+
+        const reply = await runner.sendPrompt(session.id, '帮我分析当前状态', {
+            onRetry: (status) => retryStatuses.push(status),
+            onUpdate: (updated) => {
+                const last = updated.messages[updated.messages.length - 1];
+                if (last?.role === 'assistant' && last.retryStatus) {
+                    observedLiveRetryStates.push(last.retryStatus);
+                }
+            },
+        });
+
+        expect(transport.requests).toHaveLength(3);
+        expect(retryStatuses).toHaveLength(2);
+        expect(retryStatuses[0]).toMatchObject({ attempt: 1, maxAttempts: 2 });
+        expect(retryStatuses[1]).toMatchObject({ attempt: 2, maxAttempts: 2 });
+        expect(observedLiveRetryStates.length).toBeGreaterThanOrEqual(2);
+
+        // Partial text from Attempt 1 must have been rolled back cleanly without duplication
+        expect(reply.content).toBe('最终完整答复内容。');
+        expect(reply.content).not.toContain('半截失败输出');
+        expect(reply.retryStatus).toBeUndefined();
+        expect(reply.interrupted).toBeUndefined();
+        expect(trajectoryStore.getMessageCount(toAssistantThreadId(session.id))).toBe(2);
+    });
+
+    it('aborts immediately during auto-retry backoff and saves a resumable user_stop checkpoint', async () => {
+        const { transport, trajectoryStore, runner } = createRunnerHarness(
+            [
+                {
+                    error: new LLMTransportError('Upstream gateway timeout', {
+                        status: 504,
+                        retryable: true,
+                    }),
+                },
+                { content: 'SHOULD_NOT_BE_REACHED' },
+            ],
+            {
+                stream: false,
+                autoRetry: { maxRetries: 3, initialDelayMs: 10_000, maxDelayMs: 10_000 },
+            },
+        );
+
+        const session = await runner.createSession({ title: '退避中断测试', mode: 'chat' });
+        const startedAt = Date.now();
+        const result = await runner.sendPrompt(session.id, '触发重试并立即中止', {
+            onRetry: () => {
+                setTimeout(() => runner.abort(session.id), 10);
+            },
+        });
+        const elapsed = Date.now() - startedAt;
+
+        expect(elapsed).toBeLessThan(1000);
+        expect(transport.requests).toHaveLength(1);
+        expect(result.interrupted).toBe(true);
+        expect(result.errorCode).toBe('user_stop');
+        expect(result.canContinue).toBe(true);
+        expect(result.retryStatus).toBeUndefined();
+        expect(trajectoryStore.getMessageCount(toAssistantThreadId(session.id))).toBe(0);
+        expect(runner.sessionStore.getInterruptedCheckpoint(session.id)).toMatchObject({
+            messageId: result.id,
+            reason: 'user_stop',
+        });
+    });
+
+    it('preserves completed tool rounds in checkpoint on exhausted retries and resumes via continueLastMessage()', async () => {
+        const { transport, trajectoryStore, runner } = createRunnerHarness(
+            [
+                // Round 1: calls list_dir (succeeds)
+                {
+                    toolCalls: [
+                        {
+                            id: 'call_list_1',
+                            name: 'list_dir',
+                            arguments: JSON.stringify({ path: '/' }),
+                        },
+                    ],
+                },
+                // Round 2: exhausts initial attempt + 1 autoRetry with network failure
+                {
+                    content: '开始汇总：',
+                    chunkSize: 5,
+                    error: new Error('network error mid-summary'),
+                    errorAfterChunks: 1,
+                },
+                {
+                    error: new LLMTransportError('Bad gateway', { status: 502, retryable: true }),
+                },
+                // Resumed Round via continueLastMessage(): receives tool history without re-running list_dir
+                {
+                    content: '已完成目录盘点。',
+                },
+            ],
+            {
+                stream: true,
+                autoRetry: { maxRetries: 1, initialDelayMs: 5, maxDelayMs: 10 },
+            },
+        );
+
+        const session = await runner.createSession({ title: '断线续传测试', mode: 'chat' });
+        await expect(runner.sendPrompt(session.id, '列出根目录文件并总结')).rejects.toThrow(
+            /Bad gateway/,
+        );
+
+        // Must NOT commit half-baked turn into TrajectoryStore while interrupted
+        expect(trajectoryStore.getMessageCount(toAssistantThreadId(session.id))).toBe(0);
+
+        const afterErrorSession = runner.getSession(session.id)!;
+        const failedBubble = afterErrorSession.messages[afterErrorSession.messages.length - 1];
+        expect(failedBubble.role).toBe('assistant');
+        expect(failedBubble.interrupted).toBe(true);
+        expect(failedBubble.errorCode).toBe('network');
+        expect(failedBubble.canContinue).toBe(true);
+        expect(failedBubble.toolCalls).toHaveLength(1);
+        expect(failedBubble.toolCalls![0].name).toBe('list_dir');
+        expect(afterErrorSession.interruptedCheckpoint).toBeDefined();
+        expect(afterErrorSession.interruptedCheckpoint!.messageId).toBe(failedBubble.id);
+        expect(afterErrorSession.interruptedCheckpoint!.inFlightMessages.some((m) => m.role === 'tool')).toBe(
+            true,
+        );
+
+        const continued = await runner.continueLastMessage(session.id);
+
+        // Resumed request contains completed assistant(toolCalls) + tool result without repeating list_dir
+        expect(transport.requests).toHaveLength(4);
+        const resumedMsgs = transport.requests[3].messages;
+        expect(resumedMsgs.some((m) => m.role === 'tool' && m.toolCallId === 'call_list_1')).toBe(true);
+
+        // Same assistant bubble updated in place, [Error] banner cleared, toolCalls kept intact
+        const finalSession = runner.getSession(session.id)!;
+        expect(finalSession.messages).toHaveLength(2);
+        expect(continued.id).toBe(failedBubble.id);
+        expect(continued.content).toBe('已完成目录盘点。');
+        expect(continued.content).not.toContain('[Error]');
+        expect(continued.interrupted).toBeUndefined();
+        expect(continued.canContinue).toBeUndefined();
+        expect(continued.toolCalls).toHaveLength(1);
+        expect(finalSession.interruptedCheckpoint).toBeUndefined();
+        expect(trajectoryStore.getMessageCount(toAssistantThreadId(session.id))).toBeGreaterThanOrEqual(4);
+    });
+
+    it('marks max_tool_rounds interruption with checkpoint and continues cleanly via continueLastMessage()', async () => {
+        const { transport, trajectoryStore, runner } = createRunnerHarness(
+            [
+                // Round 1 (reaches maxToolRounds=1)
+                {
+                    toolCalls: [
+                        {
+                            id: 'call_list_cap',
+                            name: 'list_dir',
+                            arguments: JSON.stringify({ path: '/character' }),
+                        },
+                    ],
+                },
+                // Resumed Round after clicking Continue
+                {
+                    content: '继续执行后已完成角色目录分析。',
+                },
+            ],
+            {
+                stream: false,
+                maxToolRounds: 1,
+                autoRetry: false,
+            },
+        );
+
+        const session = await runner.createSession({ title: '轮次上限续跑', mode: 'chat' });
+        const capped = await runner.sendPrompt(session.id, '检查角色卡目录');
+
+        expect(capped.interrupted).toBe(true);
+        expect(capped.errorCode).toBe('max_tool_rounds');
+        expect(capped.canContinue).toBe(true);
+        expect(capped.toolCalls).toHaveLength(1);
+        expect(trajectoryStore.getMessageCount(toAssistantThreadId(session.id))).toBe(0);
+        expect(runner.sessionStore.getInterruptedCheckpoint(session.id)?.reason).toBe('max_tool_rounds');
+
+        const finished = await runner.continueLastMessage(session.id);
+        expect(transport.requests).toHaveLength(2);
+        expect(finished.id).toBe(capped.id);
+        expect(finished.interrupted).toBeUndefined();
+        expect(finished.content).toBe('继续执行后已完成角色目录分析。');
+        expect(runner.sessionStore.getInterruptedCheckpoint(session.id)).toBeNull();
+        expect(trajectoryStore.getMessageCount(toAssistantThreadId(session.id))).toBeGreaterThanOrEqual(4);
+    });
+
+    it('handles finishReason=length truncation across consecutive continuations and protects truncated tool JSON', async () => {
+        // 1. Consecutive text length truncations without duplicating already-output segments
+        const { transport: textTransport, trajectoryStore: textTrajectory, runner: textRunner } =
+            createRunnerHarness(
+                [
+                    { content: '第一段', finishReason: 'length' },
+                    { content: '第二段', finishReason: 'MAX_TOKENS' },
+                    { content: '第三段', finishReason: 'stop' },
+                ],
+                { stream: true, autoRetry: false },
+            );
+
+        const s1 = await textRunner.createSession({ title: '长度截断连续续写', mode: 'chat' });
+        const r1 = await textRunner.sendPrompt(s1.id, '写三段故事');
+        expect(r1.interrupted).toBe(true);
+        expect(r1.errorCode).toBe('length');
+        expect(r1.canContinue).toBe(true);
+        expect(r1.content).toBe('第一段');
+        expect(textTrajectory.getMessageCount(toAssistantThreadId(s1.id))).toBe(0);
+
+        const r2 = await textRunner.continueLastMessage(s1.id);
+        expect(r2.id).toBe(r1.id);
+        expect(r2.interrupted).toBe(true);
+        expect(r2.errorCode).toBe('length');
+        expect(r2.content).toBe('第一段第二段');
+
+        const r3 = await textRunner.continueLastMessage(s1.id);
+        expect(r3.id).toBe(r1.id);
+        expect(r3.interrupted).toBeUndefined();
+        expect(r3.content).toBe('第一段第二段第三段');
+
+        const committed = textTrajectory.getMessages(toAssistantThreadId(s1.id));
+        const assistantTexts = committed
+            .filter((m) => m.role === 'assistant')
+            .map((m) => String(m.content));
+        expect(assistantTexts).toEqual(['第一段', '第二段', '第三段']);
+        expect(textTransport.requests).toHaveLength(3);
+
+        // 2. Truncated tool JSON on finishReason=length must NOT execute partial tool call
+        const { runner: toolRunner } = createRunnerHarness(
+            [
+                {
+                    toolCalls: [
+                        {
+                            id: 'call_trunc_1',
+                            name: 'read_file',
+                            arguments: '{"path":"/character/desc',
+                        },
+                    ],
+                    finishReason: 'length',
+                },
+                {
+                    content: '已重新输出并完成答复。',
+                    finishReason: 'stop',
+                },
+            ],
+            { stream: false, autoRetry: false },
+        );
+
+        const s2 = await toolRunner.createSession({ title: '截断工具参数保护', mode: 'chat' });
+        const t1 = await toolRunner.sendPrompt(s2.id, '读取角色描述');
+        expect(t1.interrupted).toBe(true);
+        expect(t1.errorCode).toBe('length');
+        expect(t1.canContinue).toBe(true);
+        expect(t1.toolCalls).toBeUndefined();
+
+        const t2 = await toolRunner.continueLastMessage(s2.id);
+        expect(t2.interrupted).toBeUndefined();
+        expect(t2.content).toBe('已重新输出并完成答复。');
+    });
+
+    it('supports legacy continueLastMessage() fallback when trailing bubble has toolCalls and empty content without checkpoint', async () => {
+        const { transport, trajectoryStore, runner } = createRunnerHarness(
+            [
+                {
+                    content: '根据已读取的设定文件，角色档案已整理完毕。',
+                },
+            ],
+            { stream: false, autoRetry: false },
+        );
+
+        const session = await runner.createSession({ title: '旧版空回复兜底续写', mode: 'chat' });
+        runner.sessionStore.appendMessage(session.id, {
+            id: 'legacy_u_1',
+            role: 'user',
+            content: '读取描述并整理重点',
+            timestamp: 1000,
+        });
+        runner.sessionStore.appendMessage(session.id, {
+            id: 'legacy_a_1',
+            role: 'assistant',
+            content: '',
+            toolCalls: [
+                {
+                    id: 'legacy_tc_1',
+                    name: 'read_file',
+                    scopeLabel: 'VFS: /character/description.md',
+                    status: 'ok',
+                    durationMs: 2,
+                    argsSummary: '{"path":"/character/description.md"}',
+                    resultSummary: '主角是一名驻守雾港的调查员。',
+                },
+            ],
+            timestamp: 1001,
+        });
+
+        const continued = await runner.continueLastMessage(session.id);
+        expect(continued.id).toBe('legacy_a_1');
+        expect(continued.content).toBe('根据已读取的设定文件，角色档案已整理完毕。');
+        expect(continued.toolCalls).toHaveLength(1);
+        expect(runner.getSession(session.id)!.messages).toHaveLength(2);
+        expect(transport.requests).toHaveLength(1);
+        const sentText = transport.requests[0].messages
+            .map((m) => (typeof m.content === 'string' ? m.content : ''))
+            .join('\n');
+        expect(sentText).toContain('read_file');
+        expect(trajectoryStore.getMessageCount(toAssistantThreadId(session.id))).toBeGreaterThanOrEqual(2);
     });
 });

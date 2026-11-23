@@ -601,6 +601,8 @@ export interface RegexRule {
 
 原版手写 jQuery 模板直接混在酒馆宿主 DOM 中，极易被 `public/style.css` 裸标签规则与第三方美化主题污染，且弹窗套弹窗导致配置、日志、覆盖与文件编辑割裂。新版 UI 采用 **Preact（~4KB JSX 组件化，单文件打包进 `dist/index.js`，零外部运行时依赖）+ 原生 `<dialog>` + Shadow DOM 物理隔离**，将所有配置、查看、编辑与文件管理整合进**唯一一个独立渲染的全功能控制台**，同时保持对酒馆原生聊天区与入口菜单的零侵入挂载。
 
+> 视觉与交互细则（设计令牌、组件规范、外壳布局、文案与 CSS 约定）见 [`docs/UI_DESIGN_SYSTEM.md`](./UI_DESIGN_SYSTEM.md)。本节为其上位硬性约束。
+
 ### 9.1 物理样式隔离、Dark/Light 双主题、键盘护栏与独立调试
 
 1. **物理级 CSS 结界（Zero CSS Leakage）**：

@@ -1019,6 +1019,46 @@ export function createMockAssistantRuntime(
             notify();
             return structuredClone(reply);
         },
+        async continueLastMessage(sessionId, sendOpts) {
+            const session = sessions.find((s) => s.id === sessionId);
+            if (!session) {
+                throw new Error(`Session not found: ${sessionId}`);
+            }
+            if (session.messages.length === 0) {
+                throw new Error('No message available to continue.');
+            }
+            const lastMsg = session.messages[session.messages.length - 1];
+            if (lastMsg.role === 'assistant') {
+                const cleaned = lastMsg.content.startsWith('[Error] ')
+                    ? ''
+                    : lastMsg.content.replace(/\n\n\[Error\] [\s\S]*$/, '');
+                const addition = cleaned.trim()
+                    ? '\n\n已接着继续完成剩余内容（Mock）。'
+                    : '已继续执行并完成回复（Mock）。';
+                lastMsg.content = `${cleaned}${addition}`;
+                delete lastMsg.interrupted;
+                delete lastMsg.errorCode;
+                delete lastMsg.errorMessage;
+                delete lastMsg.canContinue;
+                delete lastMsg.retryStatus;
+                delete session.interruptedCheckpoint;
+                session.updatedAt = Date.now();
+                sendOpts?.onUpdate?.(structuredClone(session));
+                notify();
+                return structuredClone(lastMsg);
+            }
+            const reply: AssistantMessage = {
+                id: `ast_mock_cont_${Date.now()}`,
+                role: 'assistant',
+                content: `已继续处理上一条指令（Mock）：${lastMsg.content}`,
+                timestamp: Date.now(),
+            };
+            session.messages.push(reply);
+            session.updatedAt = reply.timestamp;
+            sendOpts?.onUpdate?.(structuredClone(session));
+            notify();
+            return structuredClone(reply);
+        },
         abort: () => {
             // Mock no-op
         },

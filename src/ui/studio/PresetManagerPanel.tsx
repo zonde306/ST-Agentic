@@ -10,6 +10,7 @@ import {
     Badge,
     Button,
     CodeEditor,
+    DropdownMenu,
     FormField,
     SelectInput,
     ShadowModal,
@@ -19,7 +20,9 @@ import {
 import {
     IconCheck,
     IconCopy,
+    IconCreditCard,
     IconDownload,
+    IconEdit,
     IconPlus,
     IconTrash,
     IconUpload,
@@ -461,99 +464,93 @@ export function PresetManagerPanel({
     };
 
     return (
-        <div
-            style={{
-                padding: compact ? '10px 12px' : '12px 14px',
-                borderBottom: '1px solid var(--border)',
-                background: 'color-mix(in srgb, var(--sidebar) 55%, var(--content))',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: '8px',
-                minWidth: 0,
-            }}
-        >
-            <div class="ag-row-wrap" style={{ justifyContent: 'space-between' }}>
-                <div class="ag-row-wrap" style={{ flex: '1 1 220px', minWidth: 0 }}>
-                    <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--muted-foreground)' }}>
-                        当前预设
-                    </span>
-                    <div style={{ flex: '1 1 180px', minWidth: 0 }}>
-                        <SelectInput
-                            ariaLabel="切换当前预设"
-                            value={activePreset?.id ?? ''}
-                            options={presetOptions}
-                            onChange={(id) => {
-                                void store.setCurrentPreset(id);
-                                onPresetChanged?.(id);
-                            }}
-                        />
-                    </div>
-                    {activePreset ? (
-                        <Badge tone="neutral">
-                            {Object.keys(activePreset.agents).length} 智能体 ·{' '}
-                            {activePreset.triggers.length} 触发 ·{' '}
-                            {activePreset.regexRules.length} 正则
-                        </Badge>
-                    ) : null}
-                </div>
-
-                <div class="ag-row-wrap">
-                    <Button
-                        size="sm"
-                        variant="secondary"
-                        icon={<IconPlus size={14} />}
-                        onClick={openCreateModal}
-                    >
-                        新建预设
-                    </Button>
-                    <Button size="sm" variant="secondary" onClick={openRenameModal}>
-                        重命名
-                    </Button>
-                    <Button
-                        size="sm"
-                        variant="secondary"
-                        icon={<IconCopy size={14} />}
-                        onClick={() => void handleDuplicatePreset()}
-                    >
-                        复制
-                    </Button>
-                    <Button
-                        size="sm"
-                        variant="danger"
-                        icon={<IconTrash size={14} />}
-                        disabled={presetList.length <= 1}
-                        onClick={handleDeletePreset}
-                    >
-                        删除
-                    </Button>
-                    <Button
-                        size="sm"
-                        variant="secondary"
-                        icon={<IconUpload size={14} />}
-                        onClick={() => {
-                            setErrorText(null);
-                            setLastImportReport(null);
-                            setDialogKind('import');
+        <div class={compact ? 'ag-toolbar ag-toolbar-compact' : 'ag-toolbar'}>
+            <div class="ag-toolbar-group" style={{ flex: '1 1 260px' }}>
+                <span class="ag-toolbar-label">当前预设</span>
+                <div style={{ flex: '1 1 180px', minWidth: 0, maxWidth: '320px' }}>
+                    <SelectInput
+                        ariaLabel="切换当前预设"
+                        value={activePreset?.id ?? ''}
+                        options={presetOptions}
+                        onChange={(id) => {
+                            void store.setCurrentPreset(id);
+                            onPresetChanged?.(id);
                         }}
-                    >
-                        导入 / 迁移
-                    </Button>
-                    <Button
-                        size="sm"
-                        variant="secondary"
-                        icon={<IconDownload size={14} />}
-                        onClick={() => setDialogKind('export')}
-                    >
-                        导出预设
-                    </Button>
-                    <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={() => setDialogKind('embed')}
-                    >
-                        角色卡嵌入
-                    </Button>
+                    />
                 </div>
+                {activePreset ? (
+                    <span class="ag-toolbar-meta">
+                        {Object.keys(activePreset.agents).length} 智能体 ·{' '}
+                        {activePreset.triggers.length} 触发 ·{' '}
+                        {activePreset.regexRules.length} 正则
+                    </span>
+                ) : null}
+            </div>
+
+            <div class="ag-toolbar-group">
+                <Button
+                    size="sm"
+                    variant="ghost"
+                    icon={<IconPlus size={16} />}
+                    title="新建预设"
+                    onClick={openCreateModal}
+                >
+                    新建
+                </Button>
+                <Button
+                    size="sm"
+                    variant="ghost"
+                    icon={<IconUpload size={16} />}
+                    title="导入预设 / 旧版自动迁移"
+                    onClick={() => {
+                        setErrorText(null);
+                        setLastImportReport(null);
+                        setDialogKind('import');
+                    }}
+                >
+                    导入
+                </Button>
+                <Button
+                    size="sm"
+                    variant="ghost"
+                    icon={<IconDownload size={16} />}
+                    title="导出脱敏预设"
+                    onClick={() => setDialogKind('export')}
+                >
+                    导出
+                </Button>
+                <DropdownMenu
+                    ariaLabel="更多预设操作"
+                    items={[
+                        {
+                            id: 'rename',
+                            label: '重命名',
+                            icon: <IconEdit size={15} />,
+                            onSelect: openRenameModal,
+                        },
+                        {
+                            id: 'duplicate',
+                            label: '复制预设',
+                            icon: <IconCopy size={15} />,
+                            onSelect: () => void handleDuplicatePreset(),
+                        },
+                        {
+                            id: 'embed',
+                            label: '角色卡嵌入',
+                            icon: <IconCreditCard size={15} />,
+                            onSelect: () => setDialogKind('embed'),
+                        },
+                        {
+                            id: 'delete',
+                            label: '删除预设',
+                            icon: <IconTrash size={15} />,
+                            danger: true,
+                            separatorBefore: true,
+                            disabled: presetList.length <= 1,
+                            onSelect: handleDeletePreset,
+                        },
+                    ]}
+                />
             </div>
 
             {/* Create / Rename Preset Modal (Shadow DOM) */}

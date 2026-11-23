@@ -579,4 +579,102 @@ describe('FetchLLMTransport', () => {
         ).rejects.toMatchObject({ name: 'AbortError' });
         expect(neverFetch).not.toHaveBeenCalled();
     });
+
+    it('retries pre-chunk SSE transient errors and stream read failures, but never duplicates already-yielded stream chunks', async () => {
+        const conn = makeConnection();
+        const enc = new TextEncoder();
+
+        // 1. Pre-chunk inline overloaded_error (attempt 1) + pre-chunk stream drop (attempt 2) -> succeeds on attempt 3
+        let preChunkAttempt = 0;
+        const preChunkTransport = new FetchLLMTransport({
+            fetchImpl: async () => {
+                preChunkAttempt += 1;
+                if (preChunkAttempt === 1) {
+                    return new Response(
+                        makeSSEStream([
+                            'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Server overloaded"}}\n\n',
+                        ]),
+                        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+                    );
+                }
+                if (preChunkAttempt === 2) {
+                    const failingBody = new ReadableStream<Uint8Array>({
+                        pull() {
+                            return Promise.reject(new TypeError('network reset before first token'));
+                        },
+                    });
+                    return new Response(failingBody, {
+                        status: 200,
+                        headers: { 'Content-Type': 'text/event-stream' },
+                    });
+                }
+                return new Response(
+                    makeSSEStream([
+                        'data: {"choices":[{"index":0,"delta":{"content":"Recovered!"}}]}\n\n',
+                        'data: [DONE]\n\n',
+                    ]),
+                    { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+                );
+            },
+            connections: { [conn.id]: conn },
+            retry: { maxAttempts: 3, initialDelayMs: 5, backoffFactor: 1 },
+        });
+
+        const preChunkReceived: string[] = [];
+        for await (const chunk of preChunkTransport.stream({
+            connectionId: conn.id,
+            messages: [{ role: 'user', content: 'hi' }],
+            tools: [],
+        })) {
+            if (chunk.type === 'text_delta' && chunk.textDelta) {
+                preChunkReceived.push(chunk.textDelta);
+            }
+        }
+        expect(preChunkAttempt).toBe(3);
+        expect(preChunkReceived.join('')).toBe('Recovered!');
+
+        // 2. Error AFTER an observable chunk was already yielded -> does NOT retry silently in transport
+        let midStreamCalls = 0;
+        const midStreamTransport = new FetchLLMTransport({
+            fetchImpl: async () => {
+                midStreamCalls += 1;
+                const partialThenFail = new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(
+                            enc.encode('data: {"choices":[{"index":0,"delta":{"content":"half"}}]}\n\n'),
+                        );
+                    },
+                    pull() {
+                        return Promise.reject(new TypeError('socket hang up mid-stream'));
+                    },
+                });
+                return new Response(partialThenFail, {
+                    status: 200,
+                    headers: { 'Content-Type': 'text/event-stream' },
+                });
+            },
+            connections: { [conn.id]: conn },
+            retry: { maxAttempts: 3, initialDelayMs: 5 },
+        });
+
+        const midChunks: string[] = [];
+        let midErr: unknown;
+        try {
+            for await (const chunk of midStreamTransport.stream({
+                connectionId: conn.id,
+                messages: [{ role: 'user', content: 'hi' }],
+                tools: [],
+            })) {
+                if (chunk.type === 'text_delta' && chunk.textDelta) {
+                    midChunks.push(chunk.textDelta);
+                }
+            }
+        } catch (err) {
+            midErr = err;
+        }
+        expect(midStreamCalls).toBe(1);
+        expect(midChunks).toEqual(['half']);
+        expect(midErr).toBeInstanceOf(LLMTransportError);
+        expect((midErr as LLMTransportError).retryable).toBe(true);
+    });
 });

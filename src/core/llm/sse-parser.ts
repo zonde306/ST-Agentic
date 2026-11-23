@@ -1,6 +1,12 @@
 import type { LLMResponse, LLMStreamChunk } from '../bridge';
 import type { ApiProviderFormat, CanonicalToolCall, TokenUsage } from '../types';
-import { createAbortError, isAbortError, LLMTransportError } from './errors';
+import {
+    createAbortError,
+    isAbortError,
+    isContextOverflowError,
+    isRetryableStatus,
+    LLMTransportError,
+} from './errors';
 
 export interface SSEEvent {
     event: string;
@@ -120,6 +126,95 @@ function asNonEmptyString(value: unknown): string | undefined {
 
 function asNumber(value: unknown): number | undefined {
     return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+const PERMANENT_STREAM_ERROR_CODES = new Set([
+    'invalid_api_key',
+    'authentication_error',
+    'permission_error',
+    'invalid_request_error',
+    'insufficient_quota',
+    'billing_hard_limit_reached',
+    'not_found_error',
+]);
+
+const RETRYABLE_STREAM_ERROR_CODES = new Set([
+    'overloaded_error',
+    'rate_limit_error',
+    'api_error',
+    'server_error',
+    'internal_error',
+    'service_unavailable',
+    'timeout',
+    'request_timeout',
+    'bad_gateway',
+    'gateway_timeout',
+    'temporarily_unavailable',
+]);
+
+const PERMANENT_STREAM_ERROR_MSG_RE =
+    /\b(invalid[\s_-]?api[\s_-]?key|authentication|unauthorized|forbidden|permission|quota[\s_-]?exceeded|insufficient[\s_-]?quota|invalid[\s_-]?request)\b/i;
+
+const RETRYABLE_STREAM_ERROR_MSG_RE =
+    /\b(overloaded|rate[\s_-]?limit|too many requests|temporarily unavailable|service unavailable|internal server error|bad gateway|gateway timeout|timed?\s*out|connection reset|try again|upstream)\b/i;
+
+function isRetryableStreamError(rawError: unknown, message: string): boolean {
+    if (isContextOverflowError(message) || (isRecord(rawError) && isContextOverflowError(rawError))) {
+        return false;
+    }
+
+    if (isRecord(rawError)) {
+        const status = asNumber(rawError.status);
+        if (status !== undefined) {
+            if (isRetryableStatus(status)) {
+                return true;
+            }
+            if (status >= 400 && status < 500) {
+                return false;
+            }
+        }
+
+        const typeStr = asNonEmptyString(rawError.type)?.trim().toLowerCase() ?? '';
+        const codeStr = asNonEmptyString(rawError.code)?.trim().toLowerCase() ?? '';
+        if (
+            PERMANENT_STREAM_ERROR_CODES.has(typeStr)
+            || PERMANENT_STREAM_ERROR_CODES.has(codeStr)
+        ) {
+            return false;
+        }
+        if (
+            RETRYABLE_STREAM_ERROR_CODES.has(typeStr)
+            || RETRYABLE_STREAM_ERROR_CODES.has(codeStr)
+        ) {
+            return true;
+        }
+    }
+
+    if (PERMANENT_STREAM_ERROR_MSG_RE.test(message)) {
+        return false;
+    }
+
+    return RETRYABLE_STREAM_ERROR_MSG_RE.test(message);
+}
+
+function createStreamErrorFromPayload(
+    parsed: Record<string, unknown>,
+    message: string,
+    extra?: { responseBody?: string },
+): LLMTransportError {
+    const rawErrObj = isRecord(parsed.error)
+        ? parsed.error
+        : isRecord(parsed.detail) && isRecord(parsed.detail.error)
+            ? parsed.detail.error
+            : parsed;
+    const status = asNumber(rawErrObj.status) ?? asNumber(parsed.status);
+    const code = asNonEmptyString(rawErrObj.code) ?? asNonEmptyString(rawErrObj.type);
+    return new LLMTransportError(message, {
+        ...(status !== undefined ? { status } : {}),
+        ...(code !== undefined ? { code } : {}),
+        retryable: isRetryableStreamError(rawErrObj, message),
+        ...(extra?.responseBody !== undefined ? { responseBody: extra.responseBody } : {}),
+    });
 }
 
 function extractStreamErrorMessage(parsed: Record<string, unknown>): string | null {
@@ -528,7 +623,7 @@ export class SSEParser {
 
         const errorMsg = extractStreamErrorMessage(parsed);
         if (errorMsg) {
-            throw new LLMTransportError(errorMsg, { retryable: false });
+            throw createStreamErrorFromPayload(parsed, errorMsg);
         }
 
         const out: LLMStreamChunk[] = [];
@@ -738,7 +833,7 @@ export class SSEParser {
                 asNonEmptyString(errObj?.message)
                 ?? asNonEmptyString(errObj?.type)
                 ?? 'Anthropic stream error';
-            throw new LLMTransportError(message, { retryable: false });
+            throw createStreamErrorFromPayload(parsed, message);
         }
 
         if (type === 'message_start') {
@@ -1010,7 +1105,7 @@ export function parseCompletionResponse(
 
     const errorMsg = extractStreamErrorMessage(data);
     if (errorMsg) {
-        throw new LLMTransportError(errorMsg, { retryable: false, responseBody: JSON.stringify(data) });
+        throw createStreamErrorFromPayload(data, errorMsg, { responseBody: JSON.stringify(data) });
     }
 
     // Anthropic non-streaming Messages response: { type: 'message', content: [...], usage: {...} }
@@ -1259,7 +1354,24 @@ export async function* parseSSEStream(
                 throw createAbortError(signal, 'SSE stream aborted');
             }
 
-            const { done, value } = await readNextWithAbort(reader, signal);
+            let readResult: ReadableStreamReadResult<Uint8Array>;
+            try {
+                readResult = await readNextWithAbort(reader, signal);
+            } catch (err) {
+                if (signal?.aborted || isAbortError(err)) {
+                    throw createAbortError(signal, 'SSE stream aborted');
+                }
+                if (err instanceof LLMTransportError) {
+                    throw err;
+                }
+                const message = err instanceof Error ? err.message : String(err);
+                throw new LLMTransportError(`SSE stream read failed: ${message}`, {
+                    retryable: true,
+                    code: 'STREAM_READ_ERROR',
+                    cause: err,
+                });
+            }
+            const { done, value } = readResult;
             if (done) {
                 streamCompleted = true;
                 break;

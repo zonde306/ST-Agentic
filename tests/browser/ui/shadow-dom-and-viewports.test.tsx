@@ -300,10 +300,11 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
         const darkCapBg = window.getComputedStyle(capShell).backgroundColor;
         const darkCapFg = window.getComputedStyle(capShell).color;
 
-        expect(darkConsoleBg).toBe('rgb(32, 36, 44)');
-        expect(darkConsoleFg).toBe('rgb(230, 233, 239)');
-        expect(darkCapBg).toBe('rgb(24, 27, 34)');
-        expect(darkCapFg).toBe('rgb(230, 233, 239)');
+        // "Iris" design tokens (docs/UI_DESIGN_SYSTEM.md §1): console frame = --sidebar chrome
+        expect(darkConsoleBg).toBe('rgb(20, 20, 22)');
+        expect(darkConsoleFg).toBe('rgb(236, 236, 241)');
+        expect(darkCapBg).toBe('rgb(31, 31, 35)');
+        expect(darkCapFg).toBe('rgb(236, 236, 241)');
 
         // Click the header theme toggle button: dark -> light
         const themeToggleBtn = shadowRoot.querySelector(
@@ -322,10 +323,10 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
         const lightCapBg = window.getComputedStyle(capShell).backgroundColor;
         const lightCapFg = window.getComputedStyle(capShell).color;
 
-        expect(lightConsoleBg).toBe('rgb(255, 255, 255)');
-        expect(lightConsoleFg).toBe('rgb(24, 28, 36)');
-        expect(lightCapBg).toBe('rgb(244, 246, 250)');
-        expect(lightCapFg).toBe('rgb(24, 28, 36)');
+        expect(lightConsoleBg).toBe('rgb(244, 244, 246)');
+        expect(lightConsoleFg).toBe('rgb(26, 26, 31)');
+        expect(lightCapBg).toBe('rgb(244, 244, 246)');
+        expect(lightCapFg).toBe('rgb(26, 26, 31)');
 
         expect(lightConsoleBg).not.toBe(darkConsoleBg);
         expect(lightConsoleFg).not.toBe(darkConsoleFg);

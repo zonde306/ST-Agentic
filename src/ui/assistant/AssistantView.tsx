@@ -636,6 +636,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             executor: (hooks: {
                 signal: AbortSignal;
                 onDelta: (delta: string) => void;
+                onRetry: () => void;
                 onUpdate: (updatedSession: AssistantSession) => void;
             }) => Promise<AssistantMessage | AssistantSession | void>,
             errorPrefix: string,
@@ -646,12 +647,13 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             setStreamingDelta({ sessionId, text: '' });
 
             let receivedOnUpdate = false;
+            let liveBubbleOwned = false;
 
             try {
                 const result = await executor({
                     signal: controller.signal,
                     onDelta: (delta: string) => {
-                        if (controller.signal.aborted) {
+                        if (controller.signal.aborted || liveBubbleOwned) {
                             return;
                         }
                         setStreamingDelta((prev) => ({
@@ -659,8 +661,18 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                             text: prev && prev.sessionId === sessionId ? prev.text + delta : delta,
                         }));
                     },
+                    onRetry: () => {
+                        setStreamingDelta({ sessionId, text: '' });
+                    },
                     onUpdate: (updatedSession: AssistantSession) => {
                         receivedOnUpdate = true;
+                        const last = updatedSession.messages[updatedSession.messages.length - 1];
+                        if (last?.role === 'assistant') {
+                            liveBubbleOwned = true;
+                            setStreamingDelta({ sessionId, text: '' });
+                        } else {
+                            liveBubbleOwned = false;
+                        }
                         upsertSessionInStore(updatedSession);
                     },
                 });
@@ -677,6 +689,26 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                             updatedAt: Date.now(),
                             messages: [...cur.messages, result],
                         });
+                    }
+                }
+
+                const finalAssistantMsg =
+                    result && 'role' in result
+                        ? result
+                        : result && 'messages' in result && Array.isArray(result.messages)
+                            ? result.messages[result.messages.length - 1]
+                            : undefined;
+                if (finalAssistantMsg?.interrupted) {
+                    if (finalAssistantMsg.errorCode === 'max_tool_rounds') {
+                        store.pushToast(
+                            '已达到单轮工具调用上限，可点击「继续执行」接着运行',
+                            'warning',
+                        );
+                    } else if (finalAssistantMsg.errorCode === 'length') {
+                        store.pushToast(
+                            '输出达到长度上限已截断，可点击「继续生成」接着输出',
+                            'warning',
+                        );
                     }
                 }
             } catch (err) {
@@ -987,6 +1019,32 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             sessionId,
             (hooks) => runtime.regenerateLastMessage!(sessionId, hooks),
             '重新生成失败',
+        );
+    }, [activeSession, isStreamingCurrent, runStreamingOperation, store]);
+
+    const handleContinueLastMessage = useCallback(async () => {
+        if (!activeSession || isStreamingCurrent) {
+            return;
+        }
+        const runtime = store.assistantRuntime;
+        if (!runtime) {
+            store.pushToast('助手运行时未连接，暂时无法继续生成', 'warning');
+            return;
+        }
+        if (!runtime.continueLastMessage) {
+            store.pushToast('当前运行时不支持继续生成', 'warning');
+            return;
+        }
+
+        setEditingMessageId(null);
+        setActiveActionsMessageId(null);
+        setOpenPopover(null);
+        const sessionId = activeSession.id;
+
+        await runStreamingOperation(
+            sessionId,
+            (hooks) => runtime.continueLastMessage!(sessionId, hooks),
+            '继续生成失败',
         );
     }, [activeSession, isStreamingCurrent, runStreamingOperation, store]);
 
@@ -1786,6 +1844,19 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                 isLastMessage
                                 && hasPriorOrSelfUser
                                 && !(showSyntheticStreamingBubble && !syntheticMessageAlreadyReflected);
+                            const canContinue =
+                                isLastMessage
+                                && msg.role === 'assistant'
+                                && msg.errorCode !== 'context_overflow'
+                                && !(showSyntheticStreamingBubble && !syntheticMessageAlreadyReflected)
+                                && Boolean(
+                                    msg.interrupted
+                                    || msg.canContinue
+                                    || activeSession?.interruptedCheckpoint?.messageId === msg.id
+                                    || (!msg.content.trim()
+                                        && (msg.toolCalls?.length ?? 0) > 0
+                                        && !(msg.approvalIds?.length)),
+                                );
 
                             return (
                                 <MessageBubble
@@ -1795,6 +1866,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                     isStreaming={isLastStreamingMsg}
                                     isLastMessage={isLastMessage}
                                     canRegenerate={canRegenerate}
+                                    canContinue={canContinue}
                                     isSessionStreaming={isStreamingCurrent}
                                     isCompacting={effectiveCompacting}
                                     isEditing={editingMessageId === msg.id}
@@ -1822,6 +1894,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                     onSaveAndResendEdit={handleSaveAndResendMessage}
                                     onRetract={handleRetractMessage}
                                     onRegenerate={handleRegenerateLastMessage}
+                                    onContinue={handleContinueLastMessage}
                                     onCompactAndRetryOverflow={handleCompactAndRetryOverflow}
                                     onCopy={handleCopyMessage}
                                 />

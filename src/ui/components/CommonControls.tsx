@@ -1,7 +1,7 @@
-import type { ComponentChildren, TargetedMouseEvent } from 'preact';
-import { useEffect } from 'preact/hooks';
+import { type ComponentChildren, Fragment, type TargetedMouseEvent } from 'preact';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import type { ToastItem, ToastTone } from '../store/app-store';
-import { IconAlertTriangle, IconCheck, IconClose, IconInfo } from './Icons';
+import { IconAlertTriangle, IconCheck, IconClose, IconInfo, IconMore } from './Icons';
 
 export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
 export type ButtonSize = 'sm' | 'md';
@@ -334,6 +334,7 @@ export function SegmentedControl<T extends string = string>({
                         type="button"
                         role="radio"
                         aria-checked={selected}
+                        data-value={opt.value}
                         disabled={opt.disabled}
                         title={opt.title}
                         class={
@@ -470,6 +471,114 @@ export function ShadowModal({
                 <div class="ag-modal-body ag-thin-scroll">{children}</div>
                 {footer ? <div class="ag-modal-footer">{footer}</div> : null}
             </div>
+        </div>
+    );
+}
+
+export interface DropdownMenuItem {
+    id: string;
+    label: string;
+    icon?: ComponentChildren;
+    danger?: boolean;
+    disabled?: boolean;
+    /** Render a separator line above this item. */
+    separatorBefore?: boolean;
+    onSelect: () => void;
+}
+
+export interface DropdownMenuProps {
+    items: readonly DropdownMenuItem[];
+    ariaLabel: string;
+    title?: string;
+    /** Optional trigger text; defaults to an icon-only `⋯` trigger. */
+    label?: ComponentChildren;
+    icon?: ComponentChildren;
+    variant?: ButtonVariant;
+    size?: ButtonSize;
+    align?: 'left' | 'right';
+    className?: string;
+}
+
+/**
+ * Lightweight overflow menu rendered inside the Shadow DOM (design spec §3.9).
+ * Closes on outside pointer, `Escape`, or item selection.
+ */
+export function DropdownMenu({
+    items,
+    ariaLabel,
+    title,
+    label,
+    icon,
+    variant = 'ghost',
+    size = 'sm',
+    align = 'right',
+    className,
+}: DropdownMenuProps) {
+    const [open, setOpen] = useState(false);
+    const wrapRef = useRef<HTMLDivElement | null>(null);
+
+    useEffect(() => {
+        if (!open) {
+            return;
+        }
+        const onPointerDown = (event: Event) => {
+            const wrap = wrapRef.current;
+            if (wrap && !event.composedPath().includes(wrap)) {
+                setOpen(false);
+            }
+        };
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                event.stopPropagation();
+                setOpen(false);
+            }
+        };
+        window.addEventListener('pointerdown', onPointerDown, true);
+        window.addEventListener('keydown', onKeyDown, true);
+        return () => {
+            window.removeEventListener('pointerdown', onPointerDown, true);
+            window.removeEventListener('keydown', onKeyDown, true);
+        };
+    }, [open]);
+
+    return (
+        <div ref={wrapRef} class={className ? `ag-menu ${className}` : 'ag-menu'}>
+            <Button
+                variant={variant}
+                size={size}
+                ariaLabel={ariaLabel}
+                title={title ?? ariaLabel}
+                active={open}
+                icon={icon ?? <IconMore size={16} />}
+                onClick={() => setOpen((prev) => !prev)}
+            >
+                {label}
+            </Button>
+            {open ? (
+                <div class="ag-menu-panel" role="menu" aria-label={ariaLabel} data-align={align}>
+                    {items.map((item) => (
+                        <Fragment key={item.id}>
+                            {item.separatorBefore ? (
+                                <div class="ag-menu-separator" role="separator" />
+                            ) : null}
+                            <button
+                                type="button"
+                                role="menuitem"
+                                class={item.danger ? 'ag-menu-item ag-menu-item-danger' : 'ag-menu-item'}
+                                disabled={item.disabled}
+                                onClick={() => {
+                                    setOpen(false);
+                                    item.onSelect();
+                                }}
+                            >
+                                {item.icon ? <span class="ag-menu-item-icon">{item.icon}</span> : null}
+                                <span>{item.label}</span>
+                            </button>
+                        </Fragment>
+                    ))}
+                </div>
+            ) : null}
         </div>
     );
 }

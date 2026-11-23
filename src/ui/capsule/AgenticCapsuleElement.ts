@@ -107,15 +107,15 @@ const CAPSULE_STYLES = `
 }
 
 .cap-shell {
-    --cap-bg: var(--ag-cap-bg, #181b22);
-    --cap-bg-hover: var(--ag-cap-bg-hover, #232834);
-    --cap-border: var(--ag-cap-border, #2f3542);
-    --cap-fg: var(--ag-cap-fg, #e6e9ef);
-    --cap-muted: var(--ag-cap-muted, #9aa3b2);
-    --cap-primary: var(--ag-cap-primary, #6c8cff);
-    --cap-success: var(--ag-cap-success, #34d399);
-    --cap-warning: var(--ag-cap-warning, #fbbf24);
-    --cap-error: var(--ag-cap-error, #f87171);
+    --cap-bg: var(--ag-cap-bg, #1f1f23);
+    --cap-bg-hover: var(--ag-cap-bg-hover, #28282d);
+    --cap-border: var(--ag-cap-border, #2a2a30);
+    --cap-fg: var(--ag-cap-fg, #ececf1);
+    --cap-muted: var(--ag-cap-muted, #a1a1ab);
+    --cap-primary: var(--ag-cap-primary, #7d7bf6);
+    --cap-success: var(--ag-cap-success, #4cc38a);
+    --cap-warning: var(--ag-cap-warning, #e8a93c);
+    --cap-error: var(--ag-cap-error, #f06470);
 
     display: flex;
     align-items: center;
@@ -130,7 +130,7 @@ const CAPSULE_STYLES = `
     border: 1px solid var(--cap-border);
     background: var(--cap-bg);
     color: var(--cap-fg);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
     font-size: 12px;
     line-height: 1.4;
     overflow: hidden;
@@ -138,15 +138,15 @@ const CAPSULE_STYLES = `
 }
 
 .cap-shell[data-theme="light"] {
-    --cap-bg: var(--ag-cap-bg, #f4f6fa);
-    --cap-bg-hover: var(--ag-cap-bg-hover, #e8edf5);
-    --cap-border: var(--ag-cap-border, #d5dce8);
-    --cap-fg: var(--ag-cap-fg, #181c24);
-    --cap-muted: var(--ag-cap-muted, #5f697a);
-    --cap-primary: var(--ag-cap-primary, #3b66f5);
-    --cap-success: var(--ag-cap-success, #10b981);
-    --cap-warning: var(--ag-cap-warning, #d97706);
-    --cap-error: var(--ag-cap-error, #dc2626);
+    --cap-bg: var(--ag-cap-bg, #f4f4f6);
+    --cap-bg-hover: var(--ag-cap-bg-hover, #ebebef);
+    --cap-border: var(--ag-cap-border, #e3e3e8);
+    --cap-fg: var(--ag-cap-fg, #1a1a1f);
+    --cap-muted: var(--ag-cap-muted, #62626d);
+    --cap-primary: var(--ag-cap-primary, #5753e0);
+    --cap-success: var(--ag-cap-success, #1a8a52);
+    --cap-warning: var(--ag-cap-warning, #b5650b);
+    --cap-error: var(--ag-cap-error, #d3344a);
     color-scheme: light;
 }
 

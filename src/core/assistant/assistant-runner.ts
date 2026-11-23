@@ -12,7 +12,12 @@ import {
     TransientToolSpillStore,
     type EffectiveContextBudget,
 } from '@/core/context';
-import { parseContextOverflowError } from '@/core/llm';
+import {
+    delayWithAbort,
+    isAbortError,
+    LLMTransportError,
+    parseContextOverflowError,
+} from '@/core/llm';
 import type { TraceLogger } from '@/core/logger';
 import { ChatDataStore, DATA_NAMESPACES, MESSAGE_OVERRIDE_KEY } from '@/core/store';
 import type { DynamicVariableSchema } from '@/core/tools';
@@ -22,9 +27,12 @@ import type {
     AssistantCompactOptions,
     AssistantCompactReport,
     AssistantCompactionNotice,
+    AssistantErrorCode,
+    AssistantInterruptedCheckpoint,
     AssistantMessage,
     AssistantMessageUsage,
     AssistantMode,
+    AssistantRetryStatus,
     AssistantSession,
     AssistantSessionTokenStatus,
     AssistantToolCallRecord,
@@ -87,6 +95,14 @@ import {
     type UndoRevertResult,
 } from './undo-store';
 
+export interface AssistantRetryOptions {
+    /** Maximum automatic retries per LLM round on transient/empty-response errors (default: 2). */
+    maxRetries?: number;
+    initialDelayMs?: number;
+    maxDelayMs?: number;
+    backoffFactor?: number;
+}
+
 export interface AssistantRunnerOptions {
     bridge: HostBridge;
     transport: LLMTransport;
@@ -107,6 +123,7 @@ export interface AssistantRunnerOptions {
     getStatusSnapshot?: () => Record<string, unknown>;
     extraTools?: readonly AssistantToolDefinition[];
     maxToolRounds?: number;
+    autoRetry?: AssistantRetryOptions | false;
     stream?: boolean;
     now?: () => number;
     idGenerator?: () => string;
@@ -117,6 +134,7 @@ export interface AssistantSendOptions {
     attachments?: AssistantAttachment[];
     onDelta?: (delta: string) => void;
     onReasoningDelta?: (delta: string) => void;
+    onRetry?: (status: AssistantRetryStatus) => void;
     onUpdate?: (session: AssistantSession) => void;
     signal?: AbortSignal;
     stream?: boolean;
@@ -140,8 +158,90 @@ interface TurnLLMOutput {
     finishReason?: string;
 }
 
-const DEFAULT_MAX_TOOL_ROUNDS = 12;
+const DEFAULT_MAX_TOOL_ROUNDS = 20;
 const DEFAULT_COMPACTION_SUMMARY_TIMEOUT_MS = 25_000;
+const DEFAULT_AUTO_RETRY_OPTIONS: Required<AssistantRetryOptions> = {
+    maxRetries: 2,
+    initialDelayMs: 1000,
+    maxDelayMs: 8000,
+    backoffFactor: 2,
+};
+
+const NETWORK_RETRYABLE_MESSAGE_RE =
+    /failed to fetch|network\s*error|load failed|connection reset|socket hang up|econnreset|econnrefused|etimedout|incomplete_chunked_encoding|premature close|body stream|stream read failed|sse.*(?:dropped|closed|error)|temporarily unavailable|service unavailable|bad gateway|gateway timeout|overloaded|rate[\s_-]?limit|too many requests|empty_response/i;
+
+function isLengthFinishReason(finishReason?: string): boolean {
+    return (
+        finishReason === 'length'
+        || finishReason === 'max_tokens'
+        || finishReason === 'MAX_TOKENS'
+    );
+}
+
+function isRetryableAssistantError(error: unknown): boolean {
+    if (isAssistantAbortError(error) || isAbortError(error)) {
+        return false;
+    }
+    if (parseContextOverflowError(error) !== null) {
+        return false;
+    }
+    if (error instanceof LLMTransportError) {
+        return error.retryable;
+    }
+    if (error && typeof error === 'object') {
+        const maybe = error as { retryable?: unknown; status?: unknown };
+        if (typeof maybe.retryable === 'boolean') {
+            return maybe.retryable;
+        }
+        if (typeof maybe.status === 'number') {
+            return (
+                maybe.status === 408
+                || maybe.status === 429
+                || (maybe.status >= 500 && maybe.status <= 599)
+            );
+        }
+    }
+    const msg = error instanceof Error ? error.message : String(error);
+    return NETWORK_RETRYABLE_MESSAGE_RE.test(msg);
+}
+
+function classifyAssistantErrorCode(error: unknown): AssistantErrorCode {
+    if (parseContextOverflowError(error) !== null) {
+        return 'context_overflow';
+    }
+    if (error instanceof LLMTransportError && error.code === 'EMPTY_RESPONSE') {
+        return 'empty_response';
+    }
+    if (isRetryableAssistantError(error)) {
+        return 'network';
+    }
+    return 'generic';
+}
+
+function stripTrailingErrorBanner(content: string): string {
+    const trimmedEnd = content.trimEnd();
+    if (trimmedEnd.startsWith('[Error] ')) {
+        return '';
+    }
+    const idx = trimmedEnd.lastIndexOf('\n\n[Error] ');
+    if (idx >= 0) {
+        return trimmedEnd.slice(0, idx);
+    }
+    return content;
+}
+
+function summarizeLegacyToolCalls(toolCalls: readonly AssistantToolCallRecord[]): string {
+    const lines = toolCalls.map((tc) => {
+        const statusLabel = tc.status === 'error' ? '失败' : '成功';
+        const args = tc.argsSummary ? ` args=${tc.argsSummary}` : '';
+        const res = tc.resultSummary ? ` -> ${tc.resultSummary}` : '';
+        return `- ${tc.name} [${statusLabel}]${args}${res}`;
+    });
+    return [
+        '[系统恢复提示：上一轮工具调用已完成如下操作，但回复在生成正文前中断，请基于这些已有结果直接继续完成回答（避免无意义重复查询）：]',
+        ...lines,
+    ].join('\n');
+}
 
 function canonicalContentToPlainText(content: CanonicalMessage['content']): string {
     if (typeof content === 'string') {
@@ -776,6 +876,7 @@ export class AssistantRunner {
     private readonly maxToolResultBytes?: number;
     private readonly compactionSummaryTimeoutMs: number;
     private readonly maxToolRounds: number;
+    private readonly autoRetryConfig: Required<AssistantRetryOptions> | false;
     private readonly defaultStream: boolean;
     private readonly now: () => number;
     private readonly idGenerator: () => string;
@@ -828,6 +929,29 @@ export class AssistantRunner {
         this.variableSchemaProvider = options.getVariableSchema;
         this.statusSnapshotProvider = options.getStatusSnapshot;
         this.maxToolRounds = Math.max(1, options.maxToolRounds ?? DEFAULT_MAX_TOOL_ROUNDS);
+        if (options.autoRetry === false) {
+            this.autoRetryConfig = false;
+        } else {
+            const initDelay = Math.max(
+                0,
+                Math.floor(options.autoRetry?.initialDelayMs ?? DEFAULT_AUTO_RETRY_OPTIONS.initialDelayMs),
+            );
+            this.autoRetryConfig = {
+                maxRetries: Math.max(
+                    0,
+                    Math.floor(options.autoRetry?.maxRetries ?? DEFAULT_AUTO_RETRY_OPTIONS.maxRetries),
+                ),
+                initialDelayMs: initDelay,
+                maxDelayMs: Math.max(
+                    initDelay,
+                    Math.floor(options.autoRetry?.maxDelayMs ?? DEFAULT_AUTO_RETRY_OPTIONS.maxDelayMs),
+                ),
+                backoffFactor: Math.max(
+                    1,
+                    options.autoRetry?.backoffFactor ?? DEFAULT_AUTO_RETRY_OPTIONS.backoffFactor,
+                ),
+            };
+        }
         this.defaultStream = options.stream ?? true;
         this.now = options.now ?? (() => Date.now());
         this.idGenerator =
@@ -1119,13 +1243,28 @@ export class AssistantRunner {
 
         this.abort(sessionId);
 
-        const updatedMsg = this.sessionStore.updateMessage(sessionId, messageId, (prev) => ({
-            ...prev,
-            content: newContent,
-            ...(prev.interrupted ? { interrupted: false } : {}),
-        }));
+        const updatedMsg = this.sessionStore.updateMessage(sessionId, messageId, (prev) => {
+            const next: AssistantMessage = {
+                ...prev,
+                content: newContent,
+            };
+            if (next.interrupted) {
+                next.interrupted = false;
+            }
+            if (next.canContinue) {
+                next.canContinue = false;
+            }
+            delete next.errorCode;
+            delete next.errorMessage;
+            delete next.retryStatus;
+            return next;
+        });
         if (!updatedMsg) {
             return null;
+        }
+        const existingCp = this.sessionStore.getInterruptedCheckpoint(sessionId);
+        if (existingCp && existingCp.messageId === messageId) {
+            this.sessionStore.setInterruptedCheckpoint(sessionId, undefined);
         }
 
         this.sessionStore.syncTrajectoryToMessages(sessionId);
@@ -1263,11 +1402,167 @@ export class AssistantRunner {
         );
     }
 
+    /**
+     * Continue an interrupted, truncated, or tool-round-capped trailing assistant response
+     * from its saved `AssistantInterruptedCheckpoint` (or legacy fallback when absent),
+     * preserving completed tool steps and continuing in-place on the same bubble.
+     */
+    public async continueLastMessage(
+        sessionId: string,
+        options: AssistantSendOptions = {},
+    ): Promise<AssistantMessage> {
+        const session = this.sessionStore.getSession(sessionId);
+        if (!session) {
+            throw new Error(`Assistant session not found: "${sessionId}".`);
+        }
+        if (session.messages.length === 0) {
+            throw new Error('No message available to continue.');
+        }
+
+        this.abort(sessionId);
+
+        const lastMsg = session.messages[session.messages.length - 1];
+
+        // Case C: Trailing message is a user prompt (e.g. response never started).
+        if (lastMsg.role === 'user') {
+            return await this.executeAssistantTurn(
+                sessionId,
+                lastMsg.content,
+                {
+                    ...options,
+                    attachments: options.attachments ?? lastMsg.attachments,
+                },
+                {
+                    appendUserMessage: false,
+                },
+            );
+        }
+
+        const initialUsage = lastMsg.usage
+            ? normalizeUsage({
+                  inputTokens: lastMsg.usage.inputTokens,
+                  cachedTokens: lastMsg.usage.cachedTokens,
+                  outputTokens: lastMsg.usage.outputTokens,
+              })
+            : normalizeUsage();
+
+        // Case A: Exact resumable checkpoint matching the trailing assistant bubble.
+        const cp = session.interruptedCheckpoint;
+        if (cp && cp.messageId === lastMsg.id) {
+            const resumedInFlight = canonicalClone(cp.inFlightMessages);
+            let bubbleBaseContent = cp.bubbleBaseContent ?? '';
+            const partial = cp.partialContent ?? '';
+
+            if (partial.trim().length > 0) {
+                resumedInFlight.push(
+                    {
+                        role: 'assistant',
+                        content: partial,
+                        ...(cp.partialThink?.trim() ? { reasoningContent: cp.partialThink } : {}),
+                    },
+                    {
+                        role: 'user',
+                        content: '请从上面中断的位置直接接着继续输出，不要重复已经输出的内容。',
+                    },
+                );
+                bubbleBaseContent = `${bubbleBaseContent}${partial}`;
+            }
+
+            return await this.executeAssistantTurn(sessionId, '', options, {
+                appendUserMessage: false,
+                resumeState: {
+                    existingAssistantMessage: lastMsg,
+                    inFlightMessages: resumedInFlight,
+                    bubbleBaseContent,
+                    initialContentBuffer: bubbleBaseContent,
+                    initialThinkBuffer: lastMsg.think ?? '',
+                    initialUsage,
+                    initialRoundsCompleted: cp.roundsCompleted,
+                    target: cp.target,
+                },
+            });
+        }
+
+        // Case B: Legacy fallback (e.g. older persisted session without interruptedCheckpoint).
+        let lastUserIdx = -1;
+        for (let i = session.messages.length - 1; i >= 0; i -= 1) {
+            if (session.messages[i].role === 'user') {
+                lastUserIdx = i;
+                break;
+            }
+        }
+        if (lastUserIdx < 0) {
+            throw new Error('No user message available to continue.');
+        }
+
+        const targetUserMsg = session.messages[lastUserIdx];
+        this.sessionStore.syncTrajectoryToMessages(sessionId, { upToMessageIndex: lastUserIdx });
+        this.emitSessionUpdate(sessionId, options.onUpdate);
+
+        const cleanContent = stripTrailingErrorBanner(lastMsg.content);
+        const resumedInFlight: CanonicalMessage[] = [
+            {
+                role: 'user',
+                content: buildAssistantUserContent(targetUserMsg.content, targetUserMsg.attachments),
+            },
+        ];
+        let bubbleBaseContent = '';
+        const hasTools = Boolean(lastMsg.toolCalls && lastMsg.toolCalls.length > 0);
+
+        if (cleanContent.trim().length > 0) {
+            const continuePrompt = hasTools
+                ? `${summarizeLegacyToolCalls(lastMsg.toolCalls!)}\n\n请从上面中断的位置直接接着继续输出，不要重复已经输出的内容。`
+                : '请从上面中断的位置直接接着继续输出，不要重复已经输出的内容。';
+            resumedInFlight.push(
+                {
+                    role: 'assistant',
+                    content: cleanContent,
+                    ...(lastMsg.think?.trim() ? { reasoningContent: lastMsg.think } : {}),
+                },
+                {
+                    role: 'user',
+                    content: continuePrompt,
+                },
+            );
+            bubbleBaseContent = cleanContent;
+        } else if (hasTools) {
+            resumedInFlight.push({
+                role: 'user',
+                content: summarizeLegacyToolCalls(lastMsg.toolCalls!),
+            });
+        }
+
+        return await this.executeAssistantTurn(sessionId, targetUserMsg.content, options, {
+            appendUserMessage: false,
+            resumeState: {
+                existingAssistantMessage: lastMsg,
+                inFlightMessages: resumedInFlight,
+                bubbleBaseContent,
+                initialContentBuffer: bubbleBaseContent,
+                initialThinkBuffer: lastMsg.think ?? '',
+                initialUsage,
+                initialRoundsCompleted: 0,
+            },
+        });
+    }
+
     private async executeAssistantTurn(
         sessionId: string,
         prompt: string,
         options: AssistantSendOptions,
-        config: { appendUserMessage: boolean },
+        config: {
+            appendUserMessage: boolean;
+            resumeState?: {
+                existingAssistantMessage: AssistantMessage;
+                inFlightMessages: CanonicalMessage[];
+                bubbleBaseContent: string;
+                initialContentBuffer: string;
+                initialThinkBuffer: string;
+                initialUsage: TokenUsage;
+                initialRoundsCompleted?: number;
+                target?: MessageTarget;
+            };
+        },
     ): Promise<AssistantMessage> {
         const session = this.sessionStore.getSession(sessionId);
         if (!session) {
@@ -1281,7 +1576,12 @@ export class AssistantRunner {
 
         const cleanupExternalSignal = this.linkExternalSignal(controller, options.signal);
 
-        const target = options.target ?? this.resolveActiveTarget();
+        const resume = config.resumeState;
+        if (!resume) {
+            this.sessionStore.setInterruptedCheckpoint(sessionId, undefined);
+        }
+
+        const target = resume?.target ?? options.target ?? this.resolveActiveTarget();
         const attachments =
             options.attachments && options.attachments.length > 0
                 ? canonicalClone(options.attachments)
@@ -1298,29 +1598,67 @@ export class AssistantRunner {
             this.sessionStore.appendMessage(sessionId, userMessage);
         }
 
-        const assistantMessageId = this.idGenerator();
-        let assistantMessage: AssistantMessage = {
-            id: assistantMessageId,
-            role: 'assistant',
-            content: '',
-            timestamp: this.now(),
-        };
-        this.sessionStore.appendMessage(sessionId, assistantMessage);
+        let assistantMessage: AssistantMessage;
+        let assistantMessageId: string;
+        if (resume) {
+            assistantMessageId = resume.existingAssistantMessage.id;
+            const restoredBase = canonicalClone(resume.existingAssistantMessage);
+            delete restoredBase.interrupted;
+            delete restoredBase.errorCode;
+            delete restoredBase.errorMessage;
+            delete restoredBase.canContinue;
+            delete restoredBase.retryStatus;
+            assistantMessage = {
+                ...restoredBase,
+                content: resume.initialContentBuffer,
+                ...(resume.initialThinkBuffer ? { think: resume.initialThinkBuffer } : {}),
+            };
+            if (!resume.initialThinkBuffer) {
+                delete assistantMessage.think;
+            }
+            this.sessionStore.setInterruptedCheckpoint(sessionId, undefined);
+            this.sessionStore.updateMessage(sessionId, assistantMessageId, () => assistantMessage);
+        } else {
+            assistantMessageId = this.idGenerator();
+            assistantMessage = {
+                id: assistantMessageId,
+                role: 'assistant',
+                content: '',
+                timestamp: this.now(),
+            };
+            this.sessionStore.appendMessage(sessionId, assistantMessage);
+        }
         this.emitSessionUpdate(sessionId, options.onUpdate);
 
-        const inFlightMessages: CanonicalMessage[] = [
-            {
-                role: 'user',
-                content: buildAssistantUserContent(prompt, attachments),
-            },
-        ];
-        const toolCallRecords: AssistantToolCallRecord[] = [];
-        const approvalIds: string[] = [];
-        const fileRefs = new Set<string>();
-        let cumulativeUsage: TokenUsage = normalizeUsage();
-        let thinkBuffer = '';
-        let contentBuffer = '';
-        let turnCompactionNotice: AssistantCompactionNotice | undefined;
+        const inFlightMessages: CanonicalMessage[] = resume
+            ? canonicalClone(resume.inFlightMessages)
+            : [
+                  {
+                      role: 'user',
+                      content: buildAssistantUserContent(prompt, attachments),
+                  },
+              ];
+        const toolCallRecords: AssistantToolCallRecord[] = resume?.existingAssistantMessage.toolCalls
+            ? canonicalClone(resume.existingAssistantMessage.toolCalls)
+            : [];
+        const approvalIds: string[] = resume?.existingAssistantMessage.approvalIds
+            ? [...resume.existingAssistantMessage.approvalIds]
+            : [];
+        const fileRefs = new Set<string>(resume?.existingAssistantMessage.fileRefs ?? []);
+        let cumulativeUsage: TokenUsage = resume
+            ? normalizeUsage(resume.initialUsage)
+            : normalizeUsage();
+        let thinkBuffer = resume?.initialThinkBuffer ?? '';
+        let contentBuffer = resume?.initialContentBuffer ?? '';
+        let committedContentPrefixLen = resume ? resume.bubbleBaseContent.length : 0;
+        const priorRoundsCompleted = resume?.initialRoundsCompleted ?? 0;
+        let rounds = 0;
+        let turnCompactionNotice: AssistantCompactionNotice | undefined =
+            resume?.existingAssistantMessage.compactionNotice
+                ? canonicalClone(resume.existingAssistantMessage.compactionNotice)
+                : undefined;
+        let activeRetryStatus: AssistantRetryStatus | undefined;
+        let currentRoundThinkBuffer = '';
 
         const syncAssistantBubble = (patch?: Partial<AssistantMessage>): void => {
             const nextMessage: AssistantMessage = {
@@ -1334,14 +1672,53 @@ export class AssistantRunner {
                     ? { usage: toAssistantMessageUsage(cumulativeUsage) }
                     : {}),
                 ...(turnCompactionNotice ? { compactionNotice: canonicalClone(turnCompactionNotice) } : {}),
+                ...(activeRetryStatus ? { retryStatus: canonicalClone(activeRetryStatus) } : {}),
                 ...(patch ?? {}),
             };
             if (!thinkBuffer && 'think' in nextMessage && !(patch && 'think' in patch)) {
                 delete nextMessage.think;
             }
+            if (!activeRetryStatus && !(patch && patch.retryStatus)) {
+                delete nextMessage.retryStatus;
+            }
+            if (patch) {
+                for (const key of [
+                    'interrupted',
+                    'canContinue',
+                    'retryStatus',
+                    'errorCode',
+                    'errorMessage',
+                ] as const) {
+                    if (key in patch && patch[key] === undefined) {
+                        delete nextMessage[key];
+                    }
+                }
+            }
             assistantMessage = nextMessage;
             this.sessionStore.updateMessage(sessionId, assistantMessageId, () => assistantMessage);
             this.emitSessionUpdate(sessionId, options.onUpdate);
+        };
+
+        const saveCheckpoint = (
+            reason: AssistantInterruptedCheckpoint['reason'],
+            extra?: { errorMessage?: string },
+        ): void => {
+            const bubbleBaseContent = contentBuffer.slice(0, committedContentPrefixLen);
+            const partialContent = contentBuffer.slice(committedContentPrefixLen);
+            this.sessionStore.setInterruptedCheckpoint(sessionId, {
+                messageId: assistantMessageId,
+                reason,
+                ...(extra?.errorMessage ? { errorMessage: extra.errorMessage } : {}),
+                inFlightMessages: canonicalClone(inFlightMessages),
+                ...(bubbleBaseContent ? { bubbleBaseContent } : {}),
+                ...(partialContent ? { partialContent } : {}),
+                ...(currentRoundThinkBuffer.trim()
+                    ? { partialThink: currentRoundThinkBuffer }
+                    : {}),
+                target: canonicalClone(target),
+                roundsCompleted: priorRoundsCompleted + rounds,
+                createdAt: this.now(),
+            });
         };
 
         try {
@@ -1374,7 +1751,6 @@ export class AssistantRunner {
                     },
                 );
 
-            let rounds = 0;
             let overflowRecoveryAttempted = false;
 
             while (rounds < this.maxToolRounds) {
@@ -1442,12 +1818,16 @@ export class AssistantRunner {
                     }
                 }
 
-                // Invoke LLM with single-shot Context Overflow Auto-Recovery (§3.3).
+                // Invoke LLM with Context Overflow Auto-Recovery (§3.3) + Transient Auto-Retry.
                 const roundStartContentBuffer = contentBuffer;
                 const roundStartThinkBuffer = thinkBuffer;
                 let turnOutput!: TurnLLMOutput;
+                let transientRetriesUsed = 0;
 
-                for (let attempt = 0; attempt < 2; attempt += 1) {
+                // eslint-disable-next-line no-constant-condition
+                while (true) {
+                    throwIfAssistantAborted(controller.signal);
+
                     const request: LLMRequest = {
                         connectionId: connection.id,
                         connection,
@@ -1458,6 +1838,8 @@ export class AssistantRunner {
                         signal: controller.signal,
                     };
 
+                    let roundStreamThinkBuffer = '';
+
                     try {
                         turnOutput = await this.invokeLLM(request, useStream, {
                             onTextDelta: (delta) => {
@@ -1466,74 +1848,168 @@ export class AssistantRunner {
                                 syncAssistantBubble();
                             },
                             onReasoningDelta: (delta) => {
+                                roundStreamThinkBuffer += delta;
                                 thinkBuffer += delta;
                                 options.onReasoningDelta?.(delta);
                                 syncAssistantBubble();
                             },
                         });
+
+                        if (
+                            turnOutput.toolCalls.length === 0
+                            && !turnOutput.content.trim()
+                            && !isLengthFinishReason(turnOutput.finishReason)
+                        ) {
+                            throw new LLMTransportError(
+                                '模型返回了空响应（可能是网络波动或流式连接提前断开）',
+                                { retryable: true, code: 'EMPTY_RESPONSE' },
+                            );
+                        }
+
+                        if (activeRetryStatus) {
+                            activeRetryStatus = undefined;
+                            syncAssistantBubble({ retryStatus: undefined });
+                        }
+                        if (!useStream && turnOutput.reasoningContent) {
+                            roundStreamThinkBuffer = turnOutput.reasoningContent;
+                        }
+                        currentRoundThinkBuffer =
+                            turnOutput.reasoningContent || roundStreamThinkBuffer;
                         break;
                     } catch (llmError) {
+                        if (
+                            isAssistantAbortError(llmError)
+                            || isAbortError(llmError)
+                            || controller.signal.aborted
+                        ) {
+                            throw llmError;
+                        }
+
                         const overflow = parseContextOverflowError(llmError);
-                        if (!overflow) {
-                            throw llmError;
+                        if (overflow) {
+                            if (overflowRecoveryAttempted) {
+                                throw llmError;
+                            }
+                            overflowRecoveryAttempted = true;
+
+                            const effectiveLimit = overflow.limitTokens ?? budget.safeInputBudget;
+                            const emergencyTargetLow = Math.max(
+                                256,
+                                Math.floor(effectiveLimit * 0.4),
+                            );
+                            const tokensBeforeRecovery =
+                                overflow.actualTokens ?? assembled.estimatedTokens;
+
+                            // Emergency compaction MUST disable LLM summary (useLLMSummary: false)
+                            // to prevent recursive 400 deadlocks against the overflowed connection.
+                            const recoveryReport = await this.sessionStore.compactSession(
+                                sessionId,
+                                {
+                                    mode: 'full',
+                                    reason: 'overflow_recovery',
+                                    force: true,
+                                    useLLMSummary: false,
+                                    targetLowTokens: emergencyTargetLow,
+                                    archiveWriter,
+                                    signal: controller.signal,
+                                    attachNotice: false,
+                                },
+                            );
+
+                            // Crop oversized role==='tool' contents in-place, preserving toolCallId pairing.
+                            const croppedInFlight = cropInFlightToolMessagesForOverflow(
+                                inFlightMessages,
+                                { limitTokens: effectiveLimit },
+                            );
+
+                            // Reset partial streaming buffers from the failed overflow attempt.
+                            contentBuffer = roundStartContentBuffer;
+                            thinkBuffer = roundStartThinkBuffer;
+                            currentRoundThinkBuffer = '';
+
+                            if (!recoveryReport.compacted && croppedInFlight === 0) {
+                                // Overflow cannot be relieved by compaction or tool cropping.
+                                throw llmError;
+                            }
+
+                            assembled = assembleCurrentRequest();
+                            turnCompactionNotice = {
+                                tokensBefore: tokensBeforeRecovery,
+                                tokensAfter: assembled.estimatedTokens,
+                                foldedToolResults:
+                                    recoveryReport.foldedToolResults + croppedInFlight,
+                                archivedTurns: recoveryReport.archivedTurns,
+                                summaryMode:
+                                    recoveryReport.summaryMode === 'none'
+                                        ? 'fold_only'
+                                        : recoveryReport.summaryMode,
+                                ...(recoveryReport.summaryText
+                                    ? { summaryText: recoveryReport.summaryText }
+                                    : {}),
+                                ...(recoveryReport.archivedChunkPath
+                                    ? { archivedChunkPath: recoveryReport.archivedChunkPath }
+                                    : {}),
+                                timestamp: this.now(),
+                            };
+                            syncAssistantBubble();
+                            continue;
                         }
-                        if (overflowRecoveryAttempted) {
-                            throw llmError;
+
+                        if (
+                            this.autoRetryConfig !== false
+                            && transientRetriesUsed < this.autoRetryConfig.maxRetries
+                            && isRetryableAssistantError(llmError)
+                        ) {
+                            transientRetriesUsed += 1;
+                            contentBuffer = roundStartContentBuffer;
+                            thinkBuffer = roundStartThinkBuffer;
+                            currentRoundThinkBuffer = '';
+
+                            const retryAfterMs =
+                                llmError instanceof LLMTransportError
+                                && typeof llmError.retryAfterMs === 'number'
+                                && Number.isFinite(llmError.retryAfterMs)
+                                    ? llmError.retryAfterMs
+                                    : 0;
+                            const expDelay = Math.round(
+                                this.autoRetryConfig.initialDelayMs
+                                * Math.pow(
+                                    this.autoRetryConfig.backoffFactor,
+                                    transientRetriesUsed - 1,
+                                ),
+                            );
+                            const delayMs = Math.min(
+                                this.autoRetryConfig.maxDelayMs,
+                                Math.max(retryAfterMs, expDelay),
+                            );
+
+                            const rawReason =
+                                llmError instanceof Error ? llmError.message : String(llmError);
+                            const reason = truncateSummary(redactWithReport(rawReason).value, 120);
+                            activeRetryStatus = {
+                                attempt: transientRetriesUsed,
+                                maxAttempts: this.autoRetryConfig.maxRetries,
+                                reason,
+                                delayMs,
+                            };
+                            try {
+                                options.onRetry?.(canonicalClone(activeRetryStatus));
+                            } catch {
+                                // Keep retry loop resilient to callback errors.
+                            }
+                            syncAssistantBubble({ retryStatus: activeRetryStatus });
+
+                            if (delayMs > 0) {
+                                await delayWithAbort(delayMs, controller.signal);
+                            }
+                            throwIfAssistantAborted(controller.signal);
+
+                            activeRetryStatus = undefined;
+                            syncAssistantBubble({ retryStatus: undefined });
+                            continue;
                         }
-                        overflowRecoveryAttempted = true;
 
-                        const effectiveLimit = overflow.limitTokens ?? budget.safeInputBudget;
-                        const emergencyTargetLow = Math.max(256, Math.floor(effectiveLimit * 0.4));
-                        const tokensBeforeRecovery =
-                            overflow.actualTokens ?? assembled.estimatedTokens;
-
-                        // Emergency compaction MUST disable LLM summary (useLLMSummary: false)
-                        // to prevent recursive 400 deadlocks against the overflowed connection.
-                        const recoveryReport = await this.sessionStore.compactSession(sessionId, {
-                            mode: 'full',
-                            reason: 'overflow_recovery',
-                            force: true,
-                            useLLMSummary: false,
-                            targetLowTokens: emergencyTargetLow,
-                            archiveWriter,
-                            signal: controller.signal,
-                            attachNotice: false,
-                        });
-
-                        // Crop oversized role==='tool' contents in-place, preserving toolCallId pairing.
-                        const croppedInFlight = cropInFlightToolMessagesForOverflow(
-                            inFlightMessages,
-                            { limitTokens: effectiveLimit },
-                        );
-
-                        // Reset partial streaming buffers from the failed overflow attempt.
-                        contentBuffer = roundStartContentBuffer;
-                        thinkBuffer = roundStartThinkBuffer;
-
-                        if (!recoveryReport.compacted && croppedInFlight === 0) {
-                            // Overflow cannot be relieved by compaction or tool cropping.
-                            throw llmError;
-                        }
-
-                        assembled = assembleCurrentRequest();
-                        turnCompactionNotice = {
-                            tokensBefore: tokensBeforeRecovery,
-                            tokensAfter: assembled.estimatedTokens,
-                            foldedToolResults: recoveryReport.foldedToolResults + croppedInFlight,
-                            archivedTurns: recoveryReport.archivedTurns,
-                            summaryMode:
-                                recoveryReport.summaryMode === 'none'
-                                    ? 'fold_only'
-                                    : recoveryReport.summaryMode,
-                            ...(recoveryReport.summaryText
-                                ? { summaryText: recoveryReport.summaryText }
-                                : {}),
-                            ...(recoveryReport.archivedChunkPath
-                                ? { archivedChunkPath: recoveryReport.archivedChunkPath }
-                                : {}),
-                            timestamp: this.now(),
-                        };
-                        syncAssistantBubble();
+                        throw llmError;
                     }
                 }
 
@@ -1549,21 +2025,46 @@ export class AssistantRunner {
 
                 cumulativeUsage = addTokenUsage(cumulativeUsage, turnOutput.usage);
                 if (!useStream) {
-                    if (turnOutput.content) {
+                    if (turnOutput.content && !(isLengthFinishReason(turnOutput.finishReason) && turnOutput.toolCalls.length > 0)) {
                         contentBuffer += turnOutput.content;
                         options.onDelta?.(turnOutput.content);
                     }
-                    if (turnOutput.reasoningContent) {
+                    if (turnOutput.reasoningContent && !(isLengthFinishReason(turnOutput.finishReason) && turnOutput.toolCalls.length > 0)) {
                         thinkBuffer += turnOutput.reasoningContent;
                         options.onReasoningDelta?.(turnOutput.reasoningContent);
                     }
                 }
 
+                // Protect against max_tokens truncation (both partial text and truncated tool JSON).
+                if (isLengthFinishReason(turnOutput.finishReason)) {
+                    if (turnOutput.toolCalls.length > 0) {
+                        contentBuffer = roundStartContentBuffer;
+                        thinkBuffer = roundStartThinkBuffer;
+                        currentRoundThinkBuffer = '';
+                    }
+                    const lengthMsg =
+                        turnOutput.toolCalls.length > 0
+                            ? '模型输出达到长度上限，工具参数可能已截断，请点击继续生成。'
+                            : '模型输出达到长度上限已截断，请点击继续生成。';
+                    saveCheckpoint('length', { errorMessage: lengthMsg });
+                    activeRetryStatus = undefined;
+                    syncAssistantBubble({
+                        interrupted: true,
+                        errorCode: 'length',
+                        errorMessage: lengthMsg,
+                        canContinue: true,
+                        retryStatus: undefined,
+                    });
+                    return canonicalClone(assistantMessage);
+                }
+
                 // Final text-only turn: commit to TrajectoryStore & run adaptive watermark check.
                 if (turnOutput.toolCalls.length === 0) {
+                    const finalContentForTrajectory =
+                        committedContentPrefixLen === 0 ? contentBuffer : turnOutput.content;
                     const finalCanonicalAssistant: CanonicalMessage = {
                         role: 'assistant',
-                        content: turnOutput.content,
+                        content: finalContentForTrajectory,
                         ...(turnOutput.reasoningContent
                             ? { reasoningContent: turnOutput.reasoningContent }
                             : {}),
@@ -1572,6 +2073,7 @@ export class AssistantRunner {
                         ...inFlightMessages,
                         finalCanonicalAssistant,
                     ]);
+                    this.sessionStore.setInterruptedCheckpoint(sessionId, undefined);
                     const autoReport = await this.sessionStore.compactSession(sessionId, {
                         mode: 'auto',
                         reason: 'auto_watermark',
@@ -1607,11 +2109,18 @@ export class AssistantRunner {
                             timestamp: autoReport.timestamp,
                         };
                     }
-                    syncAssistantBubble();
+                    activeRetryStatus = undefined;
+                    syncAssistantBubble({
+                        interrupted: undefined,
+                        errorCode: undefined,
+                        errorMessage: undefined,
+                        canContinue: undefined,
+                        retryStatus: undefined,
+                    });
                     return canonicalClone(assistantMessage);
                 }
 
-                // Tool-calling round
+                // Tool-calling round: execute tools, committing paired assistant(toolCalls)+tool results atomically.
                 const assistantToolMessage: CanonicalMessage = {
                     role: 'assistant',
                     content: turnOutput.content,
@@ -1620,7 +2129,7 @@ export class AssistantRunner {
                         : {}),
                     toolCalls: canonicalClone(turnOutput.toolCalls),
                 };
-                inFlightMessages.push(assistantToolMessage);
+                const roundExecutedTools: CanonicalMessage[] = [];
 
                 const liveSession = this.sessionStore.getSession(sessionId) ?? currentSession;
                 let suspendedThisRound = false;
@@ -1659,7 +2168,7 @@ export class AssistantRunner {
                                 policy.reason ?? `Denied tool "${toolCall.name}"`,
                             ),
                         });
-                        inFlightMessages.push({
+                        roundExecutedTools.push({
                             role: 'tool',
                             toolCallId: toolCall.id,
                             toolName: toolCall.name,
@@ -1681,7 +2190,7 @@ export class AssistantRunner {
                             argsSummary: redactedArgsSummary,
                             resultSummary: missingMsg,
                         });
-                        inFlightMessages.push({
+                        roundExecutedTools.push({
                             role: 'tool',
                             toolCallId: toolCall.id,
                             toolName: toolCall.name,
@@ -1719,7 +2228,7 @@ export class AssistantRunner {
                                 resultSummary: truncateSummary(errResult.error ?? errResult.output),
                                 ...(errResult.hasSecretRedaction ? { hasSecretRedaction: true } : {}),
                             });
-                            inFlightMessages.push({
+                            roundExecutedTools.push({
                                 role: 'tool',
                                 toolCallId: toolCall.id,
                                 toolName: toolCall.name,
@@ -1758,7 +2267,11 @@ export class AssistantRunner {
                             toolCall: canonicalClone(toolCall),
                             policy,
                             target,
-                            inFlightMessages: canonicalClone(inFlightMessages),
+                            inFlightMessages: canonicalClone([
+                                ...inFlightMessages,
+                                assistantToolMessage,
+                                ...roundExecutedTools,
+                            ]),
                         });
                         suspendedThisRound = true;
                         syncAssistantBubble();
@@ -1789,7 +2302,7 @@ export class AssistantRunner {
                         ...(execResult.undoId ? { undoId: execResult.undoId } : {}),
                     });
 
-                    inFlightMessages.push({
+                    roundExecutedTools.push({
                         role: 'tool',
                         toolCallId: toolCall.id,
                         toolName: toolCall.name,
@@ -1798,6 +2311,10 @@ export class AssistantRunner {
                     syncAssistantBubble();
                 }
 
+                inFlightMessages.push(assistantToolMessage, ...roundExecutedTools);
+                committedContentPrefixLen = contentBuffer.length;
+                currentRoundThinkBuffer = '';
+
                 // Suspend turn cleanly so the inline bubble approval UI renders without blocking.
                 if (suspendedThisRound) {
                     syncAssistantBubble();
@@ -1805,26 +2322,53 @@ export class AssistantRunner {
                 }
             }
 
-            // Reached maxToolRounds: finalize whatever was streamed so far.
-            syncAssistantBubble();
+            // Reached maxToolRounds: save checkpoint and mark interrupted so user can continue.
+            const maxRoundsMsg = `已达到单轮最大工具调用次数上限（${this.maxToolRounds} 轮），可点击继续接着执行。`;
+            saveCheckpoint('max_tool_rounds', { errorMessage: maxRoundsMsg });
+            activeRetryStatus = undefined;
+            syncAssistantBubble({
+                interrupted: true,
+                errorCode: 'max_tool_rounds',
+                errorMessage: maxRoundsMsg,
+                canContinue: true,
+                retryStatus: undefined,
+            });
             return canonicalClone(assistantMessage);
         } catch (error) {
-            if (isAssistantAbortError(error) || controller.signal.aborted) {
-                syncAssistantBubble({ interrupted: true });
+            activeRetryStatus = undefined;
+            if (
+                isAssistantAbortError(error)
+                || isAbortError(error)
+                || controller.signal.aborted
+            ) {
+                saveCheckpoint('user_stop');
+                syncAssistantBubble({
+                    interrupted: true,
+                    errorCode: 'user_stop',
+                    canContinue: true,
+                    retryStatus: undefined,
+                });
                 return canonicalClone(assistantMessage);
             }
-            const isOverflow = parseContextOverflowError(error) !== null;
-            const errorCode: AssistantMessage['errorCode'] = isOverflow
-                ? 'context_overflow'
-                : 'generic';
-            const redactedErr = redactWithReport(
-                error instanceof Error ? error.message : String(error),
-            ).value;
+            const errorCode = classifyAssistantErrorCode(error);
+            const isOverflow = errorCode === 'context_overflow';
+            const redactedErr = String(
+                redactWithReport(error instanceof Error ? error.message : String(error)).value,
+            );
+            if (!isOverflow) {
+                saveCheckpoint(errorCode, { errorMessage: redactedErr });
+            }
             contentBuffer = contentBuffer
-                ? `${contentBuffer}\n\n[Error] ${String(redactedErr)}`
-                : `[Error] ${String(redactedErr)}`;
-            syncAssistantBubble({ interrupted: true, errorCode });
-            throw new Error(String(redactedErr));
+                ? `${contentBuffer}\n\n[Error] ${redactedErr}`
+                : `[Error] ${redactedErr}`;
+            syncAssistantBubble({
+                interrupted: true,
+                errorCode,
+                errorMessage: redactedErr,
+                canContinue: !isOverflow,
+                retryStatus: undefined,
+            });
+            throw new Error(redactedErr);
         } finally {
             cleanupExternalSignal();
             if (this.activeControllers.get(sessionId) === controller) {
