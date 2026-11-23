@@ -2,12 +2,14 @@ import { render } from 'preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { page, userEvent } from 'vitest/browser';
 import type { ConsoleTabId } from '@/core/types';
+import { registerAssistantView } from '@/ui/assistant';
 import {
     type AgenticCapsuleElement,
     registerAgenticCapsuleElement,
 } from '@/ui/capsule';
 import { registerSessionViews } from '@/ui/session';
 import { AgenticAppShell } from '@/ui/shell';
+import { registerSideGenView } from '@/ui/sidegen';
 import {
     AppStore,
     AppStoreProvider,
@@ -19,6 +21,8 @@ import {
 import { registerStudioViews } from '@/ui/studio';
 
 const ALL_CONSOLE_TABS: readonly ConsoleTabId[] = [
+    'assistant',
+    'sidegen',
     'files',
     'logs',
     'cache',
@@ -92,6 +96,8 @@ function getShellElements(): {
 
 function createHarness(options: { initialTab?: ConsoleTabId; initialOpen?: boolean } = {}): MountedHarness {
     registerAgenticCapsuleElement();
+    const unregisterAssistant = registerAssistantView();
+    const unregisterSideGen = registerSideGenView();
     const unregisterSession = registerSessionViews();
     const unregisterStudio = registerStudioViews();
 
@@ -142,6 +148,8 @@ function createHarness(options: { initialTab?: ConsoleTabId; initialOpen?: boole
             capsule.remove();
             render(null, shellContainer);
             shellContainer.remove();
+            unregisterAssistant();
+            unregisterSideGen();
             unregisterSession();
             unregisterStudio();
             store.dispose();
@@ -498,7 +506,7 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
         }
     });
 
-    it('satisfies desktop (1280x800) layout, overflow, >=40x40px targets, and >=16px inputs across all 9 views', async () => {
+    it('satisfies desktop (1280x800) layout, overflow, >=40x40px targets, and >=16px inputs across all 11 views', async () => {
         await page.viewport(1280, 800);
         activeHarness = createHarness({ initialTab: 'files', initialOpen: true });
         await settleLayout(5);
@@ -541,7 +549,7 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
         }
     });
 
-    it('satisfies mobile (390x844) single-column push-stack navigation, backdrop-filter: none, zero overflow, >=40x40px targets, and >=16px inputs across all 9 views', async () => {
+    it('satisfies mobile (390x844) single-column push-stack navigation, backdrop-filter: none, zero overflow, >=40x40px targets, and >=16px inputs across all 11 views', async () => {
         await page.viewport(390, 844);
         activeHarness = createHarness({ initialTab: 'files', initialOpen: true });
         await settleLayout(5);
