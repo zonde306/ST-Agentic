@@ -1,5 +1,6 @@
 import { createContext, createElement, type ComponentChildren } from 'preact';
 import { useContext, useEffect, useRef, useState } from 'preact/hooks';
+import type { ToolSideGenApi } from '@/core/bridge';
 import {
     createDefaultSettings,
     normalizeSettings,
@@ -9,6 +10,9 @@ import {
 import type {
     AgentRunTrace,
     ApiConnection,
+    AssistantMessage,
+    AssistantMode,
+    AssistantSession,
     BackgroundTaskStatus,
     ClassifiedLoreEntry,
     CompactionReport,
@@ -18,10 +22,14 @@ import type {
     GenerationEventPayload,
     MessageTarget,
     MigrationReport,
+    PendingApproval,
     Preset,
     RunMode,
     Settings,
+    SideClueDoc,
+    SideSessionInfo,
     ThemeMode,
+    UndoRecord,
     WICategory,
 } from '@/core/types';
 import {
@@ -33,6 +41,8 @@ import {
 
 export type ResolvedTheme = 'dark' | 'light';
 export type ToastTone = 'primary' | 'success' | 'warning' | 'error';
+export type MobileViewStack = 'list' | 'detail';
+export type SideGenSubTab = 'clues' | 'sessions' | 'sdk';
 
 export interface DeepLinkState {
     messageId?: number;
@@ -40,7 +50,64 @@ export interface DeepLinkState {
     swipeId?: number;
     logId?: string;
     viewMode?: 'edit' | 'diff';
+    assistantSessionId?: string;
+    sideCluePath?: string;
+    sideGenSubTab?: SideGenSubTab;
 }
+
+/**
+ * Runtime bridge binding decoupling `AssistantView` (TS3.1) from `AssistantRunner` (TS2.1).
+ */
+export interface AssistantRuntimeBridge {
+    listSessions(): Promise<AssistantSession[]> | AssistantSession[];
+    getSession?(sessionId: string): Promise<AssistantSession | null> | AssistantSession | null;
+    createSession(options?: {
+        title?: string;
+        mode?: AssistantMode;
+        connectionId?: string;
+        stAdminEnabled?: boolean;
+        autoApproveAuthor?: boolean;
+    }): Promise<AssistantSession>;
+    deleteSession?(sessionId: string): Promise<boolean>;
+    updateSessionConfig?(
+        sessionId: string,
+        patch: Partial<
+            Pick<
+                AssistantSession,
+                'title' | 'mode' | 'stAdminEnabled' | 'autoApproveAuthor' | 'connectionId'
+            >
+        >,
+    ): Promise<AssistantSession | null>;
+    sendPrompt(
+        sessionId: string,
+        prompt: string,
+        options?: {
+            onDelta?: (delta: string) => void;
+            onUpdate?: (session: AssistantSession) => void;
+            signal?: AbortSignal;
+        },
+    ): Promise<AssistantMessage | AssistantSession | void>;
+    abort?(sessionId?: string): void;
+    listApprovals?(sessionId?: string): Promise<PendingApproval[]> | PendingApproval[];
+    decideApproval(
+        approvalId: string,
+        decision: 'approve' | 'reject',
+        feedback?: string,
+    ): Promise<PendingApproval | null | void>;
+    retryApproval(
+        approvalId: string,
+        feedback?: string,
+    ): Promise<PendingApproval | null | void>;
+    listUndoRecords?(sessionId?: string): Promise<UndoRecord[]> | UndoRecord[];
+    applyUndo(undoId: string): Promise<boolean | UndoRecord | null | void>;
+    readPreviewFile?(path: string): Promise<string | null>;
+    subscribe?(listener: () => void): () => void;
+}
+
+/**
+ * Runtime bridge binding decoupling `SideGenView` (TS3.2) from `SideGenService` (TS1.3).
+ */
+export type SideGenRuntimeBridge = ToolSideGenApi;
 
 export interface ToastItem {
     id: string;
@@ -215,6 +282,10 @@ export interface AgenticUIServices {
     // Host Theme Luminance & Live Events
     getHostLuminance?(): ResolvedTheme;
     subscribeEvents?(listener: (event: GenerationEventPayload) => void): () => void;
+
+    // Off-Mainline Runtime Bridges (Assistant & SideGen, optional for backward compatibility)
+    assistantRuntime?: AssistantRuntimeBridge;
+    sideGenRuntime?: SideGenRuntimeBridge;
 }
 
 export interface AppStoreState {
@@ -230,6 +301,18 @@ export interface AppStoreState {
     backgroundTasks: BackgroundTaskStatus[];
     toastQueue: ToastItem[];
     activeModal: ActiveModalState | null;
+    // Off-Mainline UI State Slice (Assistant & SideGen)
+    mobileAssistantStack: MobileViewStack;
+    mobileSideGenStack: MobileViewStack;
+    selectedAssistantSessionId: string | null;
+    selectedSideCluePath: string | null;
+    sideGenSubTab: SideGenSubTab;
+    assistantSessions: AssistantSession[];
+    assistantPendingApprovals: PendingApproval[];
+    assistantUndoStack: UndoRecord[];
+    assistantStreamingSessionId: string | null;
+    sideClues: SideClueDoc[];
+    sideSessions: SideSessionInfo[];
 }
 
 export interface AppStoreOptions {
@@ -239,7 +322,19 @@ export interface AppStoreOptions {
     initialTab?: ConsoleTabId;
     initialOpen?: boolean;
     initialTarget?: MessageTarget;
+    initialMobileAssistantStack?: MobileViewStack;
+    initialMobileSideGenStack?: MobileViewStack;
+    initialAssistantSessionId?: string | null;
+    initialSideCluePath?: string | null;
+    initialSideGenSubTab?: SideGenSubTab;
+    initialAssistantSessions?: AssistantSession[];
+    initialAssistantPendingApprovals?: PendingApproval[];
+    initialAssistantUndoStack?: UndoRecord[];
+    initialSideClues?: SideClueDoc[];
+    initialSideSessions?: SideSessionInfo[];
     services?: AgenticUIServices;
+    assistantRuntime?: AssistantRuntimeBridge;
+    sideGenRuntime?: SideGenRuntimeBridge;
     getHostLuminance?: () => ResolvedTheme;
 }
 
@@ -386,6 +481,9 @@ export class AppStore {
     private readonly toastTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private readonly customLuminanceReader?: () => ResolvedTheme;
     private unsubscribeEvents?: () => void;
+    private unsubscribeAssistantRuntime?: () => void;
+    private _assistantRuntime: AssistantRuntimeBridge | null = null;
+    private _sideGenRuntime: SideGenRuntimeBridge | null = null;
     private toastCounter = 0;
     private resumedEventCount = 0;
 
@@ -419,13 +517,73 @@ export class AppStore {
             backgroundTasks: [...initialTasks],
             toastQueue: [],
             activeModal: null,
+            mobileAssistantStack: options.initialMobileAssistantStack ?? 'list',
+            mobileSideGenStack: options.initialMobileSideGenStack ?? 'list',
+            selectedAssistantSessionId: options.initialAssistantSessionId ?? null,
+            selectedSideCluePath: options.initialSideCluePath ?? null,
+            sideGenSubTab: options.initialSideGenSubTab ?? 'clues',
+            assistantSessions: options.initialAssistantSessions
+                ? [...options.initialAssistantSessions]
+                : [],
+            assistantPendingApprovals: options.initialAssistantPendingApprovals
+                ? [...options.initialAssistantPendingApprovals]
+                : [],
+            assistantUndoStack: options.initialAssistantUndoStack
+                ? [...options.initialAssistantUndoStack]
+                : [],
+            assistantStreamingSessionId: null,
+            sideClues: options.initialSideClues ? [...options.initialSideClues] : [],
+            sideSessions: options.initialSideSessions ? [...options.initialSideSessions] : [],
         };
+
+        const initialAssistantRuntime =
+            options.assistantRuntime ?? this.services.assistantRuntime ?? null;
+        if (initialAssistantRuntime) {
+            this.setAssistantRuntime(initialAssistantRuntime);
+        }
+
+        const initialSideGenRuntime =
+            options.sideGenRuntime ?? this.services.sideGenRuntime ?? null;
+        if (initialSideGenRuntime) {
+            this.setSideGenRuntime(initialSideGenRuntime);
+        }
 
         if (this.services.subscribeEvents) {
             this.unsubscribeEvents = this.services.subscribeEvents((event) => {
                 this.handleGenerationEvent(event);
             });
         }
+    }
+
+    get assistantRuntime(): AssistantRuntimeBridge | null {
+        return this._assistantRuntime;
+    }
+
+    get sideGenRuntime(): SideGenRuntimeBridge | null {
+        return this._sideGenRuntime;
+    }
+
+    getAssistantRuntime(): AssistantRuntimeBridge | null {
+        return this._assistantRuntime;
+    }
+
+    setAssistantRuntime(runtime: AssistantRuntimeBridge | null): void {
+        this.unsubscribeAssistantRuntime?.();
+        this.unsubscribeAssistantRuntime = undefined;
+        this._assistantRuntime = runtime;
+        if (runtime?.subscribe) {
+            this.unsubscribeAssistantRuntime = runtime.subscribe(() => {
+                void this.refreshAssistantState();
+            });
+        }
+    }
+
+    getSideGenRuntime(): SideGenRuntimeBridge | null {
+        return this._sideGenRuntime;
+    }
+
+    setSideGenRuntime(runtime: SideGenRuntimeBridge | null): void {
+        this._sideGenRuntime = runtime;
     }
 
     getSnapshot(): AppStoreState {
@@ -472,12 +630,46 @@ export class AppStore {
                 }
                 : this.state.activeTarget;
 
+        let nextMobileAssistantStack = this.state.mobileAssistantStack;
+        let nextSelectedAssistantSessionId = this.state.selectedAssistantSessionId;
+        if (nextTab === 'assistant') {
+            if (deepLink?.assistantSessionId) {
+                nextSelectedAssistantSessionId = deepLink.assistantSessionId;
+                nextMobileAssistantStack = 'detail';
+            } else if (tab === 'assistant' || this.state.activeTab !== 'assistant') {
+                // Default mobile assistant entry to session list unless deep-linking a specific session.
+                nextMobileAssistantStack = 'list';
+            }
+        } else if (this.state.activeTab === 'assistant') {
+            nextMobileAssistantStack = 'list';
+        }
+
+        let nextMobileSideGenStack = this.state.mobileSideGenStack;
+        let nextSelectedSideCluePath = this.state.selectedSideCluePath;
+        let nextSideGenSubTab = this.state.sideGenSubTab;
+        if (nextTab === 'sidegen') {
+            if (deepLink?.sideGenSubTab) {
+                nextSideGenSubTab = deepLink.sideGenSubTab;
+            }
+            if (deepLink?.sideCluePath) {
+                nextSelectedSideCluePath = deepLink.sideCluePath;
+                nextMobileSideGenStack = 'detail';
+            } else if (tab === 'sidegen' || this.state.activeTab !== 'sidegen') {
+                nextMobileSideGenStack = 'list';
+            }
+        }
+
         this.setState({
             isOpen: true,
             activeTab: nextTab,
             deepLink: nextDeepLink,
             activeTarget: nextTarget,
             resolvedTheme: resolveThemeValue(this.state.themeMode, this.customLuminanceReader),
+            mobileAssistantStack: nextMobileAssistantStack,
+            selectedAssistantSessionId: nextSelectedAssistantSessionId,
+            mobileSideGenStack: nextMobileSideGenStack,
+            selectedSideCluePath: nextSelectedSideCluePath,
+            sideGenSubTab: nextSideGenSubTab,
         });
     }
 
@@ -500,10 +692,194 @@ export class AppStore {
     }
 
     setActiveTab(tab: ConsoleTabId): void {
-        if (this.state.activeTab === tab) {
+        const patch: Partial<AppStoreState> = {};
+        if (this.state.activeTab !== tab) {
+            patch.activeTab = tab;
+        }
+
+        // Mobile rule: switching to 'assistant' (or leaving it) resets stack to 'list'
+        // so users always land on the session list and console chrome stays visible.
+        if (tab === 'assistant' && this.state.mobileAssistantStack !== 'list') {
+            patch.mobileAssistantStack = 'list';
+        } else if (
+            tab !== 'assistant'
+            && this.state.activeTab === 'assistant'
+            && this.state.mobileAssistantStack !== 'list'
+        ) {
+            patch.mobileAssistantStack = 'list';
+        }
+
+        if (tab === 'sidegen' && this.state.mobileSideGenStack !== 'list') {
+            patch.mobileSideGenStack = 'list';
+        }
+
+        if (Object.keys(patch).length === 0) {
             return;
         }
-        this.setState({ activeTab: tab });
+        this.setState(patch);
+    }
+
+    setMobileAssistantStack(stack: MobileViewStack): void {
+        if (this.state.mobileAssistantStack === stack) {
+            return;
+        }
+        this.setState({ mobileAssistantStack: stack });
+    }
+
+    setSelectedAssistantSessionId(sessionId: string | null): void {
+        if (this.state.selectedAssistantSessionId === sessionId) {
+            return;
+        }
+        this.setState({ selectedAssistantSessionId: sessionId });
+    }
+
+    openAssistantSession(sessionId: string): void {
+        this.setState({
+            selectedAssistantSessionId: sessionId,
+            mobileAssistantStack: 'detail',
+        });
+    }
+
+    backToAssistantList(): void {
+        if (this.state.mobileAssistantStack === 'list') {
+            return;
+        }
+        this.setState({ mobileAssistantStack: 'list' });
+    }
+
+    setMobileSideGenStack(stack: MobileViewStack): void {
+        if (this.state.mobileSideGenStack === stack) {
+            return;
+        }
+        this.setState({ mobileSideGenStack: stack });
+    }
+
+    setSideGenSubTab(subTab: SideGenSubTab): void {
+        if (this.state.sideGenSubTab === subTab && this.state.mobileSideGenStack === 'list') {
+            return;
+        }
+        this.setState({
+            sideGenSubTab: subTab,
+            mobileSideGenStack: 'list',
+        });
+    }
+
+    setSelectedSideCluePath(path: string | null): void {
+        if (this.state.selectedSideCluePath === path) {
+            return;
+        }
+        this.setState({ selectedSideCluePath: path });
+    }
+
+    openSideClue(path: string): void {
+        this.setState({
+            selectedSideCluePath: path,
+            mobileSideGenStack: 'detail',
+        });
+    }
+
+    backToSideClueList(): void {
+        if (this.state.mobileSideGenStack === 'list') {
+            return;
+        }
+        this.setState({ mobileSideGenStack: 'list' });
+    }
+
+    setAssistantSessions(sessions: AssistantSession[]): void {
+        const nextSessions = [...sessions];
+        const currentSelected = this.state.selectedAssistantSessionId;
+        const stillExists =
+            currentSelected !== null
+            && nextSessions.some((session) => session.id === currentSelected);
+        this.setState({
+            assistantSessions: nextSessions,
+            selectedAssistantSessionId: stillExists
+                ? currentSelected
+                : (nextSessions[0]?.id ?? null),
+        });
+    }
+
+    setAssistantPendingApprovals(approvals: PendingApproval[]): void {
+        this.setState({ assistantPendingApprovals: [...approvals] });
+    }
+
+    setAssistantUndoStack(records: UndoRecord[]): void {
+        this.setState({ assistantUndoStack: [...records] });
+    }
+
+    setAssistantStreamingSessionId(sessionId: string | null): void {
+        if (this.state.assistantStreamingSessionId === sessionId) {
+            return;
+        }
+        this.setState({ assistantStreamingSessionId: sessionId });
+    }
+
+    setSideClues(clues: SideClueDoc[]): void {
+        const nextClues = [...clues];
+        const currentPath = this.state.selectedSideCluePath;
+        const stillExists =
+            currentPath !== null
+            && nextClues.some((clue) => clue.path === currentPath);
+        this.setState({
+            sideClues: nextClues,
+            selectedSideCluePath: stillExists ? currentPath : (nextClues[0]?.path ?? null),
+        });
+    }
+
+    setSideSessions(sessions: SideSessionInfo[]): void {
+        this.setState({ sideSessions: [...sessions] });
+    }
+
+    async refreshAssistantState(): Promise<void> {
+        const runtime = this._assistantRuntime;
+        if (!runtime) {
+            return;
+        }
+        const [sessions, approvals, undoRecords] = await Promise.all([
+            Promise.resolve(runtime.listSessions()),
+            runtime.listApprovals ? Promise.resolve(runtime.listApprovals()) : Promise.resolve(null),
+            runtime.listUndoRecords ? Promise.resolve(runtime.listUndoRecords()) : Promise.resolve(null),
+        ]);
+
+        const patch: Partial<AppStoreState> = {
+            assistantSessions: [...sessions],
+        };
+        const currentSelected = this.state.selectedAssistantSessionId;
+        if (
+            !currentSelected
+            || !sessions.some((session) => session.id === currentSelected)
+        ) {
+            patch.selectedAssistantSessionId = sessions[0]?.id ?? null;
+        }
+        if (approvals !== null) {
+            patch.assistantPendingApprovals = [...approvals];
+        }
+        if (undoRecords !== null) {
+            patch.assistantUndoStack = [...undoRecords];
+        }
+        this.setState(patch);
+    }
+
+    async refreshSideGenState(target?: MessageTarget): Promise<void> {
+        const runtime = this._sideGenRuntime;
+        if (!runtime) {
+            return;
+        }
+        const resolvedTarget = target ?? this.state.activeTarget;
+        const [clues, sessions] = await Promise.all([
+            runtime.clues.list(resolvedTarget),
+            runtime.listSessions(),
+        ]);
+        const currentPath = this.state.selectedSideCluePath;
+        const nextSelectedPath =
+            currentPath && clues.some((clue) => clue.path === currentPath)
+                ? currentPath
+                : (clues[0]?.path ?? null);
+        this.setState({
+            sideClues: [...clues],
+            sideSessions: [...sessions],
+            selectedSideCluePath: nextSelectedPath,
+        });
     }
 
     setDeepLink(deepLink: DeepLinkState): void {
@@ -822,6 +1198,8 @@ export class AppStore {
     dispose(): void {
         this.unsubscribeEvents?.();
         this.unsubscribeEvents = undefined;
+        this.unsubscribeAssistantRuntime?.();
+        this.unsubscribeAssistantRuntime = undefined;
         this.toastTimers.forEach((timer) => clearTimeout(timer));
         this.toastTimers.clear();
         this.listeners.clear();

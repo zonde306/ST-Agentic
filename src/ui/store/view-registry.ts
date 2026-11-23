@@ -3,7 +3,7 @@ import { useEffect, useState } from 'preact/hooks';
 import type { ConsoleTabId } from '@/core/types';
 import type { AppStore } from './app-store';
 
-export type ConsoleTabGroup = 'session' | 'system';
+export type ConsoleTabGroup = 'offmain' | 'session' | 'system';
 
 export interface ConsoleTabMeta {
     id: ConsoleTabId;
@@ -22,9 +22,26 @@ export interface ConsoleViewProps {
 export type ConsoleViewComponent = ComponentType<ConsoleViewProps>;
 
 /**
- * Canonical 2-group, 9-tab navigation metadata matching ARCHITECTURE.md §9.2.
+ * Canonical 3-group, 11-tab navigation metadata matching ARCHITECTURE.md §9.2
+ * and OFF_MAINLINE_PLAN.md §6.1 (`offmain` top-most group).
  */
 export const CONSOLE_TABS: readonly ConsoleTabMeta[] = [
+    {
+        id: 'assistant',
+        group: 'offmain',
+        groupLabel: '线外协作',
+        label: '助手工作台',
+        shortLabel: '助手',
+        description: '4档模式 / 气泡审批 / 撤销',
+    },
+    {
+        id: 'sidegen',
+        group: 'offmain',
+        groupLabel: '线外协作',
+        label: '线外会话与线索',
+        shortLabel: '线外线索',
+        description: 'SideSession / /side/*',
+    },
     {
         id: 'files',
         group: 'session',
@@ -100,6 +117,7 @@ export const CONSOLE_TABS: readonly ConsoleTabMeta[] = [
 ] as const;
 
 export const CONSOLE_TAB_GROUPS: readonly { id: ConsoleTabGroup; label: string }[] = [
+    { id: 'offmain', label: '线外协作' },
     { id: 'session', label: '当前会话' },
     { id: 'system', label: '预设与系统' },
 ] as const;
@@ -123,7 +141,7 @@ export function getConsoleTabMeta(tabId: ConsoleTabId): ConsoleTabMeta {
 }
 
 /**
- * Register a Preact view component for one of the 9 console tabs.
+ * Register a Preact view component for one of the console tabs.
  * Returns an unregister callback for clean module teardown or hot replacement.
  */
 export function registerConsoleView(

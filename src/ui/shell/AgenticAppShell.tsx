@@ -46,6 +46,47 @@ import { AGENTIC_DIALOG_RESET_STYLES, AGENTIC_SHELL_STYLES } from './styles';
 
 function TabIcon({ tabId }: { tabId: ConsoleTabId }) {
     switch (tabId) {
+        case 'assistant':
+            return (
+                <svg
+                    width={16}
+                    height={16}
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth={1.9}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    class="ag-icon"
+                    aria-hidden="true"
+                >
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                    <path d="M9 10h.01" />
+                    <path d="M12 10h.01" />
+                    <path d="M15 10h.01" />
+                </svg>
+            );
+        case 'sidegen':
+            return (
+                <svg
+                    width={16}
+                    height={16}
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth={1.9}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    class="ag-icon"
+                    aria-hidden="true"
+                >
+                    <circle cx="12" cy="12" r="2" />
+                    <path d="M16.24 7.76a6 6 0 0 1 0 8.49" />
+                    <path d="M7.76 16.24a6 6 0 0 1 0-8.49" />
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                    <path d="M4.93 19.07a10 10 0 0 1 0-14.14" />
+                </svg>
+            );
         case 'files':
             return <IconFolder size={16} />;
         case 'logs':
@@ -64,8 +105,6 @@ function TabIcon({ tabId }: { tabId: ConsoleTabId }) {
             return <IconBookOpen size={16} />;
         case 'connections':
             return <IconPlug size={16} />;
-        default:
-            return null;
     }
 }
 
@@ -213,6 +252,8 @@ function AgenticShellContent() {
     const store = useAppStoreInstance();
     const isMobile = useIsMobileViewport();
     const activeTab = useAppStore((s) => s.activeTab);
+    const mobileAssistantStack = useAppStore((s) => s.mobileAssistantStack);
+    const assistantPendingApprovals = useAppStore((s) => s.assistantPendingApprovals);
     const runMode = useAppStore((s) => s.runMode);
     const themeMode = useAppStore((s) => s.themeMode);
     const settings = useAppStore((s) => s.settings);
@@ -220,6 +261,16 @@ function AgenticShellContent() {
 
     const RegisteredView = useConsoleView(activeTab);
     const activeTabMeta = getConsoleTabMeta(activeTab);
+
+    // CRITICAL Mobile (< 768px) Stacking Rule (OFF_MAINLINE_PLAN.md §6.2):
+    // Hide top console header and mobile tab bar while inside an assistant chat detail thread.
+    const hideMobileChrome =
+        isMobile && activeTab === 'assistant' && mobileAssistantStack === 'detail';
+
+    const pendingApprovalCount = useMemo(
+        () => assistantPendingApprovals.filter((item) => item.status === 'pending').length,
+        [assistantPendingApprovals],
+    );
 
     const connectionOptions = useMemo(
         () =>
@@ -256,113 +307,130 @@ function AgenticShellContent() {
     return (
         <div
             class="ag-console"
+            data-mobile-chrome-hidden={hideMobileChrome ? 'true' : 'false'}
             onKeyDown={stopKeyPropagation}
             onKeyUp={stopKeyPropagation}
         >
-            {/* Header Bar */}
-            <header class="ag-header">
-                <div class="ag-brand">
-                    <span class="ag-brand-logo" aria-hidden="true">
-                        <IconBolt size={17} />
-                    </span>
-                    <span class="ag-brand-title">ST-Agentic</span>
-                    <span class="ag-isolation-pill">Shadow DOM 隔离</span>
-                </div>
+            {/* Header Bar & Mobile Horizontal Group Navigation (auto-hidden in mobile assistant detail) */}
+            {!hideMobileChrome ? (
+                <Fragment>
+                    <header class="ag-header">
+                        <div class="ag-brand">
+                            <span class="ag-brand-logo" aria-hidden="true">
+                                <IconBolt size={17} />
+                            </span>
+                            <span class="ag-brand-title">ST-Agentic</span>
+                            <span class="ag-isolation-pill">Shadow DOM 隔离</span>
+                        </div>
 
-                <div class="ag-header-controls">
-                    <SegmentedControl<RunMode>
-                        ariaLabel="运行模式"
-                        value={runMode}
-                        options={runModeOptions}
-                        onChange={(mode) => {
-                            void store.setRunMode(mode);
-                        }}
-                    />
+                        <div class="ag-header-controls">
+                            <SegmentedControl<RunMode>
+                                ariaLabel="运行模式"
+                                value={runMode}
+                                options={runModeOptions}
+                                onChange={(mode) => {
+                                    void store.setRunMode(mode);
+                                }}
+                            />
 
-                    <div class="ag-header-select-wrap">
-                        <SelectInput
-                            ariaLabel="主 API 连接"
-                            className="ag-header-select"
-                            value={settings.currentConnectionId}
-                            options={connectionOptions}
-                            onChange={(id) => {
-                                void store.setCurrentConnection(id);
-                            }}
-                        />
-                        <SelectInput
-                            ariaLabel="当前预设"
-                            className="ag-header-select"
-                            value={settings.currentPresetId}
-                            options={presetOptions}
-                            onChange={(id) => {
-                                void store.setCurrentPreset(id);
-                            }}
-                        />
-                    </div>
-
-                    <div class="ag-header-actions">
-                        <Button
-                            variant="secondary"
-                            size="sm"
-                            ariaLabel={`切换主题（当前：${themeModeLabel(themeMode)}）`}
-                            title={`主题模式：${themeModeLabel(themeMode)}（点击切换 深色 / 浅色 / 自动）`}
-                            icon={<ThemeModeIcon mode={themeMode} />}
-                            onClick={() => {
-                                void store.setThemeMode(nextThemeMode(store.getSnapshot().themeMode));
-                            }}
-                        >
-                            {themeModeLabel(themeMode)}
-                        </Button>
-
-                        <Button
-                            variant="secondary"
-                            size="sm"
-                            ariaLabel="导入、导出与角色卡嵌入"
-                            icon={<IconUpload size={15} />}
-                            onClick={() => store.openModal({ kind: 'import_manager' })}
-                        >
-                            导入 / 嵌卡
-                        </Button>
-
-                        <Button
-                            variant="ghost"
-                            size="sm"
-                            ariaLabel="关闭控制台"
-                            title="关闭控制台"
-                            icon={<IconClose size={17} />}
-                            onClick={() => store.closeConsole()}
-                        />
-                    </div>
-                </div>
-            </header>
-
-            {/* Mobile Horizontal Group Navigation (< 768px) */}
-            <nav class="ag-mobile-nav ag-thin-scroll" aria-label="控制台导航">
-                {CONSOLE_TABS.map((tab, index) => {
-                    const prev = index > 0 ? CONSOLE_TABS[index - 1] : null;
-                    const showDivider = prev !== null && prev.group !== tab.group;
-                    const isActive = activeTab === tab.id;
-                    return (
-                        <Fragment key={tab.id}>
-                            {showDivider ? (
-                                <span
-                                    class="ag-mobile-nav-divider"
-                                    aria-hidden="true"
+                            <div class="ag-header-select-wrap">
+                                <SelectInput
+                                    ariaLabel="主 API 连接"
+                                    className="ag-header-select"
+                                    value={settings.currentConnectionId}
+                                    options={connectionOptions}
+                                    onChange={(id) => {
+                                        void store.setCurrentConnection(id);
+                                    }}
                                 />
-                            ) : null}
-                            <button
-                                type="button"
-                                class={isActive ? 'ag-mobile-tab ag-mobile-tab-active' : 'ag-mobile-tab'}
-                                aria-current={isActive ? 'page' : undefined}
-                                onClick={() => store.setActiveTab(tab.id)}
-                            >
-                                <TabIcon tabId={tab.id} />
-                                <span>{tab.shortLabel}</span>
-                            </button>
-                        </Fragment>
-                    );
-                })}
-            </nav>
+                                <SelectInput
+                                    ariaLabel="当前预设"
+                                    className="ag-header-select"
+                                    value={settings.currentPresetId}
+                                    options={presetOptions}
+                                    onChange={(id) => {
+                                        void store.setCurrentPreset(id);
+                                    }}
+                                />
+                            </div>
+
+                            <div class="ag-header-actions">
+                                <Button
+                                    variant="secondary"
+                                    size="sm"
+                                    ariaLabel={`切换主题（当前：${themeModeLabel(themeMode)}）`}
+                                    title={`主题模式：${themeModeLabel(themeMode)}（点击切换 深色 / 浅色 / 自动）`}
+                                    icon={<ThemeModeIcon mode={themeMode} />}
+                                    onClick={() => {
+                                        void store.setThemeMode(
+                                            nextThemeMode(store.getSnapshot().themeMode),
+                                        );
+                                    }}
+                                >
+                                    {themeModeLabel(themeMode)}
+                                </Button>
+
+                                <Button
+                                    variant="secondary"
+                                    size="sm"
+                                    ariaLabel="导入、导出与角色卡嵌入"
+                                    icon={<IconUpload size={15} />}
+                                    onClick={() => store.openModal({ kind: 'import_manager' })}
+                                >
+                                    导入 / 嵌卡
+                                </Button>
+
+                                <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    ariaLabel="关闭控制台"
+                                    title="关闭控制台"
+                                    icon={<IconClose size={17} />}
+                                    onClick={() => store.closeConsole()}
+                                />
+                            </div>
+                        </div>
+                    </header>
+
+                    {/* Mobile Horizontal Group Navigation (< 768px) */}
+                    <nav class="ag-mobile-nav ag-mobile-tabs ag-thin-scroll" aria-label="控制台导航">
+                        {CONSOLE_TABS.map((tab, index) => {
+                            const prev = index > 0 ? CONSOLE_TABS[index - 1] : null;
+                            const showDivider = prev !== null && prev.group !== tab.group;
+                            const isActive = activeTab === tab.id;
+                            return (
+                                <Fragment key={tab.id}>
+                                    {showDivider ? (
+                                        <span
+                                            class="ag-mobile-nav-divider"
+                                            aria-hidden="true"
+                                        />
+                                    ) : null}
+                                    <button
+                                        type="button"
+                                        data-tab-id={tab.id}
+                                        class={
+                                            isActive
+                                                ? 'ag-mobile-tab ag-mobile-tab-active'
+                                                : 'ag-mobile-tab'
+                                        }
+                                        aria-current={isActive ? 'page' : undefined}
+                                        onClick={() => store.setActiveTab(tab.id)}
+                                    >
+                                        <TabIcon tabId={tab.id} />
+                                        <span>{tab.shortLabel}</span>
+                                        {tab.id === 'assistant' && pendingApprovalCount > 0 ? (
+                                            <span class="ag-nav-count-badge">
+                                                {pendingApprovalCount}
+                                            </span>
+                                        ) : null}
+                                    </button>
+                                </Fragment>
+                            );
+                        })}
+                    </nav>
+                </Fragment>
+            ) : null}
 
             {/* Body: Desktop Sidebar + Active View Slot */}
             <div class="ag-body">
@@ -376,6 +444,7 @@ function AgenticShellContent() {
                                     <button
                                         key={tab.id}
                                         type="button"
+                                        data-tab-id={tab.id}
                                         class={isActive ? 'ag-nav-item ag-nav-item-active' : 'ag-nav-item'}
                                         aria-current={isActive ? 'page' : undefined}
                                         onClick={() => store.setActiveTab(tab.id)}
@@ -384,7 +453,20 @@ function AgenticShellContent() {
                                             <TabIcon tabId={tab.id} />
                                         </span>
                                         <span class="ag-nav-item-text">
-                                            <span class="ag-nav-item-label">{tab.label}</span>
+                                            <span class="ag-nav-item-label-row">
+                                                <span class="ag-nav-item-label">{tab.label}</span>
+                                                {tab.id === 'assistant' && pendingApprovalCount > 0 ? (
+                                                    <span
+                                                        class={
+                                                            isActive
+                                                                ? 'ag-nav-count-badge ag-nav-count-badge-on-active'
+                                                                : 'ag-nav-count-badge'
+                                                        }
+                                                    >
+                                                        {pendingApprovalCount}
+                                                    </span>
+                                                ) : null}
+                                            </span>
                                             <span class="ag-nav-item-desc">{tab.description}</span>
                                         </span>
                                     </button>

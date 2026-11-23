@@ -330,7 +330,12 @@ export function mountExtensionsSettingsCard(
     };
 }
 
-export type ExtensionsMenuActionId = 'files' | 'logs' | 'rerun_after_turn';
+export type ExtensionsMenuActionId =
+    | 'assistant'
+    | 'sidegen'
+    | 'files'
+    | 'logs'
+    | 'rerun_after_turn';
 
 export interface ExtensionsMenuOptions {
     target?: MessageTarget;
@@ -349,6 +354,39 @@ function createMenuSvgIcon(action: ExtensionsMenuActionId): SVGSVGElement {
     svg.setAttribute('stroke-linecap', 'round');
     svg.setAttribute('stroke-linejoin', 'round');
     svg.setAttribute('aria-hidden', 'true');
+
+    if (action === 'assistant') {
+        const bubble = document.createElementNS(ns, 'path');
+        bubble.setAttribute(
+            'd',
+            'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z',
+        );
+        const dot1 = document.createElementNS(ns, 'path');
+        dot1.setAttribute('d', 'M9 10h.01');
+        const dot2 = document.createElementNS(ns, 'path');
+        dot2.setAttribute('d', 'M12 10h.01');
+        const dot3 = document.createElementNS(ns, 'path');
+        dot3.setAttribute('d', 'M15 10h.01');
+        svg.append(bubble, dot1, dot2, dot3);
+        return svg;
+    }
+
+    if (action === 'sidegen') {
+        const core = document.createElementNS(ns, 'circle');
+        core.setAttribute('cx', '12');
+        core.setAttribute('cy', '12');
+        core.setAttribute('r', '2');
+        const wave1 = document.createElementNS(ns, 'path');
+        wave1.setAttribute('d', 'M16.24 7.76a6 6 0 0 1 0 8.49');
+        const wave2 = document.createElementNS(ns, 'path');
+        wave2.setAttribute('d', 'M7.76 16.24a6 6 0 0 1 0-8.49');
+        const wave3 = document.createElementNS(ns, 'path');
+        wave3.setAttribute('d', 'M19.07 4.93a10 10 0 0 1 0 14.14');
+        const wave4 = document.createElementNS(ns, 'path');
+        wave4.setAttribute('d', 'M4.93 19.07a10 10 0 0 1 0-14.14');
+        svg.append(core, wave1, wave2, wave3, wave4);
+        return svg;
+    }
 
     if (action === 'files') {
         const path = document.createElementNS(ns, 'path');
@@ -387,6 +425,8 @@ function createMenuSvgIcon(action: ExtensionsMenuActionId): SVGSVGElement {
 
 /**
  * Pure DOM helper building SillyTavern `#extensionsMenu` wand menu items:
+ * - `🤖 打开 Agentic 助手` -> opens console directly on `'assistant'`
+ * - `📡 线外会话与线索` -> opens console directly on `'sidegen'`
  * - `文件与内容覆盖` -> opens console at `'files'`
  * - `查看生成日志` -> opens console at `'logs'`
  * - `重新运行后置触发` -> calls `services.rerunAfterTurn()` via `store.rerunAfterTurn()`
@@ -402,6 +442,34 @@ export function buildExtensionsMenuItems(
         title: string;
         run: () => void;
     }> = [
+        {
+            id: 'agentic_menu_assistant',
+            action: 'assistant',
+            label: '🤖 打开 Agentic 助手',
+            title: '打开 ST-Agentic 独立助手工作台（4 档权限模式 · 0 占用主线上下文）',
+            run: () => {
+                const target = options.target ?? store.getSnapshot().activeTarget;
+                store.openConsole('assistant', {
+                    messageId: target.messageId,
+                    swipeId: target.swipeId,
+                });
+                options.onAction?.('assistant');
+            },
+        },
+        {
+            id: 'agentic_menu_sidegen',
+            action: 'sidegen',
+            label: '📡 线外会话与线索',
+            title: '打开 ST-Agentic 线外会话与 /side/* 线索控制台',
+            run: () => {
+                const target = options.target ?? store.getSnapshot().activeTarget;
+                store.openConsole('sidegen', {
+                    messageId: target.messageId,
+                    swipeId: target.swipeId,
+                });
+                options.onAction?.('sidegen');
+            },
+        },
         {
             id: 'agentic_menu_files',
             action: 'files',
@@ -492,7 +560,7 @@ export function buildExtensionsMenuItems(
 }
 
 /**
- * Idempotently mount the 3 ST-Agentic wand menu entries into `#extensionsMenu`
+ * Idempotently mount the ST-Agentic wand menu entries into `#extensionsMenu`
  * (or any supplied container) and return a cleanup function.
  */
 export function mountExtensionsMenuItems(
