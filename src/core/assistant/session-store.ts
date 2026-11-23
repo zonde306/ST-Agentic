@@ -748,10 +748,14 @@ export class AssistantSessionStore {
         systemPrompt: string,
         tools: readonly CanonicalToolSchema[],
         forceRecompile: boolean = false,
+        extraPrefixMessages: readonly CanonicalMessage[] = [],
     ): FrozenStaticPrefix {
         const threadId = toAssistantThreadId(sessionId);
         const existing = this.trajectoryStore.getFrozenPrefix(threadId);
-        const desiredMessages: CanonicalMessage[] = [{ role: 'system', content: systemPrompt }];
+        const desiredMessages: CanonicalMessage[] = [
+            { role: 'system', content: systemPrompt },
+            ...extraPrefixMessages.map((msg) => canonicalClone(msg)),
+        ];
         const desiredTools = canonicalClone([...tools]);
 
         if (
@@ -766,7 +770,7 @@ export class AssistantSessionStore {
         const nextPrefix: FrozenStaticPrefix = {
             messages: desiredMessages,
             tools: desiredTools,
-            layer0EndIndex: 0,
+            layer0EndIndex: Math.max(0, desiredMessages.length - 1),
         };
         this.trajectoryStore.setFrozenPrefix(nextPrefix, threadId);
         return this.trajectoryStore.getFrozenPrefix(threadId)!;
@@ -774,21 +778,33 @@ export class AssistantSessionStore {
 
     /**
      * Assemble a KV-cache-friendly `LLMRequest` payload for `assistant:<sessionId>`:
-     * Layer 0 (frozen system prefix) + Layer 1 (append-only committed trajectory) + in-flight turn messages.
+     * Layer 0 (frozen system prefix) + Layer 1 (append-only committed trajectory) + in-flight turn messages
+     * + optional ephemeral tail messages.
      */
     public buildRequestMessages(
         sessionId: string,
         systemPrompt: string,
         tools: readonly CanonicalToolSchema[],
         inFlightMessages: readonly CanonicalMessage[] = [],
+        options?: {
+            extraPrefixMessages?: readonly CanonicalMessage[];
+            tailMessages?: readonly CanonicalMessage[];
+        },
     ): AssistantRequestAssembly {
         const threadId = toAssistantThreadId(sessionId);
-        const frozen = this.ensureFrozenPrefix(sessionId, systemPrompt, tools);
+        const frozen = this.ensureFrozenPrefix(
+            sessionId,
+            systemPrompt,
+            tools,
+            false,
+            options?.extraPrefixMessages ?? [],
+        );
         const layer0 = canonicalClone([...frozen.messages]);
         const layer1 = canonicalClone([...this.trajectoryStore.getMessages(threadId)]);
         const inFlight = canonicalClone([...inFlightMessages]);
+        const tail = canonicalClone([...(options?.tailMessages ?? [])]);
 
-        const messages: CanonicalMessage[] = [...layer0, ...layer1, ...inFlight];
+        const messages: CanonicalMessage[] = [...layer0, ...layer1, ...inFlight, ...tail];
         const canonicalTools = canonicalClone([...frozen.tools]);
 
         const cacheBreakpoints: number[] = [];

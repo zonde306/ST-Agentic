@@ -1,5 +1,10 @@
 import type { ChatMessageRole, HostBridge, LLMRequest, LLMTransport } from '@/core/bridge';
-import { createDefaultSettings, resolveConnection } from '@/core/config';
+import {
+    createDefaultSettings,
+    resolveActivePreset,
+    resolveConnection,
+    selectPresetBlocksForContext,
+} from '@/core/config';
 import { TrajectoryStore } from '@/core/context';
 import type { TraceLogger } from '@/core/logger';
 import { ChatDataStore, DATA_NAMESPACES, MESSAGE_OVERRIDE_KEY } from '@/core/store';
@@ -1040,6 +1045,7 @@ export class AssistantRunner {
             );
             const canonicalTools: CanonicalToolSchema[] =
                 toCanonicalAssistantToolSchemas(allowedToolDefs);
+            const presetPrompts = this.resolvePresetPromptMessages(currentSession);
             const useStream = options.stream ?? connection.stream ?? this.defaultStream;
 
             let rounds = 0;
@@ -1053,6 +1059,10 @@ export class AssistantRunner {
                     systemPrompt,
                     canonicalTools,
                     inFlightMessages,
+                    {
+                        extraPrefixMessages: presetPrompts.prefixMessages,
+                        tailMessages: presetPrompts.tailMessages,
+                    },
                 );
 
                 const request: LLMRequest = {
@@ -1519,11 +1529,16 @@ export class AssistantRunner {
         ];
 
         try {
+            const presetPrompts = this.resolvePresetPromptMessages(session);
             const assembled = this.sessionStore.buildRequestMessages(
                 existing.sessionId,
                 systemPrompt,
                 canonicalTools,
                 retryInFlight,
+                {
+                    extraPrefixMessages: presetPrompts.prefixMessages,
+                    tailMessages: presetPrompts.tailMessages,
+                },
             );
             const useStream = connection.stream ?? this.defaultStream;
             const request: LLMRequest = {
@@ -1654,6 +1669,43 @@ export class AssistantRunner {
     // ========================================================================
     // Internal Helpers
     // ========================================================================
+
+    private resolvePresetPromptMessages(session: AssistantSession): {
+        prefixMessages: CanonicalMessage[];
+        tailMessages: CanonicalMessage[];
+    } {
+        const preset = resolveActivePreset(this.settingsProvider());
+        const selected = selectPresetBlocksForContext(
+            preset,
+            {
+                kind: 'assistant',
+                mode: session.mode,
+                stAdminEnabled: session.stAdminEnabled,
+            },
+            { requireExplicit: true },
+        );
+
+        const toMessages = (
+            blocks: readonly { role: 'system' | 'user' | 'assistant'; content: string }[],
+        ): CanonicalMessage[] => {
+            const messages: CanonicalMessage[] = [];
+            for (const block of blocks) {
+                const rendered = this.bridge.substituteMacros(block.content).trim();
+                if (rendered) {
+                    messages.push({
+                        role: block.role,
+                        content: rendered,
+                    });
+                }
+            }
+            return messages;
+        };
+
+        return {
+            prefixMessages: toMessages(selected.prefix),
+            tailMessages: toMessages(selected.tail),
+        };
+    }
 
     private cleanupApprovalsForMessages(
         sessionId: string,

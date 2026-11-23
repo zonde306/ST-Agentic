@@ -5,7 +5,7 @@ import {
     resolveActivePreset,
 } from '@/core/config';
 import { BUILTIN_TOOL_NAMES } from '@/core/tools';
-import type { AgentProfile, PromptBlock, SessionMode } from '@/core/types';
+import type { AgentProfile, PromptBlock, SessionMode, TriggerRule } from '@/core/types';
 import {
     Badge,
     Button,
@@ -33,6 +33,7 @@ import {
     useAppStoreInstance,
 } from '@/ui/store';
 import { PresetManagerPanel } from './PresetManagerPanel';
+import { PromptTriggerPicker } from './PromptTriggerPicker';
 import {
     allocateUniqueId,
     moveArrayItem,
@@ -60,6 +61,8 @@ const BUILTIN_TOOL_DESCRIPTIONS: Record<string, string> = {
 
 interface PromptBlockCardProps {
     agentId: string;
+    isMainAgent: boolean;
+    presetTriggers: readonly TriggerRule[];
     block: PromptBlock;
     index: number;
     total: number;
@@ -70,6 +73,8 @@ interface PromptBlockCardProps {
 
 function PromptBlockCard({
     agentId,
+    isMainAgent,
+    presetTriggers,
     block,
     index,
     total,
@@ -204,6 +209,18 @@ function PromptBlockCard({
                     />
                 </FormField>
             </div>
+
+            <FormField label="触发器 (生效模式筛选)">
+                <PromptTriggerPicker
+                    value={block.triggers ?? []}
+                    onChange={(triggers) =>
+                        onUpdate({ triggers: triggers.length > 0 ? triggers : undefined })
+                    }
+                    placement={block.placement}
+                    isMainAgent={isMainAgent}
+                    presetTriggers={presetTriggers}
+                />
+            </FormField>
 
             <CodeEditor
                 label="积木指令正文"
@@ -544,7 +561,10 @@ export function AgentsView(props: Partial<ConsoleViewProps> = {}) {
             ...activeAgent,
             id,
             name: `${activeAgent.name} (副本)`,
-            promptBlocks: activeAgent.promptBlocks.map((b) => ({ ...b })),
+            promptBlocks: activeAgent.promptBlocks.map((b) => ({
+                ...b,
+                ...(b.triggers ? { triggers: [...b.triggers] } : {}),
+            })),
             enabledTools: [...activeAgent.enabledTools],
             permissions: {
                 read: [...activeAgent.permissions.read],
@@ -888,15 +908,24 @@ export function AgentsView(props: Partial<ConsoleViewProps> = {}) {
                                 <PromptBlockCard
                                     key={block.id}
                                     agentId={activeAgent.id}
+                                    isMainAgent={activeAgent.id === activePreset.mainAgentId}
+                                    presetTriggers={activePreset.triggers}
                                     block={block}
                                     index={index}
                                     total={activeAgent.promptBlocks.length}
                                     onUpdate={(patch) =>
                                         mutateActiveAgent((ag) => ({
                                             ...ag,
-                                            promptBlocks: ag.promptBlocks.map((b) =>
-                                                b.id === block.id ? { ...b, ...patch } : b,
-                                            ),
+                                            promptBlocks: ag.promptBlocks.map((b) => {
+                                                if (b.id !== block.id) {
+                                                    return b;
+                                                }
+                                                const next = { ...b, ...patch };
+                                                if (!next.triggers || next.triggers.length === 0) {
+                                                    delete next.triggers;
+                                                }
+                                                return next;
+                                            }),
                                         }))
                                     }
                                     onMove={(toIndex) =>

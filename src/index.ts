@@ -1553,6 +1553,7 @@ jQuery(async () => {
             dataStore: store,
             vfs,
             getDefaultConnectionId: () => currentSettings.currentConnectionId,
+            getSettings: () => currentSettings,
             resolveConnection: resolveConnectionById,
             defaultDelivery: currentSettings.offMainline?.defaultDelivery,
             onTrace: (trace) => {

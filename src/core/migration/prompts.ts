@@ -1,4 +1,4 @@
-import { isPlainRecord, sanitizeName } from '../config';
+import { isPlainRecord, normalizePromptTriggers, sanitizeName } from '../config';
 import type { MigrationReport, PromptBlock } from '../types';
 
 /**
@@ -170,6 +170,7 @@ export function convertLegacyPromptsToBlocks(
             ? true
             : Boolean(item.enabled);
         const id = allocateUniqueId(`${prefix}_${name}`, usedIds, `${prefix}_${index + 1}`);
+        const triggers = normalizePromptTriggers(item.triggers ?? item.injection_trigger);
 
         blocks.push({
             id,
@@ -178,6 +179,7 @@ export function convertLegacyPromptsToBlocks(
             placement,
             content,
             enabled,
+            ...(triggers ? { triggers } : {}),
         });
         report.migratedPromptBlocks += 1;
     });
@@ -292,6 +294,7 @@ export function convertStOpenAiPromptsToBlocks(
         }
 
         const id = allocateUniqueId(identifier || name, usedIds, `st_block_${index + 1}`);
+        const triggers = normalizePromptTriggers(prompt.injection_trigger);
         blocks.push({
             id,
             name,
@@ -299,6 +302,7 @@ export function convertStOpenAiPromptsToBlocks(
             placement,
             content,
             enabled,
+            ...(triggers ? { triggers } : {}),
         });
         report.migratedPromptBlocks += 1;
     });

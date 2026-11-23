@@ -42,6 +42,43 @@ export interface ScopedPermissions {
     write: string[];
 }
 
+export type BuiltinPromptTriggerType =
+    | 'main'
+    | 'main_normal'
+    | 'main_continue'
+    | 'main_regenerate'
+    | 'main_swipe'
+    | 'assistant'
+    | 'assistant_chat'
+    | 'assistant_adjust'
+    | 'assistant_author'
+    | 'assistant_full'
+    | 'assistant_admin'
+    | 'trigger'
+    | 'trigger_before'
+    | 'trigger_after'
+    | 'trigger_maintenance'
+    | 'trigger_variables'
+    | 'trigger_lore'
+    | 'trigger_output'
+    | 'subagent'
+    | 'sidegen';
+
+export type PromptTriggerType = BuiltinPromptTriggerType | `trigger_rule:${string}`;
+
+export type PromptTriggerContext =
+    | { kind: 'main'; action?: 'normal' | 'continue' | 'regenerate' | 'swipe' }
+    | { kind: 'assistant'; mode: 'chat' | 'adjust' | 'author' | 'full'; stAdminEnabled?: boolean }
+    | {
+          kind: 'trigger';
+          phase: PipelinePhase;
+          triggerIds?: readonly string[];
+          decorators?: readonly string[];
+          targetPaths?: readonly string[];
+      }
+    | { kind: 'subagent'; phase?: PipelinePhase }
+    | { kind: 'sidegen'; mode?: 'once' | 'session' };
+
 export interface PromptBlock {
     id: string;
     name: string;
@@ -49,6 +86,7 @@ export interface PromptBlock {
     placement: 'prefix' | 'tail';
     content: string;
     enabled: boolean;
+    triggers?: PromptTriggerType[];
 }
 
 export interface AgentProfile {

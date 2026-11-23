@@ -5,7 +5,11 @@ import type {
     ToolSideCluesApi,
     ToolSideGenApi,
 } from '@/core/bridge';
-import { DEFAULT_CONNECTION_ID } from '@/core/config';
+import {
+    DEFAULT_CONNECTION_ID,
+    resolveActivePreset,
+    selectPresetBlocksForContext,
+} from '@/core/config';
 import {
     type Layer1TurnGroup,
     TrajectoryStore,
@@ -24,6 +28,7 @@ import {
     type CanonicalMessage,
     type CreateSideSessionOptions,
     type MessageTarget,
+    type Settings,
     type SideClueDelivery,
     type SideGenOnceOptions,
     type SideGenResult,
@@ -65,6 +70,7 @@ export interface SideGenServiceOptions {
     vfs?: SideClueVfsLike;
     clueStorage?: SideClueStorageAdapter;
     getDefaultConnectionId?: () => string;
+    getSettings?: () => Settings | undefined;
     resolveConnection?: (connectionId: string) => ApiConnection | undefined;
     defaultDelivery?: SideClueDelivery;
     defaultWatermark?: { high: number; low: number };
@@ -295,6 +301,7 @@ export class SideGenService implements ToolSideGenApi {
     private readonly transport: LLMTransport;
     private readonly dataStore: ChatDataStore;
     private readonly getDefaultConnectionIdFn?: () => string;
+    private readonly getSettingsFn?: () => Settings | undefined;
     private readonly resolveConnectionFn?: (connectionId: string) => ApiConnection | undefined;
     private readonly defaultWatermark: { high: number; low: number };
     private readonly summarizeCompactionFn?: SideCompactionSummarizer;
@@ -333,6 +340,7 @@ export class SideGenService implements ToolSideGenApi {
             });
 
         this.getDefaultConnectionIdFn = options.getDefaultConnectionId;
+        this.getSettingsFn = options.getSettings;
         this.resolveConnectionFn = options.resolveConnection;
         this.defaultWatermark = normalizeWatermark(
             options.defaultWatermark,
@@ -407,12 +415,16 @@ export class SideGenService implements ToolSideGenApi {
         try {
             throwIfAborted(signal, 'SideGen runOnce aborted before request');
 
+            const presetPrompts = this.resolvePresetPromptMessages('once');
             const messages: CanonicalMessage[] = [];
             if (opts.systemPrompt && opts.systemPrompt.trim()) {
                 messages.push({
                     role: 'system',
                     content: opts.systemPrompt.trim(),
                 });
+            }
+            for (const msg of presetPrompts.prefixMessages) {
+                messages.push(canonicalClone(msg));
             }
 
             const userContent = this.composeUserContent(
@@ -425,6 +437,9 @@ export class SideGenService implements ToolSideGenApi {
                 role: 'user',
                 content: userContent,
             });
+            for (const msg of presetPrompts.tailMessages) {
+                messages.push(canonicalClone(msg));
+            }
 
             const { connectionId, connection } = this.resolveRequestConnection(opts.connectionId);
             const request: LLMRequest = {
@@ -506,7 +521,8 @@ export class SideGenService implements ToolSideGenApi {
         const systemPrompt = opts.systemPrompt ?? '';
         const threadId = toSideThreadId(id);
 
-        const layer0Messages = this.buildLayer0Messages(systemPrompt);
+        const presetPrompts = this.resolvePresetPromptMessages('session');
+        const layer0Messages = this.buildLayer0Messages(systemPrompt, presetPrompts.prefixMessages);
         this.trajectoryStore.ensureThread(threadId);
         this.trajectoryStore.setFrozenPrefix(
             {
@@ -564,7 +580,12 @@ export class SideGenService implements ToolSideGenApi {
         try {
             throwIfAborted(signal, `SideGen send(${sessionId}) aborted before request`);
 
-            const layer0Messages = this.ensureFrozenLayer0(threadId, session.systemPrompt);
+            const presetPrompts = this.resolvePresetPromptMessages('session');
+            const layer0Messages = this.ensureFrozenLayer0(
+                threadId,
+                session.systemPrompt,
+                presetPrompts.prefixMessages,
+            );
             const layer1Messages = this.trajectoryStore
                 .getMessages(threadId)
                 .map((m) => canonicalClone(m));
@@ -584,6 +605,7 @@ export class SideGenService implements ToolSideGenApi {
                 ...layer0Messages.map((m) => canonicalClone(m)),
                 ...layer1Messages,
                 canonicalClone(userMessage),
+                ...presetPrompts.tailMessages.map((m) => canonicalClone(m)),
             ];
 
             const cacheBreakpoints = computeSideCacheBreakpoints(
@@ -937,12 +959,55 @@ export class SideGenService implements ToolSideGenApi {
         return doc.path;
     }
 
-    private ensureFrozenLayer0(threadId: string, systemPrompt: string): readonly CanonicalMessage[] {
+    private resolvePresetPromptMessages(mode: 'once' | 'session'): {
+        prefixMessages: CanonicalMessage[];
+        tailMessages: CanonicalMessage[];
+    } {
+        const settings = this.getSettingsFn?.();
+        if (!settings) {
+            return { prefixMessages: [], tailMessages: [] };
+        }
+        const preset = resolveActivePreset(settings);
+        const selected = selectPresetBlocksForContext(
+            preset,
+            { kind: 'sidegen', mode },
+            { requireExplicit: true },
+        );
+
+        const toMessages = (
+            blocks: readonly { role: 'system' | 'user' | 'assistant'; content: string }[],
+        ): CanonicalMessage[] => {
+            const messages: CanonicalMessage[] = [];
+            for (const block of blocks) {
+                const rendered = this.bridge.substituteMacros(block.content).trim();
+                if (rendered) {
+                    messages.push({
+                        role: block.role,
+                        content: rendered,
+                    });
+                }
+            }
+            return messages;
+        };
+
+        return {
+            prefixMessages: toMessages(selected.prefix),
+            tailMessages: toMessages(selected.tail),
+        };
+    }
+
+    private ensureFrozenLayer0(
+        threadId: string,
+        systemPrompt: string,
+        extraPrefixMessages?: readonly CanonicalMessage[],
+    ): readonly CanonicalMessage[] {
         const existing = this.trajectoryStore.getFrozenPrefix(threadId);
         if (existing) {
             return existing.messages;
         }
-        const layer0Messages = this.buildLayer0Messages(systemPrompt);
+        const resolvedExtra =
+            extraPrefixMessages ?? this.resolvePresetPromptMessages('session').prefixMessages;
+        const layer0Messages = this.buildLayer0Messages(systemPrompt, resolvedExtra);
         this.trajectoryStore.ensureThread(threadId);
         this.trajectoryStore.setFrozenPrefix(
             {
@@ -955,17 +1020,22 @@ export class SideGenService implements ToolSideGenApi {
         return this.trajectoryStore.getFrozenPrefix(threadId)?.messages ?? layer0Messages;
     }
 
-    private buildLayer0Messages(systemPrompt: string): CanonicalMessage[] {
+    private buildLayer0Messages(
+        systemPrompt: string,
+        extraPrefixMessages: readonly CanonicalMessage[] = [],
+    ): CanonicalMessage[] {
+        const messages: CanonicalMessage[] = [];
         const trimmed = systemPrompt.trim();
-        if (!trimmed) {
-            return [];
-        }
-        return [
-            {
+        if (trimmed) {
+            messages.push({
                 role: 'system',
                 content: trimmed,
-            },
-        ];
+            });
+        }
+        for (const msg of extraPrefixMessages) {
+            messages.push(canonicalClone(msg));
+        }
+        return messages;
     }
 
     private normalizeAutoBridge(

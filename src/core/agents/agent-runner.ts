@@ -10,6 +10,7 @@ import type {
 import {
     createDefaultMainAgent,
     createDefaultSettings,
+    matchesPromptTriggers,
     resolveActivePreset,
     resolveConnection,
 } from '@/core/config';
@@ -55,6 +56,8 @@ import type {
     MessageTarget,
     PipelinePhase,
     Preset,
+    PromptBlock,
+    PromptTriggerContext,
     RadarScanResult,
     RawLoreEntry,
     RegexRule,
@@ -199,6 +202,8 @@ export interface AgentRunInput {
     characterFields?: Record<string, string>;
     personaDescription?: string;
     systemBasePrompt?: string;
+    generationAction?: 'normal' | 'continue' | 'regenerate' | 'swipe';
+    promptTriggerContext?: PromptTriggerContext;
     forceRecompilePrefix?: boolean;
     /** Force mandatory `/output.md` mode (defaults to `phase === 'main_turn' && delegationDepth === 0`). */
     requireOutputFile?: boolean;
@@ -556,6 +561,61 @@ export class AgentRunner {
         const isMainOutputMode =
             input.requireOutputFile ?? (input.phase === 'main_turn' && delegationDepth === 0);
 
+        const promptTriggerContext: PromptTriggerContext = input.promptTriggerContext ?? (
+            delegationDepth > 0
+                ? { kind: 'subagent', phase: input.phase }
+                : input.phase === 'main_turn'
+                    ? { kind: 'main', action: input.generationAction ?? 'normal' }
+                    : {
+                          kind: 'trigger',
+                          phase: input.phase,
+                          ...(input.triggerId
+                              ? {
+                                    triggerIds: input.triggerId
+                                        .split(',')
+                                        .map((id) => id.trim())
+                                        .filter(Boolean),
+                                }
+                              : {}),
+                      }
+        );
+
+        let effectiveAgent = agent;
+        if (agent.id !== preset.mainAgentId) {
+            const mainAgent = preset.agents[preset.mainAgentId];
+            const inheritedBlocks = (mainAgent?.promptBlocks ?? []).filter(
+                (b) =>
+                    b.enabled
+                    && b.content.trim().length > 0
+                    && matchesPromptTriggers(b.triggers, promptTriggerContext, {
+                        requireExplicit: true,
+                    }),
+            );
+            if (inheritedBlocks.length > 0) {
+                const existingIds = new Set((agent.promptBlocks ?? []).map((b) => b.id));
+                const extraBlocks: PromptBlock[] = [];
+                for (const block of inheritedBlocks) {
+                    if (block.id === 'system_base' && existingIds.has('system_base')) {
+                        if (!existingIds.has('__preset_main_system_base')) {
+                            existingIds.add('__preset_main_system_base');
+                            extraBlocks.push({ ...block, id: '__preset_main_system_base' });
+                        }
+                        continue;
+                    }
+                    if (!existingIds.has(block.id)) {
+                        existingIds.add(block.id);
+                        extraBlocks.push(block);
+                    }
+                }
+                if (extraBlocks.length > 0) {
+                    effectiveAgent = {
+                        ...agent,
+                        promptBlocks: [...(agent.promptBlocks ?? []), ...extraBlocks],
+                    };
+                }
+            }
+        }
+
         this.runSequence += 1;
         const runId = `run_${target.messageId}_${target.swipeId}_${this.runSequence}`;
         const startedAt = Date.now();
@@ -868,7 +928,7 @@ export class AgentRunner {
 
         try {
             const baseAssembleInput = {
-                agent,
+                agent: effectiveAgent,
                 connectionId: connection.id,
                 tools: canonicalTools,
                 characterFields,
@@ -877,6 +937,7 @@ export class AgentRunner {
                 wiRouterOverrides: preset.wiRouterOverrides,
                 presetFiles: preset.files,
                 systemBasePrompt: input.systemBasePrompt,
+                promptTriggerContext,
                 trajectoryStore: agent.sessionMode === 'persistent' ? this.trajectoryStore : undefined,
                 recentChatMessages,
                 hostBridge: this.bridge,
@@ -1818,6 +1879,7 @@ export class AgentRunner {
                 preset: parentParams.preset,
                 target: parentParams.target,
                 phase: parentParams.parentPhase,
+                promptTriggerContext: { kind: 'subagent', phase: parentParams.parentPhase },
                 userInput: taskPrompt,
                 loreEntries: parentParams.loreEntries,
                 includeCategory4DynamicEntries: false,

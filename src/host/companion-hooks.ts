@@ -479,6 +479,13 @@ async function runCompanionBeforeTurnUnits(
                 userInput: substitutedPrompt,
                 target,
                 phase: 'before_turn',
+                promptTriggerContext: {
+                    kind: 'trigger',
+                    phase: 'before_turn',
+                    triggerIds: [rule.id],
+                    ...(rule.decorator ? { decorators: [rule.decorator] } : {}),
+                    ...(rule.targetPath ? { targetPaths: [rule.targetPath] } : {}),
+                },
                 preset,
                 signal,
             });

@@ -1,6 +1,7 @@
 import type { TargetedEvent } from 'preact';
 import { useMemo, useRef, useState } from 'preact/hooks';
 import {
+    getPromptTriggerDisplay,
     isPlainRecord,
     normalizePromptBlock,
     resolveActivePreset,
@@ -9,7 +10,7 @@ import {
     importSillyTavernOpenAIPreset,
     isSillyTavernOpenAIPreset,
 } from '@/core/migration';
-import type { AgentProfile, PromptBlock } from '@/core/types';
+import type { AgentProfile, PromptBlock, PromptTriggerType } from '@/core/types';
 import {
     Badge,
     Button,
@@ -38,6 +39,7 @@ import {
     useAppStoreInstance,
 } from '@/ui/store';
 import { PresetManagerPanel } from './PresetManagerPanel';
+import { PromptTriggerPicker } from './PromptTriggerPicker';
 import {
     allocateUniqueId,
     copyTextToClipboard,
@@ -231,6 +233,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
     const [draftRole, setDraftRole] = useState<PromptBlock['role']>('system');
     const [draftPlacement, setDraftPlacement] = useState<PromptBlock['placement']>('prefix');
     const [draftEnabled, setDraftEnabled] = useState(true);
+    const [draftTriggers, setDraftTriggers] = useState<PromptTriggerType[]>([]);
     const [draftContent, setDraftContent] = useState('');
     const [editError, setEditError] = useState<string | null>(null);
 
@@ -288,6 +291,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
         setDraftRole('system');
         setDraftPlacement('prefix');
         setDraftEnabled(true);
+        setDraftTriggers([]);
         setDraftContent('');
         setEditError(null);
     };
@@ -299,6 +303,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
         setDraftRole(block.role);
         setDraftPlacement(block.placement);
         setDraftEnabled(block.enabled);
+        setDraftTriggers(block.triggers ? [...block.triggers] : []);
         setDraftContent(block.content);
         setEditError(null);
     };
@@ -309,6 +314,8 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
             setEditError('请输入提示词名称');
             return;
         }
+
+        const nextTriggers = draftTriggers.length > 0 ? [...draftTriggers] : undefined;
 
         if (editorMode === 'create') {
             mutateActiveAgentBlocks((blocks) => {
@@ -324,6 +331,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                     placement: draftPlacement,
                     content: draftContent,
                     enabled: draftEnabled,
+                    ...(nextTriggers ? { triggers: nextTriggers } : {}),
                 };
                 return [...blocks, created];
             });
@@ -334,18 +342,25 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
 
         if (editorMode === 'edit' && editingBlockId) {
             mutateActiveAgentBlocks((blocks) =>
-                blocks.map((b) =>
-                    b.id === editingBlockId
-                        ? {
-                            ...b,
-                            name: trimmedName,
-                            role: draftRole,
-                            placement: draftPlacement,
-                            enabled: draftEnabled,
-                            content: draftContent,
-                        }
-                        : b,
-                ),
+                blocks.map((b) => {
+                    if (b.id !== editingBlockId) {
+                        return b;
+                    }
+                    const next: PromptBlock = {
+                        ...b,
+                        name: trimmedName,
+                        role: draftRole,
+                        placement: draftPlacement,
+                        enabled: draftEnabled,
+                        content: draftContent,
+                    };
+                    if (nextTriggers) {
+                        next.triggers = nextTriggers;
+                    } else {
+                        delete next.triggers;
+                    }
+                    return next;
+                }),
             );
             store.pushToast(`已保存提示词：${trimmedName}`, 'success');
             setEditorMode(null);
@@ -358,6 +373,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
         }
         const trimmedName = draftName.trim() || '提示词';
         const copyName = `${trimmedName} (副本)`;
+        const nextTriggers = draftTriggers.length > 0 ? [...draftTriggers] : undefined;
         mutateActiveAgentBlocks((blocks) => {
             const idx = blocks.findIndex((b) => b.id === editingBlockId);
             const nextId = allocateUniqueId(
@@ -372,6 +388,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                 placement: draftPlacement,
                 content: draftContent,
                 enabled: draftEnabled,
+                ...(nextTriggers ? { triggers: nextTriggers } : {}),
             };
             if (idx < 0) {
                 return [...blocks, copyBlock];
@@ -777,6 +794,41 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                                                             : 'Tail'}
                                                     </Badge>
                                                     <Badge tone="neutral">{block.role}</Badge>
+                                                    {block.triggers && block.triggers.length > 0 ? (
+                                                        <>
+                                                            {block.triggers.slice(0, 3).map((tag) => {
+                                                                const disp = getPromptTriggerDisplay(
+                                                                    tag,
+                                                                    activePreset.triggers,
+                                                                );
+                                                                return (
+                                                                    <Badge
+                                                                        key={tag}
+                                                                        tone={disp.tone}
+                                                                        title={disp.label}
+                                                                    >
+                                                                        {disp.shortLabel}
+                                                                    </Badge>
+                                                                );
+                                                            })}
+                                                            {block.triggers.length > 3 ? (
+                                                                <Badge
+                                                                    tone="neutral"
+                                                                    title={block.triggers
+                                                                        .map(
+                                                                            (tag) =>
+                                                                                getPromptTriggerDisplay(
+                                                                                    tag,
+                                                                                    activePreset.triggers,
+                                                                                ).label,
+                                                                        )
+                                                                        .join('、')}
+                                                                >
+                                                                    +{block.triggers.length - 3}
+                                                                </Badge>
+                                                            ) : null}
+                                                        </>
+                                                    ) : null}
                                                 </div>
                                             </div>
 
@@ -946,6 +998,19 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                             />
                         </FormField>
                     </div>
+
+                    <FormField
+                        label="触发器 (生效模式筛选)"
+                        hint="留空表示仅当前智能体默认生效；选择后仅在匹配生成模式或触发器时参与上下文组装"
+                    >
+                        <PromptTriggerPicker
+                            value={draftTriggers}
+                            onChange={setDraftTriggers}
+                            placement={draftPlacement}
+                            isMainAgent={activeAgent?.id === activePreset.mainAgentId}
+                            presetTriggers={activePreset.triggers}
+                        />
+                    </FormField>
 
                     <CodeEditor
                         label={`提示词正文 (${draftContent.length} 字符)`}

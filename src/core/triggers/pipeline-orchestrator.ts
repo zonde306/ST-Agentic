@@ -440,6 +440,8 @@ export class PipelineOrchestrator {
                 preset,
                 target,
                 phase: 'main_turn',
+                generationAction: input.action,
+                promptTriggerContext: { kind: 'main', action: input.action },
                 userInput: mainUserInput,
                 userName: input.userName,
                 turnBrief: beforeTurnBrief,
@@ -568,6 +570,8 @@ export class PipelineOrchestrator {
                 preset,
                 target,
                 phase: 'main_turn',
+                generationAction: 'continue',
+                promptTriggerContext: { kind: 'main', action: 'continue' },
                 resumeMessages: [
                     ...cp.completedTurnMessages,
                     { role: 'user', content: recoveryPrompt },
@@ -1242,6 +1246,14 @@ export class PipelineOrchestrator {
         const permissions = mergeUnitPermissions(profile.permissions, unit.triggers);
         const triggerTools = resolveUnitTools(profile.enabledTools, unit.triggers);
 
+        const triggerIds = unit.triggers.map((t) => t.id);
+        const decorators = unit.triggers
+            .map((t) => t.decorator)
+            .filter((d): d is string => Boolean(d));
+        const targetPaths = unit.triggers
+            .map((t) => t.targetPath)
+            .filter((p): p is string => Boolean(p));
+
         const agentResult = await this.agentRunner.run({
             agent: {
                 ...profile,
@@ -1251,13 +1263,20 @@ export class PipelineOrchestrator {
             preset: ctx.preset,
             target: ctx.target,
             phase: unit.phase,
+            promptTriggerContext: {
+                kind: 'trigger',
+                phase: unit.phase,
+                triggerIds,
+                decorators,
+                targetPaths,
+            },
             userInput: promptInput,
             loreEntries: ctx.loreEntries,
             subAgents: ctx.subAgents,
             includeCategory4DynamicEntries: false,
             runTailRadar: false,
             getVariableSchema: unitSchema ? () => unitSchema : undefined,
-            triggerId: unit.triggers.map((t) => t.id).join(','),
+            triggerId: triggerIds.join(','),
             triggerLabel: unit.label,
             staged: ctx.staged,
             stream: false,

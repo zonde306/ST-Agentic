@@ -35,6 +35,7 @@ import {
     DEFAULT_PRESET_ID,
     SETTINGS_VERSION,
 } from './defaults';
+import { normalizePromptTriggers } from './prompt-triggers';
 
 export function isPlainRecord(value: unknown): value is Record<string, unknown> {
     return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -286,6 +287,8 @@ export function normalizePromptBlock(
         ? (raw.placement as PromptBlock['placement'])
         : 'prefix';
 
+    const triggers = normalizePromptTriggers(raw.triggers ?? raw.injection_trigger);
+
     return {
         id: sanitizeName(raw.id, fallbackId),
         name: sanitizeName(raw.name, fallbackName),
@@ -293,6 +296,7 @@ export function normalizePromptBlock(
         placement,
         content: typeof raw.content === 'string' ? raw.content : String(raw.content ?? ''),
         enabled: raw.enabled === undefined ? true : Boolean(raw.enabled),
+        ...(triggers ? { triggers } : {}),
     };
 }
 

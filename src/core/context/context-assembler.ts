@@ -1,5 +1,9 @@
 import type { HostBridge, LLMRequest } from '@/core/bridge';
-import { DEFAULT_MAIN_AGENT_ID, createDefaultPromptBlocks } from '@/core/config';
+import {
+    DEFAULT_MAIN_AGENT_ID,
+    createDefaultPromptBlocks,
+    matchesPromptTriggers,
+} from '@/core/config';
 import {
     buildCoreManifest,
     classifyEntry,
@@ -20,6 +24,7 @@ import type {
     ClassifiedLoreEntry,
     MessageTarget,
     PromptBlock,
+    PromptTriggerContext,
     RadarScanResult,
     RawLoreEntry,
     RegexRule,
@@ -83,6 +88,7 @@ export interface ContextAssembleInput {
     presetFiles?: Record<string, string>;
     hollowThreshold?: number;
     systemBasePrompt?: string;
+    promptTriggerContext?: PromptTriggerContext;
     forceRecompilePrefix?: boolean;
 
     // Layer 1 inputs
@@ -392,6 +398,7 @@ export class ContextAssembler {
         presetFiles?: Record<string, string>;
         hollowThreshold?: number;
         systemBasePrompt?: string;
+        promptTriggerContext?: PromptTriggerContext;
         hostBridge?: HostBridge;
     }): StaticPrefixResult {
         const canonicalTools = canonicalizeTools(input.tools);
@@ -404,7 +411,11 @@ export class ContextAssembler {
         if (input.systemBasePrompt !== undefined) {
             rawBaseText = input.systemBasePrompt;
         } else if (systemBaseBlock) {
-            rawBaseText = systemBaseBlock.enabled ? systemBaseBlock.content : '';
+            rawBaseText =
+                systemBaseBlock.enabled
+                && matchesPromptTriggers(systemBaseBlock.triggers, input.promptTriggerContext)
+                    ? systemBaseBlock.content
+                    : '';
         } else {
             rawBaseText = this.defaultSystemBase;
         }
@@ -480,7 +491,8 @@ export class ContextAssembler {
                 b.enabled
                 && b.placement === 'prefix'
                 && b.id !== 'system_base'
-                && b.content.trim().length > 0,
+                && b.content.trim().length > 0
+                && matchesPromptTriggers(b.triggers, input.promptTriggerContext),
         );
         for (const block of prefixBlocks) {
             const rendered = substituteText(block.content, input.hostBridge).trim();
@@ -517,9 +529,18 @@ export class ContextAssembler {
         let systemRuleCount: number;
 
         const isPersistent = input.agent.sessionMode === 'persistent';
-        const existingFrozen = isPersistent && !input.forceRecompilePrefix
-            ? input.trajectoryStore?.getFrozenPrefix(input.agent.id) ?? null
-            : null;
+        const hasTriggerScopedBlocks = (input.agent.promptBlocks ?? []).some(
+            (b) => b.triggers && b.triggers.length > 0,
+        );
+        const isNonMainTriggerRun =
+            isPersistent
+            && input.promptTriggerContext !== undefined
+            && input.promptTriggerContext.kind !== 'main'
+            && hasTriggerScopedBlocks;
+        const existingFrozen =
+            isPersistent && !input.forceRecompilePrefix && !isNonMainTriggerRun
+                ? input.trajectoryStore?.getFrozenPrefix(input.agent.id) ?? null
+                : null;
 
         if (existingFrozen) {
             tools = canonicalClone(existingFrozen.tools) as CanonicalToolSchema[];
@@ -547,6 +568,7 @@ export class ContextAssembler {
                 presetFiles: input.presetFiles,
                 hollowThreshold: input.hollowThreshold,
                 systemBasePrompt: input.systemBasePrompt,
+                promptTriggerContext: input.promptTriggerContext,
                 hostBridge,
             });
             tools = prefix.tools;
@@ -555,7 +577,7 @@ export class ContextAssembler {
             coreManifest = prefix.coreManifest;
             systemRuleCount = prefix.systemRuleCount;
 
-            if (isPersistent && input.trajectoryStore) {
+            if (isPersistent && !isNonMainTriggerRun && input.trajectoryStore) {
                 input.trajectoryStore.setFrozenPrefix(
                     {
                         tools,
@@ -878,7 +900,10 @@ export class ContextAssembler {
         // 3. Enabled `tail` PromptBlocks
         const tailPromptBlocks = (input.agent.promptBlocks ?? []).filter(
             (b: PromptBlock) =>
-                b.enabled && b.placement === 'tail' && b.content.trim().length > 0,
+                b.enabled
+                && b.placement === 'tail'
+                && b.content.trim().length > 0
+                && matchesPromptTriggers(b.triggers, input.promptTriggerContext),
         );
         for (const block of tailPromptBlocks) {
             const rendered = substituteText(block.content, input.hostBridge, macroOverrides).trim();
