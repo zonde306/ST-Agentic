@@ -87,6 +87,38 @@ export interface AssistantRuntimeBridge {
             signal?: AbortSignal;
         },
     ): Promise<AssistantMessage | AssistantSession | void>;
+    editMessage?(
+        sessionId: string,
+        messageId: string,
+        newContent: string,
+    ): Promise<AssistantSession | null | void>;
+    editAndResendMessage?(
+        sessionId: string,
+        messageId: string,
+        newContent: string,
+        options?: {
+            onDelta?: (delta: string) => void;
+            onUpdate?: (session: AssistantSession) => void;
+            signal?: AbortSignal;
+        },
+    ): Promise<AssistantMessage | AssistantSession | void>;
+    retractMessage?(
+        sessionId: string,
+        messageId: string,
+    ): Promise<
+        | { session: AssistantSession; removedMessages: AssistantMessage[] }
+        | AssistantSession
+        | null
+        | void
+    >;
+    regenerateLastMessage?(
+        sessionId: string,
+        options?: {
+            onDelta?: (delta: string) => void;
+            onUpdate?: (session: AssistantSession) => void;
+            signal?: AbortSignal;
+        },
+    ): Promise<AssistantMessage | AssistantSession | void>;
     abort?(sessionId?: string): void;
     listApprovals?(sessionId?: string): Promise<PendingApproval[]> | PendingApproval[];
     decideApproval(
@@ -300,6 +332,7 @@ export interface AgenticUIServices {
 
 export interface AppStoreState {
     isOpen: boolean;
+    isMaximized: boolean;
     activeTab: ConsoleTabId;
     deepLink: DeepLinkState;
     activeTarget: MessageTarget;
@@ -331,6 +364,7 @@ export interface AppStoreOptions {
     initialBackgroundTasks?: BackgroundTaskStatus[];
     initialTab?: ConsoleTabId;
     initialOpen?: boolean;
+    initialMaximized?: boolean;
     initialTarget?: MessageTarget;
     initialMobileAssistantStack?: MobileViewStack;
     initialMobileSideGenStack?: MobileViewStack;
@@ -516,6 +550,7 @@ export class AppStore {
 
         this.state = {
             isOpen: options.initialOpen ?? false,
+            isMaximized: options.initialMaximized ?? false,
             activeTab: options.initialTab ?? 'files',
             deepLink: {},
             activeTarget: options.initialTarget ?? { messageId: 12, swipeId: 0 },
@@ -699,6 +734,17 @@ export class AppStore {
         } else {
             this.openConsole(tab);
         }
+    }
+
+    setMaximized(maximized: boolean): void {
+        if (this.state.isMaximized === maximized) {
+            return;
+        }
+        this.setState({ isMaximized: maximized });
+    }
+
+    toggleMaximized(): void {
+        this.setMaximized(!this.state.isMaximized);
     }
 
     setActiveTab(tab: ConsoleTabId): void {

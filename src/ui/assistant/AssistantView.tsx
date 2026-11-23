@@ -19,6 +19,7 @@ import { SessionListPanel } from './SessionListPanel';
 import { UndoHistoryModal } from './UndoHistoryModal';
 import {
     ASSISTANT_MODE_META,
+    copyTextSafe,
     formatErrorMessage,
     renderRedactedText,
     resolveConnectionDisplay,
@@ -66,6 +67,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     } | null>(null);
     const [busyApprovalId, setBusyApprovalId] = useState<string | null>(null);
     const [busyUndoId, setBusyUndoId] = useState<string | null>(null);
+    const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
 
     const abortControllerRef = useRef<AbortController | null>(null);
     const threadRef = useRef<HTMLDivElement | null>(null);
@@ -121,6 +123,10 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     const isStreamingCurrent = Boolean(
         activeSession && streamingSessionId === activeSession.id,
     );
+
+    useEffect(() => {
+        setEditingMessageId(null);
+    }, [activeSession?.id]);
 
     // Auto-scroll thread when messages or live streaming delta update.
     const messageCount = activeSession?.messages.length ?? 0;
@@ -365,6 +371,77 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
         store.pushToast('已停止当前助手生成', 'warning');
     }, [activeSession?.id, store]);
 
+    const runStreamingOperation = useCallback(
+        async (
+            sessionId: string,
+            executor: (hooks: {
+                signal: AbortSignal;
+                onDelta: (delta: string) => void;
+                onUpdate: (updatedSession: AssistantSession) => void;
+            }) => Promise<AssistantMessage | AssistantSession | void>,
+            errorPrefix: string,
+        ) => {
+            const controller = new AbortController();
+            abortControllerRef.current = controller;
+            store.setAssistantStreamingSessionId(sessionId);
+            setStreamingDelta({ sessionId, text: '' });
+
+            let receivedOnUpdate = false;
+
+            try {
+                const result = await executor({
+                    signal: controller.signal,
+                    onDelta: (delta: string) => {
+                        if (controller.signal.aborted) {
+                            return;
+                        }
+                        setStreamingDelta((prev) => ({
+                            sessionId,
+                            text: prev && prev.sessionId === sessionId ? prev.text + delta : delta,
+                        }));
+                    },
+                    onUpdate: (updatedSession: AssistantSession) => {
+                        receivedOnUpdate = true;
+                        upsertSessionInStore(updatedSession);
+                    },
+                });
+
+                if (result && 'messages' in result && Array.isArray(result.messages)) {
+                    upsertSessionInStore(result);
+                } else if (!receivedOnUpdate && result && 'role' in result) {
+                    const cur = store
+                        .getSnapshot()
+                        .assistantSessions.find((item) => item.id === sessionId);
+                    if (cur && !cur.messages.some((m) => m.id === result.id)) {
+                        upsertSessionInStore({
+                            ...cur,
+                            updatedAt: Date.now(),
+                            messages: [...cur.messages, result],
+                        });
+                    }
+                }
+            } catch (err) {
+                if (!controller.signal.aborted) {
+                    store.pushToast(`${errorPrefix}：${formatErrorMessage(err)}`, 'error');
+                }
+            } finally {
+                if (abortControllerRef.current === controller) {
+                    abortControllerRef.current = null;
+                }
+                if (store.getSnapshot().assistantStreamingSessionId === sessionId) {
+                    store.setAssistantStreamingSessionId(null);
+                }
+                setStreamingDelta(null);
+                try {
+                    await store.refreshAssistantState();
+                } catch {
+                    // Keep UI responsive even if refresh fails after abort.
+                }
+            }
+        },
+        [store, upsertSessionInStore],
+    );
+
     const handleSendPrompt = useCallback(async () => {
         if (isStreamingCurrent) {
             handleAbortStream();
@@ -394,73 +471,216 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
         const sessionId = targetSession.id;
         setDraft('');
         setOpenPopover(null);
+        setEditingMessageId(null);
 
-        const controller = new AbortController();
-        abortControllerRef.current = controller;
-        store.setAssistantStreamingSessionId(sessionId);
-        setStreamingDelta({ sessionId, text: '' });
-
-        let receivedOnUpdate = false;
-
-        try {
-            const result = await runtime.sendPrompt(sessionId, text, {
-                signal: controller.signal,
-                onDelta: (delta: string) => {
-                    if (controller.signal.aborted) {
-                        return;
-                    }
-                    setStreamingDelta((prev) => ({
-                        sessionId,
-                        text: prev && prev.sessionId === sessionId ? prev.text + delta : delta,
-                    }));
-                },
-                onUpdate: (updatedSession: AssistantSession) => {
-                    receivedOnUpdate = true;
-                    upsertSessionInStore(updatedSession);
-                },
-            });
-
-            if (result && 'messages' in result && Array.isArray(result.messages)) {
-                upsertSessionInStore(result);
-            } else if (!receivedOnUpdate && result && 'role' in result) {
-                const cur = store
-                    .getSnapshot()
-                    .assistantSessions.find((item) => item.id === sessionId);
-                if (cur && !cur.messages.some((m) => m.id === result.id)) {
-                    upsertSessionInStore({
-                        ...cur,
-                        updatedAt: Date.now(),
-                        messages: [...cur.messages, result],
-                    });
-                }
-            }
-        } catch (err) {
-            if (!controller.signal.aborted) {
-                store.pushToast(`助手执行失败：${formatErrorMessage(err)}`, 'error');
-            }
-        } finally {
-            if (abortControllerRef.current === controller) {
-                abortControllerRef.current = null;
-            }
-            if (store.getSnapshot().assistantStreamingSessionId === sessionId) {
-                store.setAssistantStreamingSessionId(null);
-            }
-            setStreamingDelta(null);
-            try {
-                await store.refreshAssistantState();
-            } catch {
-                // Keep UI responsive even if refresh fails after abort.
-            }
-        }
+        await runStreamingOperation(
+            sessionId,
+            (hooks) => runtime.sendPrompt(sessionId, text, hooks),
+            '助手执行失败',
+        );
     }, [
         activeSession,
         draft,
         handleAbortStream,
         handleCreateSession,
         isStreamingCurrent,
+        runStreamingOperation,
         store,
-        upsertSessionInStore,
     ]);
+
+    const handleCopyMessage = useCallback(
+        async (content: string) => {
+            const ok = await copyTextSafe(content);
+            store.pushToast(
+                ok ? '已复制消息内容' : '复制失败，请手动选中文本复制',
+                ok ? 'success' : 'warning',
+            );
+        },
+        [store],
+    );
+
+    const handleSaveEditMessage = useCallback(
+        async (messageId: string, newContent: string) => {
+            if (!activeSession || isStreamingCurrent) {
+                return;
+            }
+            if (!newContent.trim()) {
+                store.pushToast('消息内容不能为空', 'warning');
+                return;
+            }
+
+            const runtime = store.assistantRuntime;
+            try {
+                if (runtime?.editMessage) {
+                    const updated = await runtime.editMessage(
+                        activeSession.id,
+                        messageId,
+                        newContent,
+                    );
+                    if (updated) {
+                        upsertSessionInStore(updated);
+                    }
+                    await store.refreshAssistantState();
+                } else {
+                    upsertSessionInStore({
+                        ...activeSession,
+                        updatedAt: Date.now(),
+                        messages: activeSession.messages.map((m) =>
+                            m.id === messageId
+                                ? {
+                                    ...m,
+                                    content: newContent,
+                                    ...(m.interrupted ? { interrupted: false } : {}),
+                                }
+                                : m,
+                        ),
+                    });
+                }
+                setEditingMessageId(null);
+                store.pushToast('已保存消息改写', 'success');
+            } catch (err) {
+                store.pushToast(`保存改写失败：${formatErrorMessage(err)}`, 'error');
+            }
+        },
+        [activeSession, isStreamingCurrent, store, upsertSessionInStore],
+    );
+
+    const handleSaveAndResendMessage = useCallback(
+        async (messageId: string, newContent: string) => {
+            if (!activeSession || isStreamingCurrent) {
+                return;
+            }
+            if (!newContent.trim()) {
+                store.pushToast('消息内容不能为空', 'warning');
+                return;
+            }
+            const runtime = store.assistantRuntime;
+            if (!runtime) {
+                store.pushToast('助手运行时未连接，暂时无法发送指令', 'warning');
+                return;
+            }
+            if (!runtime.editAndResendMessage) {
+                store.pushToast('当前运行时不支持改写并发送', 'warning');
+                return;
+            }
+
+            setEditingMessageId(null);
+            setOpenPopover(null);
+            const sessionId = activeSession.id;
+
+            await runStreamingOperation(
+                sessionId,
+                (hooks) => runtime.editAndResendMessage!(sessionId, messageId, newContent, hooks),
+                '改写并发送失败',
+            );
+        },
+        [activeSession, isStreamingCurrent, runStreamingOperation, store],
+    );
+
+    const handleRetractMessage = useCallback(
+        (messageId: string) => {
+            if (!activeSession || isStreamingCurrent) {
+                return;
+            }
+            const idx = activeSession.messages.findIndex((m) => m.id === messageId);
+            if (idx < 0) {
+                return;
+            }
+
+            const targetMsg = activeSession.messages[idx];
+            const tailCount = activeSession.messages.length - idx;
+            const tailAfter = tailCount - 1;
+            const isLastTurnPair =
+                tailAfter === 1
+                && targetMsg.role === 'user'
+                && activeSession.messages[idx + 1]?.role === 'assistant';
+            const isInstantSafe = tailAfter === 0 || isLastTurnPair;
+            const sessionId = activeSession.id;
+
+            const executeRetract = async () => {
+                const runtime = store.assistantRuntime;
+                try {
+                    if (runtime?.retractMessage) {
+                        const result = await runtime.retractMessage(sessionId, messageId);
+                        if (result && 'session' in result) {
+                            upsertSessionInStore(result.session);
+                        } else if (result && 'messages' in result) {
+                            upsertSessionInStore(result);
+                        }
+                        await store.refreshAssistantState();
+                    } else {
+                        const cur = store
+                            .getSnapshot()
+                            .assistantSessions.find((s) => s.id === sessionId);
+                        if (cur) {
+                            const curIdx = cur.messages.findIndex((m) => m.id === messageId);
+                            if (curIdx >= 0) {
+                                upsertSessionInStore({
+                                    ...cur,
+                                    updatedAt: Date.now(),
+                                    messages: cur.messages.slice(0, curIdx),
+                                });
+                            }
+                        }
+                    }
+
+                    setEditingMessageId((prev) => (prev === messageId ? null : prev));
+                    if (targetMsg.role === 'user' && draft.trim() === '') {
+                        setDraft(targetMsg.content);
+                    }
+                    store.pushToast(
+                        tailCount > 1
+                            ? `已撤回该轮及后续共 ${tailCount} 条消息`
+                            : '已撤回消息',
+                        'warning',
+                    );
+                } catch (err) {
+                    store.pushToast(`撤回消息失败：${formatErrorMessage(err)}`, 'error');
+                }
+            };
+
+            if (isInstantSafe) {
+                void executeRetract();
+                return;
+            }
+
+            store.openModal({
+                kind: 'confirm',
+                title: '确认撤回消息',
+                message: `撤回此消息将同时移除其后方的 ${tailAfter} 条对话记录（共 ${tailCount} 条），此操作不可恢复。是否继续？`,
+                confirmLabel: '确认撤回',
+                cancelLabel: '取消',
+                tone: 'danger',
+                onConfirm: executeRetract,
+            });
+        },
+        [activeSession, draft, isStreamingCurrent, store, upsertSessionInStore],
+    );
+
+    const handleRegenerateLastMessage = useCallback(async () => {
+        if (!activeSession || isStreamingCurrent) {
+            return;
+        }
+        const runtime = store.assistantRuntime;
+        if (!runtime) {
+            store.pushToast('助手运行时未连接，暂时无法重新生成', 'warning');
+            return;
+        }
+        if (!runtime.regenerateLastMessage) {
+            store.pushToast('当前运行时不支持重新生成末尾消息', 'warning');
+            return;
+        }
+
+        setEditingMessageId(null);
+        setOpenPopover(null);
+        const sessionId = activeSession.id;
+
+        await runStreamingOperation(
+            sessionId,
+            (hooks) => runtime.regenerateLastMessage!(sessionId, hooks),
+            '重新生成失败',
+        );
+    }, [activeSession, isStreamingCurrent, runStreamingOperation, store]);
 
     const handleDecideApproval = useCallback(
         async (approvalId: string, decision: 'approve' | 'reject', feedback?: string) => {
@@ -686,9 +906,16 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
 
     const handleRootKeyDown = (event: TargetedKeyboardEvent<HTMLDivElement>) => {
         event.stopPropagation();
-        if (event.key === 'Escape' && openPopover !== null) {
-            event.preventDefault();
-            setOpenPopover(null);
+        if (event.key === 'Escape') {
+            if (editingMessageId !== null) {
+                event.preventDefault();
+                setEditingMessageId(null);
+                return;
+            }
+            if (openPopover !== null) {
+                event.preventDefault();
+                setOpenPopover(null);
+            }
         }
     };
 
@@ -893,17 +1120,29 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 ) : (
                     <>
                         {renderedMessages.map((msg, idx) => {
+                            const isLastMessage = idx === renderedMessages.length - 1;
                             const isLastStreamingMsg =
                                 isStreamingCurrent
-                                && idx === renderedMessages.length - 1
+                                && isLastMessage
                                 && msg.role === 'assistant'
                                 && (!showSyntheticStreamingBubble || syntheticMessageAlreadyReflected);
+                            const hasPriorOrSelfUser =
+                                msg.role === 'user'
+                                || renderedMessages.slice(0, idx).some((m) => m.role === 'user');
+                            const canRegenerate =
+                                isLastMessage
+                                && hasPriorOrSelfUser
+                                && !(showSyntheticStreamingBubble && !syntheticMessageAlreadyReflected);
 
                             return (
                                 <MessageBubble
                                     key={msg.id}
                                     message={msg}
                                     isStreaming={isLastStreamingMsg}
+                                    isLastMessage={isLastMessage}
+                                    canRegenerate={canRegenerate}
+                                    isSessionStreaming={isStreamingCurrent}
+                                    isEditing={editingMessageId === msg.id}
                                     approvalsById={approvalsById}
                                     undoById={undoById}
                                     busyApprovalId={busyApprovalId}
@@ -912,6 +1151,16 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                     onRetryApproval={handleRetryApproval}
                                     onApplyUndo={handleApplyUndo}
                                     onPreviewFile={(path) => void handlePreviewFile(path)}
+                                    onStartEdit={(id) => {
+                                        setOpenPopover(null);
+                                        setEditingMessageId(id);
+                                    }}
+                                    onCancelEdit={() => setEditingMessageId(null)}
+                                    onSaveEdit={handleSaveEditMessage}
+                                    onSaveAndResendEdit={handleSaveAndResendMessage}
+                                    onRetract={handleRetractMessage}
+                                    onRegenerate={handleRegenerateLastMessage}
+                                    onCopy={handleCopyMessage}
                                 />
                             );
                         })}
@@ -926,6 +1175,8 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                     timestamp: Date.now(),
                                 }}
                                 isStreaming
+                                isSyntheticStreaming
+                                isSessionStreaming={isStreamingCurrent}
                                 approvalsById={approvalsById}
                                 undoById={undoById}
                                 busyApprovalId={busyApprovalId}

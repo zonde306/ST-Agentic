@@ -44,6 +44,18 @@ export const AGENTIC_DIALOG_RESET_STYLES = `
     font-size: 14px !important;
     line-height: 1.5 !important;
 }
+#agentic-app[data-maximized="true"] {
+    width: 100vw !important;
+    height: var(--ag-viewport-height, 100dvh) !important;
+    max-width: 100vw !important;
+    max-height: var(--ag-viewport-height, 100dvh) !important;
+    margin: 0 !important;
+    inset: 0 !important;
+}
+#agentic-app[data-maximized="true"]::backdrop {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+}
 @media (max-width: 767px) {
     #agentic-app {
         width: 100vw !important;
@@ -209,6 +221,12 @@ select {
     box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
 }
 
+.ag-console[data-maximized="true"] {
+    border-radius: 0;
+    border: none;
+    box-shadow: none;
+}
+
 /* Header */
 .ag-header {
     flex-shrink: 0;
@@ -229,6 +247,7 @@ select {
     align-items: center;
     gap: 8px;
     min-width: 0;
+    user-select: none;
 }
 
 .ag-brand-logo {
@@ -287,6 +306,10 @@ select {
     align-items: center;
     gap: 6px;
     flex-wrap: wrap;
+}
+
+.ag-window-toggle-btn {
+    padding: 0;
 }
 
 /* Mobile Top Horizontal Nav */
@@ -1624,8 +1647,29 @@ select {
     justify-content: flex-start;
 }
 
+.ag-ast-msg-col {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.ag-ast-msg-col-user {
+    align-items: flex-end;
+    max-width: min(86%, 760px);
+}
+
+.ag-ast-msg-col-user.ag-ast-msg-col-editing {
+    width: min(86%, 760px);
+}
+
+.ag-ast-msg-col-assistant {
+    align-items: flex-start;
+    width: 100%;
+    max-width: 96%;
+}
+
 .ag-ast-bubble-user {
-    max-width: min(86%, 680px);
+    max-width: 100%;
     min-width: 0;
     padding: 9px 12px;
     border-radius: 16px 4px 16px 16px;
@@ -1639,7 +1683,7 @@ select {
 
 .ag-ast-bubble-assistant {
     width: 100%;
-    max-width: 96%;
+    max-width: 100%;
     min-width: 0;
     padding: 10px 12px;
     border-radius: 4px 16px 16px 16px;
@@ -1651,6 +1695,100 @@ select {
     flex-direction: column;
     gap: 8px;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+/* DeepSeek-style Below-Message Action Bar & Inline Rewrite Editor */
+.ag-ast-msg-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px;
+    margin-top: 2px;
+    max-width: 100%;
+}
+
+.ag-ast-msg-actions-user {
+    justify-content: flex-end;
+}
+
+.ag-ast-msg-actions-assistant {
+    justify-content: flex-start;
+}
+
+.ag-ast-action-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0 8px;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--muted-foreground);
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.78;
+    transition: background-color 0.15s, color 0.15s, opacity 0.15s, border-color 0.15s;
+}
+
+.ag-ast-action-btn:hover:not(:disabled) {
+    background: var(--secondary);
+    color: var(--foreground);
+    opacity: 1;
+}
+
+.ag-ast-action-btn-danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--error) 14%, transparent);
+    color: var(--error);
+    border-color: color-mix(in srgb, var(--error) 35%, transparent);
+    opacity: 1;
+}
+
+.ag-ast-action-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+
+.ag-ast-edit-box {
+    width: 100%;
+    min-width: 0;
+    padding: 10px;
+    border-radius: 14px;
+    border: 1px solid var(--primary);
+    background: var(--card);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+.ag-ast-edit-textarea {
+    width: 100%;
+    min-height: 84px;
+    max-height: 320px;
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--content);
+    color: var(--foreground);
+    font-size: 16px;
+    line-height: 1.5;
+    resize: vertical;
+    outline: none;
+}
+
+.ag-ast-edit-textarea:focus {
+    border-color: var(--primary);
+}
+
+.ag-ast-edit-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
 }
 
 .ag-ast-bubble-content {
@@ -2701,6 +2839,19 @@ select {
     }
 
     .ag-ast-bubble-assistant {
+        max-width: 100%;
+    }
+
+    .ag-ast-msg-col-assistant {
+        max-width: 100%;
+    }
+
+    .ag-ast-msg-col-user {
+        max-width: 92%;
+    }
+
+    .ag-ast-msg-col-user.ag-ast-msg-col-editing {
+        width: 100%;
         max-width: 100%;
     }
 

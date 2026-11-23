@@ -910,4 +910,77 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
             activeHarness = null;
         }
     });
+
+    it('toggles Windows-style webpage fullscreen maximize and restore on desktop while keeping mobile hidden', async () => {
+        // 1. Desktop (1280x800): maximize button and header double-click toggle fullscreen cleanly
+        await page.viewport(1280, 800);
+        activeHarness = createHarness({ initialTab: 'assistant', initialOpen: true });
+        await settleLayout(5);
+
+        const { dialog, shadowHost, shadowRoot, consoleEl } = getShellElements();
+
+        const maximizeBtn = shadowRoot.querySelector(
+            'button[aria-label="网页全屏"]',
+        ) as HTMLButtonElement | null;
+        expect(maximizeBtn).toBeTruthy();
+        expect(isElementVisible(maximizeBtn!)).toBe(true);
+        expect(dialog.getAttribute('data-maximized')).toBe('false');
+        expect(shadowHost.getAttribute('data-maximized')).toBe('false');
+        expect(consoleEl.getAttribute('data-maximized')).toBe('false');
+
+        const normalRect = dialog.getBoundingClientRect();
+        expect(Math.round(normalRect.width)).toBe(1180);
+        expect(Math.round(normalRect.height)).toBe(760);
+        expect(window.getComputedStyle(consoleEl).borderRadius).toBe('16px');
+
+        assertNoHorizontalOverflow(dialog, shadowRoot, 'desktop:normal');
+        assertInteractiveTargetsAndTypography(shadowRoot, 'desktop:normal');
+
+        // Click maximize button -> expands to full 1280x800 viewport with 0px border-radius
+        maximizeBtn!.click();
+        await settleLayout(5);
+
+        expect(activeHarness.store.getSnapshot().isMaximized).toBe(true);
+        expect(dialog.getAttribute('data-maximized')).toBe('true');
+        expect(shadowHost.getAttribute('data-maximized')).toBe('true');
+        expect(consoleEl.getAttribute('data-maximized')).toBe('true');
+
+        const maxRect = dialog.getBoundingClientRect();
+        expect(Math.round(maxRect.width)).toBe(1280);
+        expect(Math.round(maxRect.height)).toBe(800);
+        expect(window.getComputedStyle(consoleEl).borderRadius).toBe('0px');
+
+        const restoreBtn = shadowRoot.querySelector(
+            'button[aria-label="还原窗口"]',
+        ) as HTMLButtonElement | null;
+        expect(restoreBtn).toBeTruthy();
+        expect(isElementVisible(restoreBtn!)).toBe(true);
+
+        assertNoHorizontalOverflow(dialog, shadowRoot, 'desktop:maximized');
+        assertInteractiveTargetsAndTypography(shadowRoot, 'desktop:maximized');
+
+        // Double-click .ag-brand -> restores back to windowed 1180x760 frame
+        const brandEl = shadowRoot.querySelector('.ag-brand') as HTMLDivElement;
+        expect(brandEl).toBeTruthy();
+        brandEl.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+        await settleLayout(5);
+
+        expect(activeHarness.store.getSnapshot().isMaximized).toBe(false);
+        expect(dialog.getAttribute('data-maximized')).toBe('false');
+        const restoredRect = dialog.getBoundingClientRect();
+        expect(Math.round(restoredRect.width)).toBe(1180);
+        expect(Math.round(restoredRect.height)).toBe(760);
+        expect(window.getComputedStyle(consoleEl).borderRadius).toBe('16px');
+
+        activeHarness.cleanup();
+        activeHarness = null;
+
+        // 2. Mobile (390x844): maximize/restore button is hidden on mobile viewport
+        await page.viewport(390, 844);
+        activeHarness = createHarness({ initialTab: 'files', initialOpen: true });
+        await settleLayout(5);
+        const { shadowRoot: mobileShadowRoot } = getShellElements();
+        expect(mobileShadowRoot.querySelector('button[aria-label="网页全屏"]')).toBeNull();
+        expect(mobileShadowRoot.querySelector('button[aria-label="还原窗口"]')).toBeNull();
+    });
 });

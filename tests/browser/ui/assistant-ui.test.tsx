@@ -167,6 +167,10 @@ interface MockAssistantController {
     undoRecords: UndoRecord[];
     updateSessionConfigSpy: Mock<(...args: unknown[]) => void>;
     sendPromptSpy: Mock<(...args: unknown[]) => void>;
+    editMessageSpy: Mock<(...args: unknown[]) => void>;
+    editAndResendMessageSpy: Mock<(...args: unknown[]) => void>;
+    retractMessageSpy: Mock<(...args: unknown[]) => void>;
+    regenerateLastMessageSpy: Mock<(...args: unknown[]) => void>;
     abortSpy: Mock<(...args: unknown[]) => void>;
     decideApprovalSpy: Mock<(...args: unknown[]) => void>;
     retryApprovalSpy: Mock<(...args: unknown[]) => void>;
@@ -256,6 +260,10 @@ function createMockAssistantRuntime(options: {
         undoRecords,
         updateSessionConfigSpy: vi.fn(),
         sendPromptSpy: vi.fn(),
+        editMessageSpy: vi.fn(),
+        editAndResendMessageSpy: vi.fn(),
+        retractMessageSpy: vi.fn(),
+        regenerateLastMessageSpy: vi.fn(),
         abortSpy: vi.fn(),
         decideApprovalSpy: vi.fn(),
         retryApprovalSpy: vi.fn(),
@@ -335,6 +343,135 @@ function createMockAssistantRuntime(options: {
             if (target) {
                 target.messages.push(reply);
             }
+            return reply;
+        },
+        editMessage: async (sessionId, messageId, newContent) => {
+            controller.editMessageSpy(sessionId, messageId, newContent);
+            const target = controller.sessions.find((s) => s.id === sessionId);
+            if (!target) {
+                return null;
+            }
+            const msg = target.messages.find((m) => m.id === messageId);
+            if (!msg) {
+                return null;
+            }
+            msg.content = newContent;
+            if (msg.interrupted) {
+                msg.interrupted = false;
+            }
+            target.updatedAt = Date.now();
+            return structuredClone(target);
+        },
+        editAndResendMessage: async (sessionId, messageId, newContent, sendOpts) => {
+            controller.editAndResendMessageSpy(sessionId, messageId, newContent, sendOpts);
+            controller.lastSendOptions = sendOpts ?? null;
+            const target = controller.sessions.find((s) => s.id === sessionId);
+            if (!target) {
+                throw new Error(`Session not found: ${sessionId}`);
+            }
+            const idx = target.messages.findIndex((m) => m.id === messageId);
+            if (idx < 0) {
+                throw new Error(`Message not found: ${messageId}`);
+            }
+            target.messages[idx].content = newContent;
+            const removed = target.messages.slice(idx + 1);
+            target.messages = target.messages.slice(0, idx + 1);
+            const removedIds = new Set(removed.map((m) => m.id));
+            for (let i = controller.approvals.length - 1; i >= 0; i -= 1) {
+                if (removedIds.has(controller.approvals[i].messageId)) {
+                    controller.approvals.splice(i, 1);
+                }
+            }
+            sendOpts?.onUpdate?.(structuredClone(target));
+
+            if (controller.nextSendDeferred) {
+                const deferred = controller.nextSendDeferred;
+                controller.nextSendDeferred = null;
+                const resolved = await deferred.promise;
+                if (resolved && !target.messages.some((m) => m.id === resolved.id)) {
+                    target.messages.push(resolved);
+                }
+                return resolved;
+            }
+
+            const reply: AssistantMessage = {
+                id: `ast_resent_${Date.now()}`,
+                role: 'assistant',
+                content: `改写重发响应：${newContent}`,
+                timestamp: Date.now(),
+            };
+            target.messages.push(reply);
+            return reply;
+        },
+        retractMessage: async (sessionId, messageId) => {
+            controller.retractMessageSpy(sessionId, messageId);
+            const target = controller.sessions.find((s) => s.id === sessionId);
+            if (!target) {
+                return null;
+            }
+            const idx = target.messages.findIndex((m) => m.id === messageId);
+            if (idx < 0) {
+                return null;
+            }
+            const removedMessages = structuredClone(target.messages.slice(idx));
+            target.messages = target.messages.slice(0, idx);
+            target.updatedAt = Date.now();
+            const removedIds = new Set(removedMessages.map((m) => m.id));
+            for (let i = controller.approvals.length - 1; i >= 0; i -= 1) {
+                if (removedIds.has(controller.approvals[i].messageId)) {
+                    controller.approvals.splice(i, 1);
+                }
+            }
+            return {
+                session: structuredClone(target),
+                removedMessages,
+            };
+        },
+        regenerateLastMessage: async (sessionId, sendOpts) => {
+            controller.regenerateLastMessageSpy(sessionId, sendOpts);
+            controller.lastSendOptions = sendOpts ?? null;
+            const target = controller.sessions.find((s) => s.id === sessionId);
+            if (!target) {
+                throw new Error(`Session not found: ${sessionId}`);
+            }
+            let lastUserIdx = -1;
+            for (let i = target.messages.length - 1; i >= 0; i -= 1) {
+                if (target.messages[i].role === 'user') {
+                    lastUserIdx = i;
+                    break;
+                }
+            }
+            if (lastUserIdx < 0) {
+                throw new Error('No user message available to regenerate.');
+            }
+            const userMsg = target.messages[lastUserIdx];
+            const removed = target.messages.slice(lastUserIdx + 1);
+            target.messages = target.messages.slice(0, lastUserIdx + 1);
+            const removedIds = new Set(removed.map((m) => m.id));
+            for (let i = controller.approvals.length - 1; i >= 0; i -= 1) {
+                if (removedIds.has(controller.approvals[i].messageId)) {
+                    controller.approvals.splice(i, 1);
+                }
+            }
+            sendOpts?.onUpdate?.(structuredClone(target));
+
+            if (controller.nextSendDeferred) {
+                const deferred = controller.nextSendDeferred;
+                controller.nextSendDeferred = null;
+                const resolved = await deferred.promise;
+                if (resolved && !target.messages.some((m) => m.id === resolved.id)) {
+                    target.messages.push(resolved);
+                }
+                return resolved;
+            }
+
+            const reply: AssistantMessage = {
+                id: `ast_regen_${Date.now()}`,
+                role: 'assistant',
+                content: `重新生成响应：${userMsg.content}`,
+                timestamp: Date.now(),
+            };
+            target.messages.push(reply);
             return reply;
         },
         abort: (sessionId) => {
@@ -993,5 +1130,248 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
             expect(token.textContent).toBe('***REDACTED***');
         }
         expect(toolCard.textContent).not.toContain('sk-proj-');
+    });
+
+    it('renders DeepSeek-style emoji action bar below messages, supports inline edit/save/resend & Escape guard across desktop and mobile', async () => {
+        for (const vp of [
+            { label: 'desktop', width: 1280, height: 800, isMobile: false },
+            { label: 'mobile', width: 390, height: 844, isMobile: true },
+        ]) {
+            await page.viewport(vp.width, vp.height);
+            activeHarness = mountAssistantHarness({
+                initialMobileAssistantStack: vp.isMobile ? 'detail' : 'list',
+            });
+            await settleLayout(5);
+
+            const { dialog, shadowRoot } = getShellElements();
+
+            const msg1Actions = shadowRoot.querySelector(
+                '[data-assistant-msg-actions="ast_msg_1"]',
+            ) as HTMLDivElement;
+            const msg2Actions = shadowRoot.querySelector(
+                '[data-assistant-msg-actions="ast_msg_2"]',
+            ) as HTMLDivElement;
+            expect(msg1Actions, `${vp.label}: expected user action bar`).toBeTruthy();
+            expect(msg2Actions, `${vp.label}: expected assistant action bar`).toBeTruthy();
+
+            // Regenerate button (🔄) ONLY renders on the last message (ast_msg_2), NOT on ast_msg_1
+            expect(msg1Actions.querySelector('[data-msg-action="copy"]')?.textContent?.trim()).toBe('📋');
+            expect(msg1Actions.querySelector('[data-msg-action="edit"]')?.textContent?.trim()).toBe('✏️');
+            expect(msg1Actions.querySelector('[data-msg-action="retract"]')?.textContent?.trim()).toBe('↩️');
+            expect(msg1Actions.querySelector('[data-msg-action="regenerate"]')).toBeNull();
+
+            expect(msg2Actions.querySelector('[data-msg-action="copy"]')?.textContent?.trim()).toBe('📋');
+            expect(msg2Actions.querySelector('[data-msg-action="regenerate"]')?.textContent?.trim()).toBe('🔄');
+            expect(msg2Actions.querySelector('[data-msg-action="edit"]')?.textContent?.trim()).toBe('✏️');
+            expect(msg2Actions.querySelector('[data-msg-action="retract"]')?.textContent?.trim()).toBe('↩️');
+
+            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:msg-actions`);
+            assertTouchTargetsAndTypography(shadowRoot, `${vp.label}:msg-actions`);
+
+            // Click ✏️ on assistant message ast_msg_2 -> verify >=16px textarea & Escape cancels without closing dialog
+            (msg2Actions.querySelector('[data-msg-action="edit"]') as HTMLButtonElement).click();
+            await settleLayout(4);
+
+            const astEditInput = shadowRoot.querySelector(
+                'textarea[data-assistant-edit-input="ast_msg_2"]',
+            ) as HTMLTextAreaElement;
+            expect(astEditInput).toBeTruthy();
+            expect(parseFloat(window.getComputedStyle(astEditInput).fontSize)).toBeGreaterThanOrEqual(16);
+            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:edit-assistant`);
+            assertTouchTargetsAndTypography(shadowRoot, `${vp.label}:edit-assistant`);
+
+            astEditInput.dispatchEvent(
+                new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+            );
+            await settleLayout(3);
+            expect(dialog.open).toBe(true);
+            expect(shadowRoot.querySelector('[data-assistant-edit-box="ast_msg_2"]')).toBeNull();
+
+            // Edit assistant message and click 保存改写
+            (shadowRoot.querySelector(
+                '[data-assistant-msg-actions="ast_msg_2"] [data-msg-action="edit"]',
+            ) as HTMLButtonElement).click();
+            await settleLayout(3);
+            const astEditInput2 = shadowRoot.querySelector(
+                'textarea[data-assistant-edit-input="ast_msg_2"]',
+            ) as HTMLTextAreaElement;
+            setInputValue(astEditInput2, '已手动改写后的助手分析内容');
+            await settleLayout(2);
+            (shadowRoot.querySelector('[data-assistant-edit-save="ast_msg_2"]') as HTMLButtonElement).click();
+            await settleLayout(4);
+
+            expect(activeHarness.runtime.editMessageSpy).toHaveBeenCalledWith(
+                'ast_session_1',
+                'ast_msg_2',
+                '已手动改写后的助手分析内容',
+            );
+            expect(
+                shadowRoot.querySelector('[data-assistant-message-content="ast_msg_2"]')?.textContent,
+            ).toContain('已手动改写后的助手分析内容');
+
+            // Edit user message ast_msg_1 -> verify 仅保存 & 保存并发送 buttons, and trigger 保存并发送 with streaming ■
+            (shadowRoot.querySelector(
+                '[data-assistant-msg-actions="ast_msg_1"] [data-msg-action="edit"]',
+            ) as HTMLButtonElement).click();
+            await settleLayout(3);
+
+            const userEditInput = shadowRoot.querySelector(
+                'textarea[data-assistant-edit-input="ast_msg_1"]',
+            ) as HTMLTextAreaElement;
+            expect(userEditInput).toBeTruthy();
+            expect(shadowRoot.querySelector('[data-assistant-edit-save="ast_msg_1"]')).toBeTruthy();
+            const userResendBtn = shadowRoot.querySelector(
+                '[data-assistant-edit-resend="ast_msg_1"]',
+            ) as HTMLButtonElement;
+            expect(userResendBtn).toBeTruthy();
+
+            const deferred = createDeferred<AssistantMessage | void>();
+            activeHarness.runtime.nextSendDeferred = deferred;
+            setInputValue(userEditInput, '改写后的用户指令：只看人物设定');
+            await settleLayout(2);
+            userResendBtn.click();
+            await settleLayout(4);
+
+            expect(activeHarness.runtime.editAndResendMessageSpy).toHaveBeenCalledTimes(1);
+            expect(shadowRoot.querySelector('[data-assistant-stop-btn="true"]')).toBeTruthy();
+            activeHarness.runtime.lastSendOptions?.onDelta?.('正在按改写指令输出...');
+            await settleLayout(3);
+            expect(shadowRoot.textContent).toContain('正在按改写指令输出...');
+
+            deferred.resolve({
+                id: 'ast_resent_final',
+                role: 'assistant',
+                content: '改写后重发完成的响应',
+                timestamp: Date.now(),
+            });
+            await settleLayout(5);
+            expect(shadowRoot.querySelector('[data-assistant-send-btn="true"]')).toBeTruthy();
+            expect(shadowRoot.textContent).toContain('改写后重发完成的响应');
+
+            activeHarness.cleanup();
+            activeHarness = null;
+        }
+    });
+
+    it('supports instant retract, draft restore, ShadowModal confirm for multi-message retract, and regenerate last message', async () => {
+        await page.viewport(1280, 800);
+        const windowConfirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+        const fourMsgSession: AssistantSession = {
+            ...structuredClone(SAMPLE_ASSISTANT_SESSION),
+            messages: [
+                ...structuredClone(SAMPLE_ASSISTANT_SESSION.messages),
+                {
+                    id: 'ast_msg_3',
+                    role: 'user',
+                    content: '第二轮提问：整理时间线',
+                    timestamp: 1732328500000,
+                },
+                {
+                    id: 'ast_msg_4',
+                    role: 'assistant',
+                    content: '第二轮回复：时间线已整理。',
+                    timestamp: 1732328600000,
+                },
+            ],
+        };
+
+        const runtime = createMockAssistantRuntime({ sessions: [fourMsgSession] });
+        activeHarness = mountAssistantHarness({ runtime });
+        await settleLayout(5);
+
+        const { shadowRoot } = getShellElements();
+
+        // 1. Regenerate last assistant message (ast_msg_4) -> switches ▶ to ■ -> updates trailing reply
+        const regenDeferred = createDeferred<AssistantMessage | void>();
+        activeHarness.runtime.nextSendDeferred = regenDeferred;
+
+        const regenBtn = shadowRoot.querySelector(
+            '[data-assistant-msg-actions="ast_msg_4"] [data-msg-action="regenerate"]',
+        ) as HTMLButtonElement;
+        expect(regenBtn).toBeTruthy();
+        regenBtn.click();
+        await settleLayout(4);
+
+        expect(activeHarness.runtime.regenerateLastMessageSpy).toHaveBeenCalledTimes(1);
+        expect(shadowRoot.querySelector('[data-assistant-stop-btn="true"]')).toBeTruthy();
+        activeHarness.runtime.lastSendOptions?.onDelta?.('流式重新生成中...');
+        await settleLayout(3);
+        expect(shadowRoot.textContent).toContain('流式重新生成中...');
+
+        regenDeferred.resolve({
+            id: 'ast_msg_4_v2',
+            role: 'assistant',
+            content: '这是重新生成后的第二轮回复。',
+            timestamp: Date.now(),
+        });
+        await settleLayout(5);
+        expect(shadowRoot.textContent).toContain('这是重新生成后的第二轮回复。');
+        expect(shadowRoot.querySelector('[data-assistant-send-btn="true"]')).toBeTruthy();
+
+        // 2. Retract trailing assistant message (ast_msg_4_v2) -> instant, no confirm modal
+        (shadowRoot.querySelector(
+            '[data-assistant-msg-actions="ast_msg_4_v2"] [data-msg-action="retract"]',
+        ) as HTMLButtonElement).click();
+        await settleLayout(4);
+        expect(activeHarness.runtime.retractMessageSpy).toHaveBeenLastCalledWith(
+            'ast_session_1',
+            'ast_msg_4_v2',
+        );
+        expect(shadowRoot.querySelector('[data-assistant-message="ast_msg_4_v2"]')).toBeNull();
+        expect(shadowRoot.querySelector('.ag-modal')).toBeNull();
+
+        // Now ast_msg_3 (user) is the last message and STILL has 🔄 regenerate!
+        expect(
+            shadowRoot.querySelector(
+                '[data-assistant-msg-actions="ast_msg_3"] [data-msg-action="regenerate"]',
+            ),
+        ).toBeTruthy();
+
+        // 3. Retract trailing user message (ast_msg_3) -> instant and restores its text to empty composer draft
+        (shadowRoot.querySelector(
+            '[data-assistant-msg-actions="ast_msg_3"] [data-msg-action="retract"]',
+        ) as HTMLButtonElement).click();
+        await settleLayout(4);
+        expect(activeHarness.runtime.retractMessageSpy).toHaveBeenLastCalledWith(
+            'ast_session_1',
+            'ast_msg_3',
+        );
+        const composerDraft = shadowRoot.querySelector(
+            'textarea[data-assistant-draft-input="true"]',
+        ) as HTMLTextAreaElement;
+        expect(composerDraft.value).toBe('第二轮提问：整理时间线');
+
+        // 4. Retract earlier user message (ast_msg_1) while ast_msg_2 follows -> wait: (ast_msg_1 + ast_msg_2) is last turn pair!
+        // Let's add back a second turn or test confirm modal with a 4-message session:
+        setInputValue(composerDraft, '新的第二轮提问');
+        await settleLayout(2);
+        (shadowRoot.querySelector('[data-assistant-send-btn="true"]') as HTMLButtonElement).click();
+        await settleLayout(5);
+
+        // Now session has 4 messages again; retracting ast_msg_1 removes 4 messages -> opens ShadowModal confirm (zero window.confirm)
+        (shadowRoot.querySelector(
+            '[data-assistant-msg-actions="ast_msg_1"] [data-msg-action="retract"]',
+        ) as HTMLButtonElement).click();
+        await settleLayout(4);
+
+        expect(windowConfirmSpy).not.toHaveBeenCalled();
+        const modal = shadowRoot.querySelector('.ag-modal') as HTMLDivElement;
+        expect(modal).toBeTruthy();
+        expect(modal.textContent).toContain('确认撤回消息');
+
+        const confirmRetractBtn = Array.from(modal.querySelectorAll('button')).find(
+            (btn) => btn.textContent?.trim() === '确认撤回',
+        ) as HTMLButtonElement;
+        expect(confirmRetractBtn).toBeTruthy();
+        confirmRetractBtn.click();
+        await settleLayout(5);
+
+        expect(windowConfirmSpy).not.toHaveBeenCalled();
+        expect(activeHarness.runtime.retractMessageSpy).toHaveBeenLastCalledWith(
+            'ast_session_1',
+            'ast_msg_1',
+        );
+        expect(shadowRoot.querySelectorAll('[data-assistant-message]').length).toBe(0);
     });
 });

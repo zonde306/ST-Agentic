@@ -2154,6 +2154,14 @@ jQuery(async () => {
             updateSession: (sessionId, patch) => assistantRunner.updateSessionConfig(sessionId, patch),
             deleteSession: (sessionId) => assistantRunner.deleteSession(sessionId),
             send: (sessionId, prompt, opts) => assistantRunner.sendPrompt(sessionId, prompt, opts),
+            editMessage: (sessionId, messageId, newContent) =>
+                assistantRunner.editMessage(sessionId, messageId, newContent),
+            editAndResendMessage: (sessionId, messageId, newContent, opts) =>
+                assistantRunner.editAndResendMessage(sessionId, messageId, newContent, opts),
+            retractMessage: (sessionId, messageId) =>
+                assistantRunner.retractMessage(sessionId, messageId),
+            regenerateLastMessage: (sessionId, opts) =>
+                assistantRunner.regenerateLastMessage(sessionId, opts),
             decideApproval: (approvalId, decision, feedback) =>
                 assistantRunner.decideApproval(approvalId, decision, feedback),
             retryApproval: (approvalId, feedback) =>

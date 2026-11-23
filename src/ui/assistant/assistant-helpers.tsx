@@ -290,6 +290,39 @@ export function renderRedactedText(text: string): ComponentChildren {
     ));
 }
 
+/** Copy text to clipboard with fallback for restricted/embedded browser contexts. */
+export async function copyTextSafe(text: string): Promise<boolean> {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        try {
+            await navigator.clipboard.writeText(text);
+            return true;
+        } catch {
+            // Fall through to execCommand fallback.
+        }
+    }
+
+    if (typeof document === 'undefined' || !document.body) {
+        return false;
+    }
+
+    try {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.left = '-9999px';
+        textarea.style.top = '-9999px';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const ok = typeof document.execCommand === 'function' && document.execCommand('copy');
+        textarea.remove();
+        return ok;
+    } catch {
+        return false;
+    }
+}
+
 /** Subscribe directly to an `AppStore` slice using pure `preact/hooks`. */
 export function useAssistantStoreSlice<T>(
     store: AppStore,

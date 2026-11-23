@@ -68,6 +68,133 @@ export interface AssistantCompactionResult {
     archivedTurnCount: number;
 }
 
+export interface AssistantRetractResult {
+    session: AssistantSession;
+    removedMessages: AssistantMessage[];
+}
+
+interface UiTurnGroup {
+    user: AssistantMessage | null;
+    assistants: AssistantMessage[];
+}
+
+function isEmptyInterruptedAssistantMessage(msg: AssistantMessage): boolean {
+    return (
+        msg.role === 'assistant'
+        && Boolean(msg.interrupted)
+        && !msg.content.trim()
+        && !msg.think?.trim()
+        && !(msg.toolCalls && msg.toolCalls.length > 0)
+    );
+}
+
+function groupUiMessagesIntoTurns(messages: readonly AssistantMessage[]): UiTurnGroup[] {
+    const turns: UiTurnGroup[] = [];
+    let current: UiTurnGroup | null = null;
+
+    const flush = () => {
+        if (current && (current.user !== null || current.assistants.length > 0)) {
+            turns.push(current);
+        }
+        current = null;
+    };
+
+    for (const msg of messages) {
+        if (msg.role === 'user') {
+            flush();
+            current = { user: msg, assistants: [] };
+            continue;
+        }
+        if (isEmptyInterruptedAssistantMessage(msg)) {
+            continue;
+        }
+        if (!current) {
+            current = { user: null, assistants: [] };
+        }
+        current.assistants.push(msg);
+    }
+
+    flush();
+    return turns;
+}
+
+function synthesizeTurnMessages(uiTurn: UiTurnGroup): CanonicalMessage[] {
+    const out: CanonicalMessage[] = [];
+    if (uiTurn.user) {
+        out.push({ role: 'user', content: uiTurn.user.content });
+    }
+    for (const ast of uiTurn.assistants) {
+        if (!ast.content.trim() && !ast.think?.trim()) {
+            continue;
+        }
+        out.push({
+            role: 'assistant',
+            content: ast.content,
+            ...(ast.think?.trim() ? { reasoningContent: ast.think } : {}),
+        });
+    }
+    return out;
+}
+
+function reconcileTurnMessages(
+    uiTurn: UiTurnGroup,
+    existingTurn: Layer1TurnGroup | undefined,
+): CanonicalMessage[] {
+    if (!existingTurn || existingTurn.messages.length === 0 || !uiTurn.user) {
+        return synthesizeTurnMessages(uiTurn);
+    }
+
+    const firstExisting = existingTurn.messages[0];
+    if (firstExisting.role !== 'user') {
+        return synthesizeTurnMessages(uiTurn);
+    }
+
+    const existingUserText = contentToPlainText(firstExisting.content);
+    const uiUserText = uiTurn.user.content;
+    const nonEmptyAssistants = uiTurn.assistants.filter(
+        (ast) => ast.content.trim().length > 0 || Boolean(ast.think?.trim()),
+    );
+
+    if (nonEmptyAssistants.length === 0) {
+        if (existingTurn.messages.length === 1 && existingUserText === uiUserText) {
+            return [...existingTurn.messages];
+        }
+        return [{ role: 'user', content: uiUserText }];
+    }
+
+    if (nonEmptyAssistants.length === 1) {
+        const finalUiAssistant = nonEmptyAssistants[0];
+        const lastExisting = existingTurn.messages[existingTurn.messages.length - 1];
+        const canPreserveTail =
+            existingTurn.messages.length >= 2
+            && lastExisting.role === 'assistant'
+            && !(lastExisting.toolCalls && lastExisting.toolCalls.length > 0);
+
+        if (canPreserveTail) {
+            const existingAssistantText = contentToPlainText(lastExisting.content);
+            if (existingUserText === uiUserText && existingAssistantText === finalUiAssistant.content) {
+                return [...existingTurn.messages];
+            }
+            const nextMsgs = [...existingTurn.messages];
+            if (existingUserText !== uiUserText) {
+                nextMsgs[0] = {
+                    ...canonicalClone(firstExisting),
+                    content: uiUserText,
+                };
+            }
+            if (existingAssistantText !== finalUiAssistant.content) {
+                nextMsgs[nextMsgs.length - 1] = {
+                    ...canonicalClone(lastExisting),
+                    content: finalUiAssistant.content,
+                };
+            }
+            return nextMsgs;
+        }
+    }
+
+    return synthesizeTurnMessages(uiTurn);
+}
+
 function contentToPlainText(content: string | CanonicalContentPart[]): string {
     if (typeof content === 'string') {
         return content;
@@ -317,6 +444,145 @@ export class AssistantSessionStore {
         session.updatedAt = this.now();
         this.persist();
         return canonicalClone(updated);
+    }
+
+    /**
+     * Retract `messageId` and all subsequent messages from `session.messages`,
+     * syncing `TrajectoryStore` Layer 1 while preserving earlier turns verbatim.
+     */
+    public retractFromMessage(
+        sessionId: string,
+        messageId: string,
+    ): AssistantRetractResult | null {
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+            return null;
+        }
+        const idx = session.messages.findIndex((m) => m.id === messageId);
+        if (idx < 0) {
+            return null;
+        }
+        const removedMessages = session.messages.slice(idx).map((m) => canonicalClone(m));
+        session.messages = session.messages.slice(0, idx);
+        session.updatedAt = this.now();
+        this.syncTrajectoryToMessages(sessionId);
+        this.persist();
+        return {
+            session: cloneSession(session),
+            removedMessages,
+        };
+    }
+
+    /**
+     * Remove all messages strictly after `messageId`, keeping `messageId` intact,
+     * and synchronize `TrajectoryStore` Layer 1.
+     */
+    public truncateAfterMessage(
+        sessionId: string,
+        messageId: string,
+    ): AssistantRetractResult | null {
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+            return null;
+        }
+        const idx = session.messages.findIndex((m) => m.id === messageId);
+        if (idx < 0) {
+            return null;
+        }
+        const removedMessages = session.messages.slice(idx + 1).map((m) => canonicalClone(m));
+        session.messages = session.messages.slice(0, idx + 1);
+        session.updatedAt = this.now();
+        this.syncTrajectoryToMessages(sessionId);
+        this.persist();
+        return {
+            session: cloneSession(session),
+            removedMessages,
+        };
+    }
+
+    /**
+     * Reconcile `TrajectoryStore` Layer 1 with `session.messages` (or a prefix up to `upToMessageIndex`),
+     * preserving unmodified prior turns (including tool-call chains) verbatim for KV cache stability.
+     */
+    public syncTrajectoryToMessages(
+        sessionId: string,
+        options?: { upToMessageIndex?: number },
+    ): void {
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+            return;
+        }
+
+        const endIdx =
+            options?.upToMessageIndex !== undefined
+                ? Math.max(0, Math.min(session.messages.length, options.upToMessageIndex))
+                : session.messages.length;
+
+        const uiTurns = groupUiMessagesIntoTurns(session.messages.slice(0, endIdx));
+        const threadId = toAssistantThreadId(sessionId);
+        const existingLayer1 = this.trajectoryStore.getMessages(threadId);
+        const headerCount = this.trajectoryStore.getCompactionHeaderCount(threadId);
+        const prevChunk = this.trajectoryStore.getArchivedUpToChunk(threadId);
+
+        const { headerMessages, turns: existingTurns } = groupLayer1Turns(
+            existingLayer1,
+            headerCount > 0 ? headerCount : undefined,
+        );
+
+        let retainedHeaders: CanonicalMessage[] = [];
+        let reconcileUiTurns: UiTurnGroup[] = uiTurns;
+
+        if (headerMessages.length > 0 && existingTurns.length > 0) {
+            const firstExistingUser = existingTurns[0].messages.find((m) => m.role === 'user');
+            if (firstExistingUser) {
+                const needle = contentToPlainText(firstExistingUser.content);
+                const approxStart = Math.max(0, uiTurns.length - existingTurns.length - 2);
+                let offset = -1;
+                for (let i = approxStart; i < uiTurns.length; i += 1) {
+                    if (uiTurns[i].user?.content === needle) {
+                        offset = i;
+                        break;
+                    }
+                }
+                if (offset < 0) {
+                    for (let i = 0; i < approxStart; i += 1) {
+                        if (uiTurns[i].user?.content === needle) {
+                            offset = i;
+                            break;
+                        }
+                    }
+                }
+                if (offset >= 0 && offset < uiTurns.length) {
+                    retainedHeaders = [...headerMessages];
+                    reconcileUiTurns = uiTurns.slice(offset);
+                }
+            }
+        }
+
+        const compactedMessages: CanonicalMessage[] = [...retainedHeaders];
+        const turnEndCounts: number[] = [];
+        let runningLen = retainedHeaders.length;
+
+        for (let i = 0; i < reconcileUiTurns.length; i += 1) {
+            const uiTurn = reconcileUiTurns[i];
+            const existingTurn = i < existingTurns.length ? existingTurns[i] : undefined;
+            const turnMsgs = reconcileTurnMessages(uiTurn, existingTurn);
+            if (turnMsgs.length > 0) {
+                compactedMessages.push(...turnMsgs);
+                runningLen += turnMsgs.length;
+                turnEndCounts.push(runningLen);
+            }
+        }
+
+        this.trajectoryStore.applyCompaction(
+            {
+                compactedMessages,
+                archivedUpToChunk: prevChunk,
+                compactionHeaderCount: retainedHeaders.length,
+                turnEndCounts,
+            },
+            threadId,
+        );
     }
 
     /** Return the `TrajectoryStore` thread ID (`assistant:<sessionId>`). */

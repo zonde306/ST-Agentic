@@ -276,6 +276,7 @@ function AgenticShellContent() {
     const assistantPendingApprovals = useAppStore((s) => s.assistantPendingApprovals);
     const runMode = useAppStore((s) => s.runMode);
     const themeMode = useAppStore((s) => s.themeMode);
+    const isMaximized = useAppStore((s) => s.isMaximized);
     const settings = useAppStore((s) => s.settings);
     const toastQueue = useAppStore((s) => s.toastQueue);
 
@@ -327,6 +328,7 @@ function AgenticShellContent() {
     return (
         <div
             class="ag-console"
+            data-maximized={isMaximized ? 'true' : 'false'}
             data-mobile-chrome-hidden={hideMobileChrome ? 'true' : 'false'}
             onKeyDown={stopKeyPropagation}
             onKeyUp={stopKeyPropagation}
@@ -335,7 +337,15 @@ function AgenticShellContent() {
             {!hideMobileChrome ? (
                 <Fragment>
                     <header class="ag-header">
-                        <div class="ag-brand">
+                        <div
+                            class="ag-brand"
+                            title={!isMobile ? '双击切换网页全屏 / 还原窗口' : undefined}
+                            onDblClick={() => {
+                                if (!isMobile) {
+                                    store.toggleMaximized();
+                                }
+                            }}
+                        >
                             <span class="ag-brand-logo" aria-hidden="true">
                                 <IconBolt size={17} />
                             </span>
@@ -399,6 +409,21 @@ function AgenticShellContent() {
                                 >
                                     导入 / 嵌卡
                                 </Button>
+
+                                {!isMobile ? (
+                                    <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        ariaLabel={isMaximized ? '还原窗口' : '网页全屏'}
+                                        title={isMaximized ? '还原窗口' : '网页全屏'}
+                                        className="ag-window-toggle-btn"
+                                        onClick={() => store.toggleMaximized()}
+                                    >
+                                        <span aria-hidden="true" style={{ fontSize: '15px', lineHeight: 1 }}>
+                                            {isMaximized ? '🪟' : '🖥️'}
+                                        </span>
+                                    </Button>
+                                ) : null}
 
                                 <Button
                                     variant="ghost"
@@ -538,6 +563,7 @@ export function AgenticAppShell({ store: propStore }: AgenticAppShellProps) {
     const mountTargetRef = useRef<HTMLDivElement | null>(null);
 
     const isOpen = useAppStore((s) => s.isOpen);
+    const isMaximized = useAppStore((s) => s.isMaximized);
     const resolvedTheme = useAppStore((s) => s.resolvedTheme);
     const themeMode = useAppStore((s) => s.themeMode);
 
@@ -735,6 +761,7 @@ export function AgenticAppShell({ store: propStore }: AgenticAppShellProps) {
         <dialog
             id="agentic-app"
             ref={dialogRef}
+            data-maximized={isMaximized ? 'true' : 'false'}
             onClick={(event) => {
                 if (event.target === dialogRef.current) {
                     if (store.getSnapshot().activeModal) {
@@ -746,7 +773,12 @@ export function AgenticAppShell({ store: propStore }: AgenticAppShellProps) {
             }}
         >
             <style data-agentic-dialog-reset="true">{AGENTIC_DIALOG_RESET_STYLES}</style>
-            <div data-agentic-shadow-host="true" data-theme={resolvedTheme} ref={shadowHostRef} />
+            <div
+                data-agentic-shadow-host="true"
+                data-theme={resolvedTheme}
+                data-maximized={isMaximized ? 'true' : 'false'}
+                ref={shadowHostRef}
+            />
         </dialog>
     );
 }

@@ -36,6 +36,7 @@ import {
 import { redactString, redactWithReport } from './redact';
 import {
     AssistantSessionStore,
+    type AssistantRetractResult,
     type AssistantSessionPatch,
     type CreateAssistantSessionOptions,
 } from './session-store';
@@ -713,6 +714,156 @@ export class AssistantRunner {
         prompt: string,
         options: AssistantSendOptions = {},
     ): Promise<AssistantMessage> {
+        return await this.executeAssistantTurn(sessionId, prompt, options, {
+            appendUserMessage: true,
+        });
+    }
+
+    /**
+     * Rewrite an existing user or assistant message in place and reconcile `TrajectoryStore`
+     * while preserving prior turns verbatim.
+     */
+    public async editMessage(
+        sessionId: string,
+        messageId: string,
+        newContent: string,
+    ): Promise<AssistantSession | null> {
+        if (!newContent.trim()) {
+            throw new Error('Edited message content cannot be empty.');
+        }
+
+        this.abort(sessionId);
+
+        const updatedMsg = this.sessionStore.updateMessage(sessionId, messageId, (prev) => ({
+            ...prev,
+            content: newContent,
+            ...(prev.interrupted ? { interrupted: false } : {}),
+        }));
+        if (!updatedMsg) {
+            return null;
+        }
+
+        this.sessionStore.syncTrajectoryToMessages(sessionId);
+        this.notify();
+        return this.sessionStore.getSession(sessionId);
+    }
+
+    /**
+     * Rewrite a user message, truncate any subsequent messages and pending approvals,
+     * sync `TrajectoryStore` strictly before that turn, and stream a fresh assistant reply.
+     */
+    public async editAndResendMessage(
+        sessionId: string,
+        messageId: string,
+        newContent: string,
+        options: AssistantSendOptions = {},
+    ): Promise<AssistantMessage> {
+        const session = this.sessionStore.getSession(sessionId);
+        if (!session) {
+            throw new Error(`Assistant session not found: "${sessionId}".`);
+        }
+        const idx = session.messages.findIndex((m) => m.id === messageId);
+        if (idx < 0) {
+            throw new Error(`Assistant message not found: "${messageId}".`);
+        }
+        if (session.messages[idx].role !== 'user') {
+            throw new Error(`Only user messages can be edited and resent ("${messageId}").`);
+        }
+        if (!newContent.trim()) {
+            throw new Error('Edited message content cannot be empty.');
+        }
+
+        this.abort(sessionId);
+
+        this.sessionStore.updateMessage(sessionId, messageId, (prev) => ({
+            ...prev,
+            content: newContent,
+        }));
+
+        const truncated = this.sessionStore.truncateAfterMessage(sessionId, messageId);
+        if (truncated && truncated.removedMessages.length > 0) {
+            this.cleanupApprovalsForMessages(sessionId, truncated.removedMessages);
+        }
+
+        this.sessionStore.syncTrajectoryToMessages(sessionId, { upToMessageIndex: idx });
+        this.emitSessionUpdate(sessionId, options.onUpdate);
+
+        return await this.executeAssistantTurn(sessionId, newContent, options, {
+            appendUserMessage: false,
+        });
+    }
+
+    /**
+     * Retract `messageId` and all following messages from the session, removing any
+     * associated pending approvals while keeping historical `UndoRecord`s intact.
+     */
+    public async retractMessage(
+        sessionId: string,
+        messageId: string,
+    ): Promise<AssistantRetractResult | null> {
+        this.abort(sessionId);
+
+        const result = this.sessionStore.retractFromMessage(sessionId, messageId);
+        if (!result) {
+            return null;
+        }
+
+        this.cleanupApprovalsForMessages(sessionId, result.removedMessages);
+        this.notify();
+        return result;
+    }
+
+    /**
+     * Regenerate the response for the trailing user turn (truncating any trailing assistant
+     * reply/tool approvals first) while preserving earlier turns' KV-cache prefix verbatim.
+     */
+    public async regenerateLastMessage(
+        sessionId: string,
+        options: AssistantSendOptions = {},
+    ): Promise<AssistantMessage> {
+        const session = this.sessionStore.getSession(sessionId);
+        if (!session) {
+            throw new Error(`Assistant session not found: "${sessionId}".`);
+        }
+        if (session.messages.length === 0) {
+            throw new Error('No user message available to regenerate.');
+        }
+
+        let lastUserIdx = -1;
+        for (let i = session.messages.length - 1; i >= 0; i -= 1) {
+            if (session.messages[i].role === 'user') {
+                lastUserIdx = i;
+                break;
+            }
+        }
+        if (lastUserIdx < 0) {
+            throw new Error('No user message available to regenerate.');
+        }
+
+        this.abort(sessionId);
+
+        const targetUserMsg = session.messages[lastUserIdx];
+        if (lastUserIdx < session.messages.length - 1) {
+            const truncated = this.sessionStore.truncateAfterMessage(sessionId, targetUserMsg.id);
+            if (truncated && truncated.removedMessages.length > 0) {
+                this.cleanupApprovalsForMessages(sessionId, truncated.removedMessages);
+            }
+        }
+
+        this.sessionStore.syncTrajectoryToMessages(sessionId, { upToMessageIndex: lastUserIdx });
+        this.emitSessionUpdate(sessionId, options.onUpdate);
+
+        return await this.executeAssistantTurn(sessionId, targetUserMsg.content, options, {
+            appendUserMessage: false,
+        });
+    }
+
+    private async executeAssistantTurn(
+        sessionId: string,
+        prompt: string,
+        options: AssistantSendOptions,
+        config: { appendUserMessage: boolean },
+    ): Promise<AssistantMessage> {
         const session = this.sessionStore.getSession(sessionId);
         if (!session) {
             throw new Error(`Assistant session not found: "${sessionId}".`);
@@ -726,13 +877,15 @@ export class AssistantRunner {
         const cleanupExternalSignal = this.linkExternalSignal(controller, options.signal);
 
         const target = options.target ?? this.resolveActiveTarget();
-        const userMessage: AssistantMessage = {
-            id: this.idGenerator(),
-            role: 'user',
-            content: prompt,
-            timestamp: this.now(),
-        };
-        this.sessionStore.appendMessage(sessionId, userMessage);
+        if (config.appendUserMessage) {
+            const userMessage: AssistantMessage = {
+                id: this.idGenerator(),
+                role: 'user',
+                content: prompt,
+                timestamp: this.now(),
+            };
+            this.sessionStore.appendMessage(sessionId, userMessage);
+        }
 
         const assistantMessageId = this.idGenerator();
         let assistantMessage: AssistantMessage = {
@@ -1387,6 +1540,34 @@ export class AssistantRunner {
     // ========================================================================
     // Internal Helpers
     // ========================================================================
+
+    private cleanupApprovalsForMessages(
+        sessionId: string,
+        removedMessages: readonly AssistantMessage[],
+    ): void {
+        if (removedMessages.length === 0) {
+            return;
+        }
+        const removedMsgIds = new Set<string>();
+        const targetApprovalIds = new Set<string>();
+        for (const msg of removedMessages) {
+            removedMsgIds.add(msg.id);
+            if (Array.isArray(msg.approvalIds)) {
+                for (const apprId of msg.approvalIds) {
+                    targetApprovalIds.add(apprId);
+                }
+            }
+        }
+        for (const appr of this.approvalGate.list({ sessionId })) {
+            if (removedMsgIds.has(appr.messageId)) {
+                targetApprovalIds.add(appr.id);
+            }
+        }
+        for (const apprId of targetApprovalIds) {
+            this.approvalGate.remove(apprId);
+            this.suspendedApprovals.delete(apprId);
+        }
+    }
 
     private resolveActiveTarget(): MessageTarget {
         if (this.activeTargetProvider) {

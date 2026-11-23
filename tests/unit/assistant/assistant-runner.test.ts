@@ -459,4 +459,158 @@ describe('AssistantRunner & AssistantSessionStore (TS2.1)', () => {
         expect(compactedMsgs[0].role).toBe('system');
         expect(String(compactedMsgs[0].content)).toContain('<assistant-history-summary>');
     });
+
+    it('supports editMessage, editAndResendMessage, retractMessage, and regenerateLastMessage with KV-cache prefix preservation', async () => {
+        const { bridge, transport, trajectoryStore, runner } = createRunnerHarness([
+            // Turn 1: adjust mode executes chat_edit_message (captures UndoRecord) then finishes
+            {
+                toolCalls: [
+                    {
+                        id: 'call_edit_chat_1',
+                        name: 'chat_edit_message',
+                        arguments: JSON.stringify({
+                            target: { messageId: 1, swipeId: 0 },
+                            newText: '雾港夜雨初停，林晚站在灯塔下。',
+                        }),
+                    },
+                ],
+            },
+            {
+                content: '已帮你微调第 1 楼文本。',
+            },
+            // Turn 2: proposes wi_upsert_primary_entry (suspends for approval)
+            {
+                content: '我准备更新主世界书条目 #7，请确认。',
+                toolCalls: [
+                    {
+                        id: 'call_wi_pending_1',
+                        name: 'wi_upsert_primary_entry',
+                        arguments: JSON.stringify({
+                            uid: 7,
+                            keys: ['规则'],
+                            content: '@@system\n草案内容',
+                        }),
+                    },
+                ],
+            },
+            // Turn 3 (after editAndResendMessage on Turn 2 user prompt): plain reply
+            {
+                content: '已按改写后的要求重新分析：主线暂不改世界书。',
+            },
+            // Turn 4 (after regenerateLastMessage on Turn 2 assistant reply): plain reply
+            {
+                content: '重新生成版：建议先保留当前世界书规则。',
+            },
+            // Turn 5 (after retracting Turn 2 assistant reply, regenerating from trailing user msg)
+            {
+                content: '仅剩用户消息时重新生成的新回复。',
+            },
+            // Turn 6 (after editMessage on Turn 1 assistant & Turn 2 prompt, follow-up prompt)
+            {
+                content: '收到，继续后续步骤。',
+            },
+        ]);
+
+        const session = await runner.createSession({
+            title: '改写撤回与重生成测试',
+            mode: 'author',
+            autoApproveAuthor: false,
+        });
+
+        // 1. Execute Turn 1 (captures UndoRecord #1, preserves tool_calls -> tool in TrajectoryStore)
+        const reply1 = await runner.sendPrompt(session.id, '帮我润色第 1 楼对话');
+        expect(reply1.content).toBe('已帮你微调第 1 楼文本。');
+        expect(runner.listUndoRecords(session.id)).toHaveLength(1);
+
+        const threadId = toAssistantThreadId(session.id);
+        const layer1AfterTurn1 = trajectoryStore.getMessages(threadId);
+        // [user, assistant(toolCalls), tool, assistant]
+        expect(layer1AfterTurn1).toHaveLength(4);
+        const frozenTurn1PrefixJson = canonicalStringify(layer1AfterTurn1);
+
+        // 2. Execute Turn 2 (creates suspended PendingApproval)
+        const reply2 = await runner.sendPrompt(session.id, '顺便修改主世界书 #7');
+        expect(reply2.approvalIds).toHaveLength(1);
+        expect(runner.listApprovals(session.id)).toHaveLength(1);
+
+        const userMsg2 = runner.getSession(session.id)!.messages[2];
+        expect(userMsg2.role).toBe('user');
+
+        // 3. editAndResendMessage on Turn 2 user message:
+        //    - clears Turn 2's PendingApproval
+        //    - preserves Turn 1's UndoRecord & exact tool-call trajectory prefix
+        //    - generates Turn 3 response
+        const resentReply = await runner.editAndResendMessage(
+            session.id,
+            userMsg2.id,
+            '改写指令：先只做分析，不要动世界书',
+        );
+        expect(resentReply.content).toBe('已按改写后的要求重新分析：主线暂不改世界书。');
+        expect(runner.listApprovals(session.id)).toHaveLength(0);
+        expect(runner.listUndoRecords(session.id)).toHaveLength(1);
+        expect((await bridge.author!.readWorldInfoBook('雾港侦探录'))!.entries[0].content).toContain(
+            '保持冷硬派侦探叙事口吻',
+        );
+
+        const sessionAfterResend = runner.getSession(session.id)!;
+        expect(sessionAfterResend.messages).toHaveLength(4);
+        expect(sessionAfterResend.messages[2].content).toBe('改写指令：先只做分析，不要动世界书');
+        expect(sessionAfterResend.messages[3].content).toBe('已按改写后的要求重新分析：主线暂不改世界书。');
+
+        // Verify Turn 1 prefix in request #4 remained byte-for-byte identical (KV cache invariance)
+        const resendReq = transport.requests[3];
+        expect(canonicalStringify(resendReq.messages.slice(1, 5))).toBe(frozenTurn1PrefixJson);
+
+        // 4. regenerateLastMessage when last message is assistant:
+        const regenReply1 = await runner.regenerateLastMessage(session.id);
+        expect(regenReply1.content).toBe('重新生成版：建议先保留当前世界书规则。');
+        const sessionAfterRegen1 = runner.getSession(session.id)!;
+        expect(sessionAfterRegen1.messages).toHaveLength(4);
+        expect(sessionAfterRegen1.messages[2].content).toBe('改写指令：先只做分析，不要动世界书');
+        expect(sessionAfterRegen1.messages[3].content).toBe('重新生成版：建议先保留当前世界书规则。');
+
+        const regenReq1 = transport.requests[4];
+        expect(canonicalStringify(regenReq1.messages.slice(1, 5))).toBe(frozenTurn1PrefixJson);
+
+        // 5. retractMessage on the last assistant message, then regenerateLastMessage from trailing user message:
+        const retractedAssistant = await runner.retractMessage(
+            session.id,
+            sessionAfterRegen1.messages[3].id,
+        );
+        expect(retractedAssistant?.removedMessages).toHaveLength(1);
+        expect(runner.getSession(session.id)!.messages).toHaveLength(3);
+
+        const regenReply2 = await runner.regenerateLastMessage(session.id);
+        expect(regenReply2.content).toBe('仅剩用户消息时重新生成的新回复。');
+        expect(runner.getSession(session.id)!.messages).toHaveLength(4);
+
+        // 6. editMessage in place preserves Turn 1 tool-call chain while updating edited content:
+        const editedSession = await runner.editMessage(
+            session.id,
+            reply1.id,
+            '已润色第 1 楼文本（手工改写版）。',
+        );
+        expect(editedSession?.messages[1].content).toBe('已润色第 1 楼文本（手工改写版）。');
+
+        await runner.sendPrompt(session.id, '好的，继续');
+        const postEditReq = transport.requests[6];
+        // Layer 1 still contains the tool-call chain from Turn 1 with updated final assistant text
+        expect(postEditReq.messages.some((m) => m.role === 'tool')).toBe(true);
+        expect(
+            postEditReq.messages.some(
+                (m) => m.role === 'assistant' && m.content === '已润色第 1 楼文本（手工改写版）。',
+            ),
+        ).toBe(true);
+
+        // 7. retractMessage from Turn 2 user message drops Turn 2 and Turn 3 cleanly:
+        const retractedTurn2 = await runner.retractMessage(session.id, userMsg2.id);
+        expect(retractedTurn2?.removedMessages).toHaveLength(4);
+        expect(runner.getSession(session.id)!.messages).toHaveLength(2);
+
+        // 8. regenerateLastMessage on an empty session throws cleanly:
+        const emptySession = await runner.createSession({ title: '空会话', mode: 'chat' });
+        await expect(runner.regenerateLastMessage(emptySession.id)).rejects.toThrow(
+            'No user message available to regenerate.',
+        );
+    });
 });

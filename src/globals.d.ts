@@ -4,6 +4,7 @@
 /// <reference types="toastr" />
 
 import type {
+    AssistantRetractResult,
     AssistantSendOptions,
     AssistantSessionPatch,
     CreateAssistantSessionOptions,
@@ -39,6 +40,15 @@ export interface AgenticAssistantPublicApi {
     updateSession(sessionId: string, patch: AssistantSessionPatch): Promise<AssistantSession | null>;
     deleteSession(sessionId: string): Promise<boolean>;
     send(sessionId: string, prompt: string, opts?: AssistantSendOptions): Promise<AssistantMessage>;
+    editMessage(sessionId: string, messageId: string, newContent: string): Promise<AssistantSession | null>;
+    editAndResendMessage(
+        sessionId: string,
+        messageId: string,
+        newContent: string,
+        opts?: AssistantSendOptions,
+    ): Promise<AssistantMessage>;
+    retractMessage(sessionId: string, messageId: string): Promise<AssistantRetractResult | null>;
+    regenerateLastMessage(sessionId: string, opts?: AssistantSendOptions): Promise<AssistantMessage>;
     decideApproval(
         approvalId: string,
         decision: 'approve' | 'reject',
