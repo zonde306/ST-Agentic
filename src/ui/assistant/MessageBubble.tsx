@@ -11,6 +11,7 @@ import type {
     PendingApproval,
     UndoRecord,
 } from '@/core/types';
+import { MarkdownContent } from '@/ui/components';
 import { AttachedApprovalCard } from './AttachedApprovalCard';
 import {
     formatAssistantTime,
@@ -129,7 +130,7 @@ function ToolCallItem({ toolCall, undoRecord, busyUndoId, onApplyUndo }: ToolCal
 /**
  * Assistant or User chat bubble, featuring:
  * - Collapsible thinking + tool-call activity strip with redaction badge & quick undo
- * - Safe inline markdown rendering & streaming cursor
+ * - Full safe GFM Markdown rendering (AST -> VNodes) for assistant replies & streaming cursor
  * - Clickable read-only file reference chips
  * - Inline attached approval cards directly inside the AI bubble
  */
@@ -669,8 +670,11 @@ export function MessageBubble({
                             </div>
                         </div>
                     ) : (
-                        <div class="ag-ast-bubble-content" data-assistant-message-content={message.id}>
-                            {message.content ? renderSimpleMarkdown(message.content) : null}
+                        <div
+                            class="ag-ast-bubble-content ag-ast-bubble-markdown"
+                            data-assistant-message-content={message.id}
+                        >
+                            {message.content ? <MarkdownContent content={message.content} /> : null}
                             {isStreaming ? (
                                 <span class="ag-ast-streaming-cursor" aria-label="生成中" />
                             ) : null}

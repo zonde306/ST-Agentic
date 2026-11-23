@@ -1558,4 +1558,161 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
             activeHarness = null;
         }
     });
+
+    it('renders full safe GFM Markdown (headings, lists, code copy, tables, links, streaming, ***REDACTED***) across desktop and mobile', async () => {
+        const richMarkdown = [
+            '**可以，我现在能够访问 SillyTavern 的 Slash / STscript 命令执行工具 (`st_slash_exec`)。**',
+            '',
+            '---',
+            '',
+            '### 一、支持消息操作的常用 Slash 命令',
+            '',
+            '1. 删除消息：',
+            '  - `/del [message_id]` 或 `/delete`：删除指定的单条或最新消息。',
+            '  - `/cut [message_id]`：剪切/截断该消息之后的所有历史。',
+            '',
+            '- [ ] 检查 `fast_ui_mode` 设置',
+            '- [x] 已确认 `***REDACTED***` 自动脱敏',
+            '',
+            '> 提示：使用 [安全文档](https://example.com) 查看详情，忽略 [危险脚本](javascript:alert(1))。',
+            '',
+            '| 命令 | 说明 | 示例参数 |',
+            '| :--- | :---: | ---: |',
+            '| `/send` | 发送消息 | `hello_world_parameter_long_value_123456` |',
+            '| `/sys` | 系统消息 | ***REDACTED*** |',
+            '',
+            '```typescript',
+            'export async function runSlashCommand(cmd: string): Promise<string> {',
+            '    return `executed:${cmd} with token=***REDACTED*** and a_very_long_line_that_scrolls_horizontally`;',
+            '}',
+            '```',
+            '',
+            '原始脚本标签应保持纯文本：<script>window.__xss=1</script>',
+        ].join('\n');
+
+        for (const vp of [
+            { label: 'desktop', width: 1280, height: 800, isMobile: false },
+            { label: 'mobile', width: 390, height: 844, isMobile: true },
+        ]) {
+            await page.viewport(vp.width, vp.height);
+            const runtime = createMockAssistantRuntime({
+                sessions: [
+                    {
+                        id: 'ast_md_session',
+                        title: 'Markdown 渲染验证',
+                        mode: 'full',
+                        stAdminEnabled: true,
+                        autoApproveAuthor: false,
+                        connectionId: 'inherit',
+                        updatedAt: 1732329000000,
+                        messages: [
+                            {
+                                id: 'ast_md_user',
+                                role: 'user',
+                                content: '现在你能访问 command 吗',
+                                timestamp: 1732328900000,
+                            },
+                            {
+                                id: 'ast_md_ai',
+                                role: 'assistant',
+                                content: richMarkdown,
+                                timestamp: 1732329000000,
+                            },
+                        ],
+                    },
+                ],
+                approvals: [],
+                undoRecords: [],
+            });
+
+            activeHarness = mountAssistantHarness({
+                runtime,
+                initialSessionId: 'ast_md_session',
+                initialMobileAssistantStack: vp.isMobile ? 'detail' : 'list',
+            });
+            await settleLayout(5);
+
+            const { dialog, shadowRoot } = getShellElements();
+            const contentEl = shadowRoot.querySelector(
+                '[data-assistant-message-content="ast_md_ai"]',
+            ) as HTMLDivElement;
+            expect(contentEl, `${vp.label}: expected markdown content container`).toBeTruthy();
+
+            // Verify semantic GFM Markdown DOM elements
+            expect(contentEl.querySelector('h3')?.textContent).toBe('一、支持消息操作的常用 Slash 命令');
+            expect(contentEl.querySelector('hr')).toBeTruthy();
+            expect(contentEl.querySelector('strong code')?.textContent).toBe('st_slash_exec');
+            expect(contentEl.querySelectorAll('ol > li').length).toBe(1);
+            expect(contentEl.querySelectorAll('ol > li ul > li').length).toBe(2);
+            expect(contentEl.querySelectorAll('input[type="checkbox"][disabled]').length).toBe(2);
+            expect(contentEl.querySelector('blockquote')).toBeTruthy();
+            expect(contentEl.querySelectorAll('table thead th').length).toBe(3);
+
+            const codeEl = contentEl.querySelector('.ag-md-code-block pre code');
+            expect(codeEl).toBeTruthy();
+            expect(contentEl.querySelector('.ag-md-code-lang')?.textContent).toBe('typescript');
+
+            // Verify safe link & XSS rejection
+            const safeLink = contentEl.querySelector('a[href="https://example.com"]');
+            expect(safeLink).toBeTruthy();
+            expect(safeLink?.getAttribute('target')).toBe('_blank');
+            expect(safeLink?.getAttribute('rel')).toBe('noopener noreferrer');
+            expect(contentEl.querySelector('a[href^="javascript:"]')).toBeNull();
+            expect(contentEl.querySelector('script')).toBeNull();
+            expect(contentEl.textContent).toContain('<script>window.__xss=1</script>');
+            expect((window as unknown as { __xss?: number }).__xss).toBeUndefined();
+
+            // Verify ***REDACTED*** tokens highlighted in markdown & code blocks
+            const redactedTokens = contentEl.querySelectorAll('.ag-redacted-token');
+            expect(redactedTokens.length).toBeGreaterThanOrEqual(3);
+
+            // Verify snake_case was NOT converted to <em>
+            expect(contentEl.querySelector('em')).toBeNull();
+
+            // Click code copy button -> changes label to ✓ 已复制
+            const copyBtn = contentEl.querySelector('[data-md-code-copy="true"]') as HTMLButtonElement;
+            expect(copyBtn).toBeTruthy();
+            copyBtn.click();
+            await settleLayout(3);
+            expect(copyBtn.textContent).toContain('已复制');
+
+            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:markdown`);
+            assertTouchTargetsAndTypography(shadowRoot, `${vp.label}:markdown`);
+
+            // Verify streaming Markdown (unclosed fenced code block + heading + cursor)
+            const deferred = createDeferred<AssistantMessage | void>();
+            activeHarness.runtime.nextSendDeferred = deferred;
+            const draftInput = shadowRoot.querySelector(
+                'textarea[data-assistant-draft-input="true"]',
+            ) as HTMLTextAreaElement;
+            setInputValue(draftInput, '流式测试');
+            await settleLayout(2);
+            (shadowRoot.querySelector('[data-assistant-send-btn="true"]') as HTMLButtonElement).click();
+            await settleLayout(4);
+
+            activeHarness.runtime.lastSendOptions?.onDelta?.('### 流式标题\n\n```ts\nconst x = 1;');
+            await settleLayout(3);
+
+            const streamingBubble = shadowRoot.querySelector(
+                '[data-assistant-message-content="assistant-streaming-live"]',
+            ) as HTMLDivElement;
+            expect(streamingBubble).toBeTruthy();
+            expect(streamingBubble.querySelector('h3')?.textContent).toBe('流式标题');
+            expect(streamingBubble.querySelector('.ag-md-code-block pre code')?.textContent).toContain(
+                'const x = 1;',
+            );
+            expect(streamingBubble.querySelector('.ag-ast-streaming-cursor')).toBeTruthy();
+
+            deferred.resolve({
+                id: 'ast_md_stream_done',
+                role: 'assistant',
+                content: '### 流式标题\n\n```ts\nconst x = 1;\n```',
+                timestamp: Date.now(),
+            });
+            await settleLayout(5);
+
+            activeHarness.cleanup();
+            activeHarness = null;
+        }
+    });
 });
