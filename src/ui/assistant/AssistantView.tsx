@@ -1,4 +1,4 @@
-import type { TargetedEvent, TargetedKeyboardEvent } from 'preact';
+import type { TargetedEvent, TargetedKeyboardEvent, TargetedPointerEvent } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type {
     AssistantAttachment,
@@ -8,7 +8,7 @@ import type {
     PendingApproval,
     UndoRecord,
 } from '@/core/types';
-import { Button, ShadowModal } from '@/ui/components';
+import { Button, IconCheck, IconClose, IconEdit, ShadowModal } from '@/ui/components';
 import type { ConsoleViewProps } from '@/ui/store';
 import { MessageBubble } from './MessageBubble';
 import {
@@ -76,11 +76,16 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     const [isDragOver, setIsDragOver] = useState<boolean>(false);
     const [activeActionsMessageId, setActiveActionsMessageId] = useState<string | null>(null);
     const [previewImage, setPreviewImage] = useState<AssistantAttachment | null>(null);
+    const [topbarRenameRevealed, setTopbarRenameRevealed] = useState<boolean>(false);
+    const [isRenamingTopbarTitle, setIsRenamingTopbarTitle] = useState<boolean>(false);
+    const [topbarTitleDraft, setTopbarTitleDraft] = useState<string>('');
 
     const abortControllerRef = useRef<AbortController | null>(null);
     const threadRef = useRef<HTMLDivElement | null>(null);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
+    const topbarRenameInputRef = useRef<HTMLInputElement | null>(null);
+    const titleLastPointerTypeRef = useRef<string>('mouse');
     const dragDepthRef = useRef<number>(0);
     const pendingAttachmentsRef = useRef<AssistantAttachment[]>(pendingAttachments);
     pendingAttachmentsRef.current = pendingAttachments;
@@ -139,7 +144,25 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     useEffect(() => {
         setEditingMessageId(null);
         setActiveActionsMessageId(null);
+        setIsRenamingTopbarTitle(false);
+        setTopbarRenameRevealed(false);
+        setTopbarTitleDraft('');
     }, [activeSession?.id]);
+
+    useEffect(() => {
+        if (!isRenamingTopbarTitle) {
+            return;
+        }
+        const input = topbarRenameInputRef.current;
+        if (input) {
+            input.focus();
+            try {
+                input.select();
+            } catch {
+                // Ignore selection errors in restricted environments.
+            }
+        }
+    }, [isRenamingTopbarTitle]);
 
     useEffect(() => {
         if (isStreamingCurrent) {
@@ -277,6 +300,119 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             }
         },
         [store],
+    );
+
+    const handleRenameSession = useCallback(
+        async (sessionId: string, nextTitle: string): Promise<boolean> => {
+            const trimmed = nextTitle.trim();
+            if (!trimmed) {
+                store.pushToast('会话标题不能为空', 'warning');
+                return false;
+            }
+            const target = store
+                .getSnapshot()
+                .assistantSessions.find((s) => s.id === sessionId);
+            if (!target) {
+                return false;
+            }
+            if (trimmed === target.title) {
+                return true;
+            }
+
+            const optimistic: AssistantSession = {
+                ...target,
+                title: trimmed,
+            };
+            upsertSessionInStore(optimistic);
+
+            const runtime = store.assistantRuntime;
+            if (runtime?.updateSessionConfig) {
+                try {
+                    const updated = await runtime.updateSessionConfig(sessionId, {
+                        title: trimmed,
+                    });
+                    if (updated) {
+                        upsertSessionInStore(updated);
+                    } else {
+                        await store.refreshAssistantState();
+                    }
+                } catch (err) {
+                    store.pushToast(`重命名会话失败：${formatErrorMessage(err)}`, 'error');
+                    await store.refreshAssistantState();
+                    return false;
+                }
+            }
+
+            store.pushToast('已更新会话标题', 'success');
+            return true;
+        },
+        [store, upsertSessionInStore],
+    );
+
+    const handleTitlePointerDown = useCallback(
+        (event: TargetedPointerEvent<HTMLSpanElement>) => {
+            if (event.pointerType) {
+                titleLastPointerTypeRef.current = event.pointerType;
+            }
+        },
+        [],
+    );
+
+    const handleTitleTap = useCallback(() => {
+        if (
+            isMobile
+            || titleLastPointerTypeRef.current === 'touch'
+            || titleLastPointerTypeRef.current === 'pen'
+        ) {
+            setTopbarRenameRevealed((prev) => !prev);
+        }
+    }, [isMobile]);
+
+    const handleStartTopbarRename = useCallback(() => {
+        if (!activeSession) {
+            return;
+        }
+        setOpenPopover(null);
+        setTopbarRenameRevealed(false);
+        setTopbarTitleDraft(activeSession.title);
+        setIsRenamingTopbarTitle(true);
+    }, [activeSession]);
+
+    const handleCancelTopbarRename = useCallback(() => {
+        setIsRenamingTopbarTitle(false);
+        setTopbarRenameRevealed(false);
+        setTopbarTitleDraft('');
+    }, []);
+
+    const handleCommitTopbarRename = useCallback(async () => {
+        if (!activeSession) {
+            return;
+        }
+        const trimmed = topbarTitleDraft.trim();
+        if (!trimmed) {
+            store.pushToast('会话标题不能为空', 'warning');
+            return;
+        }
+        setIsRenamingTopbarTitle(false);
+        setTopbarRenameRevealed(false);
+        setTopbarTitleDraft('');
+        await handleRenameSession(activeSession.id, trimmed);
+    }, [activeSession, handleRenameSession, store, topbarTitleDraft]);
+
+    const handleTopbarRenameKeyDown = useCallback(
+        (event: TargetedKeyboardEvent<HTMLInputElement>) => {
+            event.stopPropagation();
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                handleCancelTopbarRename();
+                return;
+            }
+            if (event.key === 'Enter' && !event.isComposing && topbarTitleDraft.trim()) {
+                event.preventDefault();
+                void handleCommitTopbarRename();
+            }
+        },
+        [handleCancelTopbarRename, handleCommitTopbarRename, topbarTitleDraft],
     );
 
     const patchActiveSessionConfig = useCallback(
@@ -992,6 +1128,16 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     const handleRootKeyDown = (event: TargetedKeyboardEvent<HTMLDivElement>) => {
         event.stopPropagation();
         if (event.key === 'Escape') {
+            if (isRenamingTopbarTitle) {
+                event.preventDefault();
+                handleCancelTopbarRename();
+                return;
+            }
+            if (topbarRenameRevealed) {
+                event.preventDefault();
+                setTopbarRenameRevealed(false);
+                return;
+            }
             if (editingMessageId !== null) {
                 event.preventDefault();
                 setEditingMessageId(null);
@@ -1140,6 +1286,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                     isMobile
                     onSelectSession={handleSelectSession}
                     onCreateSession={() => void handleCreateSession()}
+                    onRenameSession={handleRenameSession}
                     onDeleteSession={(id) => void handleDeleteSession(id)}
                     onOpenUndoModal={() => setUndoModalOpen(true)}
                 />
@@ -1219,55 +1366,136 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                             aria-expanded={openPopover === 'sessions'}
                             title="打开助手会话列表"
                             class="ag-ast-topbar-btn"
-                            onClick={() =>
+                            onClick={() => {
+                                setTopbarRenameRevealed(false);
                                 setOpenPopover((prev) =>
                                     prev === 'sessions' ? null : 'sessions',
-                                )
-                            }
+                                );
+                            }}
                         >
                             <span>☰</span>
                             <span>会话 ({assistantSessions.length})</span>
                         </button>
                     )}
 
-                    <span
-                        class="ag-ast-title"
-                        data-assistant-session-title="true"
-                        title={activeSession?.title ?? '助手工作台'}
-                    >
-                        {activeSession?.title ?? '助手工作台'}
-                    </span>
+                    {activeSession ? (
+                        isRenamingTopbarTitle ? (
+                            <div
+                                class="ag-ast-title-edit"
+                                data-assistant-topbar-rename-form="true"
+                            >
+                                <input
+                                    ref={topbarRenameInputRef}
+                                    type="text"
+                                    class="ag-ast-title-input"
+                                    data-assistant-topbar-rename-input="true"
+                                    aria-label="编辑会话标题"
+                                    placeholder="输入会话标题..."
+                                    maxLength={80}
+                                    value={topbarTitleDraft}
+                                    onInput={(e) => setTopbarTitleDraft(e.currentTarget.value)}
+                                    onKeyDown={handleTopbarRenameKeyDown}
+                                    onKeyUp={(e) => e.stopPropagation()}
+                                />
+                                <button
+                                    type="button"
+                                    class="ag-ast-title-edit-btn ag-ast-title-edit-save"
+                                    data-assistant-topbar-rename-save="true"
+                                    aria-label="保存会话标题"
+                                    title="保存 (Enter)"
+                                    disabled={!topbarTitleDraft.trim()}
+                                    onClick={() => void handleCommitTopbarRename()}
+                                >
+                                    <IconCheck size={14} />
+                                </button>
+                                <button
+                                    type="button"
+                                    class="ag-ast-title-edit-btn"
+                                    data-assistant-topbar-rename-cancel="true"
+                                    aria-label="取消重命名"
+                                    title="取消 (Esc)"
+                                    onClick={handleCancelTopbarRename}
+                                >
+                                    <IconClose size={14} />
+                                </button>
+                            </div>
+                        ) : (
+                            <div
+                                class="ag-ast-title-wrap"
+                                data-assistant-title-wrap="true"
+                                data-rename-revealed={topbarRenameRevealed ? 'true' : 'false'}
+                            >
+                                <span
+                                    class="ag-ast-title ag-ast-title-interactive"
+                                    data-assistant-session-title="true"
+                                    title={activeSession.title}
+                                    onPointerDown={handleTitlePointerDown}
+                                    onClick={handleTitleTap}
+                                    onDblClick={handleStartTopbarRename}
+                                >
+                                    {activeSession.title}
+                                </span>
+                                <button
+                                    type="button"
+                                    class="ag-ast-title-rename-btn"
+                                    data-assistant-topbar-rename-btn="true"
+                                    aria-label={`重命名会话：${activeSession.title}`}
+                                    title="重命名会话"
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleStartTopbarRename();
+                                    }}
+                                >
+                                    <IconEdit size={14} />
+                                </button>
+                            </div>
+                        )
+                    ) : (
+                        <span
+                            class="ag-ast-title"
+                            data-assistant-session-title="true"
+                            title="助手工作台"
+                        >
+                            助手工作台
+                        </span>
+                    )}
                 </div>
 
-                <div class="ag-ast-topbar-right">
-                    <button
-                        type="button"
-                        data-assistant-new-session-btn="true"
-                        aria-label="新建助手会话"
-                        title="新建助手会话"
-                        class="ag-ast-topbar-btn"
-                        onClick={() => void handleCreateSession()}
-                    >
-                        ＋
-                    </button>
+                {!(isMobile && isRenamingTopbarTitle) ? (
+                    <div class="ag-ast-topbar-right">
+                        <button
+                            type="button"
+                            data-assistant-new-session-btn="true"
+                            aria-label="新建助手会话"
+                            title="新建助手会话"
+                            class="ag-ast-topbar-btn"
+                            onClick={() => {
+                                setTopbarRenameRevealed(false);
+                                void handleCreateSession();
+                            }}
+                        >
+                            ＋
+                        </button>
 
-                    <button
-                        type="button"
-                        data-assistant-undo-btn="true"
-                        aria-label={`写前快照撤销历史 (${activeUndoCount})`}
-                        title="写前快照撤销历史"
-                        class="ag-ast-topbar-btn"
-                        onClick={() => {
-                            setOpenPopover(null);
-                            setUndoModalOpen(true);
-                        }}
-                    >
-                        <span>↩</span>
-                        {activeUndoCount > 0 ? (
-                            <span class="ag-ast-undo-count">{activeUndoCount}</span>
-                        ) : null}
-                    </button>
-                </div>
+                        <button
+                            type="button"
+                            data-assistant-undo-btn="true"
+                            aria-label={`写前快照撤销历史 (${activeUndoCount})`}
+                            title="写前快照撤销历史"
+                            class="ag-ast-topbar-btn"
+                            onClick={() => {
+                                setTopbarRenameRevealed(false);
+                                setOpenPopover(null);
+                                setUndoModalOpen(true);
+                            }}
+                        >
+                            <span>↩</span>
+                            {activeUndoCount > 0 ? (
+                                <span class="ag-ast-undo-count">{activeUndoCount}</span>
+                            ) : null}
+                        </button>
+                    </div>
+                ) : null}
             </div>
 
             {/* 2. Main Conversation Stream (Maximized Viewport) */}
@@ -1276,6 +1504,9 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 class="ag-ast-thread ag-thin-scroll"
                 data-assistant-thread="true"
                 onClick={(e) => {
+                    if (topbarRenameRevealed) {
+                        setTopbarRenameRevealed(false);
+                    }
                     if (e.target === e.currentTarget && activeActionsMessageId !== null) {
                         setActiveActionsMessageId(null);
                     }
@@ -1606,6 +1837,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                             isMobile={false}
                             onSelectSession={handleSelectSession}
                             onCreateSession={() => void handleCreateSession()}
+                            onRenameSession={handleRenameSession}
                             onDeleteSession={(id) => void handleDeleteSession(id)}
                             onOpenUndoModal={() => {
                                 setOpenPopover(null);

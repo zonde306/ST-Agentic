@@ -1740,4 +1740,197 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
             activeHarness = null;
         }
     });
+
+    it('supports renaming session titles via hover/touch-revealed topbar control and always-visible session list action on desktop & mobile', async () => {
+        // 1. Desktop (1280x800): topbar rename button is hidden by default, revealed on hover;
+        //    drawer session list always displays rename button directly alongside delete.
+        await page.viewport(1280, 800);
+        activeHarness = mountAssistantHarness();
+        await settleLayout(5);
+
+        let shell = getShellElements();
+        const firstSessionId = activeHarness.runtime.sessions[0].id;
+        const secondSessionId = activeHarness.runtime.sessions[1].id;
+
+        const topbarRenameBtn = shell.shadowRoot.querySelector(
+            '[data-assistant-topbar-rename-btn="true"]',
+        ) as HTMLButtonElement;
+        expect(topbarRenameBtn).toBeTruthy();
+        expect(window.getComputedStyle(topbarRenameBtn).display).toBe('none');
+        assertNoHorizontalOverflow(shell.dialog, shell.shadowRoot, 'desktop:rename-idle');
+        assertTouchTargetsAndTypography(shell.shadowRoot, 'desktop:rename-idle');
+
+        // Hover over title wrapper -> reveals rename button
+        const titleEl = shell.shadowRoot.querySelector(
+            '[data-assistant-session-title="true"]',
+        ) as HTMLSpanElement;
+        await userEvent.hover(titleEl);
+        await settleLayout(3);
+        expect(isElementVisible(topbarRenameBtn)).toBe(true);
+
+        // Click topbar rename -> enters inline edit; Escape cancels without closing dialog
+        topbarRenameBtn.click();
+        await settleLayout(3);
+
+        let topbarInput = shell.shadowRoot.querySelector(
+            '[data-assistant-topbar-rename-input="true"]',
+        ) as HTMLInputElement;
+        expect(topbarInput).toBeTruthy();
+        expect(parseFloat(window.getComputedStyle(topbarInput).fontSize)).toBeGreaterThanOrEqual(16);
+        assertNoHorizontalOverflow(shell.dialog, shell.shadowRoot, 'desktop:topbar-rename-edit');
+        assertTouchTargetsAndTypography(shell.shadowRoot, 'desktop:topbar-rename-edit');
+
+        setInputValue(topbarInput, '临时取消标题');
+        await settleLayout(2);
+        topbarInput.dispatchEvent(
+            new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+        );
+        await settleLayout(3);
+        expect(shell.dialog.open).toBe(true);
+        expect(
+            shell.shadowRoot.querySelector('[data-assistant-topbar-rename-input="true"]'),
+        ).toBeNull();
+        expect(
+            shell.shadowRoot.querySelector('[data-assistant-session-title="true"]')?.textContent,
+        ).toBe(SAMPLE_ASSISTANT_SESSION.title);
+
+        // Double-click title -> enter inline edit and save with Enter
+        const titleAfterCancel = shell.shadowRoot.querySelector(
+            '[data-assistant-session-title="true"]',
+        ) as HTMLSpanElement;
+        titleAfterCancel.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+        await settleLayout(3);
+        topbarInput = shell.shadowRoot.querySelector(
+            '[data-assistant-topbar-rename-input="true"]',
+        ) as HTMLInputElement;
+        expect(topbarInput).toBeTruthy();
+        setInputValue(topbarInput, '雾港主线设定整理');
+        await settleLayout(2);
+        topbarInput.dispatchEvent(
+            new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
+        );
+        await settleLayout(5);
+
+        expect(activeHarness.runtime.updateSessionConfigSpy).toHaveBeenCalledWith(
+            firstSessionId,
+            { title: '雾港主线设定整理' },
+        );
+        expect(
+            shell.shadowRoot.querySelector('[data-assistant-session-title="true"]')?.textContent,
+        ).toBe('雾港主线设定整理');
+
+        // Open desktop drawer -> session list shows rename buttons directly without hover
+        const drawerBtn = shell.shadowRoot.querySelector(
+            '[data-assistant-drawer-btn="true"]',
+        ) as HTMLButtonElement;
+        drawerBtn.click();
+        await settleLayout(4);
+
+        const listRenameBtn = shell.shadowRoot.querySelector(
+            `[data-assistant-session-rename="${secondSessionId}"]`,
+        ) as HTMLButtonElement;
+        expect(listRenameBtn).toBeTruthy();
+        expect(isElementVisible(listRenameBtn)).toBe(true);
+        assertNoHorizontalOverflow(shell.dialog, shell.shadowRoot, 'desktop:drawer-rename-visible');
+        assertTouchTargetsAndTypography(shell.shadowRoot, 'desktop:drawer-rename-visible');
+
+        // Click rename on non-active session -> inline editor opens without switching active session or closing drawer
+        listRenameBtn.click();
+        await settleLayout(3);
+        expect(activeHarness.store.getSnapshot().selectedAssistantSessionId).toBe(firstSessionId);
+        const listInput = shell.shadowRoot.querySelector(
+            `[data-assistant-session-rename-input="${secondSessionId}"]`,
+        ) as HTMLInputElement;
+        expect(listInput).toBeTruthy();
+        expect(parseFloat(window.getComputedStyle(listInput).fontSize)).toBeGreaterThanOrEqual(16);
+        assertNoHorizontalOverflow(shell.dialog, shell.shadowRoot, 'desktop:drawer-rename-edit');
+        assertTouchTargetsAndTypography(shell.shadowRoot, 'desktop:drawer-rename-edit');
+
+        setInputValue(listInput, '世界书变量排查');
+        await settleLayout(2);
+        (
+            shell.shadowRoot.querySelector(
+                `[data-assistant-session-rename-save="${secondSessionId}"]`,
+            ) as HTMLButtonElement
+        ).click();
+        await settleLayout(5);
+
+        expect(activeHarness.runtime.updateSessionConfigSpy).toHaveBeenCalledWith(
+            secondSessionId,
+            { title: '世界书变量排查' },
+        );
+        const updatedSecondItem = shell.shadowRoot.querySelector(
+            `[data-assistant-session-item="${secondSessionId}"] .ag-ast-session-item-title`,
+        );
+        expect(updatedSecondItem?.textContent).toBe('世界书变量排查');
+
+        activeHarness.cleanup();
+        activeHarness = null;
+
+        // 2. Mobile (390x844): list view always displays rename button; detail view reveals topbar rename on tap.
+        await page.viewport(390, 844);
+        activeHarness = mountAssistantHarness({ initialMobileAssistantStack: 'list' });
+        await settleLayout(5);
+        shell = getShellElements();
+
+        const mobileFirstId = activeHarness.runtime.sessions[0].id;
+        const mobileListRenameBtn = shell.shadowRoot.querySelector(
+            `[data-assistant-session-rename="${mobileFirstId}"]`,
+        ) as HTMLButtonElement;
+        expect(mobileListRenameBtn).toBeTruthy();
+        expect(isElementVisible(mobileListRenameBtn)).toBe(true);
+        assertNoHorizontalOverflow(shell.dialog, shell.shadowRoot, 'mobile:list-rename-visible');
+        assertTouchTargetsAndTypography(shell.shadowRoot, 'mobile:list-rename-visible');
+
+        // Enter detail view -> topbar rename button is hidden until title is tapped
+        (
+            shell.shadowRoot.querySelector(
+                `[data-assistant-session-select="${mobileFirstId}"]`,
+            ) as HTMLButtonElement
+        ).click();
+        await settleLayout(5);
+
+        const mobileTopbarRenameBtn = shell.shadowRoot.querySelector(
+            '[data-assistant-topbar-rename-btn="true"]',
+        ) as HTMLButtonElement;
+        expect(mobileTopbarRenameBtn).toBeTruthy();
+        expect(window.getComputedStyle(mobileTopbarRenameBtn).display).toBe('none');
+
+        const mobileTitleEl = shell.shadowRoot.querySelector(
+            '[data-assistant-session-title="true"]',
+        ) as HTMLSpanElement;
+        mobileTitleEl.click();
+        await settleLayout(3);
+        expect(isElementVisible(mobileTopbarRenameBtn)).toBe(true);
+        assertNoHorizontalOverflow(shell.dialog, shell.shadowRoot, 'mobile:topbar-rename-revealed');
+        assertTouchTargetsAndTypography(shell.shadowRoot, 'mobile:topbar-rename-revealed');
+
+        // Tap rename button -> edit and save on mobile with >=40px controls & >=16px input
+        mobileTopbarRenameBtn.click();
+        await settleLayout(3);
+        const mobileTopbarInput = shell.shadowRoot.querySelector(
+            '[data-assistant-topbar-rename-input="true"]',
+        ) as HTMLInputElement;
+        expect(mobileTopbarInput).toBeTruthy();
+        expect(parseFloat(window.getComputedStyle(mobileTopbarInput).fontSize)).toBeGreaterThanOrEqual(16);
+        assertNoHorizontalOverflow(shell.dialog, shell.shadowRoot, 'mobile:topbar-rename-edit');
+        assertTouchTargetsAndTypography(shell.shadowRoot, 'mobile:topbar-rename-edit');
+
+        setInputValue(mobileTopbarInput, '移动端新标题');
+        await settleLayout(2);
+        (
+            shell.shadowRoot.querySelector(
+                '[data-assistant-topbar-rename-save="true"]',
+            ) as HTMLButtonElement
+        ).click();
+        await settleLayout(5);
+
+        expect(activeHarness.runtime.updateSessionConfigSpy).toHaveBeenCalledWith(
+            mobileFirstId,
+            { title: '移动端新标题' },
+        );
+        expect(
+            shell.shadowRoot.querySelector('[data-assistant-session-title="true"]')?.textContent,
+        ).toBe('移动端新标题');
+    });
 });

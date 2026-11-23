@@ -1465,6 +1465,15 @@ select {
     flex-shrink: 0;
 }
 
+.ag-ast-title-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    max-width: 100%;
+    flex: 0 1 auto;
+}
+
 .ag-ast-title {
     font-size: 13px;
     font-weight: 600;
@@ -1473,6 +1482,117 @@ select {
     overflow: hidden;
     text-overflow: ellipsis;
     min-width: 0;
+}
+
+.ag-ast-title-interactive {
+    cursor: pointer;
+    border-radius: 6px;
+    padding: 4px 6px;
+    margin: -4px 0 -4px -6px;
+    transition: background-color 0.15s;
+}
+
+.ag-ast-title-interactive:hover,
+.ag-ast-title-wrap[data-rename-revealed="true"] .ag-ast-title-interactive {
+    background: color-mix(in srgb, var(--secondary) 75%, transparent);
+}
+
+.ag-ast-title-rename-btn {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    min-width: 28px;
+    min-height: 28px;
+    padding: 0;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--muted-foreground);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background-color 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.ag-ast-title-rename-btn:hover:not(:disabled) {
+    background: var(--secondary);
+    color: var(--foreground);
+    border-color: var(--border);
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .ag-ast-title-wrap:hover .ag-ast-title-rename-btn {
+        display: inline-flex;
+    }
+}
+
+.ag-ast-title-wrap:focus-within .ag-ast-title-rename-btn,
+.ag-ast-title-wrap[data-rename-revealed="true"] .ag-ast-title-rename-btn {
+    display: inline-flex;
+}
+
+.ag-ast-title-edit {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: 380px;
+}
+
+.ag-ast-title-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: 100%;
+    height: 36px;
+    padding: 4px 10px;
+    border-radius: 10px;
+    border: 1px solid var(--primary);
+    background: var(--content);
+    color: var(--foreground);
+    font-size: 16px;
+    font-weight: 500;
+    line-height: 1.3;
+    outline: none;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 18%, transparent);
+}
+
+.ag-ast-title-edit-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--foreground);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.ag-ast-title-edit-btn:hover:not(:disabled) {
+    background: var(--secondary);
+}
+
+.ag-ast-title-edit-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.ag-ast-title-edit-save {
+    border-color: color-mix(in srgb, var(--primary) 55%, var(--border));
+    background: color-mix(in srgb, var(--primary) 14%, var(--card));
+    color: var(--primary);
+}
+
+.ag-ast-title-edit-save:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--primary) 24%, var(--card));
 }
 
 .ag-ast-topbar-btn {
@@ -1517,7 +1637,7 @@ select {
 }
 
 .ag-ast-drawer {
-    width: min(296px, 88%);
+    width: min(312px, 88%);
     height: 100%;
     min-height: 0;
     background: var(--sidebar);
@@ -1611,6 +1731,53 @@ select {
     gap: 6px;
     font-size: 10px;
     color: var(--muted-foreground);
+}
+
+.ag-ast-session-item-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+}
+
+.ag-ast-session-icon-btn {
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0;
+    flex-shrink: 0;
+    color: var(--muted-foreground);
+}
+
+.ag-ast-session-icon-btn:hover:not(:disabled) {
+    color: var(--foreground);
+}
+
+.ag-ast-session-rename-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    min-width: 0;
+    padding: 4px 0;
+}
+
+.ag-ast-session-rename-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: 100%;
+    height: 38px;
+    padding: 4px 10px;
+    border-radius: 10px;
+    border: 1px solid var(--primary);
+    background: var(--content);
+    color: var(--foreground);
+    font-size: 16px;
+    font-weight: 500;
+    line-height: 1.3;
+    outline: none;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 18%, transparent);
 }
 
 .ag-ast-session-footer {
@@ -3585,6 +3752,17 @@ select {
 
     .ag-ast-topbar {
         padding: 4px 8px;
+    }
+
+    .ag-ast-title-rename-btn {
+        width: 40px;
+        height: 40px;
+        min-width: 40px;
+        min-height: 40px;
+    }
+
+    .ag-ast-title-edit {
+        max-width: 100%;
     }
 
     .ag-ast-thread {
