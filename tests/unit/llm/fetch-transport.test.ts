@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { LLMRequest, LLMStreamChunk } from '@/core/bridge';
 import type { ApiConnection } from '@/core/types';
-import { FetchLLMTransport, LLMTransportError } from '@/core/llm';
+import { FetchLLMTransport, LLMTransportError, parseModelsResponse } from '@/core/llm';
 import { DeferredGate } from '../../mocks';
 
 function makeConnection(overrides: Partial<ApiConnection> = {}): ApiConnection {
@@ -416,5 +416,167 @@ describe('FetchLLMTransport', () => {
         }
         expect(cancelSpy).toHaveBeenCalledTimes(1);
         expect(streamTransport.getLimiter(conn.id)?.activeCount).toBe(0);
+    });
+
+    it('lists, deduplicates, and sorts OpenAI models while parsing alternative model payload shapes', async () => {
+        const calls: Array<{ url: string; init?: RequestInit }> = [];
+        const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+            const url = typeof input === 'string' ? input : input.toString();
+            calls.push({ url, init });
+            return new Response(
+                JSON.stringify({
+                    object: 'list',
+                    data: [
+                        { id: 'gpt-4.1', owned_by: 'openai', context_length: 1047576 },
+                        { id: 'claude-sonnet-4.5', owned_by: 'anthropic' },
+                        { id: 'gpt-4.1', display_name: 'GPT-4.1', context_length: 1047576 },
+                    ],
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } },
+            );
+        });
+
+        const conn = makeConnection({
+            providerFormat: 'openai',
+            baseUrl: 'https://api.openai.com/v1/chat/completions',
+            apiKey: 'sk-list',
+        });
+        const transport = new FetchLLMTransport({
+            fetchImpl: fetchMock,
+            connections: { [conn.id]: conn },
+        });
+
+        const models = await transport.listModels({ connectionId: conn.id });
+        expect(calls).toHaveLength(1);
+        expect(calls[0].url).toBe('https://api.openai.com/v1/models');
+        expect(calls[0].init?.method).toBe('GET');
+        expect((calls[0].init?.headers as Record<string, string>)['Content-Type']).toBeUndefined();
+        expect(models).toEqual([
+            { id: 'claude-sonnet-4.5', ownedBy: 'anthropic' },
+            {
+                id: 'gpt-4.1',
+                displayName: 'GPT-4.1',
+                ownedBy: 'openai',
+                contextLength: 1047576,
+            },
+        ]);
+
+        const geminiPage = parseModelsResponse({
+            models: [
+                {
+                    name: 'models/gemini-2.5-flash',
+                    displayName: 'Gemini 2.5 Flash',
+                    input_token_limit: 1048576,
+                },
+            ],
+        });
+        expect(geminiPage.models).toEqual([
+            {
+                id: 'gemini-2.5-flash',
+                displayName: 'Gemini 2.5 Flash',
+                contextLength: 1048576,
+            },
+        ]);
+
+        const bareArrayPage = parseModelsResponse(['llama3.3:70b', '  ', 'qwen3:32b']);
+        expect(bareArrayPage.models).toEqual([{ id: 'llama3.3:70b' }, { id: 'qwen3:32b' }]);
+    });
+
+    it('follows Anthropic model pagination cursors and fails fast on errors or AbortSignal', async () => {
+        const urls: string[] = [];
+        const fetchMock = vi.fn(async (input: string | URL | Request) => {
+            const url = typeof input === 'string' ? input : input.toString();
+            urls.push(url);
+            if (!url.includes('after_id=')) {
+                return new Response(
+                    JSON.stringify({
+                        data: [{ id: 'claude-sonnet-4-5', display_name: 'Claude Sonnet 4.5' }],
+                        has_more: true,
+                        last_id: 'claude-sonnet-4-5',
+                    }),
+                    { status: 200, headers: { 'Content-Type': 'application/json' } },
+                );
+            }
+            return new Response(
+                JSON.stringify({
+                    data: [{ id: 'claude-haiku-4-5', display_name: 'Claude Haiku 4.5' }],
+                    has_more: false,
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } },
+            );
+        });
+
+        const antConn = makeConnection({
+            id: 'ant-models',
+            providerFormat: 'anthropic',
+            baseUrl: 'https://api.anthropic.com',
+            apiKey: 'sk-ant',
+        });
+        const transport = new FetchLLMTransport({ fetchImpl: fetchMock });
+        const paged = await transport.listModels({ connection: antConn });
+        expect(urls).toEqual([
+            'https://api.anthropic.com/v1/models',
+            'https://api.anthropic.com/v1/models?after_id=claude-sonnet-4-5',
+        ]);
+        expect(paged).toEqual([
+            { id: 'claude-haiku-4-5', displayName: 'Claude Haiku 4.5' },
+            { id: 'claude-sonnet-4-5', displayName: 'Claude Sonnet 4.5' },
+        ]);
+
+        // Inline HTTP 200 error payload
+        const inlineErrorTransport = new FetchLLMTransport({
+            fetchImpl: async () =>
+                new Response(JSON.stringify({ error: { message: 'Relay token expired' } }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+        });
+        await expect(inlineErrorTransport.listModels({ connection: antConn })).rejects.toThrow(
+            'Relay token expired',
+        );
+
+        // HTTP 401/404 fails in 1 call without retry
+        const http401Mock = vi.fn(async () =>
+            new Response(JSON.stringify({ error: { message: 'Unauthorized key' } }), {
+                status: 401,
+                headers: { 'Content-Type': 'application/json' },
+            }),
+        );
+        const failTransport = new FetchLLMTransport({
+            fetchImpl: http401Mock,
+            retry: { maxAttempts: 4, initialDelayMs: 5 },
+        });
+        await expect(failTransport.listModels({ connection: antConn })).rejects.toMatchObject({
+            name: 'LLMTransportError',
+            status: 401,
+            message: 'Unauthorized key',
+        });
+        expect(http401Mock).toHaveBeenCalledTimes(1);
+
+        // Local connection with empty apiKey omits Authorization header
+        const localHeaders: Record<string, string>[] = [];
+        const localTransport = new FetchLLMTransport({
+            fetchImpl: async (_url, init) => {
+                localHeaders.push((init?.headers ?? {}) as Record<string, string>);
+                return new Response(JSON.stringify({ data: [{ id: 'local-model' }] }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            },
+        });
+        await localTransport.listModels({
+            connection: makeConnection({ baseUrl: 'http://127.0.0.1:1234/v1', apiKey: '' }),
+        });
+        expect(localHeaders[0].Authorization).toBeUndefined();
+
+        // Pre-aborted AbortSignal rejects with AbortError without hitting fetch
+        const neverFetch = vi.fn();
+        const abortController = new AbortController();
+        abortController.abort();
+        const abortTransport = new FetchLLMTransport({ fetchImpl: neverFetch });
+        await expect(
+            abortTransport.listModels({ connection: antConn, signal: abortController.signal }),
+        ).rejects.toMatchObject({ name: 'AbortError' });
+        expect(neverFetch).not.toHaveBeenCalled();
     });
 });

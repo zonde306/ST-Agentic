@@ -11,6 +11,7 @@ import { registerSessionViews } from '@/ui/session';
 import { AgenticAppShell } from '@/ui/shell';
 import { registerSideGenView } from '@/ui/sidegen';
 import {
+    type AgenticUIServices,
     AppStore,
     AppStoreProvider,
     createMockBackgroundTasks,
@@ -95,7 +96,9 @@ function getShellElements(): {
     return { dialog, shadowHost, shadowRoot, consoleEl };
 }
 
-function createHarness(options: { initialTab?: ConsoleTabId; initialOpen?: boolean } = {}): MountedHarness {
+function createHarness(
+    options: { initialTab?: ConsoleTabId; initialOpen?: boolean; services?: AgenticUIServices } = {},
+): MountedHarness {
     registerAgenticCapsuleElement();
     const unregisterAssistant = registerAssistantView();
     const unregisterSideGen = registerSideGenView();
@@ -108,7 +111,7 @@ function createHarness(options: { initialTab?: ConsoleTabId; initialOpen?: boole
         initialBackgroundTasks: createMockBackgroundTasks(),
         initialOpen: options.initialOpen ?? true,
         initialTab: options.initialTab ?? 'files',
-        services: createMockUIServices(),
+        services: options.services ?? createMockUIServices(),
     });
 
     const shellContainer = document.createElement('div');
@@ -788,6 +791,120 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
             await settleLayout(3);
             expect(onResumeSpy).toHaveBeenCalledTimes(1);
             expect(dialog.open).toBe(false);
+
+            activeHarness.cleanup();
+            activeHarness = null;
+        }
+    });
+
+    it('fetches, filters, selects remote models, and displays errors cleanly in ConnectionsView across desktop and mobile viewports', async () => {
+        for (const vp of [
+            { label: 'desktop', width: 1280, height: 800, isMobile: false },
+            { label: 'mobile', width: 390, height: 844, isMobile: true },
+        ]) {
+            await page.viewport(vp.width, vp.height);
+            const mockServices = createMockUIServices();
+            activeHarness = createHarness({
+                initialTab: 'connections',
+                initialOpen: true,
+                services: mockServices,
+            });
+            await settleLayout(5);
+
+            const { dialog, shadowRoot } = getShellElements();
+
+            if (vp.isMobile) {
+                const firstConnItem = shadowRoot.querySelector('.ag-list-item') as HTMLButtonElement | null;
+                expect(firstConnItem, `${vp.label}: expected connection list item`).toBeTruthy();
+                firstConnItem!.click();
+                await settleLayout(4);
+            }
+
+            const fetchBtn = Array.from(shadowRoot.querySelectorAll('button')).find(
+                (btn) => btn.textContent?.includes('获取模型'),
+            ) as HTMLButtonElement | undefined;
+            expect(fetchBtn, `${vp.label}: expected 获取模型 button`).toBeTruthy();
+            fetchBtn!.click();
+            await settleLayout(6);
+
+            const picker = shadowRoot.querySelector('.ag-model-picker') as HTMLDivElement | null;
+            expect(picker, `${vp.label}: expected .ag-model-picker after fetching models`).toBeTruthy();
+            const optionBtns = Array.from(
+                shadowRoot.querySelectorAll('.ag-model-option'),
+            ) as HTMLButtonElement[];
+            expect(optionBtns.length).toBeGreaterThan(0);
+
+            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:connections:model_picker`);
+            assertInteractiveTargetsAndTypography(shadowRoot, `${vp.label}:connections:model_picker`);
+
+            const filterInput = shadowRoot.querySelector(
+                'input[type="search"][aria-label="筛选模型"]',
+            ) as HTMLInputElement | null;
+            expect(filterInput, `${vp.label}: expected model search input`).toBeTruthy();
+            filterInput!.value = 'opus';
+            filterInput!.dispatchEvent(new Event('input', { bubbles: true }));
+            await settleLayout(4);
+
+            const filteredOptions = Array.from(
+                shadowRoot.querySelectorAll('.ag-model-option'),
+            ) as HTMLButtonElement[];
+            expect(filteredOptions.length).toBe(1);
+            expect(filteredOptions[0].textContent).toContain('claude-opus-4-20250514');
+
+            filteredOptions[0].click();
+            await settleLayout(4);
+
+            // Picker collapses and Model ID + store update to selected model
+            expect(shadowRoot.querySelector('.ag-model-picker-list')).toBeNull();
+            const activeConnId = activeHarness.store.getSnapshot().settings.currentConnectionId;
+            expect(activeHarness.store.getSnapshot().settings.connections[activeConnId].model).toBe(
+                'claude-opus-4-20250514',
+            );
+
+            const modelInput = shadowRoot.querySelector(
+                'input[placeholder*="claude-sonnet-4.5"]',
+            ) as HTMLInputElement | null;
+            expect(modelInput).toBeTruthy();
+            expect(modelInput!.value).toBe('claude-opus-4-20250514');
+
+            // Verify error banner renders cleanly when fetchModels fails
+            const failingServices: AgenticUIServices = {
+                ...mockServices,
+                async fetchModels() {
+                    return {
+                        ok: false,
+                        latencyMs: 35,
+                        models: [],
+                        message: '获取模型列表失败 (35ms)：HTTP 401 Unauthorized',
+                    };
+                },
+            };
+            activeHarness.cleanup();
+            activeHarness = createHarness({
+                initialTab: 'connections',
+                initialOpen: true,
+                services: failingServices,
+            });
+            await settleLayout(5);
+
+            const { dialog: errDialog, shadowRoot: errShadowRoot } = getShellElements();
+            if (vp.isMobile) {
+                const firstConnItem = errShadowRoot.querySelector('.ag-list-item') as HTMLButtonElement | null;
+                firstConnItem!.click();
+                await settleLayout(4);
+            }
+            const errFetchBtn = Array.from(errShadowRoot.querySelectorAll('button')).find(
+                (btn) => btn.textContent?.includes('获取模型'),
+            ) as HTMLButtonElement | undefined;
+            expect(errFetchBtn).toBeTruthy();
+            errFetchBtn!.click();
+            await settleLayout(5);
+
+            const errBanner = errShadowRoot.querySelector('.ag-banner-error') as HTMLDivElement | null;
+            expect(errBanner, `${vp.label}: expected .ag-banner-error on fetch failure`).toBeTruthy();
+            expect(errBanner!.textContent).toContain('HTTP 401 Unauthorized');
+            assertNoHorizontalOverflow(errDialog, errShadowRoot, `${vp.label}:connections:fetch_error`);
+            assertInteractiveTargetsAndTypography(errShadowRoot, `${vp.label}:connections:fetch_error`);
 
             activeHarness.cleanup();
             activeHarness = null;

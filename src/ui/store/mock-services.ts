@@ -31,10 +31,12 @@ import type {
 import type {
     AgentWatermarkStatus,
     AgenticUIServices,
+    ConnectionModelsResult,
     ConnectionTestResult,
     EmbeddedCardStatus,
     FileOverrideItem,
     ImportPresetResult,
+    RemoteModelInfo,
     ResolvedTheme,
     StorageOverview,
     ToastTone,
@@ -1091,6 +1093,86 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
                 latencyMs: 248,
                 cacheSupport: policyText,
                 message: `✓ 模拟握手成功 (248ms) · ${connection.model || '未填模型'} · ${policyText}`,
+            };
+        },
+
+        async fetchModels(connection: ApiConnection): Promise<ConnectionModelsResult> {
+            if (!connection.baseUrl.trim()) {
+                return {
+                    ok: false,
+                    latencyMs: 12,
+                    models: [],
+                    message: '获取模型列表失败：请先填写 Endpoint (Base URL)',
+                };
+            }
+
+            const baseModels: RemoteModelInfo[] =
+                connection.providerFormat === 'anthropic'
+                    ? [
+                        {
+                            id: 'claude-sonnet-4-5-20250929',
+                            displayName: 'Claude Sonnet 4.5',
+                            ownedBy: 'anthropic',
+                            contextLength: 200000,
+                        },
+                        {
+                            id: 'claude-opus-4-20250514',
+                            displayName: 'Claude Opus 4',
+                            ownedBy: 'anthropic',
+                            contextLength: 200000,
+                        },
+                        {
+                            id: 'claude-haiku-4-5-20251001',
+                            displayName: 'Claude Haiku 4.5',
+                            ownedBy: 'anthropic',
+                            contextLength: 200000,
+                        },
+                    ]
+                    : [
+                        {
+                            id: 'gemini-2.5-flash',
+                            displayName: 'Gemini 2.5 Flash',
+                            ownedBy: 'google',
+                            contextLength: 1048576,
+                        },
+                        {
+                            id: 'gemini-2.5-pro',
+                            displayName: 'Gemini 2.5 Pro',
+                            ownedBy: 'google',
+                            contextLength: 1048576,
+                        },
+                        {
+                            id: 'gpt-4.1',
+                            displayName: 'GPT-4.1',
+                            ownedBy: 'openai',
+                            contextLength: 1047576,
+                        },
+                        {
+                            id: 'deepseek-chat',
+                            displayName: 'DeepSeek Chat',
+                            ownedBy: 'deepseek',
+                            contextLength: 128000,
+                        },
+                        {
+                            id: 'qwen3-32b-instruct',
+                            displayName: 'Qwen3 32B Instruct',
+                            ownedBy: 'qwen',
+                            contextLength: 32768,
+                        },
+                    ];
+
+            const currentModel = connection.model.trim();
+            const models = [...baseModels];
+            if (currentModel && !models.some((m) => m.id === currentModel)) {
+                models.push({ id: currentModel });
+            }
+            models.sort((a, b) => a.id.localeCompare(b.id, undefined, { sensitivity: 'base' }));
+
+            return {
+                ok: true,
+                latencyMs: 142,
+                models,
+                message: `已获取 ${models.length} 个可用模型 (142ms)`,
             };
         },
 

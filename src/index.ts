@@ -116,6 +116,7 @@ import {
     AppStore,
     type AgenticUIServices,
     type AgentWatermarkStatus,
+    type ConnectionModelsResult,
     type ConnectionTestResult,
     type EmbeddedCardStatus,
     type FileOverrideItem,
@@ -1125,6 +1126,40 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                     ok: false,
                     latencyMs,
                     message: `连接失败 (${latencyMs}ms)：${msg}`,
+                };
+            } finally {
+                clearTimeout(timer);
+            }
+        },
+
+        async fetchModels(connection: ApiConnection): Promise<ConnectionModelsResult> {
+            const startedAt = performance.now();
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 15_000);
+            try {
+                const models = await transport.listModels({
+                    connectionId: connection.id,
+                    connection,
+                    signal: controller.signal,
+                });
+                const latencyMs = Math.max(1, Math.round(performance.now() - startedAt));
+                return {
+                    ok: true,
+                    latencyMs,
+                    models,
+                    message:
+                        models.length > 0
+                            ? `已获取 ${models.length} 个可用模型 (${latencyMs}ms)`
+                            : `接口连接正常，但返回了 0 个模型 (${latencyMs}ms)`,
+                };
+            } catch (error) {
+                const latencyMs = Math.max(1, Math.round(performance.now() - startedAt));
+                const msg = error instanceof Error ? error.message : String(error);
+                return {
+                    ok: false,
+                    latencyMs,
+                    models: [],
+                    message: `获取模型列表失败 (${latencyMs}ms)：${msg}`,
                 };
             } finally {
                 clearTimeout(timer);

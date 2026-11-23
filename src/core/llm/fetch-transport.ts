@@ -1,8 +1,15 @@
-import type { LLMRequest, LLMResponse, LLMStreamChunk, LLMTransport } from '../bridge';
+import type {
+    ListModelsRequest,
+    LLMRequest,
+    LLMResponse,
+    LLMStreamChunk,
+    LLMTransport,
+    RemoteModelInfo,
+} from '../bridge';
 import type { ApiConnection } from '../types';
 import { ConcurrencyLimiter } from './concurrency-limiter';
 import { createAbortError, isAbortError, isRetryableStatus, LLMTransportError, throwIfAborted } from './errors';
-import { type CompiledPayload, PayloadCompiler } from './payload-compiler';
+import { type CompiledModelsRequest, type CompiledPayload, PayloadCompiler } from './payload-compiler';
 import { type RetryOptions, withRetry } from './retry';
 import { assembleStreamChunks, parseCompletionResponse, parseSSEStream } from './sse-parser';
 
@@ -57,6 +64,150 @@ function parseRetryAfterMs(headerValue: string | null): number | undefined {
     return undefined;
 }
 
+export interface ParsedModelsPage {
+    models: RemoteModelInfo[];
+    hasMore: boolean;
+    lastId?: string;
+}
+
+function firstNonEmptyString(...values: unknown[]): string | undefined {
+    for (const value of values) {
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (trimmed) {
+                return trimmed;
+            }
+        }
+    }
+    return undefined;
+}
+
+function firstPositiveInt(...values: unknown[]): number | undefined {
+    for (const value of values) {
+        if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+            const floored = Math.floor(value);
+            if (floored > 0) {
+                return floored;
+            }
+        }
+    }
+    return undefined;
+}
+
+function extractErrorMessageFromRecord(parsed: Record<string, unknown>): string | undefined {
+    const err = parsed.error ?? (parsed.detail as Record<string, unknown> | undefined)?.error;
+    if (typeof err === 'string' && err) {
+        return err;
+    }
+    if (err && typeof err === 'object') {
+        const errObj = err as Record<string, unknown>;
+        if (typeof errObj.message === 'string' && errObj.message) {
+            return errObj.message;
+        }
+        if (typeof errObj.code === 'string' && errObj.code) {
+            return errObj.code;
+        }
+        if (typeof errObj.type === 'string' && errObj.type) {
+            return errObj.type;
+        }
+    }
+    if (typeof parsed.detail === 'string' && parsed.detail) {
+        return parsed.detail;
+    }
+    if (typeof parsed.message === 'string' && parsed.message) {
+        return parsed.message;
+    }
+    return undefined;
+}
+
+function parseModelEntry(entry: unknown): RemoteModelInfo | null {
+    if (typeof entry === 'string') {
+        const id = entry.trim();
+        return id ? { id } : null;
+    }
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        return null;
+    }
+
+    const obj = entry as Record<string, unknown>;
+    const rawId = firstNonEmptyString(obj.id);
+    const rawName = firstNonEmptyString(obj.name);
+    const rawModel = firstNonEmptyString(obj.model);
+
+    let id = rawId;
+    if (!id && rawName) {
+        id = rawName.startsWith('models/') ? rawName.slice('models/'.length).trim() : rawName;
+    }
+    if (!id && rawModel) {
+        id = rawModel;
+    }
+    if (!id) {
+        return null;
+    }
+
+    const explicitDisplay = firstNonEmptyString(obj.display_name, obj.displayName);
+    const candidateDisplay = explicitDisplay ?? (rawName && rawName !== id ? rawName : undefined);
+    const displayName = candidateDisplay && candidateDisplay !== id ? candidateDisplay : undefined;
+    const ownedBy = firstNonEmptyString(obj.owned_by, obj.ownedBy, obj.provider);
+    const contextLength = firstPositiveInt(
+        obj.context_length,
+        obj.contextLength,
+        obj.input_token_limit,
+        obj.max_context_length,
+    );
+
+    return {
+        id,
+        ...(displayName !== undefined ? { displayName } : {}),
+        ...(ownedBy !== undefined ? { ownedBy } : {}),
+        ...(contextLength !== undefined ? { contextLength } : {}),
+    };
+}
+
+/**
+ * Parses model discovery payloads across OpenAI (`data`), Anthropic (`data` + `has_more`/`last_id`),
+ * Google/Gemini (`models`), and bare array responses.
+ */
+export function parseModelsResponse(rawJson: unknown): ParsedModelsPage {
+    let rawList: unknown[] | null = null;
+    let hasMore = false;
+    let lastId: string | undefined;
+
+    if (Array.isArray(rawJson)) {
+        rawList = rawJson;
+    } else if (rawJson && typeof rawJson === 'object') {
+        const record = rawJson as Record<string, unknown>;
+        if (Array.isArray(record.data)) {
+            rawList = record.data;
+            hasMore = record.has_more === true;
+            lastId = firstNonEmptyString(record.last_id);
+        } else if (Array.isArray(record.models)) {
+            rawList = record.models;
+        } else {
+            const inlineError = extractErrorMessageFromRecord(record);
+            if (inlineError) {
+                throw new LLMTransportError(inlineError, { retryable: false });
+            }
+        }
+    }
+
+    if (!rawList) {
+        throw new LLMTransportError('Models response did not contain a valid model list', {
+            retryable: false,
+        });
+    }
+
+    const models: RemoteModelInfo[] = [];
+    for (const item of rawList) {
+        const parsed = parseModelEntry(item);
+        if (parsed) {
+            models.push(parsed);
+        }
+    }
+
+    return { models, hasMore, lastId };
+}
+
 function extractHttpErrorMessage(rawText: string, status: number, statusText: string): string {
     const fallback = `HTTP ${status}${statusText ? ` ${statusText}` : ''}`;
     if (!rawText) {
@@ -67,27 +218,9 @@ function extractHttpErrorMessage(rawText: string, status: number, statusText: st
         if (!parsed || typeof parsed !== 'object') {
             return rawText.trim() || fallback;
         }
-        const err = parsed.error ?? (parsed.detail as Record<string, unknown> | undefined)?.error;
-        if (typeof err === 'string' && err) {
-            return err;
-        }
-        if (err && typeof err === 'object') {
-            const errObj = err as Record<string, unknown>;
-            if (typeof errObj.message === 'string' && errObj.message) {
-                return errObj.message;
-            }
-            if (typeof errObj.code === 'string' && errObj.code) {
-                return errObj.code;
-            }
-            if (typeof errObj.type === 'string' && errObj.type) {
-                return errObj.type;
-            }
-        }
-        if (typeof parsed.detail === 'string' && parsed.detail) {
-            return parsed.detail;
-        }
-        if (typeof parsed.message === 'string' && parsed.message) {
-            return parsed.message;
+        const extracted = extractErrorMessageFromRecord(parsed);
+        if (extracted) {
+            return extracted;
         }
     } catch {
         // Not JSON; fall back to plain text body if concise.
@@ -312,15 +445,69 @@ export class FetchLLMTransport implements LLMTransport {
         }
     }
 
-    private async getConnection(request: LLMRequest): Promise<ApiConnection> {
+    async listModels(request: ListModelsRequest = {}): Promise<RemoteModelInfo[]> {
+        throwIfAborted(request.signal, 'List models request aborted');
+
+        const connection = await this.getConnection(request);
+        const compiled = this.payloadCompiler.compileModelsRequest(connection);
+
+        let page = await this.performModelsFetch(compiled, compiled.url, request.signal);
+        const allModels: RemoteModelInfo[] = [...page.models];
+        const seenCursors = new Set<string>();
+        let pageCount = 1;
+
+        while (
+            compiled.providerFormat === 'anthropic'
+            && page.hasMore
+            && page.lastId
+            && !seenCursors.has(page.lastId)
+            && pageCount < 5
+        ) {
+            seenCursors.add(page.lastId);
+            const separator = compiled.url.includes('?') ? '&' : '?';
+            const nextUrl = `${compiled.url}${separator}after_id=${encodeURIComponent(page.lastId)}`;
+            page = await this.performModelsFetch(compiled, nextUrl, request.signal);
+            allModels.push(...page.models);
+            pageCount += 1;
+        }
+
+        const deduped = new Map<string, RemoteModelInfo>();
+        for (const model of allModels) {
+            const existing = deduped.get(model.id);
+            if (!existing) {
+                deduped.set(model.id, { ...model });
+            } else {
+                if (!existing.displayName && model.displayName) {
+                    existing.displayName = model.displayName;
+                }
+                if (!existing.ownedBy && model.ownedBy) {
+                    existing.ownedBy = model.ownedBy;
+                }
+                if (existing.contextLength === undefined && model.contextLength !== undefined) {
+                    existing.contextLength = model.contextLength;
+                }
+            }
+        }
+
+        return Array.from(deduped.values()).sort((a, b) =>
+            a.id.localeCompare(b.id, undefined, { sensitivity: 'base' }),
+        );
+    }
+
+    private async getConnection(request: {
+        connectionId?: string;
+        connection?: ApiConnection;
+    }): Promise<ApiConnection> {
         const resolved =
             request.connection
-            ?? (await this.resolveConnectionFn?.(request.connectionId))
-            ?? this.connections[request.connectionId];
+            ?? (request.connectionId !== undefined
+                ? (await this.resolveConnectionFn?.(request.connectionId))
+                  ?? this.connections[request.connectionId]
+                : undefined);
 
         if (!resolved) {
             throw new LLMTransportError(
-                `API connection not found: "${request.connectionId}"`,
+                `API connection not found: "${request.connectionId ?? ''}"`,
                 { retryable: false },
             );
         }
@@ -349,29 +536,24 @@ export class FetchLLMTransport implements LLMTransport {
         });
     }
 
-    private async performFetch(compiled: CompiledPayload, signal?: AbortSignal): Promise<Response> {
-        throwIfAborted(signal, 'LLM request aborted');
+    private async executeHttpFetch(
+        url: string,
+        init: RequestInit,
+        signal: AbortSignal | undefined,
+        options: { retryableNetwork: boolean; retryableStatus: boolean; abortMessage: string },
+    ): Promise<Response> {
+        throwIfAborted(signal, options.abortMessage);
 
         let response: Response;
         try {
-            response = await fetchWithAbortRace(
-                this.fetchImpl,
-                compiled.url,
-                {
-                    method: compiled.method,
-                    headers: compiled.headers,
-                    body: compiled.serializedBody,
-                    signal,
-                },
-                signal,
-            );
+            response = await fetchWithAbortRace(this.fetchImpl, url, init, signal);
         } catch (err) {
             if (signal?.aborted || isAbortError(err)) {
-                throw createAbortError(signal, 'LLM request aborted');
+                throw createAbortError(signal, options.abortMessage);
             }
             const message = err instanceof Error ? err.message : String(err);
             throw new LLMTransportError(`Network request failed: ${message}`, {
-                retryable: true,
+                retryable: options.retryableNetwork,
                 cause: err,
             });
         }
@@ -382,20 +564,62 @@ export class FetchLLMTransport implements LLMTransport {
                 rawText = await readTextWithAbort(response, signal);
             } catch (readErr) {
                 if (signal?.aborted || isAbortError(readErr)) {
-                    throw createAbortError(signal, 'LLM request aborted');
+                    throw createAbortError(signal, options.abortMessage);
                 }
             }
             const retryAfterMs = parseRetryAfterMs(response.headers.get('retry-after'));
             const message = extractHttpErrorMessage(rawText, response.status, response.statusText);
             throw new LLMTransportError(message, {
                 status: response.status,
-                retryable: isRetryableStatus(response.status),
+                retryable: options.retryableStatus ? isRetryableStatus(response.status) : false,
                 retryAfterMs,
                 responseBody: rawText,
             });
         }
 
         return response;
+    }
+
+    private performFetch(compiled: CompiledPayload, signal?: AbortSignal): Promise<Response> {
+        return this.executeHttpFetch(
+            compiled.url,
+            {
+                method: compiled.method,
+                headers: compiled.headers,
+                body: compiled.serializedBody,
+                signal,
+            },
+            signal,
+            {
+                retryableNetwork: true,
+                retryableStatus: true,
+                abortMessage: 'LLM request aborted',
+            },
+        );
+    }
+
+    private async performModelsFetch(
+        compiled: CompiledModelsRequest,
+        url: string,
+        signal?: AbortSignal,
+    ): Promise<ParsedModelsPage> {
+        const response = await this.executeHttpFetch(
+            url,
+            {
+                method: compiled.method,
+                headers: compiled.headers,
+                signal,
+            },
+            signal,
+            {
+                retryableNetwork: false,
+                retryableStatus: false,
+                abortMessage: 'List models request aborted',
+            },
+        );
+        const rawText = await readTextWithAbort(response, signal);
+        const parsedJson = this.parseJsonOrThrow(rawText);
+        return parseModelsResponse(parsedJson);
     }
 
     private async performCompleteFetch(compiled: CompiledPayload, signal?: AbortSignal): Promise<LLMResponse> {

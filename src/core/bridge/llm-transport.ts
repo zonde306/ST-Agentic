@@ -45,7 +45,21 @@ export interface LLMStreamChunk {
     finishReason?: string;
 }
 
+export interface RemoteModelInfo {
+    id: string;
+    displayName?: string;
+    ownedBy?: string;
+    contextLength?: number;
+}
+
+export interface ListModelsRequest {
+    connectionId?: string;
+    connection?: ApiConnection;
+    signal?: AbortSignal;
+}
+
 export interface LLMTransport {
     complete(request: LLMRequest): Promise<LLMResponse>;
     stream(request: LLMRequest): AsyncIterable<LLMStreamChunk>;
+    listModels?(request: ListModelsRequest): Promise<RemoteModelInfo[]>;
 }

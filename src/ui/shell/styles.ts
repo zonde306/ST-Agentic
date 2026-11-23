@@ -2515,6 +2515,123 @@ select {
     background: var(--warning);
 }
 
+/* Remote Model Picker (ConnectionsView) */
+.ag-model-picker {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+}
+
+.ag-model-picker-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-width: 0;
+}
+
+.ag-model-picker-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 240px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-width: 0;
+}
+
+.ag-model-option {
+    width: 100%;
+    min-width: 40px;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--card-border);
+    background: var(--content);
+    color: var(--foreground);
+    text-align: left;
+    cursor: pointer;
+    transition: background-color 0.15s, border-color 0.15s;
+}
+
+.ag-model-option:hover {
+    background: var(--secondary);
+}
+
+.ag-model-option-active {
+    border-color: var(--primary);
+    background: color-mix(in srgb, var(--primary) 12%, var(--content));
+}
+
+.ag-model-option-main {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.ag-model-option-id {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--foreground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.ag-model-option-sub {
+    font-size: 11px;
+    color: var(--muted-foreground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.ag-model-option-meta {
+    flex-shrink: 0;
+    max-width: 48%;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 4px;
+}
+
+.ag-model-option-meta .ag-badge {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.ag-model-option-check {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--primary);
+    flex-shrink: 0;
+}
+
+.ag-model-picker-empty,
+.ag-model-picker-more {
+    padding: 8px 4px;
+    font-size: 12px;
+    color: var(--muted-foreground);
+    text-align: center;
+}
+
 /* Mobile First-Class Breakpoint (< 768px) */
 @media (max-width: 767px) {
     .ag-console {

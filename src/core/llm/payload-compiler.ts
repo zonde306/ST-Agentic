@@ -25,6 +25,13 @@ export interface CompiledPayload {
     cacheBreakpointsApplied: number;
 }
 
+export interface CompiledModelsRequest {
+    url: string;
+    method: 'GET';
+    headers: Record<string, string>;
+    providerFormat: ApiProviderFormat;
+}
+
 export interface PayloadCompilerOptions {
     /** Optional fallback Anthropic API version header (default: '2023-06-01'). */
     anthropicVersion?: string;
@@ -300,6 +307,43 @@ function buildEndpointUrl(baseUrl: string, providerFormat: ApiProviderFormat): s
     return `${base}/chat/completions`;
 }
 
+/**
+ * Resolves the `/models` endpoint URL for OpenAI-compatible and Anthropic connections,
+ * preserving optional query strings and supporting relative proxy paths.
+ */
+export function buildModelsEndpointUrl(baseUrl: string, providerFormat: ApiProviderFormat): string {
+    const trimmed = baseUrl.trim();
+    const queryIdx = trimmed.indexOf('?');
+    const rawPath = queryIdx >= 0 ? trimmed.slice(0, queryIdx) : trimmed;
+    const querySuffix = queryIdx >= 0 ? trimmed.slice(queryIdx) : '';
+    const base = rawPath.replace(/\/+$/, '');
+    if (!base) {
+        throw new LLMTransportError('API connection baseUrl is required', { retryable: false });
+    }
+
+    if (base.endsWith('/models')) {
+        return `${base}${querySuffix}`;
+    }
+
+    if (providerFormat === 'anthropic') {
+        if (base.endsWith('/messages')) {
+            return `${base.slice(0, -'/messages'.length)}/models${querySuffix}`;
+        }
+        if (/\/v\d+$/.test(base)) {
+            return `${base}/models${querySuffix}`;
+        }
+        return `${base}/v1/models${querySuffix}`;
+    }
+
+    if (base.endsWith('/chat/completions')) {
+        return `${base.slice(0, -'/chat/completions'.length)}/models${querySuffix}`;
+    }
+    if (base.endsWith('/completions')) {
+        return `${base.slice(0, -'/completions'.length)}/models${querySuffix}`;
+    }
+    return `${base}/models${querySuffix}`;
+}
+
 function setHeaderCaseInsensitive(headers: Record<string, string>, name: string, value: string): void {
     const lower = name.toLowerCase();
     for (const existing of Object.keys(headers)) {
@@ -318,10 +362,12 @@ function hasHeaderCaseInsensitive(headers: Record<string, string>, name: string)
 function buildHeaders(
     connection: ApiConnection,
     anthropicVersion: string,
+    options: { defaultContentType?: boolean } = {},
 ): Record<string, string> {
-    const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-    };
+    const headers: Record<string, string> =
+        options.defaultContentType === false
+            ? { Accept: 'application/json' }
+            : { 'Content-Type': 'application/json' };
 
     for (const [rawKey, rawValue] of Object.entries(connection.includeHeaders ?? {})) {
         const key = rawKey.trim();
@@ -856,6 +902,21 @@ export class PayloadCompiler {
             serializedBody,
             providerFormat,
             cacheBreakpointsApplied: compiled.cacheBreakpointsApplied,
+        };
+    }
+
+    /** Compiles an `ApiConnection` into a `GET /models` discovery request. */
+    compileModelsRequest(connection: ApiConnection): CompiledModelsRequest {
+        const providerFormat = connection.providerFormat;
+        const url = buildModelsEndpointUrl(connection.baseUrl, providerFormat);
+        const headers = buildHeaders(connection, this.anthropicVersion, {
+            defaultContentType: false,
+        });
+        return {
+            url,
+            method: 'GET',
+            headers,
+            providerFormat,
         };
     }
 }

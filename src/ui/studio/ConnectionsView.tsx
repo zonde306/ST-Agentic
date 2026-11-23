@@ -26,17 +26,23 @@ import {
     useIsMobileViewport,
 } from '@/ui/components';
 import {
+    IconCheck,
+    IconChevronDown,
+    IconChevronRight,
     IconCopy,
     IconDownload,
     IconPlay,
     IconPlug,
     IconPlus,
+    IconRefresh,
     IconTrash,
     IconUpload,
 } from '@/ui/components/Icons';
 import {
+    type ConnectionModelsResult,
     type ConnectionTestResult,
     type ConsoleViewProps,
+    type RemoteModelInfo,
     useAppStore,
     useAppStoreInstance,
 } from '@/ui/store';
@@ -49,6 +55,27 @@ import {
     useDraftNumber,
     useDraftString,
 } from './studio-helpers';
+
+interface FetchedModelsState {
+    result: ConnectionModelsResult;
+    pickerOpen: boolean;
+    searchQuery: string;
+}
+
+const MAX_RENDERED_MODEL_OPTIONS = 200;
+
+function formatModelContextLength(tokens?: number): string | null {
+    if (tokens === undefined || !Number.isFinite(tokens) || tokens <= 0) {
+        return null;
+    }
+    if (tokens >= 1_000_000) {
+        return `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+    }
+    if (tokens >= 1000) {
+        return `${Math.round(tokens / 1000)}K`;
+    }
+    return String(Math.floor(tokens));
+}
 
 /**
  * Produce a strictly sanitized connections export JSON string delegating to
@@ -154,6 +181,11 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
     const [showApiKey, setShowApiKey] = useState(false);
     const [testing, setTesting] = useState(false);
     const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
+    const [fetchedModelsByConn, setFetchedModelsByConn] = useState<
+        Record<string, FetchedModelsState>
+    >({});
+    const [fetchingModelsConnId, setFetchingModelsConnId] = useState<string | null>(null);
+    const fetchModelsSeqRef = useRef(0);
 
     const [importOpen, setImportOpen] = useState(false);
     const [importText, setImportText] = useState('');
@@ -361,18 +393,142 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                 });
                 setSelectedConnId(nextPrimary);
                 setDetailOpen(false);
+                setFetchedModelsByConn((prev) => {
+                    if (!(activeConn.id in prev)) {
+                        return prev;
+                    }
+                    const next = { ...prev };
+                    delete next[activeConn.id];
+                    return next;
+                });
                 store.pushToast(`已删除连接：${activeConn.name}`, 'warning');
             },
         });
+    };
+
+    const buildEffectiveConnection = (conn: ApiConnection): ApiConnection => ({
+        ...conn,
+        baseUrl: baseUrlDraft.value.trim() || conn.baseUrl,
+        apiKey: apiKeyDraft.value,
+        model: modelDraft.value.trim(),
+    });
+
+    const activeFetchedModels = activeConn ? fetchedModelsByConn[activeConn.id] : undefined;
+    const isFetchingModels = Boolean(activeConn && fetchingModelsConnId === activeConn.id);
+
+    const filteredModels = useMemo(() => {
+        if (!activeFetchedModels || !activeFetchedModels.result.ok) {
+            return [];
+        }
+        const q = activeFetchedModels.searchQuery.trim().toLowerCase();
+        const list = activeFetchedModels.result.models;
+        if (!q) {
+            return list;
+        }
+        return list.filter(
+            (m) =>
+                m.id.toLowerCase().includes(q)
+                || (m.displayName?.toLowerCase().includes(q) ?? false)
+                || (m.ownedBy?.toLowerCase().includes(q) ?? false),
+        );
+    }, [activeFetchedModels]);
+
+    const updateActiveFetchedState = (
+        updater: (prev: FetchedModelsState) => FetchedModelsState,
+    ) => {
+        if (!activeConn) {
+            return;
+        }
+        const connId = activeConn.id;
+        setFetchedModelsByConn((prev) => {
+            const current = prev[connId];
+            if (!current) {
+                return prev;
+            }
+            return {
+                ...prev,
+                [connId]: updater(current),
+            };
+        });
+    };
+
+    const handleFetchModels = async () => {
+        if (!activeConn) {
+            return;
+        }
+        const targetConnId = activeConn.id;
+        const effectiveConn = buildEffectiveConnection(activeConn);
+        if (!effectiveConn.baseUrl.trim()) {
+            const message = '获取模型列表失败：请先填写 Endpoint (Base URL)';
+            setFetchedModelsByConn((prev) => ({
+                ...prev,
+                [targetConnId]: {
+                    result: { ok: false, latencyMs: 0, models: [], message },
+                    pickerOpen: false,
+                    searchQuery: '',
+                },
+            }));
+            store.pushToast('请先填写 Endpoint (Base URL)', 'error');
+            return;
+        }
+
+        const seq = fetchModelsSeqRef.current + 1;
+        fetchModelsSeqRef.current = seq;
+        try {
+            setFetchingModelsConnId(targetConnId);
+            const res = await store.services.fetchModels(effectiveConn);
+            if (fetchModelsSeqRef.current !== seq) {
+                return;
+            }
+            setFetchedModelsByConn((prev) => ({
+                ...prev,
+                [targetConnId]: {
+                    result: res,
+                    pickerOpen: res.ok && res.models.length > 0,
+                    searchQuery: '',
+                },
+            }));
+            const tone = !res.ok ? 'error' : res.models.length > 0 ? 'success' : 'warning';
+            store.pushToast(res.message, tone);
+        } catch (error) {
+            if (fetchModelsSeqRef.current !== seq) {
+                return;
+            }
+            const msg = error instanceof Error ? error.message : String(error);
+            const message = `获取模型列表失败：${msg}`;
+            setFetchedModelsByConn((prev) => ({
+                ...prev,
+                [targetConnId]: {
+                    result: { ok: false, latencyMs: 0, models: [], message },
+                    pickerOpen: false,
+                    searchQuery: '',
+                },
+            }));
+            store.pushToast(message, 'error');
+        } finally {
+            if (fetchModelsSeqRef.current === seq) {
+                setFetchingModelsConnId((curr) => (curr === targetConnId ? null : curr));
+            }
+        }
+    };
+
+    const handleSelectFetchedModel = (model: RemoteModelInfo) => {
+        if (!activeConn) {
+            return;
+        }
+        modelDraft.onChange(model.id);
+        updateActiveFetchedState((prev) => ({ ...prev, pickerOpen: false }));
+        store.pushToast(`已选择模型：${model.id}`, 'success');
     };
 
     const handleTestConnection = async () => {
         if (!activeConn) {
             return;
         }
+        const effectiveConn = buildEffectiveConnection(activeConn);
         try {
             setTesting(true);
-            const res = await store.services.testConnection(activeConn);
+            const res = await store.services.testConnection(effectiveConn);
             setTestResult(res);
             store.pushToast(res.message, res.ok ? 'success' : 'error');
         } catch (error) {
@@ -600,28 +756,18 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                                     }
                                 />
                             </FormField>
-
-                            <FormField label="Endpoint (Base URL)" required>
-                                <TextInput
-                                    type="url"
-                                    className="ag-mono"
-                                    value={baseUrlDraft.value}
-                                    placeholder="https://api.openai.com/v1"
-                                    onInput={baseUrlDraft.onInput}
-                                    onChange={baseUrlDraft.onChange}
-                                />
-                            </FormField>
-
-                            <FormField label="Model ID">
-                                <TextInput
-                                    className="ag-mono"
-                                    value={modelDraft.value}
-                                    placeholder="claude-sonnet-4.5 / gpt-4.1"
-                                    onInput={modelDraft.onInput}
-                                    onChange={modelDraft.onChange}
-                                />
-                            </FormField>
                         </div>
+
+                        <FormField label="Endpoint (Base URL)" required>
+                            <TextInput
+                                type="url"
+                                className="ag-mono"
+                                value={baseUrlDraft.value}
+                                placeholder="https://api.openai.com/v1"
+                                onInput={baseUrlDraft.onInput}
+                                onChange={baseUrlDraft.onChange}
+                            />
+                        </FormField>
 
                         <FormField
                             label="API Key (本地存储，导出预设/连接时始终强制剥离)"
@@ -646,6 +792,173 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                                 </Button>
                             </div>
                         </FormField>
+
+                        <FormField label="Model ID">
+                            <div class="ag-row">
+                                <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+                                    <TextInput
+                                        className="ag-mono"
+                                        value={modelDraft.value}
+                                        placeholder="claude-sonnet-4.5 / gpt-4.1"
+                                        onInput={modelDraft.onInput}
+                                        onChange={modelDraft.onChange}
+                                    />
+                                </div>
+                                <Button
+                                    size="sm"
+                                    variant="secondary"
+                                    loading={isFetchingModels}
+                                    icon={<IconRefresh size={14} />}
+                                    title="从 API 的 /models 端点获取可用模型列表"
+                                    onClick={() => void handleFetchModels()}
+                                >
+                                    {isFetchingModels ? '获取中...' : '获取模型'}
+                                </Button>
+                            </div>
+                        </FormField>
+
+                        {activeFetchedModels ? (
+                            !activeFetchedModels.result.ok ? (
+                                <div class="ag-banner ag-banner-error">
+                                    <div class="ag-row-wrap">
+                                        <span>{activeFetchedModels.result.message}</span>
+                                        <Badge tone="neutral" className="ag-mono">
+                                            {activeFetchedModels.result.latencyMs} ms
+                                        </Badge>
+                                    </div>
+                                </div>
+                            ) : activeFetchedModels.result.models.length === 0 ? (
+                                <div class="ag-banner ag-banner-warning">
+                                    <div class="ag-row-wrap">
+                                        <span>{activeFetchedModels.result.message}</span>
+                                        <Badge tone="neutral" className="ag-mono">
+                                            {activeFetchedModels.result.latencyMs} ms
+                                        </Badge>
+                                    </div>
+                                </div>
+                            ) : (
+                                <div class="ag-model-picker">
+                                    <div class="ag-model-picker-header">
+                                        <div class="ag-row-wrap">
+                                            <Badge tone="success">
+                                                已获取 {activeFetchedModels.result.models.length} 个模型
+                                            </Badge>
+                                            <Badge tone="neutral" className="ag-mono">
+                                                {activeFetchedModels.result.latencyMs} ms
+                                            </Badge>
+                                        </div>
+                                        <Button
+                                            size="sm"
+                                            variant="ghost"
+                                            icon={
+                                                activeFetchedModels.pickerOpen ? (
+                                                    <IconChevronDown size={14} />
+                                                ) : (
+                                                    <IconChevronRight size={14} />
+                                                )
+                                            }
+                                            onClick={() =>
+                                                updateActiveFetchedState((prev) => ({
+                                                    ...prev,
+                                                    pickerOpen: !prev.pickerOpen,
+                                                }))
+                                            }
+                                        >
+                                            {activeFetchedModels.pickerOpen ? '收起列表' : '选择模型'}
+                                        </Button>
+                                    </div>
+
+                                    {activeFetchedModels.pickerOpen ? (
+                                        <>
+                                            <TextInput
+                                                type="search"
+                                                ariaLabel="筛选模型"
+                                                placeholder={`搜索模型 ID 或名称 (共 ${activeFetchedModels.result.models.length} 个)...`}
+                                                value={activeFetchedModels.searchQuery}
+                                                onInput={(val) =>
+                                                    updateActiveFetchedState((prev) => ({
+                                                        ...prev,
+                                                        searchQuery: val,
+                                                    }))
+                                                }
+                                                onChange={(val) =>
+                                                    updateActiveFetchedState((prev) => ({
+                                                        ...prev,
+                                                        searchQuery: val,
+                                                    }))
+                                                }
+                                            />
+                                            {filteredModels.length === 0 ? (
+                                                <div class="ag-model-picker-empty">
+                                                    未找到匹配「{activeFetchedModels.searchQuery}」的模型，可直接在上方手动输入 Model ID
+                                                </div>
+                                            ) : (
+                                                <div class="ag-model-picker-list ag-thin-scroll">
+                                                    {filteredModels
+                                                        .slice(0, MAX_RENDERED_MODEL_OPTIONS)
+                                                        .map((model) => {
+                                                            const isSelected = model.id === activeConn.model;
+                                                            const ctxLabel = formatModelContextLength(
+                                                                model.contextLength,
+                                                            );
+                                                            return (
+                                                                <button
+                                                                    key={model.id}
+                                                                    type="button"
+                                                                    class={
+                                                                        isSelected
+                                                                            ? 'ag-model-option ag-model-option-active'
+                                                                            : 'ag-model-option'
+                                                                    }
+                                                                    onClick={() =>
+                                                                        handleSelectFetchedModel(model)
+                                                                    }
+                                                                >
+                                                                    <div class="ag-model-option-main">
+                                                                        <span class="ag-model-option-id ag-mono">
+                                                                            {model.id}
+                                                                        </span>
+                                                                        {model.displayName ? (
+                                                                            <span class="ag-model-option-sub">
+                                                                                {model.displayName}
+                                                                            </span>
+                                                                        ) : null}
+                                                                    </div>
+                                                                    <div class="ag-model-option-meta">
+                                                                        {model.ownedBy ? (
+                                                                            <Badge tone="neutral">
+                                                                                {model.ownedBy}
+                                                                            </Badge>
+                                                                        ) : null}
+                                                                        {ctxLabel ? (
+                                                                            <Badge
+                                                                                tone="primary"
+                                                                                className="ag-mono"
+                                                                            >
+                                                                                {ctxLabel}
+                                                                            </Badge>
+                                                                        ) : null}
+                                                                        {isSelected ? (
+                                                                            <span class="ag-model-option-check">
+                                                                                <IconCheck size={14} />
+                                                                            </span>
+                                                                        ) : null}
+                                                                    </div>
+                                                                </button>
+                                                            );
+                                                        })}
+                                                    {filteredModels.length > MAX_RENDERED_MODEL_OPTIONS ? (
+                                                        <div class="ag-model-picker-more">
+                                                            已展示前 {MAX_RENDERED_MODEL_OPTIONS} 项，共 {filteredModels.length} 项匹配；请输入关键词缩小范围
+                                                        </div>
+                                                    ) : null}
+                                                </div>
+                                            )}
+                                        </>
+                                    ) : null}
+                                </div>
+                            )
+                        ) : null}
 
                         <div class="ag-row-wrap">
                             <Button

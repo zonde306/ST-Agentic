@@ -1,6 +1,6 @@
 import { createContext, createElement, type ComponentChildren } from 'preact';
 import { useContext, useEffect, useRef, useState } from 'preact/hooks';
-import type { ToolSideGenApi } from '@/core/bridge';
+import type { RemoteModelInfo, ToolSideGenApi } from '@/core/bridge';
 import {
     createDefaultSettings,
     normalizeSettings,
@@ -182,11 +182,20 @@ export interface StorageOverview {
     sizeThreshold: number;
 }
 
+export type { RemoteModelInfo };
+
 export interface ConnectionTestResult {
     ok: boolean;
     latencyMs: number;
     message: string;
     cacheSupport?: string;
+}
+
+export interface ConnectionModelsResult {
+    ok: boolean;
+    latencyMs: number;
+    models: RemoteModelInfo[];
+    message: string;
 }
 
 export interface ToolTestResult {
@@ -270,6 +279,7 @@ export interface AgenticUIServices {
 
     // Studio Testing & World Info Classification (Views 6, 8, 9)
     testConnection(connection: ApiConnection): Promise<ConnectionTestResult>;
+    fetchModels(connection: ApiConnection): Promise<ConnectionModelsResult>;
     testToolInSandbox(
         tool: CustomToolConfig | { name: string; code?: string; commandTemplate?: string },
         argsJson: string,

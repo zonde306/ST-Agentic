@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { LLMRequest } from '@/core/bridge';
 import type { ApiConnection, CanonicalMessage, CanonicalToolSchema } from '@/core/types';
-import { MAX_ANTHROPIC_CACHE_BREAKPOINTS, PayloadCompiler } from '@/core/llm';
+import { buildModelsEndpointUrl, MAX_ANTHROPIC_CACHE_BREAKPOINTS, PayloadCompiler } from '@/core/llm';
 
 function makeConnection(overrides: Partial<ApiConnection> = {}): ApiConnection {
     return {
@@ -411,5 +411,76 @@ describe('PayloadCompiler', () => {
         expect(anthropic.url).toBe('https://proxy.example.com/v1/messages');
         expect(anthropic.headers['x-api-key']).toBeUndefined();
         expect(anthropic.headers['anthropic-version']).toBe('2023-06-01');
+    });
+
+    it('resolves /models endpoints and GET headers across OpenAI, Anthropic, and relative proxy URLs', () => {
+        expect(buildModelsEndpointUrl('https://api.openai.com/v1', 'openai')).toBe(
+            'https://api.openai.com/v1/models',
+        );
+        expect(buildModelsEndpointUrl('https://api.openai.com/v1/', 'openai')).toBe(
+            'https://api.openai.com/v1/models',
+        );
+        expect(buildModelsEndpointUrl('https://api.openai.com/v1/chat/completions', 'openai')).toBe(
+            'https://api.openai.com/v1/models',
+        );
+        expect(buildModelsEndpointUrl('https://proxy.local/v1/completions?api-version=2024', 'openai')).toBe(
+            'https://proxy.local/v1/models?api-version=2024',
+        );
+        expect(buildModelsEndpointUrl('/proxy/v1', 'openai')).toBe('/proxy/v1/models');
+        expect(buildModelsEndpointUrl('https://api.openai.com/v1/models', 'openai')).toBe(
+            'https://api.openai.com/v1/models',
+        );
+
+        expect(buildModelsEndpointUrl('https://api.anthropic.com', 'anthropic')).toBe(
+            'https://api.anthropic.com/v1/models',
+        );
+        expect(buildModelsEndpointUrl('https://api.anthropic.com/v1/', 'anthropic')).toBe(
+            'https://api.anthropic.com/v1/models',
+        );
+        expect(buildModelsEndpointUrl('https://api.anthropic.com/v1/messages', 'anthropic')).toBe(
+            'https://api.anthropic.com/v1/models',
+        );
+        expect(() => buildModelsEndpointUrl('   ', 'openai')).toThrow(/baseUrl is required/i);
+
+        const openaiReq = compiler.compileModelsRequest(
+            makeConnection({
+                providerFormat: 'openai',
+                baseUrl: 'https://api.openai.com/v1/chat/completions',
+                apiKey: 'sk-openai',
+                includeHeaders: {
+                    'Content-Type': null,
+                    'X-Custom': '1',
+                },
+            }),
+        );
+        expect(openaiReq.method).toBe('GET');
+        expect(openaiReq.url).toBe('https://api.openai.com/v1/models');
+        expect(openaiReq.headers.Accept).toBe('application/json');
+        expect(openaiReq.headers['Content-Type']).toBeUndefined();
+        expect(openaiReq.headers.Authorization).toBe('Bearer sk-openai');
+        expect(openaiReq.headers['X-Custom']).toBe('1');
+
+        const localReq = compiler.compileModelsRequest(
+            makeConnection({
+                providerFormat: 'openai',
+                baseUrl: 'http://127.0.0.1:1234/v1',
+                apiKey: '   ',
+            }),
+        );
+        expect(localReq.headers.Authorization).toBeUndefined();
+        expect(localReq.headers['Content-Type']).toBeUndefined();
+
+        const anthropicReq = compiler.compileModelsRequest(
+            makeConnection({
+                providerFormat: 'anthropic',
+                baseUrl: 'https://api.anthropic.com',
+                apiKey: 'sk-ant',
+            }),
+        );
+        expect(anthropicReq.method).toBe('GET');
+        expect(anthropicReq.url).toBe('https://api.anthropic.com/v1/models');
+        expect(anthropicReq.headers['x-api-key']).toBe('sk-ant');
+        expect(anthropicReq.headers['anthropic-version']).toBe('2023-06-01');
+        expect(anthropicReq.headers['Content-Type']).toBeUndefined();
     });
 });
