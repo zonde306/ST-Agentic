@@ -395,18 +395,35 @@ function buildSyncVfsReader(
     };
 }
 
-function buildScanTail(scanDepth = 8): string {
-    if (!Array.isArray(chat) || chat.length === 0) {
+function readPendingSendTextareaText(): string {
+    if (typeof document === 'undefined' || typeof document.querySelector !== 'function') {
         return '';
     }
-    const tail = chat.slice(-Math.max(1, scanDepth));
-    return tail
-        .map((msg) => {
-            const m = msg as { name?: unknown; mes?: unknown };
-            const speaker = typeof m.name === 'string' && m.name ? `${m.name}: ` : '';
-            return `${speaker}${typeof m.mes === 'string' ? m.mes : ''}`;
-        })
-        .join('\n\n');
+    const textarea = document.querySelector('#send_textarea') as HTMLTextAreaElement | null;
+    return typeof textarea?.value === 'string' ? textarea.value.trim() : '';
+}
+
+function buildScanTail(scanDepth = 8, pendingUserInput = ''): string {
+    const segments = Array.isArray(chat)
+        ? chat.slice(-Math.max(1, scanDepth)).map((msg) => {
+              const m = msg as { name?: unknown; mes?: unknown };
+              const speaker = typeof m.name === 'string' && m.name ? `${m.name}: ` : '';
+              return `${speaker}${typeof m.mes === 'string' ? m.mes : ''}`;
+          })
+        : [];
+
+    const trimmedPending = pendingUserInput.trim();
+    if (trimmedPending) {
+        const lastMes =
+            Array.isArray(chat) && chat.length > 0
+                ? (chat[chat.length - 1] as { mes?: unknown } | undefined)?.mes
+                : undefined;
+        if (typeof lastMes !== 'string' || lastMes.trim() !== trimmedPending) {
+            segments.push(trimmedPending);
+        }
+    }
+
+    return segments.join('\n\n');
 }
 
 async function runCompanionBeforeTurnUnits(
@@ -415,6 +432,7 @@ async function runCompanionBeforeTurnUnits(
     settings: Settings,
     target: MessageTarget,
     signal: AbortSignal,
+    pendingUserInput = '',
 ): Promise<string> {
     const lorebooks = await bridge.listEnabledLorebooks();
     const preset = resolveActivePreset(settings);
@@ -428,7 +446,7 @@ async function runCompanionBeforeTurnUnits(
     }
 
     const units: TriggerExecutionUnit[] = groupTriggersForExecution(beforeRules);
-    const scanText = buildScanTail();
+    const scanText = buildScanTail(8, pendingUserInput);
     const turnNumber = target.messageId + 1;
     const briefFragments: string[] = [];
 
@@ -518,23 +536,36 @@ function mountCompanionCapsule(
     return capsule;
 }
 
-function collectRecentChatTexts(limit = 8): { input: string; recentMessages: string[] } {
-    if (!Array.isArray(chat) || chat.length === 0) {
-        return { input: '', recentMessages: [] };
+function collectRecentChatTexts(
+    limit = 8,
+    options?: { pendingInput?: string; includePendingTextarea?: boolean },
+): { input: string; recentMessages: string[] } {
+    const maxItems = Math.max(1, limit);
+    const texts = Array.isArray(chat)
+        ? chat
+              .slice(-maxItems)
+              .map((msg) => {
+                  const m = msg as { mes?: unknown };
+                  return typeof m?.mes === 'string' ? m.mes.trim() : '';
+              })
+              .filter(Boolean)
+        : [];
+
+    const pendingText = (
+        options?.pendingInput
+        ?? (options?.includePendingTextarea ? readPendingSendTextareaText() : '')
+    ).trim();
+    if (pendingText && texts[texts.length - 1] !== pendingText) {
+        texts.push(pendingText);
     }
-    const texts = chat
-        .slice(-Math.max(1, limit))
-        .map((msg) => {
-            const m = msg as { mes?: unknown };
-            return typeof m?.mes === 'string' ? m.mes.trim() : '';
-        })
-        .filter(Boolean);
-    if (texts.length === 0) {
+
+    const bounded = texts.slice(-maxItems);
+    if (bounded.length === 0) {
         return { input: '', recentMessages: [] };
     }
     return {
-        input: texts[texts.length - 1] ?? '',
-        recentMessages: texts.slice(0, -1),
+        input: bounded[bounded.length - 1] ?? '',
+        recentMessages: bounded.slice(0, -1),
     };
 }
 
@@ -542,6 +573,7 @@ async function buildCompanionSideBridgeContent(
     orchestrator: PipelineOrchestrator,
     radar: TailRadar,
     target: MessageTarget,
+    options?: { pendingInput?: string; includePendingTextarea?: boolean },
 ): Promise<{ content: string; briefPaths: string[] }> {
     const clues = await orchestrator.vfs.listSideClues({ target });
     if (clues.length === 0) {
@@ -551,7 +583,7 @@ async function buildCompanionSideBridgeContent(
     const briefClues = selectUnconsumedSideBriefClues(clues);
     const briefXml = formatSideBriefXml(briefClues);
 
-    const { input, recentMessages } = collectRecentChatTexts(8);
+    const { input, recentMessages } = collectRecentChatTexts(8, options);
     const scanResult = input || recentMessages.length > 0
         ? radar.scanSideClues(clues, { input, recentMessages })
         : undefined;
@@ -687,6 +719,7 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         pendingCompanionTurn?.controller.abort('Superseded by new generation');
         const controller = new AbortController();
         const target = resolveUpcomingTarget(genType);
+        const pendingUserInput = genType === 'normal' ? readPendingSendTextareaText() : '';
         pendingCompanionTurn = { target, controller };
 
         try {
@@ -704,8 +737,11 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
                     settings,
                     target,
                     controller.signal,
+                    pendingUserInput,
                 ),
-                buildCompanionSideBridgeContent(orchestrator, sideTailRadar, target),
+                buildCompanionSideBridgeContent(orchestrator, sideTailRadar, target, {
+                    pendingInput: pendingUserInput,
+                }),
             ]);
             if (controller.signal.aborted) {
                 return;

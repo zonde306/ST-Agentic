@@ -804,6 +804,10 @@ describe('Companion Hooks /side/* Bridge & Zero-Residue Cleanup', () => {
         resetStState();
     });
 
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
     it('injects matched radar_hint + unconsumed next_turn_brief into agentic_side_bridge, resolves {{file::/side/...}}, and clears on runMode=off and dispose', async () => {
         const settings: Settings = {
             ...createDefaultSettings(),
@@ -974,6 +978,139 @@ describe('Companion Hooks /side/* Bridge & Zero-Residue Cleanup', () => {
             false,
             0,
         );
+    });
+
+    it('matches /side/* radar_hint clues against pending #send_textarea input on normal GENERATION_AFTER_COMMANDS before chat[] updates', async () => {
+        // Real ST fires GENERATION_AFTER_COMMANDS before sendMessageAsUser() pushes the
+        // #send_textarea prompt onto chat[]. Keep chat[] free of '旧灯塔' initially.
+        stMocks.state.chat = [
+            {
+                name: 'Tester',
+                is_user: true,
+                is_system: false,
+                mes: '我们刚从老码头回来。',
+                swipe_id: 0,
+                swipes: ['我们刚从老码头回来。'],
+            },
+        ];
+
+        const settings: Settings = {
+            ...createDefaultSettings(),
+            runMode: 'companion',
+        };
+        const bridge = new STHostBridge({ getSettings: () => settings });
+        const store = new ChatDataStore(bridge);
+        bridge.setStore(store);
+        const vfs = new VirtualFileSystem({ bridge, store });
+
+        const target = { messageId: 0, swipeId: 0 };
+        await vfs.writeSideClue(
+            {
+                path: '/side/rumors/lighthouse.md',
+                title: '旧灯塔异响传闻',
+                delivery: 'radar_hint',
+                keywords: ['旧灯塔'],
+                summary: '午夜旧灯塔曾出现神秘信号灯',
+                body: '码头守夜人报告称，午夜时分旧灯塔顶层闪过三短三长的神秘信号灯。',
+                status: 'dormant',
+            },
+            { target, staged: false },
+        );
+
+        const sendTextarea = { value: '听说旧灯塔那边最近有点不对劲。' };
+        vi.stubGlobal('document', {
+            querySelector: (selector: string) => (selector === '#send_textarea' ? sendTextarea : null),
+        });
+
+        const mockOrchestrator = {
+            store,
+            vfs,
+            barrierCoordinator: {
+                awaitTurnBarriers: vi.fn(async () => undefined),
+                abortFromMessage: vi.fn(),
+                abortTarget: vi.fn(),
+            },
+            decoratorCompiler: {
+                compile: vi.fn(() => ({ triggers: [] })),
+            },
+            rerunAfterTurn: vi.fn(async () => []),
+            trajectoryStore: {
+                listInterruptedCheckpoints: vi.fn(() => new Map()),
+                pruneFromMessage: vi.fn(() => 0),
+                pruneSwipe: vi.fn(() => 0),
+                saveToHost: vi.fn(),
+            },
+        } as unknown as PipelineOrchestrator;
+
+        const handle = setupCompanionHooks({
+            bridge,
+            orchestrator: mockOrchestrator,
+            getSettings: () => settings,
+        });
+
+        const getLastSideBridgePrompt = () => {
+            const calls = stMocks.fns.setExtensionPrompt.mock.calls.filter(
+                (call) => call[0] === COMPANION_SIDE_BRIDGE_PROMPT_KEY,
+            );
+            return calls.length > 0 ? String(calls[calls.length - 1]![1]) : '';
+        };
+
+        // 1. Normal generation (explicit 'normal' and default undefined) matches pending #send_textarea
+        stMocks.fns.setExtensionPrompt.mockClear();
+        await stMocks.eventSource.emit(stMocks.event_types.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+        const normalPrompt = getLastSideBridgePrompt();
+        expect(normalPrompt).toContain('<side-hint>');
+        expect(normalPrompt).toContain('旧灯塔异响传闻');
+        expect(normalPrompt).toContain('午夜旧灯塔曾出现神秘信号灯');
+        expect(normalPrompt).toContain('/side/rumors/lighthouse.md');
+
+        stMocks.fns.setExtensionPrompt.mockClear();
+        await stMocks.eventSource.emit(stMocks.event_types.GENERATION_AFTER_COMMANDS, undefined, {}, false);
+        expect(getLastSideBridgePrompt()).toContain('/side/rumors/lighthouse.md');
+
+        // 2. Non-normal genTypes ('swipe', 'regenerate', 'impersonate') must ignore unsent #send_textarea drafts
+        for (const nonNormalType of ['swipe', 'regenerate', 'impersonate'] as const) {
+            stMocks.fns.setExtensionPrompt.mockClear();
+            await stMocks.eventSource.emit(
+                stMocks.event_types.GENERATION_AFTER_COMMANDS,
+                nonNormalType,
+                {},
+                false,
+            );
+            expect(getLastSideBridgePrompt()).toBe('');
+        }
+
+        // 3. Manual syncSideBridgePrompt() must also ignore unsent #send_textarea drafts
+        stMocks.fns.setExtensionPrompt.mockClear();
+        const syncedPrompt = await handle.syncSideBridgePrompt(target);
+        expect(syncedPrompt).toBe('');
+
+        // 4. First turn when chat[] is empty still matches pending #send_textarea on normal send
+        stMocks.state.chat = [];
+        stMocks.fns.setExtensionPrompt.mockClear();
+        await stMocks.eventSource.emit(stMocks.event_types.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+        expect(getLastSideBridgePrompt()).toContain('/side/rumors/lighthouse.md');
+
+        // 5. After sendMessageAsUser() pushes the prompt onto chat[] and clears #send_textarea,
+        //    subsequent scans still match cleanly without stale or duplicate text
+        stMocks.state.chat = [
+            {
+                name: 'Tester',
+                is_user: true,
+                is_system: false,
+                mes: '听说旧灯塔那边最近有点不对劲。',
+                swipe_id: 0,
+                swipes: ['听说旧灯塔那边最近有点不对劲。'],
+            },
+        ];
+        sendTextarea.value = '';
+        stMocks.fns.setExtensionPrompt.mockClear();
+        await stMocks.eventSource.emit(stMocks.event_types.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+        const afterClearPrompt = getLastSideBridgePrompt();
+        expect(afterClearPrompt).toContain('/side/rumors/lighthouse.md');
+        expect(afterClearPrompt.match(/\/side\/rumors\/lighthouse\.md/g)).toHaveLength(1);
+
+        handle.dispose();
     });
 });
 
