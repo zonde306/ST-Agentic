@@ -23,6 +23,8 @@ import type {
     RadarScanResult,
     RawLoreEntry,
     RegexRule,
+    SideClueDoc,
+    SideClueRadarScanResult,
     WICategory,
 } from '@/core/types';
 import { canonicalClone, stripJsonSchemaMeta } from '@/core/utils';
@@ -56,6 +58,14 @@ export interface AssembledContext {
     coreManifest: CoreManifestResult;
     systemRuleCount: number;
     stats: ContextLayerStats;
+    /** Paths of unconsumed `next_turn_brief` `/side/*` clues surfaced into Layer 2 `<side-brief>`. */
+    consumedSideBriefPaths: string[];
+    /** Side-clue radar scan result when `TailRadar.scanSideClues` ran or was provided. */
+    sideHintResult?: SideClueRadarScanResult;
+}
+
+export interface SideClueProvider {
+    listSideClues(target?: MessageTarget): Promise<SideClueDoc[]>;
 }
 
 export type RegexSource = RegexPipeline | readonly RegexRule[];
@@ -88,6 +98,14 @@ export interface ContextAssembleInput {
     /** Automatically evaluate Category ④ `dynamic_at_depth` lore entries into Layer 2 (default `true`). */
     includeCategory4DynamicEntries?: boolean;
     loreHint?: string | RadarScanResult;
+    /** Parsed `/side/*` clue documents for Layer 2 `<side-brief>` and optional `TailRadar.scanSideClues`. */
+    sideClues?: readonly SideClueDoc[];
+    /** Pre-computed `<side-hint>` XML or `SideClueRadarScanResult` for Layer 2 dynamic tail. */
+    sideHint?: string | SideClueRadarScanResult;
+    /** Explicit `<side-brief>` override for Layer 2 dynamic tail. */
+    sideBrief?: string;
+    /** Optional `TailRadar` for synchronous `scanSideClues` when `sideClues` is passed and `sideHint` is omitted. */
+    tailRadar?: TailRadar;
     /** Active turn messages during multi-step tool loop (bypasses regenerating Layer 2). */
     inFlightMessages?: readonly CanonicalMessage[];
 
@@ -102,9 +120,11 @@ export interface ContextAssembleInput {
 export interface AssembleWithHostInput extends Omit<ContextAssembleInput, 'hostBridge'> {
     hostBridge: HostBridge;
     tailRadar?: TailRadar;
-    /** Target coordinates passed to `TailRadar.scan` for `worldinfo` override checking. */
+    /** Optional VFS / `SideMount` provider used to enumerate `/side/*` clues when `sideClues` is omitted. */
+    vfs?: SideClueProvider;
+    /** Target coordinates passed to `TailRadar.scan` and `vfs.listSideClues`. */
     target?: MessageTarget;
-    /** Whether to automatically run `TailRadar` when `tailRadar` is provided and `loreHint` is omitted (default `true`). */
+    /** Whether to automatically run `TailRadar` when `tailRadar` is provided and hints are omitted (default `true`). */
     runTailRadar?: boolean;
 }
 
@@ -294,6 +314,54 @@ function wrapXmlIfNeeded(tag: string, body: string): string {
         return trimmed;
     }
     return `<${tag}>\n${trimmed}\n</${tag}>`;
+}
+
+/**
+ * Select unconsumed `delivery === 'next_turn_brief'` clues eligible for one-shot
+ * Layer 2 `<side-brief>` injection, ordered deterministically by `order desc`, `path asc`.
+ */
+export function selectUnconsumedSideBriefClues(
+    clues: readonly SideClueDoc[],
+): SideClueDoc[] {
+    return clues
+        .filter(
+            (clue) =>
+                clue.meta.delivery === 'next_turn_brief'
+                && clue.meta.status === 'dormant'
+                && clue.meta.consumedByTurn === undefined,
+        )
+        .sort(
+            (a, b) =>
+                (b.meta.order ?? 0) - (a.meta.order ?? 0)
+                || compareCodeUnits(a.path, b.path),
+        );
+}
+
+/** Format unconsumed `next_turn_brief` `/side/*` clues into a compact `<side-brief>` XML block. */
+export function formatSideBriefXml(clues: readonly SideClueDoc[]): string {
+    if (clues.length === 0) {
+        return '';
+    }
+
+    const lines: string[] = [
+        '<side-brief>',
+        '以下为上一阶段线外发生的事件简报（本轮一次性同步，如需完整记录可按需 read_file 查阅）：',
+    ];
+
+    for (const clue of clues) {
+        const title = clue.meta.title?.trim() || clue.meta.id || clue.path;
+        const summary = clue.meta.summary?.trim();
+        const body = clue.body.trim();
+        const detail = summary || body;
+        if (detail) {
+            lines.push(`- ${title} (${clue.path}): ${detail}`);
+        } else {
+            lines.push(`- ${title} (${clue.path})`);
+        }
+    }
+
+    lines.push('</side-brief>');
+    return lines.join('\n');
 }
 
 /**
@@ -518,9 +586,52 @@ export class ContextAssembler {
         }
 
         // Layer 2: Tail-Only Dynamic Zone (or frozen in-flight messages during tool loop)
-        const layer2Messages = input.inFlightMessages !== undefined
-            ? input.inFlightMessages.map((m) => canonicalClone(m))
-            : this.buildLayer2Messages(input, classified);
+        let layer2Messages: CanonicalMessage[];
+        let consumedSideBriefPaths: string[] = [];
+        let sideHintResult: SideClueRadarScanResult | undefined;
+
+        if (input.inFlightMessages !== undefined) {
+            layer2Messages = input.inFlightMessages.map((m) => canonicalClone(m));
+        } else {
+            const briefClues = input.sideBrief === undefined && input.sideClues?.length
+                ? selectUnconsumedSideBriefClues(input.sideClues)
+                : [];
+            consumedSideBriefPaths = briefClues.map((c) => c.path);
+            const sideBriefXml = input.sideBrief !== undefined
+                ? wrapXmlIfNeeded('side-brief', input.sideBrief)
+                : formatSideBriefXml(briefClues);
+
+            let sideHintXml = '';
+            if (input.sideHint !== undefined) {
+                if (typeof input.sideHint === 'string') {
+                    sideHintXml = input.sideHint.trim();
+                } else {
+                    sideHintResult = input.sideHint;
+                    sideHintXml = input.sideHint.hintXml.trim();
+                }
+            } else if (input.tailRadar && input.sideClues?.length) {
+                const userText = extractUserTextForRadar(input.userInput);
+                const recentTextHistory = extractRecentTexts(layer1Messages);
+                if (userText || recentTextHistory.length > 0) {
+                    const readSet = isPersistent
+                        ? input.trajectoryStore?.getReadSet(input.agent.id)
+                        : undefined;
+                    sideHintResult = input.tailRadar.scanSideClues(input.sideClues, {
+                        input: userText,
+                        recentMessages: recentTextHistory,
+                        readSet,
+                        vars: input.vars,
+                        macroOverrides: input.macroOverrides,
+                    });
+                    sideHintXml = sideHintResult.hintXml.trim();
+                }
+            }
+
+            layer2Messages = this.buildLayer2Messages(input, classified, {
+                sideBriefXml,
+                sideHintXml,
+            });
+        }
 
         const allMessages = [...layer0Messages, ...layer1Messages, ...layer2Messages];
         const layer1EndIndex = layer0Messages.length + layer1Messages.length - 1;
@@ -553,6 +664,8 @@ export class ContextAssembler {
             cacheBreakpoints,
             coreManifest,
             systemRuleCount,
+            consumedSideBriefPaths,
+            ...(sideHintResult !== undefined ? { sideHintResult } : {}),
             stats: {
                 layer0MessageCount: layer0Messages.length,
                 layer1MessageCount: layer1Messages.length,
@@ -566,11 +679,12 @@ export class ContextAssembler {
     }
 
     /**
-     * Async convenience wrapper pulling lorebooks/character/persona from `HostBridge`
-     * and optionally scanning Category ③ entries via `TailRadar` against `TrajectoryStore`'s `Read-Set`.
+     * Async convenience wrapper pulling lorebooks/character/persona from `HostBridge`,
+     * optionally enumerating `/side/*` clues from `vfs`, and scanning Category ③ + `/side/*`
+     * entries via `TailRadar` against `TrajectoryStore`'s `Read-Set`.
      */
     async assembleWithHost(input: AssembleWithHostInput): Promise<AssembledContext> {
-        const { hostBridge, tailRadar, target, runTailRadar = true, ...rest } = input;
+        const { hostBridge, tailRadar, vfs, target, runTailRadar = true, ...rest } = input;
 
         let loreEntries = rest.loreEntries;
         if (!loreEntries) {
@@ -584,40 +698,65 @@ export class ContextAssembler {
             loreEntries = raw;
         }
 
+        let sideClues = rest.sideClues;
+        if (sideClues === undefined && vfs) {
+            sideClues = await vfs.listSideClues(target);
+        }
+
+        const userText = extractUserTextForRadar(rest.userInput);
+        const readSet = rest.agent.sessionMode === 'persistent'
+            ? rest.trajectoryStore?.getReadSet(rest.agent.id)
+            : undefined;
+        const recentTextHistory = extractRecentTexts(
+            rest.agent.sessionMode === 'persistent'
+                ? (rest.trajectoryStore?.getMessages(rest.agent.id) ?? [])
+                : [],
+        );
+
         let loreHint = rest.loreHint;
-        const shouldScanRadar =
+        const shouldScanLoreRadar =
             runTailRadar
             && loreHint === undefined
             && rest.inFlightMessages === undefined
             && tailRadar !== undefined;
 
-        if (shouldScanRadar && tailRadar) {
-            const userText = extractUserTextForRadar(rest.userInput);
-            if (userText) {
-                const readSet = rest.agent.sessionMode === 'persistent'
-                    ? rest.trajectoryStore?.getReadSet(rest.agent.id)
-                    : undefined;
-                const recentTextHistory = extractRecentTexts(
-                    rest.agent.sessionMode === 'persistent'
-                        ? (rest.trajectoryStore?.getMessages(rest.agent.id) ?? [])
-                        : [],
-                );
-                const classified = classifyAllEntries(loreEntries, rest.wiRouterOverrides);
-                loreHint = await tailRadar.scan(classified, {
-                    input: userText,
-                    recentMessages: recentTextHistory,
-                    readSet,
-                    target,
-                    vars: rest.vars,
-                    macroOverrides: rest.macroOverrides,
-                });
-            }
+        if (shouldScanLoreRadar && tailRadar && userText) {
+            const classified = classifyAllEntries(loreEntries, rest.wiRouterOverrides);
+            loreHint = await tailRadar.scan(classified, {
+                input: userText,
+                recentMessages: recentTextHistory,
+                readSet,
+                target,
+                vars: rest.vars,
+                macroOverrides: rest.macroOverrides,
+            });
+        }
+
+        let sideHint = rest.sideHint;
+        const shouldScanSideRadar =
+            runTailRadar
+            && sideHint === undefined
+            && rest.inFlightMessages === undefined
+            && tailRadar !== undefined
+            && Boolean(sideClues && sideClues.length > 0);
+
+        if (shouldScanSideRadar && tailRadar && sideClues && (userText || recentTextHistory.length > 0)) {
+            sideHint = tailRadar.scanSideClues(sideClues, {
+                input: userText,
+                recentMessages: recentTextHistory,
+                readSet,
+                vars: rest.vars,
+                macroOverrides: rest.macroOverrides,
+            });
         }
 
         return this.assemble({
             ...rest,
             loreEntries,
             loreHint,
+            sideClues,
+            sideHint,
+            tailRadar: runTailRadar ? tailRadar : undefined,
             hostBridge,
         });
     }
@@ -643,6 +782,7 @@ export class ContextAssembler {
     private buildLayer2Messages(
         input: ContextAssembleInput,
         classified: readonly ClassifiedLoreEntry[],
+        sideBlocks: { sideBriefXml?: string; sideHintXml?: string } = {},
     ): CanonicalMessage[] {
         const layer2Messages: CanonicalMessage[] = [];
         const macroOverrides = buildLayer2MacroOverrides(input.vars, input.macroOverrides);
@@ -681,14 +821,22 @@ export class ContextAssembler {
         }
 
         const turnBriefXml = input.turnBrief ? wrapXmlIfNeeded('turn-brief', input.turnBrief) : '';
+        const sideBriefXml = sideBlocks.sideBriefXml?.trim() ?? '';
         const remindersXml = reminderLines.length > 0
             ? `<dynamic-reminders>\n${reminderLines.join('\n')}\n</dynamic-reminders>`
             : '';
         const loreHintXml = typeof input.loreHint === 'string'
             ? input.loreHint.trim()
             : (input.loreHint?.hintXml?.trim() ?? '');
+        const sideHintXml = sideBlocks.sideHintXml?.trim() ?? '';
 
-        const tailBlocks = [turnBriefXml, remindersXml, loreHintXml].filter((s) => s.length > 0);
+        const tailBlocks = [
+            turnBriefXml,
+            sideBriefXml,
+            remindersXml,
+            loreHintXml,
+            sideHintXml,
+        ].filter((s) => s.length > 0);
         const tailSuffix = tailBlocks.join('\n\n');
 
         // 2. User input (ingested ONCE on entry) + tail blocks
@@ -802,8 +950,10 @@ function extractUserTextForRadar(
 function stripTailMetadataTags(text: string): string {
     return text
         .replace(/<turn-brief>[\s\S]*?<\/turn-brief>/g, '')
+        .replace(/<side-brief>[\s\S]*?<\/side-brief>/g, '')
         .replace(/<dynamic-reminders>[\s\S]*?<\/dynamic-reminders>/g, '')
         .replace(/<lore-hint>[\s\S]*?<\/lore-hint>/g, '')
+        .replace(/<side-hint>[\s\S]*?<\/side-hint>/g, '')
         .trim();
 }
 

@@ -5,6 +5,9 @@ import type {
     LoreReadHook,
     MessageTarget,
     ScopedPermissions,
+    SideClueDoc,
+    SideClueMeta,
+    SideClueWriteInput,
     VfsEntryStat,
     VfsSearchHit,
 } from '@/core/types';
@@ -47,6 +50,11 @@ import {
     SkillsMount,
     WorldInfoMount,
 } from './fs-worldinfo';
+import {
+    SIDE_MOUNT,
+    SideMount,
+    type SideClueListOptions,
+} from './fs-side';
 import { ScopedToolGuard } from './fs-scopes';
 
 export interface VirtualFileSystemOptions {
@@ -236,6 +244,7 @@ function buildSnippet(content: string, matchedTerms: string[], rawQuery: string 
  * - `/preset/*` (`ro`, `Preset.files`)
  * - `/global/*` (`rw`, `HostBridge` global extension storage)
  * - `/history/*` (`ro` for agents, internal write API for compaction)
+ * - `/side/*` (`rw`, `side-files` branch-safe off-mainline clues: `comms/*`, `rumors/*`, `notes/*`)
  */
 export class VirtualFileSystem {
     public readonly bridge: HostBridge;
@@ -251,6 +260,7 @@ export class VirtualFileSystem {
     private readonly presetMount: PresetMount;
     private readonly globalMount: GlobalMount;
     private readonly historyMount: HistoryMount;
+    private readonly sideMount: SideMount;
     private readonly namedMounts: Map<string, VfsMount>;
 
     private readonly defaultTarget?: MessageTarget;
@@ -284,6 +294,7 @@ export class VirtualFileSystem {
         this.presetMount = new PresetMount(options.getPresetFiles ?? (() => ({})));
         this.globalMount = new GlobalMount(this.bridge);
         this.historyMount = new HistoryMount(this.bridge);
+        this.sideMount = new SideMount(this.store);
 
         this.namedMounts = new Map<string, VfsMount>([
             [CHARACTER_MOUNT, this.characterMount],
@@ -293,6 +304,7 @@ export class VirtualFileSystem {
             [PRESET_MOUNT, this.presetMount],
             [GLOBAL_MOUNT, this.globalMount],
             [HISTORY_MOUNT, this.historyMount],
+            [SIDE_MOUNT, this.sideMount],
         ]);
     }
 
@@ -537,6 +549,52 @@ export class VirtualFileSystem {
         await this.variablesMount.writeVariables(vars, this.mergeWriteOpts(opts));
     }
 
+    /** Enumerate parsed `/side/*` clue documents for a causal branch target or filter options. */
+    async listSideClues(targetOrOpts?: MessageTarget | SideClueListOptions): Promise<SideClueDoc[]> {
+        const opts: SideClueListOptions = isMessageTargetArg(targetOrOpts)
+            ? { target: targetOrOpts }
+            : (targetOrOpts ?? {});
+        return await this.sideMount.listSideClues(this.mergeReadOpts(opts));
+    }
+
+    /** Read and parse a single `/side/*` clue document (or `null` when absent). */
+    async readSideClue(
+        path: string,
+        targetOrOpts?: MessageTarget | VfsTargetOptions,
+    ): Promise<SideClueDoc | null> {
+        const opts: VfsTargetOptions = isMessageTargetArg(targetOrOpts)
+            ? { target: targetOrOpts }
+            : (targetOrOpts ?? {});
+        return await this.sideMount.readSideClue(path, this.mergeReadOpts(opts));
+    }
+
+    /** Canonically serialize and write a `/side/*` clue document into branch-safe storage. */
+    async writeSideClue(input: SideClueWriteInput, opts?: VfsWriteOptions): Promise<SideClueDoc> {
+        const merged = this.mergeWriteOpts({
+            ...opts,
+            target: opts?.target ?? input.target,
+        });
+        return await this.sideMount.writeSideClue(input, merged);
+    }
+
+    /** Patch Frontmatter metadata of an existing `/side/*` clue while preserving its Markdown body. */
+    async updateSideClueMeta(
+        path: string,
+        patch: Partial<SideClueMeta>,
+        opts?: VfsWriteOptions,
+    ): Promise<SideClueDoc | null> {
+        return await this.sideMount.updateSideClueMeta(path, patch, this.mergeWriteOpts(opts));
+    }
+
+    /** Mark surfaced `next_turn_brief` `/side/*` clues as consumed on the target branch. */
+    async markSideCluesConsumed(
+        paths: readonly string[],
+        turnNumber?: number,
+        opts?: VfsWriteOptions,
+    ): Promise<SideClueDoc[]> {
+        return await this.sideMount.markSideCluesConsumed(paths, turnNumber, this.mergeWriteOpts(opts));
+    }
+
     /**
      * Internal write channel for `/history/*`, reserved for watermark compaction.
      * Normal `writeFile('/history/...')` calls are always rejected.
@@ -657,6 +715,7 @@ export class VirtualFileSystem {
             this.presetMount,
             this.globalMount,
             this.historyMount,
+            this.sideMount,
         ];
     }
 
@@ -723,6 +782,15 @@ export class VirtualFileSystem {
             staged,
         };
     }
+}
+
+function isMessageTargetArg(value: unknown): value is MessageTarget {
+    return Boolean(
+        value
+        && typeof value === 'object'
+        && 'messageId' in value
+        && 'swipeId' in value,
+    );
 }
 
 export {

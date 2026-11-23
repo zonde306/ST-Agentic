@@ -5,6 +5,9 @@ import type {
     RadarCandidate,
     RadarScanResult,
     RawLoreEntry,
+    SideClueDoc,
+    SideClueRadarCandidate,
+    SideClueRadarScanResult,
 } from '@/core/types';
 import { classifyEntry, WORLD_INFO_LOGIC } from './classifier';
 import {
@@ -54,6 +57,27 @@ export interface RadarScanInput {
     /** Default case sensitivity when `entry.caseSensitive` is null/undefined (default `false`). */
     defaultCaseSensitive?: boolean;
     /** Default whole-word matching when `entry.matchWholeWords` is null/undefined (default `false`). */
+    defaultMatchWholeWords?: boolean;
+}
+
+export interface SideClueRadarScanInput {
+    /** Latest user input (or combined scan text when `recentMessages` is omitted). */
+    input: string;
+    /** Optional prior context messages ordered oldest-to-newest (combined with `input` up to `scanDepth`). */
+    recentMessages?: string[];
+    /** Default scan depth when a clue does not specify `meta.scanDepth` (default `2`). */
+    defaultScanDepth?: number;
+    /** Persistent agent Read-Set mapping VFS path -> last observed `xxHash`. */
+    readSet?: ReadonlyMap<string, string>;
+    /** Maximum number of candidates emitted in `<side-hint>` (default `5`). */
+    topK?: number;
+    /** Variable snapshot for macro substitution in keywords. */
+    vars?: Record<string, unknown>;
+    /** Macro overrides for keyword substitution. */
+    macroOverrides?: Record<string, string>;
+    /** Default case sensitivity for plain keyword matching (default `false`). */
+    defaultCaseSensitive?: boolean;
+    /** Default whole-word matching for plain keyword matching (default `false`). */
     defaultMatchWholeWords?: boolean;
 }
 
@@ -123,12 +147,11 @@ export function parseLoreRegex(input: string): RegExp | null {
     }
 }
 
-function matchSingleKeyword(
+function matchKeywordText(
     haystack: string,
     rawNeedle: string,
-    entry: RawLoreEntry,
-    defaultCaseSensitive: boolean,
-    defaultMatchWholeWords: boolean,
+    caseSensitive: boolean,
+    matchWholeWords: boolean,
 ): KeywordMatchDetail | null {
     const trimmedNeedle = rawNeedle.trim();
     if (!trimmedNeedle) {
@@ -147,9 +170,6 @@ function matchSingleKeyword(
             matchedLength: Math.max(1, execMatch[0].length),
         };
     }
-
-    const caseSensitive = entry.caseSensitive ?? defaultCaseSensitive;
-    const matchWholeWords = Boolean(entry.matchWholeWords ?? defaultMatchWholeWords);
 
     const normalizedHaystack = caseSensitive ? haystack : haystack.toLowerCase();
     const normalizedNeedle = caseSensitive ? trimmedNeedle : trimmedNeedle.toLowerCase();
@@ -174,6 +194,18 @@ function matchSingleKeyword(
         return { keyword: trimmedNeedle, matchedLength: trimmedNeedle.length };
     }
     return null;
+}
+
+function matchSingleKeyword(
+    haystack: string,
+    rawNeedle: string,
+    entry: RawLoreEntry,
+    defaultCaseSensitive: boolean,
+    defaultMatchWholeWords: boolean,
+): KeywordMatchDetail | null {
+    const caseSensitive = entry.caseSensitive ?? defaultCaseSensitive;
+    const matchWholeWords = Boolean(entry.matchWholeWords ?? defaultMatchWholeWords);
+    return matchKeywordText(haystack, rawNeedle, caseSensitive, matchWholeWords);
 }
 
 function buildHaystack(
@@ -249,6 +281,38 @@ export function formatLoreHintXml(
     }
 
     lines.push('</lore-hint>');
+    return lines.join('\n');
+}
+
+/** Format compact `<side-hint>` XML block for matched `/side/*` radar clues. */
+export function formatSideHintXml(
+    candidates: readonly SideClueRadarCandidate[],
+    overflowCount: number,
+): string {
+    if (candidates.length === 0 && overflowCount <= 0) {
+        return '';
+    }
+
+    const lines: string[] = [
+        '<side-hint>',
+        '以下线外伏笔线索匹配本轮对话（仅在剧情需要时按需 read_file 查阅，无关请直接忽略）：',
+    ];
+
+    for (const candidate of candidates) {
+        const summaryPart = candidate.summary ? ` — ${candidate.summary}` : '';
+        if (candidate.status === 'unread') {
+            const keywordsLabel = candidate.matchedKeywords.map((kw) => `"${kw}"`).join(', ');
+            lines.push(`- [未读] ${candidate.title} (${candidate.path})${summaryPart} (命中: ${keywordsLabel})`);
+        } else {
+            lines.push(`- [已更新] ${candidate.title} (${candidate.path})${summaryPart}`);
+        }
+    }
+
+    if (overflowCount > 0) {
+        lines.push(`+${overflowCount} 条更多线外线索匹配，如有需要请调用 search_files 检索 /side/*`);
+    }
+
+    lines.push('</side-hint>');
     return lines.join('\n');
 }
 
@@ -381,6 +445,185 @@ export class TailRadar {
             totalMatched,
             overflowCount,
             hintXml,
+        };
+    }
+
+    /**
+     * Synchronously scan `/side/*` clue documents for `delivery === 'radar_hint'` matches.
+     *
+     * Reuses `parseLoreRegex` and `Read-Set` `xxHash` dirty-checking:
+     * - Emits `<side-hint>` only for active (`status !== 'resolved'`) `radar_hint` clues whose
+     *   keywords (and optional `secondaryKeys`) match AND are unread or updated since last read.
+     * - Stays 100% silent when already read with an unchanged `contentHash`.
+     * - `delivery === 'none'`, `'vfs_only'`, and `'next_turn_brief'` never trigger radar hints.
+     */
+    public scanSideClues(
+        clues: readonly SideClueDoc[],
+        inputOrOptions: string | SideClueRadarScanInput,
+    ): SideClueRadarScanResult {
+        const scanOptions: SideClueRadarScanInput = typeof inputOrOptions === 'string'
+            ? { input: inputOrOptions }
+            : inputOrOptions;
+
+        const topK = Math.max(0, scanOptions.topK ?? this.defaults.topK);
+        const defaultScanDepth = scanOptions.defaultScanDepth ?? this.defaults.defaultScanDepth;
+        const defaultCaseSensitive = scanOptions.defaultCaseSensitive ?? this.defaults.defaultCaseSensitive;
+        const defaultMatchWholeWords = scanOptions.defaultMatchWholeWords ?? this.defaults.defaultMatchWholeWords;
+        const keywordMacroOverrides = buildMacroOverridesFromVars(
+            scanOptions.vars,
+            scanOptions.macroOverrides,
+        );
+
+        const rawCandidates: SideClueRadarCandidate[] = [];
+
+        for (const clue of clues) {
+            const meta = clue.meta;
+            if (meta.delivery !== 'radar_hint' || meta.status === 'resolved') {
+                continue;
+            }
+            if (!Array.isArray(meta.keywords) || meta.keywords.length === 0) {
+                continue;
+            }
+
+            const haystack = buildHaystack(
+                scanOptions.input,
+                scanOptions.recentMessages,
+                meta.scanDepth,
+                defaultScanDepth,
+            );
+            if (!haystack) {
+                continue;
+            }
+
+            const match = this.matchSideClue(
+                clue,
+                haystack,
+                defaultCaseSensitive,
+                defaultMatchWholeWords,
+                keywordMacroOverrides,
+            );
+            if (!match) {
+                continue;
+            }
+
+            const previousHash = scanOptions.readSet?.get(clue.path);
+            if (previousHash !== undefined && previousHash === clue.contentHash) {
+                // Silent suppression: Read-Set already holds identical clue content.
+                continue;
+            }
+
+            const status: 'unread' | 'updated' = previousHash === undefined ? 'unread' : 'updated';
+
+            rawCandidates.push({
+                path: clue.path,
+                id: meta.id,
+                title: meta.title?.trim() || meta.id || clue.path,
+                summary: meta.summary?.trim() ?? '',
+                status,
+                matchedKeywords: match.matchedKeywords,
+                contentHash: clue.contentHash,
+                order: meta.order ?? 0,
+                specificity: match.specificity,
+            });
+        }
+
+        rawCandidates.sort(
+            (a, b) =>
+                b.specificity - a.specificity
+                || b.order - a.order
+                || a.path.localeCompare(b.path),
+        );
+
+        const totalMatched = rawCandidates.length;
+        const candidates = rawCandidates.slice(0, topK);
+        const overflowCount = Math.max(0, totalMatched - candidates.length);
+        const hintXml = formatSideHintXml(candidates, overflowCount);
+
+        return {
+            candidates,
+            totalMatched,
+            overflowCount,
+            hintXml,
+        };
+    }
+
+    private matchSideClue(
+        clue: SideClueDoc,
+        haystack: string,
+        defaultCaseSensitive: boolean,
+        defaultMatchWholeWords: boolean,
+        macroOverrides?: Record<string, string>,
+    ): EntryMatchResult | null {
+        const primaryMatches: KeywordMatchDetail[] = [];
+
+        for (const rawKey of clue.meta.keywords) {
+            const substituted = this.evaluator.hostBridge
+                .substituteMacros(rawKey, macroOverrides)
+                .trim();
+            if (!substituted) {
+                continue;
+            }
+
+            const matched = matchKeywordText(
+                haystack,
+                substituted,
+                defaultCaseSensitive,
+                defaultMatchWholeWords,
+            );
+            if (matched) {
+                primaryMatches.push(matched);
+            }
+        }
+
+        if (primaryMatches.length === 0) {
+            return null;
+        }
+
+        const activeSecondary = (clue.meta.secondaryKeys ?? [])
+            .map((key) => this.evaluator.hostBridge.substituteMacros(key, macroOverrides).trim())
+            .filter(Boolean);
+
+        const secondaryMatches: KeywordMatchDetail[] = [];
+        if (activeSecondary.length > 0) {
+            for (const secKey of activeSecondary) {
+                const matched = matchKeywordText(
+                    haystack,
+                    secKey,
+                    defaultCaseSensitive,
+                    defaultMatchWholeWords,
+                );
+                if (matched) {
+                    secondaryMatches.push(matched);
+                }
+            }
+            if (secondaryMatches.length === 0) {
+                return null;
+            }
+        }
+
+        const allMatches = secondaryMatches.length > 0
+            ? [...primaryMatches, ...secondaryMatches]
+            : primaryMatches;
+
+        const seenKeywords = new Set<string>();
+        const matchedKeywords: string[] = [];
+        let specificity = 0;
+
+        for (const item of allMatches) {
+            if (!seenKeywords.has(item.keyword)) {
+                seenKeywords.add(item.keyword);
+                matchedKeywords.push(item.keyword);
+                specificity += item.matchedLength;
+            }
+        }
+
+        if (matchedKeywords.length > 1) {
+            specificity += matchedKeywords.length;
+        }
+
+        return {
+            matchedKeywords,
+            specificity,
         };
     }
 
