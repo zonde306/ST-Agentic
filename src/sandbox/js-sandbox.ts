@@ -1,6 +1,10 @@
 import _ from 'lodash';
 import { z } from 'zod';
-import type { ToolExecutionContext } from '@/core/bridge';
+import type {
+    ToolExecutionContext,
+    ToolSideCluesApi,
+    ToolSideGenApi,
+} from '@/core/bridge';
 import {
     type CompiledSandboxTool,
     createAbortError,
@@ -15,7 +19,41 @@ import {
     type ScriptSandbox,
     throwIfAborted,
 } from '@/core/tools';
+import type {
+    CreateSideSessionOptions,
+    ExportWorldInfoOptions,
+    MessageTarget,
+    SideClueDelivery,
+    SideClueStatus,
+    SideClueWriteInput,
+    SideGenOnceOptions,
+    SideGenSendOptions,
+    SideSessionFilter,
+} from '@/core/types';
 import { ManagedSandboxHandle, SandboxLifecycleManager } from './lifecycle';
+
+export type SandboxSideGenErrorCode =
+    | 'SIDEGEN_UNAVAILABLE'
+    | 'SIDEGEN_DISPOSED'
+    | 'SIDEGEN_INVALID_ARGS';
+
+/** Structured error thrown by the sandbox `ctx.sideGen` host proxy boundary. */
+export class SandboxSideGenError extends SandboxExecutionError {
+    public readonly code: SandboxSideGenErrorCode;
+    public readonly method: string;
+
+    constructor(
+        code: SandboxSideGenErrorCode,
+        method: string,
+        message: string,
+        causeError?: unknown,
+    ) {
+        super(message, causeError);
+        this.name = 'SandboxSideGenError';
+        this.code = code;
+        this.method = method;
+    }
+}
 
 export interface IframeJsSandboxOptions {
     lifecycle?: SandboxLifecycleManager;
@@ -267,6 +305,393 @@ function isZodSchemaObject(val: unknown): val is z.ZodTypeAny {
     );
 }
 
+function isAbortSignalLike(val: unknown): val is AbortSignal {
+    return Boolean(
+        val
+        && typeof val === 'object'
+        && typeof (val as AbortSignal).aborted === 'boolean'
+        && typeof (val as AbortSignal).addEventListener === 'function'
+        && typeof (val as AbortSignal).removeEventListener === 'function',
+    );
+}
+
+function cloneBoundaryValue<T>(value: T, method: string): T {
+    if (value === undefined || value === null) {
+        return value;
+    }
+    const kind = typeof value;
+    if (kind === 'string' || kind === 'number' || kind === 'boolean') {
+        return value;
+    }
+    try {
+        if (typeof globalThis.structuredClone === 'function') {
+            return globalThis.structuredClone(value);
+        }
+        return JSON.parse(JSON.stringify(value)) as T;
+    } catch (error) {
+        throw new SandboxSideGenError(
+            'SIDEGEN_INVALID_ARGS',
+            method,
+            `ctx.${method}() received non-serializable data across the sandbox boundary.`,
+            error,
+        );
+    }
+}
+
+function assertRecordArg(
+    value: unknown,
+    method: string,
+    argName: string,
+): Record<string, unknown> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new SandboxSideGenError(
+            'SIDEGEN_INVALID_ARGS',
+            method,
+            `ctx.${method}() requires "${argName}" to be a plain object.`,
+        );
+    }
+    return value as Record<string, unknown>;
+}
+
+function assertStringArg(value: unknown, method: string, argName: string): string {
+    if (typeof value !== 'string') {
+        throw new SandboxSideGenError(
+            'SIDEGEN_INVALID_ARGS',
+            method,
+            `ctx.${method}() requires "${argName}" to be a string.`,
+        );
+    }
+    return value;
+}
+
+function extractSignalAndCloneOptions<T extends { signal?: AbortSignal }>(
+    rawOpts: unknown,
+    method: string,
+    required: boolean,
+): { options: Omit<T, 'signal'>; callerSignal?: AbortSignal } {
+    if (rawOpts === undefined) {
+        if (required) {
+            throw new SandboxSideGenError(
+                'SIDEGEN_INVALID_ARGS',
+                method,
+                `ctx.${method}() requires an options object.`,
+            );
+        }
+        return { options: {} as Omit<T, 'signal'> };
+    }
+
+    const record = assertRecordArg(rawOpts, method, 'options');
+    let callerSignal: AbortSignal | undefined;
+    if (record.signal !== undefined) {
+        if (!isAbortSignalLike(record.signal)) {
+            throw new SandboxSideGenError(
+                'SIDEGEN_INVALID_ARGS',
+                method,
+                `ctx.${method}() received an invalid AbortSignal in options.signal.`,
+            );
+        }
+        callerSignal = record.signal;
+    }
+
+    const copy: Record<string, unknown> = {};
+    for (const key of Object.keys(record)) {
+        if (key === 'signal') {
+            continue;
+        }
+        copy[key] = record[key];
+    }
+
+    return {
+        options: cloneBoundaryValue(copy, method) as Omit<T, 'signal'>,
+        callerSignal,
+    };
+}
+
+/**
+ * Create a frozen, null-prototype host-side proxy for `ctx.sideGen` inside the JS sandbox.
+ *
+ * - Exposes only the allowlisted `ToolSideGenApi` and `ToolSideCluesApi` methods
+ *   (never leaks host `SideGenService` internals such as `sessionStore`, `trajectoryStore`,
+ *   `abortAll`, or host prototypes).
+ * - Strictly binds/forwards the parent sandbox `AbortSignal` into `runOnce` and `send`
+ *   so aborting or disposing the sandbox immediately cancels in-flight SideGen LLM calls.
+ * - Executes all LLM work strictly on the host side without relaxing iframe network isolation.
+ * - Throws structured `SandboxSideGenError` (`SIDEGEN_UNAVAILABLE` / `SIDEGEN_DISPOSED` /
+ *   `SIDEGEN_INVALID_ARGS`) when unconfigured, disposed, or misused.
+ */
+function createSandboxSideGenProxy(
+    hostSideGen: ToolSideGenApi | undefined,
+    parentSignal: AbortSignal,
+    isDisposed: () => boolean,
+): ToolSideGenApi {
+    const assertReady = (method: string, signal: AbortSignal): ToolSideGenApi => {
+        if (isDisposed()) {
+            throw new SandboxSideGenError(
+                'SIDEGEN_DISPOSED',
+                method,
+                `ctx.${method}() failed: sandbox has been disposed.`,
+            );
+        }
+        throwIfAborted(signal, `ctx.${method}() aborted`);
+        if (!hostSideGen) {
+            throw new SandboxSideGenError(
+                'SIDEGEN_UNAVAILABLE',
+                method,
+                `ctx.${method}() failed: SideGen service is not configured in this execution context.`,
+            );
+        }
+        return hostSideGen;
+    };
+
+    const invokeHost = async <T>(
+        method: string,
+        signal: AbortSignal,
+        executor: (api: ToolSideGenApi) => Promise<T>,
+    ): Promise<T> => {
+        const api = assertReady(method, signal);
+        const result = await raceWithSignalAndTimeout(
+            Promise.resolve().then(() => executor(api)),
+            signal,
+            undefined,
+            `ctx.${method}()`,
+        );
+        if (isDisposed()) {
+            throw new SandboxSideGenError(
+                'SIDEGEN_DISPOSED',
+                method,
+                `ctx.${method}() failed: sandbox was disposed during execution.`,
+            );
+        }
+        throwIfAborted(signal, `ctx.${method}() aborted`);
+        return cloneBoundaryValue(result, method);
+    };
+
+    const invokeClues = async <T>(
+        method: string,
+        executor: (clues: ToolSideCluesApi) => Promise<T>,
+    ): Promise<T> => {
+        return await invokeHost(method, parentSignal, (api) => {
+            if (!api.clues) {
+                throw new SandboxSideGenError(
+                    'SIDEGEN_UNAVAILABLE',
+                    method,
+                    `ctx.${method}() failed: SideGen clues facade is not configured.`,
+                );
+            }
+            return executor(api.clues);
+        });
+    };
+
+    const cloneOptionalTarget = (
+        target: unknown,
+        method: string,
+    ): MessageTarget | undefined => {
+        if (target === undefined) {
+            return undefined;
+        }
+        const record = assertRecordArg(target, method, 'target');
+        return cloneBoundaryValue(record, method) as unknown as MessageTarget;
+    };
+
+    const cluesMethods: ToolSideCluesApi = {
+        async write(input: SideClueWriteInput) {
+            const method = 'sideGen.clues.write';
+            assertReady(method, parentSignal);
+            const cleanInput = cloneBoundaryValue(
+                assertRecordArg(input, method, 'input'),
+                method,
+            ) as unknown as SideClueWriteInput;
+            return await invokeClues(method, (clues) => clues.write(cleanInput));
+        },
+
+        async read(path: string, target?: MessageTarget) {
+            const method = 'sideGen.clues.read';
+            assertReady(method, parentSignal);
+            const safePath = assertStringArg(path, method, 'path');
+            const safeTarget = cloneOptionalTarget(target, method);
+            return await invokeClues(method, (clues) => clues.read(safePath, safeTarget));
+        },
+
+        async list(target?: MessageTarget) {
+            const method = 'sideGen.clues.list';
+            assertReady(method, parentSignal);
+            const safeTarget = cloneOptionalTarget(target, method);
+            return await invokeClues(method, (clues) => clues.list(safeTarget));
+        },
+
+        async updateDelivery(
+            path: string,
+            delivery: SideClueDelivery,
+            target?: MessageTarget,
+        ) {
+            const method = 'sideGen.clues.updateDelivery';
+            assertReady(method, parentSignal);
+            const safePath = assertStringArg(path, method, 'path');
+            const safeDelivery = assertStringArg(
+                delivery,
+                method,
+                'delivery',
+            ) as SideClueDelivery;
+            const safeTarget = cloneOptionalTarget(target, method);
+            return await invokeClues(method, (clues) =>
+                clues.updateDelivery(safePath, safeDelivery, safeTarget),
+            );
+        },
+
+        async updateStatus(
+            path: string,
+            status: SideClueStatus,
+            target?: MessageTarget,
+        ) {
+            const method = 'sideGen.clues.updateStatus';
+            assertReady(method, parentSignal);
+            const safePath = assertStringArg(path, method, 'path');
+            const safeStatus = assertStringArg(status, method, 'status') as SideClueStatus;
+            const safeTarget = cloneOptionalTarget(target, method);
+            return await invokeClues(method, (clues) =>
+                clues.updateStatus(safePath, safeStatus, safeTarget),
+            );
+        },
+
+        async delete(path: string, target?: MessageTarget) {
+            const method = 'sideGen.clues.delete';
+            assertReady(method, parentSignal);
+            const safePath = assertStringArg(path, method, 'path');
+            const safeTarget = cloneOptionalTarget(target, method);
+            return await invokeClues(method, (clues) => clues.delete(safePath, safeTarget));
+        },
+
+        async exportToWorldInfo(path: string, options?: ExportWorldInfoOptions) {
+            const method = 'sideGen.clues.exportToWorldInfo';
+            assertReady(method, parentSignal);
+            const safePath = assertStringArg(path, method, 'path');
+            const safeOptions =
+                options === undefined
+                    ? undefined
+                    : (cloneBoundaryValue(
+                        assertRecordArg(options, method, 'options'),
+                        method,
+                    ) as unknown as ExportWorldInfoOptions);
+            return await invokeClues(method, (clues) =>
+                clues.exportToWorldInfo(safePath, safeOptions),
+            );
+        },
+    };
+
+    const frozenClues: ToolSideCluesApi = Object.freeze(
+        Object.assign(Object.create(null) as object, cluesMethods),
+    ) as ToolSideCluesApi;
+
+    const sideGenMethods: ToolSideGenApi = {
+        async runOnce(opts: SideGenOnceOptions) {
+            const method = 'sideGen.runOnce';
+            assertReady(method, parentSignal);
+            const { options: cleanOpts, callerSignal } =
+                extractSignalAndCloneOptions<SideGenOnceOptions>(opts, method, true);
+            const linked = combineAbortSignals(parentSignal, callerSignal);
+            try {
+                return await invokeHost(method, linked.signal, (api) =>
+                    api.runOnce({
+                        ...cleanOpts,
+                        signal: linked.signal,
+                    }),
+                );
+            } finally {
+                linked.cleanup();
+            }
+        },
+
+        async createSession(opts: CreateSideSessionOptions) {
+            const method = 'sideGen.createSession';
+            assertReady(method, parentSignal);
+            const cleanOpts = cloneBoundaryValue(
+                assertRecordArg(opts, method, 'options'),
+                method,
+            ) as unknown as CreateSideSessionOptions;
+            return await invokeHost(method, parentSignal, (api) =>
+                api.createSession(cleanOpts),
+            );
+        },
+
+        async send(sessionId: string, prompt: string, opts?: SideGenSendOptions) {
+            const method = 'sideGen.send';
+            assertReady(method, parentSignal);
+            const safeSessionId = assertStringArg(sessionId, method, 'sessionId');
+            const safePrompt = assertStringArg(prompt, method, 'prompt');
+            const { options: cleanOpts, callerSignal } =
+                extractSignalAndCloneOptions<SideGenSendOptions>(opts, method, false);
+            const linked = combineAbortSignals(parentSignal, callerSignal);
+            try {
+                return await invokeHost(method, linked.signal, (api) =>
+                    api.send(safeSessionId, safePrompt, {
+                        ...cleanOpts,
+                        signal: linked.signal,
+                    }),
+                );
+            } finally {
+                linked.cleanup();
+            }
+        },
+
+        async getSession(sessionId: string) {
+            const method = 'sideGen.getSession';
+            assertReady(method, parentSignal);
+            const safeSessionId = assertStringArg(sessionId, method, 'sessionId');
+            return await invokeHost(method, parentSignal, (api) =>
+                api.getSession(safeSessionId),
+            );
+        },
+
+        async listSessions(filter?: SideSessionFilter) {
+            const method = 'sideGen.listSessions';
+            assertReady(method, parentSignal);
+            const safeFilter =
+                filter === undefined
+                    ? undefined
+                    : (cloneBoundaryValue(
+                        assertRecordArg(filter, method, 'filter'),
+                        method,
+                    ) as unknown as SideSessionFilter);
+            return await invokeHost(method, parentSignal, (api) =>
+                api.listSessions(safeFilter),
+            );
+        },
+
+        async getTranscript(sessionId: string) {
+            const method = 'sideGen.getTranscript';
+            assertReady(method, parentSignal);
+            const safeSessionId = assertStringArg(sessionId, method, 'sessionId');
+            return await invokeHost(method, parentSignal, (api) =>
+                api.getTranscript(safeSessionId),
+            );
+        },
+
+        async compactSession(sessionId: string) {
+            const method = 'sideGen.compactSession';
+            assertReady(method, parentSignal);
+            const safeSessionId = assertStringArg(sessionId, method, 'sessionId');
+            return await invokeHost(method, parentSignal, (api) =>
+                api.compactSession(safeSessionId),
+            );
+        },
+
+        async deleteSession(sessionId: string) {
+            const method = 'sideGen.deleteSession';
+            assertReady(method, parentSignal);
+            const safeSessionId = assertStringArg(sessionId, method, 'sessionId');
+            return await invokeHost(method, parentSignal, (api) =>
+                api.deleteSession(safeSessionId),
+            );
+        },
+
+        clues: frozenClues,
+    };
+
+    return Object.freeze(
+        Object.assign(Object.create(null) as object, sideGenMethods),
+    ) as ToolSideGenApi;
+}
+
 interface RealmContext {
     handle: ManagedSandboxHandle;
     scopeProxy: object;
@@ -417,11 +842,18 @@ export class IframeJsSandbox implements ScriptSandbox {
                     const prevSignal = activeSignal;
                     activeSignal = combined.signal;
 
+                    const scopedSideGen = createSandboxSideGenProxy(
+                        ctx.sideGen,
+                        combined.signal,
+                        () => realm.handle.isDisposed(),
+                    );
+
                     const scopedCtx: ToolExecutionContext = {
                         fs: ctx.fs,
                         vars: ctx.vars,
                         message: ctx.message,
                         st: ctx.st,
+                        sideGen: scopedSideGen,
                         target: Object.freeze({ ...ctx.target }),
                         signal: combined.signal,
                         permissions: ctx.permissions,
@@ -464,11 +896,19 @@ export class IframeJsSandbox implements ScriptSandbox {
         const runController = new AbortController();
         const combined = combineAbortSignals(ctx.signal, runController.signal);
 
+        const handleBox: { current?: ManagedSandboxHandle } = {};
+        const scopedSideGen = createSandboxSideGenProxy(
+            ctx.sideGen,
+            combined.signal,
+            () => handleBox.current?.isDisposed() ?? false,
+        );
+
         const scopedCtx: ToolExecutionContext = {
             fs: ctx.fs,
             vars: ctx.vars,
             message: ctx.message,
             st: ctx.st,
+            sideGen: scopedSideGen,
             target: Object.freeze({ ...ctx.target }),
             signal: combined.signal,
             permissions: ctx.permissions,
@@ -488,10 +928,12 @@ export class IframeJsSandbox implements ScriptSandbox {
                 vars: scopedCtx.vars,
                 message: scopedCtx.message,
                 st: scopedCtx.st,
+                sideGen: scopedCtx.sideGen,
                 target: scopedCtx.target,
                 signal: scopedCtx.signal,
             },
         });
+        handleBox.current = realm.handle;
         realm.handle.trackAbortController(runController);
 
         try {

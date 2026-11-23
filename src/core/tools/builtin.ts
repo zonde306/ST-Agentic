@@ -1,4 +1,4 @@
-import type { HostBridge, ToolExecutionContext, ToolStApi } from '@/core/bridge';
+import type { HostBridge, ToolExecutionContext, ToolSideGenApi, ToolStApi } from '@/core/bridge';
 import { ChatDataStore } from '@/core/store';
 import type { MessageTarget, ScopedPermissions } from '@/core/types';
 import { VirtualFileSystem } from '@/core/vfs';
@@ -53,6 +53,7 @@ export interface CreateToolContextOptions {
     bridge: HostBridge;
     vfs?: VirtualFileSystem;
     store?: ChatDataStore;
+    sideGen?: ToolSideGenApi;
     target: MessageTarget;
     signal?: AbortSignal;
     permissions?: ScopedPermissions;
@@ -121,6 +122,7 @@ export function createToolExecutionContext(
         vars,
         message,
         st,
+        ...(options.sideGen ? { sideGen: options.sideGen } : {}),
         target,
         signal,
         permissions,
