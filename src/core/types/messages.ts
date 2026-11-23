@@ -80,6 +80,8 @@ export type CanonicalRole = 'system' | 'user' | 'assistant' | 'tool';
 export type CanonicalContentPart =
     | { type: 'text'; text: string }
     | { type: 'image_url'; imageUrl: string; detail?: 'auto' | 'low' | 'high' }
+    | { type: 'input_audio'; data: string; format: string; mimeType?: string; filename?: string }
+    | { type: 'video_url'; videoUrl: string; mimeType?: string; filename?: string }
     | { type: 'file'; data: string; mimeType?: string; filename?: string };
 
 export interface CanonicalToolCall {

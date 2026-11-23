@@ -6,6 +6,7 @@ import { ChatDataStore, DATA_NAMESPACES, MESSAGE_OVERRIDE_KEY } from '@/core/sto
 import type { DynamicVariableSchema } from '@/core/tools';
 import type {
     ApiConnection,
+    AssistantAttachment,
     AssistantMessage,
     AssistantMessageUsage,
     AssistantMode,
@@ -36,6 +37,7 @@ import {
 import { redactString, redactWithReport } from './redact';
 import {
     AssistantSessionStore,
+    buildAssistantUserContent,
     type AssistantRetractResult,
     type AssistantSessionPatch,
     type CreateAssistantSessionOptions,
@@ -85,6 +87,7 @@ export interface AssistantRunnerOptions {
 
 export interface AssistantSendOptions {
     target?: MessageTarget;
+    attachments?: AssistantAttachment[];
     onDelta?: (delta: string) => void;
     onReasoningDelta?: (delta: string) => void;
     onUpdate?: (session: AssistantSession) => void;
@@ -728,7 +731,18 @@ export class AssistantRunner {
         messageId: string,
         newContent: string,
     ): Promise<AssistantSession | null> {
-        if (!newContent.trim()) {
+        const session = this.sessionStore.getSession(sessionId);
+        if (!session) {
+            return null;
+        }
+        const existingMsg = session.messages.find((m) => m.id === messageId);
+        if (!existingMsg) {
+            return null;
+        }
+        const hasAttachments = Boolean(
+            existingMsg.attachments && existingMsg.attachments.length > 0,
+        );
+        if (!newContent.trim() && !hasAttachments) {
             throw new Error('Edited message content cannot be empty.');
         }
 
@@ -766,10 +780,14 @@ export class AssistantRunner {
         if (idx < 0) {
             throw new Error(`Assistant message not found: "${messageId}".`);
         }
-        if (session.messages[idx].role !== 'user') {
+        const existingMsg = session.messages[idx];
+        if (existingMsg.role !== 'user') {
             throw new Error(`Only user messages can be edited and resent ("${messageId}").`);
         }
-        if (!newContent.trim()) {
+        const hasAttachments = Boolean(
+            existingMsg.attachments && existingMsg.attachments.length > 0,
+        );
+        if (!newContent.trim() && !hasAttachments) {
             throw new Error('Edited message content cannot be empty.');
         }
 
@@ -788,9 +806,17 @@ export class AssistantRunner {
         this.sessionStore.syncTrajectoryToMessages(sessionId, { upToMessageIndex: idx });
         this.emitSessionUpdate(sessionId, options.onUpdate);
 
-        return await this.executeAssistantTurn(sessionId, newContent, options, {
-            appendUserMessage: false,
-        });
+        return await this.executeAssistantTurn(
+            sessionId,
+            newContent,
+            {
+                ...options,
+                attachments: options.attachments ?? existingMsg.attachments,
+            },
+            {
+                appendUserMessage: false,
+            },
+        );
     }
 
     /**
@@ -853,9 +879,17 @@ export class AssistantRunner {
         this.sessionStore.syncTrajectoryToMessages(sessionId, { upToMessageIndex: lastUserIdx });
         this.emitSessionUpdate(sessionId, options.onUpdate);
 
-        return await this.executeAssistantTurn(sessionId, targetUserMsg.content, options, {
-            appendUserMessage: false,
-        });
+        return await this.executeAssistantTurn(
+            sessionId,
+            targetUserMsg.content,
+            {
+                ...options,
+                attachments: options.attachments ?? targetUserMsg.attachments,
+            },
+            {
+                appendUserMessage: false,
+            },
+        );
     }
 
     private async executeAssistantTurn(
@@ -877,11 +911,17 @@ export class AssistantRunner {
         const cleanupExternalSignal = this.linkExternalSignal(controller, options.signal);
 
         const target = options.target ?? this.resolveActiveTarget();
+        const attachments =
+            options.attachments && options.attachments.length > 0
+                ? canonicalClone(options.attachments)
+                : undefined;
+
         if (config.appendUserMessage) {
             const userMessage: AssistantMessage = {
                 id: this.idGenerator(),
                 role: 'user',
                 content: prompt,
+                ...(attachments ? { attachments } : {}),
                 timestamp: this.now(),
             };
             this.sessionStore.appendMessage(sessionId, userMessage);
@@ -897,7 +937,12 @@ export class AssistantRunner {
         this.sessionStore.appendMessage(sessionId, assistantMessage);
         this.emitSessionUpdate(sessionId, options.onUpdate);
 
-        const inFlightMessages: CanonicalMessage[] = [{ role: 'user', content: prompt }];
+        const inFlightMessages: CanonicalMessage[] = [
+            {
+                role: 'user',
+                content: buildAssistantUserContent(prompt, attachments),
+            },
+        ];
         const toolCallRecords: AssistantToolCallRecord[] = [];
         const approvalIds: string[] = [];
         const fileRefs = new Set<string>();

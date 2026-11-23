@@ -1,6 +1,7 @@
-import type { TargetedKeyboardEvent } from 'preact';
+import type { TargetedEvent, TargetedKeyboardEvent } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type {
+    AssistantAttachment,
     AssistantMessage,
     AssistantMode,
     AssistantSession,
@@ -18,9 +19,12 @@ import {
 import { SessionListPanel } from './SessionListPanel';
 import { UndoHistoryModal } from './UndoHistoryModal';
 import {
+    ASSISTANT_FILE_ACCEPT,
     ASSISTANT_MODE_META,
     copyTextSafe,
     formatErrorMessage,
+    formatFileSize,
+    prepareAssistantAttachments,
     renderRedactedText,
     resolveConnectionDisplay,
     useAssistantStoreSlice,
@@ -68,10 +72,18 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     const [busyApprovalId, setBusyApprovalId] = useState<string | null>(null);
     const [busyUndoId, setBusyUndoId] = useState<string | null>(null);
     const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+    const [pendingAttachments, setPendingAttachments] = useState<AssistantAttachment[]>([]);
+    const [isDragOver, setIsDragOver] = useState<boolean>(false);
+    const [activeActionsMessageId, setActiveActionsMessageId] = useState<string | null>(null);
+    const [previewImage, setPreviewImage] = useState<AssistantAttachment | null>(null);
 
     const abortControllerRef = useRef<AbortController | null>(null);
     const threadRef = useRef<HTMLDivElement | null>(null);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+    const fileInputRef = useRef<HTMLInputElement | null>(null);
+    const dragDepthRef = useRef<number>(0);
+    const pendingAttachmentsRef = useRef<AssistantAttachment[]>(pendingAttachments);
+    pendingAttachmentsRef.current = pendingAttachments;
 
     // Hydrate from AssistantRuntimeBridge on mount.
     useEffect(() => {
@@ -126,7 +138,14 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
 
     useEffect(() => {
         setEditingMessageId(null);
+        setActiveActionsMessageId(null);
     }, [activeSession?.id]);
+
+    useEffect(() => {
+        if (isStreamingCurrent) {
+            setActiveActionsMessageId(null);
+        }
+    }, [isStreamingCurrent]);
 
     // Auto-scroll thread when messages or live streaming delta update.
     const messageCount = activeSession?.messages.length ?? 0;
@@ -442,6 +461,29 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
         [store, upsertSessionInStore],
     );
 
+    const handleAddFiles = useCallback(
+        async (files: FileList | readonly File[]) => {
+            if (!files || files.length === 0) {
+                return;
+            }
+            const { added, errors } = await prepareAssistantAttachments(
+                files,
+                pendingAttachmentsRef.current,
+            );
+            if (added.length > 0) {
+                setPendingAttachments((prev) => [...prev, ...added]);
+            }
+            for (const errMsg of errors) {
+                store.pushToast(errMsg, 'warning');
+            }
+        },
+        [store],
+    );
+
+    const handleRemovePendingAttachment = useCallback((attachmentId: string) => {
+        setPendingAttachments((prev) => prev.filter((item) => item.id !== attachmentId));
+    }, []);
+
     const handleSendPrompt = useCallback(async () => {
         if (isStreamingCurrent) {
             handleAbortStream();
@@ -449,8 +491,9 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
         }
 
         const text = draft.trim();
-        if (!text) {
-            store.pushToast('请输入指令后再发送', 'warning');
+        const attachmentsToSend = [...pendingAttachmentsRef.current];
+        if (!text && attachmentsToSend.length === 0) {
+            store.pushToast('请输入指令或上传附件后再发送', 'warning');
             return;
         }
 
@@ -470,12 +513,18 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
 
         const sessionId = targetSession.id;
         setDraft('');
+        setPendingAttachments([]);
         setOpenPopover(null);
         setEditingMessageId(null);
+        setActiveActionsMessageId(null);
 
         await runStreamingOperation(
             sessionId,
-            (hooks) => runtime.sendPrompt(sessionId, text, hooks),
+            (hooks) =>
+                runtime.sendPrompt(sessionId, text, {
+                    ...hooks,
+                    ...(attachmentsToSend.length > 0 ? { attachments: attachmentsToSend } : {}),
+                }),
             '助手执行失败',
         );
     }, [
@@ -504,7 +553,9 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             if (!activeSession || isStreamingCurrent) {
                 return;
             }
-            if (!newContent.trim()) {
+            const targetMsg = activeSession.messages.find((m) => m.id === messageId);
+            const hasAttachments = Boolean(targetMsg?.attachments?.length);
+            if (!newContent.trim() && !hasAttachments) {
                 store.pushToast('消息内容不能为空', 'warning');
                 return;
             }
@@ -537,6 +588,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                     });
                 }
                 setEditingMessageId(null);
+                setActiveActionsMessageId(null);
                 store.pushToast('已保存消息改写', 'success');
             } catch (err) {
                 store.pushToast(`保存改写失败：${formatErrorMessage(err)}`, 'error');
@@ -550,7 +602,9 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             if (!activeSession || isStreamingCurrent) {
                 return;
             }
-            if (!newContent.trim()) {
+            const targetMsg = activeSession.messages.find((m) => m.id === messageId);
+            const hasAttachments = Boolean(targetMsg?.attachments?.length);
+            if (!newContent.trim() && !hasAttachments) {
                 store.pushToast('消息内容不能为空', 'warning');
                 return;
             }
@@ -565,6 +619,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             }
 
             setEditingMessageId(null);
+            setActiveActionsMessageId(null);
             setOpenPopover(null);
             const sessionId = activeSession.id;
 
@@ -625,8 +680,18 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                     }
 
                     setEditingMessageId((prev) => (prev === messageId ? null : prev));
-                    if (targetMsg.role === 'user' && draft.trim() === '') {
-                        setDraft(targetMsg.content);
+                    setActiveActionsMessageId(null);
+                    if (targetMsg.role === 'user') {
+                        if (draft.trim() === '' && targetMsg.content) {
+                            setDraft(targetMsg.content);
+                        }
+                        if (
+                            pendingAttachmentsRef.current.length === 0
+                            && targetMsg.attachments
+                            && targetMsg.attachments.length > 0
+                        ) {
+                            setPendingAttachments(targetMsg.attachments);
+                        }
                     }
                     store.pushToast(
                         tailCount > 1
@@ -912,6 +977,11 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 setEditingMessageId(null);
                 return;
             }
+            if (activeActionsMessageId !== null) {
+                event.preventDefault();
+                setActiveActionsMessageId(null);
+                return;
+            }
             if (openPopover !== null) {
                 event.preventDefault();
                 setOpenPopover(null);
@@ -921,6 +991,98 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
 
     const handleRootKeyUp = (event: TargetedKeyboardEvent<HTMLDivElement>) => {
         event.stopPropagation();
+    };
+
+    const hasDragFiles = (event: DragEvent): boolean => {
+        const dt = event.dataTransfer;
+        if (!dt) {
+            return false;
+        }
+        if (dt.files && dt.files.length > 0) {
+            return true;
+        }
+        if (dt.types) {
+            return Array.from(dt.types).includes('Files');
+        }
+        return false;
+    };
+
+    const handleRootDragEnter = (event: TargetedEvent<HTMLDivElement, DragEvent>) => {
+        if (!hasDragFiles(event)) {
+            return;
+        }
+        event.preventDefault();
+        dragDepthRef.current += 1;
+        setIsDragOver(true);
+    };
+
+    const handleRootDragOver = (event: TargetedEvent<HTMLDivElement, DragEvent>) => {
+        if (!hasDragFiles(event)) {
+            return;
+        }
+        event.preventDefault();
+        if (event.dataTransfer) {
+            event.dataTransfer.dropEffect = 'copy';
+        }
+        if (!isDragOver) {
+            setIsDragOver(true);
+        }
+    };
+
+    const handleRootDragLeave = () => {
+        if (!isDragOver && dragDepthRef.current === 0) {
+            return;
+        }
+        dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+        if (dragDepthRef.current === 0) {
+            setIsDragOver(false);
+        }
+    };
+
+    const handleRootDrop = (event: TargetedEvent<HTMLDivElement, DragEvent>) => {
+        const dt = event.dataTransfer;
+        dragDepthRef.current = 0;
+        setIsDragOver(false);
+        if (!dt) {
+            return;
+        }
+        if (dt.files && dt.files.length > 0) {
+            event.preventDefault();
+            event.stopPropagation();
+            void handleAddFiles(dt.files);
+        }
+    };
+
+    const handleFileInputChange = (event: TargetedEvent<HTMLInputElement, Event>) => {
+        const files = event.currentTarget.files;
+        if (files && files.length > 0) {
+            void handleAddFiles(files);
+        }
+        event.currentTarget.value = '';
+    };
+
+    const handleComposerPaste = (event: TargetedEvent<HTMLTextAreaElement, ClipboardEvent>) => {
+        const dt = event.clipboardData;
+        if (!dt) {
+            return;
+        }
+        const files: File[] = [];
+        if (dt.files && dt.files.length > 0) {
+            files.push(...Array.from(dt.files));
+        } else if (dt.items && dt.items.length > 0) {
+            for (const item of Array.from(dt.items)) {
+                if (item.kind === 'file') {
+                    const f = item.getAsFile();
+                    if (f) {
+                        files.push(f);
+                    }
+                }
+            }
+        }
+        if (files.length > 0) {
+            event.preventDefault();
+            void handleAddFiles(files);
+        }
     };
 
     const handleComposerKeyDown = (event: TargetedKeyboardEvent<HTMLTextAreaElement>) => {
@@ -1008,8 +1170,13 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             class="ag-ast-root"
             data-view-id="assistant"
             data-assistant-mobile-view={isMobile ? 'detail' : 'desktop'}
+            data-drag-over={isDragOver ? 'true' : 'false'}
             onKeyDown={handleRootKeyDown}
             onKeyUp={handleRootKeyUp}
+            onDragEnter={handleRootDragEnter}
+            onDragOver={handleRootDragOver}
+            onDragLeave={handleRootDragLeave}
+            onDrop={handleRootDrop}
         >
             {/* 1. Slim Single-Line Top Bar (min-h-[46px]) */}
             <div class="ag-ast-topbar" data-assistant-topbar="true">
@@ -1088,6 +1255,11 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 ref={threadRef}
                 class="ag-ast-thread ag-thin-scroll"
                 data-assistant-thread="true"
+                onClick={(e) => {
+                    if (e.target === e.currentTarget && activeActionsMessageId !== null) {
+                        setActiveActionsMessageId(null);
+                    }
+                }}
             >
                 {!activeSession ? (
                     <div class="ag-empty" style={{ margin: 'auto' }}>
@@ -1138,11 +1310,13 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                 <MessageBubble
                                     key={msg.id}
                                     message={msg}
+                                    isMobile={isMobile}
                                     isStreaming={isLastStreamingMsg}
                                     isLastMessage={isLastMessage}
                                     canRegenerate={canRegenerate}
                                     isSessionStreaming={isStreamingCurrent}
                                     isEditing={editingMessageId === msg.id}
+                                    actionsOpen={activeActionsMessageId === msg.id}
                                     approvalsById={approvalsById}
                                     undoById={undoById}
                                     busyApprovalId={busyApprovalId}
@@ -1151,8 +1325,14 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                     onRetryApproval={handleRetryApproval}
                                     onApplyUndo={handleApplyUndo}
                                     onPreviewFile={(path) => void handlePreviewFile(path)}
+                                    onPreviewImage={(att) => setPreviewImage(att)}
+                                    onToggleActions={(id) =>
+                                        setActiveActionsMessageId((prev) => (prev === id ? null : id))
+                                    }
+                                    onCloseActions={() => setActiveActionsMessageId(null)}
                                     onStartEdit={(id) => {
                                         setOpenPopover(null);
+                                        setActiveActionsMessageId(null);
                                         setEditingMessageId(id);
                                     }}
                                     onCancelEdit={() => setEditingMessageId(null)}
@@ -1216,16 +1396,89 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                     />
                 ) : null}
 
-                <div class="ag-ast-composer-box">
+                <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    accept={ASSISTANT_FILE_ACCEPT}
+                    data-assistant-file-input="true"
+                    style={{ display: 'none' }}
+                    onChange={handleFileInputChange}
+                />
+
+                <div
+                    class={
+                        isDragOver
+                            ? 'ag-ast-composer-box ag-ast-composer-box-dragover'
+                            : 'ag-ast-composer-box'
+                    }
+                >
+                    {isDragOver ? (
+                        <div class="ag-ast-drop-hint" data-assistant-drop-hint="true">
+                            📥 松开鼠标即可上传图片、音频、视频或文件
+                        </div>
+                    ) : null}
+
+                    {pendingAttachments.length > 0 ? (
+                        <div
+                            class="ag-ast-pending-attachments"
+                            data-assistant-pending-attachments="true"
+                        >
+                            {pendingAttachments.map((att) => (
+                                <div
+                                    key={att.id}
+                                    class="ag-ast-pending-chip"
+                                    data-pending-attachment={att.id}
+                                    data-attachment-kind={att.kind}
+                                >
+                                    {att.kind === 'image' ? (
+                                        <img
+                                            src={att.dataUrl}
+                                            alt={att.name}
+                                            class="ag-ast-pending-thumb"
+                                        />
+                                    ) : (
+                                        <span class="ag-ast-pending-icon" aria-hidden="true">
+                                            {att.kind === 'audio'
+                                                ? '🎵'
+                                                : att.kind === 'video'
+                                                    ? '🎬'
+                                                    : '📄'}
+                                        </span>
+                                    )}
+                                    <div class="ag-ast-pending-meta">
+                                        <span class="ag-ast-pending-name" title={att.name}>
+                                            {att.name}
+                                        </span>
+                                        <span class="ag-ast-pending-size">
+                                            {formatFileSize(att.size)}
+                                        </span>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        class="ag-ast-pending-remove"
+                                        data-remove-attachment={att.id}
+                                        aria-label={`移除附件 ${att.name}`}
+                                        title={`移除附件 ${att.name}`}
+                                        onClick={() => handleRemovePendingAttachment(att.id)}
+                                    >
+                                        ✕
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                    ) : null}
+
                     <textarea
                         ref={textareaRef}
                         rows={1}
                         data-assistant-draft-input="true"
                         aria-label="输入助手指令"
-                        placeholder="输入指令，让助手自行读取并处理..."
+                        placeholder="输入指令或拖拽图片/音频/视频/文件到此处..."
                         class="ag-ast-composer-input"
                         value={draft}
                         onInput={(e) => setDraft(e.currentTarget.value)}
+                        onPaste={handleComposerPaste}
                         onKeyDown={handleComposerKeyDown}
                         onKeyUp={handleComposerKeyUp}
                     />
@@ -1271,29 +1524,43 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                             </button>
                         </div>
 
-                        {isStreamingCurrent ? (
+                        <div class="ag-ast-composer-right">
                             <button
                                 type="button"
-                                data-assistant-stop-btn="true"
-                                title="停止生成"
-                                aria-label="停止生成"
-                                class="ag-ast-stop-btn"
-                                onClick={handleAbortStream}
+                                data-assistant-upload-btn="true"
+                                aria-label="上传图片、音频、视频或文件"
+                                title="上传附件（图片 / 音频 / 视频 / 文件，或直接拖拽到此处）"
+                                disabled={isStreamingCurrent}
+                                class="ag-ast-upload-btn"
+                                onClick={() => fileInputRef.current?.click()}
                             >
-                                <span>■</span>
+                                <span aria-hidden="true">📎</span>
                             </button>
-                        ) : (
-                            <button
-                                type="button"
-                                data-assistant-send-btn="true"
-                                title="发送 (Enter)"
-                                aria-label="发送"
-                                class="ag-ast-send-btn"
-                                onClick={() => void handleSendPrompt()}
-                            >
-                                <span>▶</span>
-                            </button>
-                        )}
+
+                            {isStreamingCurrent ? (
+                                <button
+                                    type="button"
+                                    data-assistant-stop-btn="true"
+                                    title="停止生成"
+                                    aria-label="停止生成"
+                                    class="ag-ast-stop-btn"
+                                    onClick={handleAbortStream}
+                                >
+                                    <span>■</span>
+                                </button>
+                            ) : (
+                                <button
+                                    type="button"
+                                    data-assistant-send-btn="true"
+                                    title="发送 (Enter)"
+                                    aria-label="发送"
+                                    class="ag-ast-send-btn"
+                                    onClick={() => void handleSendPrompt()}
+                                >
+                                    <span>▶</span>
+                                </button>
+                            )}
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1367,6 +1634,37 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                         {renderRedactedText(previewFile?.content ?? '')}
                     </pre>
                 )}
+            </ShadowModal>
+
+            {/* In-Shadow-DOM Image Attachment Lightbox Modal */}
+            <ShadowModal
+                open={previewImage !== null}
+                title={previewImage ? `🖼️ 图片预览 · ${previewImage.name}` : '图片预览'}
+                maxWidth="720px"
+                onClose={() => setPreviewImage(null)}
+                footer={
+                    <Button variant="secondary" size="sm" onClick={() => setPreviewImage(null)}>
+                        关闭
+                    </Button>
+                }
+            >
+                {previewImage ? (
+                    <div
+                        data-assistant-image-preview="true"
+                        style={{ display: 'flex', justifyContent: 'center' }}
+                    >
+                        <img
+                            src={previewImage.dataUrl}
+                            alt={previewImage.name}
+                            style={{
+                                maxWidth: '100%',
+                                maxHeight: '70vh',
+                                borderRadius: '10px',
+                                objectFit: 'contain',
+                            }}
+                        />
+                    </div>
+                ) : null}
             </ShadowModal>
         </div>
     );

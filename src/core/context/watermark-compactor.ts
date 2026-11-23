@@ -136,6 +136,10 @@ function estimateContentTokens(content: string | CanonicalContentPart[]): number
             total += estimateStringTokens(part.text);
         } else if (part.type === 'image_url') {
             total += 85;
+        } else if (part.type === 'input_audio') {
+            total += Math.min(4096, Math.max(128, Math.ceil(part.data.length / 2048)));
+        } else if (part.type === 'video_url') {
+            total += Math.min(8192, Math.max(256, Math.ceil(part.videoUrl.length / 2048)));
         } else {
             total += Math.max(100, Math.ceil(part.data.length / 4));
         }
@@ -337,6 +341,12 @@ function contentToText(content: string | CanonicalContentPart[]): string {
             }
             if (part.type === 'image_url') {
                 return `[image:${part.imageUrl}]`;
+            }
+            if (part.type === 'input_audio') {
+                return `[audio:${part.filename ?? part.format}]`;
+            }
+            if (part.type === 'video_url') {
+                return `[video:${part.filename ?? part.mimeType ?? 'video'}]`;
             }
             return `[file:${part.filename ?? part.mimeType ?? 'attachment'}]`;
         })

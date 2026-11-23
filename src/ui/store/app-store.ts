@@ -10,6 +10,7 @@ import {
 import type {
     AgentRunTrace,
     ApiConnection,
+    AssistantAttachment,
     AssistantMessage,
     AssistantMode,
     AssistantSession,
@@ -82,6 +83,7 @@ export interface AssistantRuntimeBridge {
         sessionId: string,
         prompt: string,
         options?: {
+            attachments?: AssistantAttachment[];
             onDelta?: (delta: string) => void;
             onUpdate?: (session: AssistantSession) => void;
             signal?: AbortSignal;

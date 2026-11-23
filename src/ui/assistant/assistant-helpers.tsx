@@ -2,6 +2,8 @@ import { Fragment, type ComponentChildren } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import type {
     ApiConnection,
+    AssistantAttachment,
+    AssistantAttachmentKind,
     AssistantMode,
     AssistantSession,
     PendingApproval,
@@ -321,6 +323,217 @@ export async function copyTextSafe(text: string): Promise<boolean> {
     } catch {
         return false;
     }
+}
+
+export const MAX_ASSISTANT_ATTACHMENT_COUNT = 8;
+export const MAX_ASSISTANT_SINGLE_FILE_BYTES = 20 * 1024 * 1024;
+export const MAX_ASSISTANT_TOTAL_BYTES = 32 * 1024 * 1024;
+export const ASSISTANT_FILE_ACCEPT =
+    'image/*,audio/*,video/*,.pdf,.txt,.md,.json,.csv,.yaml,.yml';
+
+const IMAGE_EXT_MIME: Readonly<Record<string, string>> = {
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    bmp: 'image/bmp',
+    svg: 'image/svg+xml',
+    avif: 'image/avif',
+};
+
+const AUDIO_EXT_MIME: Readonly<Record<string, string>> = {
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    wave: 'audio/wav',
+    ogg: 'audio/ogg',
+    oga: 'audio/ogg',
+    opus: 'audio/opus',
+    flac: 'audio/flac',
+    aac: 'audio/aac',
+    m4a: 'audio/mp4',
+};
+
+const VIDEO_EXT_MIME: Readonly<Record<string, string>> = {
+    mp4: 'video/mp4',
+    webm: 'video/webm',
+    mov: 'video/quicktime',
+    mkv: 'video/x-matroska',
+    avi: 'video/x-msvideo',
+    m4v: 'video/x-m4v',
+    ogv: 'video/ogg',
+};
+
+const TEXT_EXT_MIME: Readonly<Record<string, string>> = {
+    txt: 'text/plain',
+    md: 'text/markdown',
+    markdown: 'text/markdown',
+    json: 'application/json',
+    csv: 'text/csv',
+    tsv: 'text/tab-separated-values',
+    yaml: 'application/yaml',
+    yml: 'application/yaml',
+    xml: 'application/xml',
+    html: 'text/html',
+    css: 'text/css',
+    js: 'text/javascript',
+    ts: 'text/typescript',
+    tsx: 'text/typescript',
+    jsx: 'text/javascript',
+    py: 'text/x-python',
+    log: 'text/plain',
+    ini: 'text/plain',
+    conf: 'text/plain',
+};
+
+export function formatFileSize(bytes: number): string {
+    if (!Number.isFinite(bytes) || bytes < 0) {
+        return '0 B';
+    }
+    if (bytes < 1024) {
+        return `${bytes} B`;
+    }
+    if (bytes < 1024 * 1024) {
+        return `${(bytes / 1024).toFixed(1)} KB`;
+    }
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function classifyAssistantFile(file: {
+    name: string;
+    type: string;
+}): { kind: AssistantAttachmentKind; mimeType: string; isTextReadable: boolean } | null {
+    const cleanMime = (file.type || '').split(';')[0].trim().toLowerCase();
+    const extMatch = /\.([a-z0-9]+)$/i.exec(file.name.trim());
+    const ext = extMatch ? extMatch[1].toLowerCase() : '';
+
+    if (cleanMime.startsWith('image/')) {
+        return { kind: 'image', mimeType: cleanMime, isTextReadable: false };
+    }
+    if (cleanMime.startsWith('audio/')) {
+        return { kind: 'audio', mimeType: cleanMime, isTextReadable: false };
+    }
+    if (cleanMime.startsWith('video/')) {
+        return { kind: 'video', mimeType: cleanMime, isTextReadable: false };
+    }
+    if (cleanMime === 'application/pdf') {
+        return { kind: 'file', mimeType: cleanMime, isTextReadable: false };
+    }
+    if (
+        cleanMime.startsWith('text/')
+        || cleanMime === 'application/json'
+        || cleanMime === 'application/xml'
+        || cleanMime === 'application/yaml'
+        || cleanMime === 'application/x-yaml'
+        || cleanMime === 'application/javascript'
+        || cleanMime === 'application/typescript'
+    ) {
+        return { kind: 'file', mimeType: cleanMime, isTextReadable: true };
+    }
+
+    if (ext && IMAGE_EXT_MIME[ext]) {
+        return { kind: 'image', mimeType: IMAGE_EXT_MIME[ext], isTextReadable: false };
+    }
+    if (ext && AUDIO_EXT_MIME[ext]) {
+        return { kind: 'audio', mimeType: AUDIO_EXT_MIME[ext], isTextReadable: false };
+    }
+    if (ext && VIDEO_EXT_MIME[ext]) {
+        return { kind: 'video', mimeType: VIDEO_EXT_MIME[ext], isTextReadable: false };
+    }
+    if (ext === 'pdf') {
+        return { kind: 'file', mimeType: 'application/pdf', isTextReadable: false };
+    }
+    if (ext && TEXT_EXT_MIME[ext]) {
+        return { kind: 'file', mimeType: TEXT_EXT_MIME[ext], isTextReadable: true };
+    }
+
+    return null;
+}
+
+function readBlobAsDataUrl(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+        reader.onerror = () => reject(reader.error ?? new Error('读取文件失败'));
+        reader.readAsDataURL(blob);
+    });
+}
+
+function readBlobAsText(blob: Blob): Promise<string> {
+    if (typeof blob.text === 'function') {
+        return blob.text();
+    }
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+        reader.onerror = () => reject(reader.error ?? new Error('读取文本文件失败'));
+        reader.readAsText(blob);
+    });
+}
+
+let attachmentSeq = 0;
+
+export async function prepareAssistantAttachments(
+    files: FileList | readonly File[],
+    existing: readonly AssistantAttachment[],
+): Promise<{ added: AssistantAttachment[]; errors: string[] }> {
+    const fileArray = Array.from(files);
+    const added: AssistantAttachment[] = [];
+    const errors: string[] = [];
+
+    let currentCount = existing.length;
+    let currentTotalBytes = existing.reduce((sum, item) => sum + item.size, 0);
+
+    for (const file of fileArray) {
+        if (currentCount >= MAX_ASSISTANT_ATTACHMENT_COUNT) {
+            errors.push(`最多只能附加 ${MAX_ASSISTANT_ATTACHMENT_COUNT} 个文件`);
+            break;
+        }
+        if (file.size > MAX_ASSISTANT_SINGLE_FILE_BYTES) {
+            errors.push(`「${file.name}」超过单文件大小上限 (${formatFileSize(MAX_ASSISTANT_SINGLE_FILE_BYTES)})`);
+            continue;
+        }
+        if (currentTotalBytes + file.size > MAX_ASSISTANT_TOTAL_BYTES) {
+            errors.push(`附件总大小不能超过 ${formatFileSize(MAX_ASSISTANT_TOTAL_BYTES)}`);
+            continue;
+        }
+
+        const classified = classifyAssistantFile(file);
+        if (!classified) {
+            errors.push(`不支持的文件格式：「${file.name}」`);
+            continue;
+        }
+
+        try {
+            let dataUrl = await readBlobAsDataUrl(file);
+            if (
+                classified.mimeType
+                && dataUrl.startsWith('data:application/octet-stream;')
+            ) {
+                dataUrl = `data:${classified.mimeType};${dataUrl.slice('data:application/octet-stream;'.length)}`;
+            }
+            const textContent = classified.isTextReadable
+                ? await readBlobAsText(file)
+                : undefined;
+
+            attachmentSeq += 1;
+            added.push({
+                id: `att_${Date.now().toString(36)}_${attachmentSeq}`,
+                kind: classified.kind,
+                name: file.name || `attachment_${attachmentSeq}`,
+                mimeType: classified.mimeType,
+                size: file.size,
+                dataUrl,
+                ...(textContent !== undefined ? { textContent } : {}),
+            });
+            currentCount += 1;
+            currentTotalBytes += file.size;
+        } catch (err) {
+            errors.push(`读取「${file.name}」失败：${formatErrorMessage(err)}`);
+        }
+    }
+
+    return { added, errors };
 }
 
 /** Subscribe directly to an `AppStore` slice using pure `preact/hooks`. */

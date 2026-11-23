@@ -613,4 +613,112 @@ describe('AssistantRunner & AssistantSessionStore (TS2.1)', () => {
             'No user message available to regenerate.',
         );
     });
+
+    it('sends multimodal image/audio/video/file attachments and preserves them across edit, resend, and regenerate', async () => {
+        const { transport, trajectoryStore, runner } = createRunnerHarness([
+            { content: '已查看图片、听取音频并检查视频和文本附件。' },
+            { content: '仅附件（无正文）的回复。' },
+            { content: '改写重发后仍保留多模态附件的回复。' },
+            { content: '重新生成后仍保留多模态附件的回复。' },
+        ]);
+
+        const session = await runner.createSession({ title: '多模态附件测试', mode: 'chat' });
+        const attachments = [
+            {
+                id: 'att_img_1',
+                kind: 'image' as const,
+                name: 'scene.png',
+                mimeType: 'image/png',
+                size: 128,
+                dataUrl: 'data:image/png;base64,iVBORw0KGgo=',
+            },
+            {
+                id: 'att_aud_1',
+                kind: 'audio' as const,
+                name: 'voice.wav',
+                mimeType: 'audio/wav',
+                size: 256,
+                dataUrl: 'data:audio/wav;base64,UklGRg==',
+            },
+            {
+                id: 'att_vid_1',
+                kind: 'video' as const,
+                name: 'clip.mp4',
+                mimeType: 'video/mp4',
+                size: 512,
+                dataUrl: 'data:video/mp4;base64,AAAAIGZ0eXA=',
+            },
+            {
+                id: 'att_txt_1',
+                kind: 'file' as const,
+                name: 'notes.md',
+                mimeType: 'text/markdown',
+                size: 32,
+                dataUrl: 'data:text/markdown;base64,IyBOb3Rlcw==',
+                textContent: '# Notes\nClue A',
+            },
+        ];
+
+        // 1. Send prompt with multimodal attachments
+        const reply1 = await runner.sendPrompt(session.id, '请分析以上四个附件', { attachments });
+        expect(reply1.content).toBe('已查看图片、听取音频并检查视频和文本附件。');
+
+        const req1UserMsg = transport.requests[0].messages[1];
+        expect(Array.isArray(req1UserMsg.content)).toBe(true);
+        expect(req1UserMsg.content).toEqual([
+            { type: 'text', text: '请分析以上四个附件' },
+            { type: 'image_url', imageUrl: 'data:image/png;base64,iVBORw0KGgo=' },
+            {
+                type: 'input_audio',
+                data: 'UklGRg==',
+                format: 'wav',
+                mimeType: 'audio/wav',
+                filename: 'voice.wav',
+            },
+            {
+                type: 'video_url',
+                videoUrl: 'data:video/mp4;base64,AAAAIGZ0eXA=',
+                mimeType: 'video/mp4',
+                filename: 'clip.mp4',
+            },
+            { type: 'text', text: '[Attachment: notes.md]\n# Notes\nClue A' },
+        ]);
+
+        const turn1FrozenJson = canonicalStringify(
+            trajectoryStore.getMessages(toAssistantThreadId(session.id)),
+        );
+
+        // 2. Send attachment-only message (empty text)
+        const reply2 = await runner.sendPrompt(session.id, '', {
+            attachments: [attachments[0]],
+        });
+        expect(reply2.content).toBe('仅附件（无正文）的回复。');
+        expect(transport.requests[1].messages[3].content).toEqual([
+            { type: 'image_url', imageUrl: 'data:image/png;base64,iVBORw0KGgo=' },
+        ]);
+
+        const turn2UserId = runner.getSession(session.id)!.messages[2].id;
+
+        // 3. editAndResendMessage preserves Turn 1 multimodal KV prefix verbatim & retains Turn 2 attachment
+        const resent = await runner.editAndResendMessage(
+            session.id,
+            turn2UserId,
+            '补充说明：请重点看构图',
+        );
+        expect(resent.content).toBe('改写重发后仍保留多模态附件的回复。');
+        expect(canonicalStringify(transport.requests[2].messages.slice(1, 3))).toBe(turn1FrozenJson);
+        expect(transport.requests[2].messages[3].content).toEqual([
+            { type: 'text', text: '补充说明：请重点看构图' },
+            { type: 'image_url', imageUrl: 'data:image/png;base64,iVBORw0KGgo=' },
+        ]);
+
+        // 4. regenerateLastMessage retains Turn 2 attachment & Turn 1 KV prefix
+        const regen = await runner.regenerateLastMessage(session.id);
+        expect(regen.content).toBe('重新生成后仍保留多模态附件的回复。');
+        expect(canonicalStringify(transport.requests[3].messages.slice(1, 3))).toBe(turn1FrozenJson);
+        expect(transport.requests[3].messages[3].content).toEqual([
+            { type: 'text', text: '补充说明：请重点看构图' },
+            { type: 'image_url', imageUrl: 'data:image/png;base64,iVBORw0KGgo=' },
+        ]);
+    });
 });

@@ -483,4 +483,96 @@ describe('PayloadCompiler', () => {
         expect(anthropicReq.headers['anthropic-version']).toBe('2023-06-01');
         expect(anthropicReq.headers['Content-Type']).toBeUndefined();
     });
+
+    it('compiles multimodal image_url, input_audio, video_url, and file parts for OpenAI and Anthropic', () => {
+        const multimodalMessages: CanonicalMessage[] = [
+            {
+                role: 'user',
+                content: [
+                    { type: 'text', text: '请分析图片、音频、视频和文档' },
+                    { type: 'image_url', imageUrl: 'data:image/png;base64,iVBORw0KGgo=' },
+                    {
+                        type: 'input_audio',
+                        data: 'data:audio/mp3;base64,SUQzAw==',
+                        format: 'mp3',
+                        mimeType: 'audio/mpeg',
+                        filename: 'voice.mp3',
+                    },
+                    {
+                        type: 'video_url',
+                        videoUrl: 'data:video/mp4;base64,AAAAIGZ0eXA=',
+                        mimeType: 'video/mp4',
+                        filename: 'clip.mp4',
+                    },
+                    {
+                        type: 'file',
+                        data: 'data:application/pdf;base64,JVBERi0xLjQ=',
+                        mimeType: 'application/pdf',
+                        filename: 'spec.pdf',
+                    },
+                ],
+            },
+        ];
+
+        const openaiOut = compiler.compile(
+            {
+                connectionId: 'openai-mm',
+                messages: multimodalMessages,
+                tools: [],
+                stream: false,
+            },
+            makeConnection({ providerFormat: 'openai', cachePolicy: 'none' }),
+        );
+        const openaiMsgs = openaiOut.body.messages as Array<{ content: unknown[] }>;
+        expect(openaiMsgs).toHaveLength(1);
+        expect(openaiMsgs[0].content).toEqual([
+            { type: 'text', text: '请分析图片、音频、视频和文档' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' } },
+            { type: 'input_audio', input_audio: { data: 'SUQzAw==', format: 'mp3' } },
+            { type: 'video_url', video_url: { url: 'data:video/mp4;base64,AAAAIGZ0eXA=' } },
+            {
+                type: 'file',
+                file: {
+                    file_data: 'data:application/pdf;base64,JVBERi0xLjQ=',
+                    filename: 'spec.pdf',
+                    mime_type: 'application/pdf',
+                },
+            },
+        ]);
+
+        const anthropicOut = compiler.compile(
+            {
+                connectionId: 'ant-mm',
+                messages: multimodalMessages,
+                tools: [],
+                stream: false,
+            },
+            makeConnection({
+                providerFormat: 'anthropic',
+                baseUrl: 'https://api.anthropic.com',
+                cachePolicy: 'none',
+            }),
+        );
+        const antMsgs = anthropicOut.body.messages as Array<{ content: unknown[] }>;
+        expect(antMsgs).toHaveLength(1);
+        expect(antMsgs[0].content).toEqual([
+            { type: 'text', text: '请分析图片、音频、视频和文档' },
+            {
+                type: 'image',
+                source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' },
+            },
+            {
+                type: 'document',
+                source: { type: 'base64', media_type: 'audio/mpeg', data: 'SUQzAw==' },
+            },
+            {
+                type: 'document',
+                source: { type: 'base64', media_type: 'video/mp4', data: 'AAAAIGZ0eXA=' },
+            },
+            {
+                type: 'document',
+                source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0xLjQ=' },
+            },
+        ]);
+    });
 });

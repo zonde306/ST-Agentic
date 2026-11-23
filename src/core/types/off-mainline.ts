@@ -79,10 +79,23 @@ export interface AssistantMessageUsage {
     cacheRate: string;
 }
 
+export type AssistantAttachmentKind = 'image' | 'audio' | 'video' | 'file';
+
+export interface AssistantAttachment {
+    id: string;
+    kind: AssistantAttachmentKind;
+    name: string;
+    mimeType: string;
+    size: number;
+    dataUrl: string;
+    textContent?: string;
+}
+
 export interface AssistantMessage {
     id: string;
     role: 'user' | 'assistant';
     content: string;
+    attachments?: AssistantAttachment[];
     think?: string;
     toolCalls?: AssistantToolCallRecord[];
     approvalIds?: string[];

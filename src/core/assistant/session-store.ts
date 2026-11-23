@@ -7,6 +7,7 @@ import {
     type Layer1TurnGroup,
 } from '@/core/context';
 import type {
+    AssistantAttachment,
     AssistantMessage,
     AssistantMode,
     AssistantSession,
@@ -118,10 +119,130 @@ function groupUiMessagesIntoTurns(messages: readonly AssistantMessage[]): UiTurn
     return turns;
 }
 
+const AUDIO_EXTENSION_FORMAT_MAP: Readonly<Record<string, string>> = {
+    mp3: 'mp3',
+    mpeg: 'mp3',
+    mpga: 'mp3',
+    wav: 'wav',
+    wave: 'wav',
+    ogg: 'ogg',
+    oga: 'ogg',
+    opus: 'ogg',
+    flac: 'flac',
+    aac: 'aac',
+    m4a: 'm4a',
+    mp4: 'm4a',
+    webm: 'webm',
+};
+
+const AUDIO_MIME_FORMAT_MAP: Readonly<Record<string, string>> = {
+    'audio/mpeg': 'mp3',
+    'audio/mp3': 'mp3',
+    'audio/wav': 'wav',
+    'audio/x-wav': 'wav',
+    'audio/wave': 'wav',
+    'audio/ogg': 'ogg',
+    'audio/opus': 'ogg',
+    'audio/flac': 'flac',
+    'audio/x-flac': 'flac',
+    'audio/aac': 'aac',
+    'audio/mp4': 'm4a',
+    'audio/x-m4a': 'm4a',
+    'audio/m4a': 'm4a',
+    'audio/webm': 'webm',
+};
+
+export function stripDataUrlBase64Prefix(dataOrUrl: string): string {
+    if (!dataOrUrl.startsWith('data:')) {
+        return dataOrUrl;
+    }
+    const commaIdx = dataOrUrl.indexOf(',');
+    return commaIdx >= 0 ? dataOrUrl.slice(commaIdx + 1) : dataOrUrl;
+}
+
+export function inferAudioFormat(mimeType?: string, filename?: string): string {
+    const cleanMime = (mimeType ?? '').split(';')[0].trim().toLowerCase();
+    if (cleanMime && AUDIO_MIME_FORMAT_MAP[cleanMime]) {
+        return AUDIO_MIME_FORMAT_MAP[cleanMime];
+    }
+    if (cleanMime.startsWith('audio/')) {
+        const sub = cleanMime.slice('audio/'.length).replace(/^x-/, '');
+        if (AUDIO_EXTENSION_FORMAT_MAP[sub]) {
+            return AUDIO_EXTENSION_FORMAT_MAP[sub];
+        }
+    }
+    const extMatch = /\.([a-z0-9]+)$/i.exec((filename ?? '').trim());
+    if (extMatch) {
+        const ext = extMatch[1].toLowerCase();
+        if (AUDIO_EXTENSION_FORMAT_MAP[ext]) {
+            return AUDIO_EXTENSION_FORMAT_MAP[ext];
+        }
+    }
+    return 'mp3';
+}
+
+/**
+ * Build canonical `user` message content from plain prompt text and optional multimodal attachments.
+ */
+export function buildAssistantUserContent(
+    prompt: string,
+    attachments?: readonly AssistantAttachment[],
+): string | CanonicalContentPart[] {
+    if (!attachments || attachments.length === 0) {
+        return prompt;
+    }
+
+    const parts: CanonicalContentPart[] = [];
+    if (prompt.trim().length > 0) {
+        parts.push({ type: 'text', text: prompt });
+    }
+
+    for (const att of attachments) {
+        if (att.kind === 'image') {
+            parts.push({
+                type: 'image_url',
+                imageUrl: att.dataUrl,
+            });
+        } else if (att.kind === 'audio') {
+            parts.push({
+                type: 'input_audio',
+                data: stripDataUrlBase64Prefix(att.dataUrl),
+                format: inferAudioFormat(att.mimeType, att.name),
+                mimeType: att.mimeType,
+                filename: att.name,
+            });
+        } else if (att.kind === 'video') {
+            parts.push({
+                type: 'video_url',
+                videoUrl: att.dataUrl,
+                mimeType: att.mimeType,
+                filename: att.name,
+            });
+        } else if (att.textContent !== undefined) {
+            parts.push({
+                type: 'text',
+                text: `[Attachment: ${att.name}]\n${att.textContent}`,
+            });
+        } else {
+            parts.push({
+                type: 'file',
+                data: att.dataUrl,
+                mimeType: att.mimeType,
+                filename: att.name,
+            });
+        }
+    }
+
+    return parts;
+}
+
 function synthesizeTurnMessages(uiTurn: UiTurnGroup): CanonicalMessage[] {
     const out: CanonicalMessage[] = [];
     if (uiTurn.user) {
-        out.push({ role: 'user', content: uiTurn.user.content });
+        out.push({
+            role: 'user',
+            content: buildAssistantUserContent(uiTurn.user.content, uiTurn.user.attachments),
+        });
     }
     for (const ast of uiTurn.assistants) {
         if (!ast.content.trim() && !ast.think?.trim()) {
@@ -149,17 +270,21 @@ function reconcileTurnMessages(
         return synthesizeTurnMessages(uiTurn);
     }
 
-    const existingUserText = contentToPlainText(firstExisting.content);
-    const uiUserText = uiTurn.user.content;
+    const desiredUserContent = buildAssistantUserContent(
+        uiTurn.user.content,
+        uiTurn.user.attachments,
+    );
+    const userMatches =
+        canonicalStringify(firstExisting.content) === canonicalStringify(desiredUserContent);
     const nonEmptyAssistants = uiTurn.assistants.filter(
         (ast) => ast.content.trim().length > 0 || Boolean(ast.think?.trim()),
     );
 
     if (nonEmptyAssistants.length === 0) {
-        if (existingTurn.messages.length === 1 && existingUserText === uiUserText) {
+        if (existingTurn.messages.length === 1 && userMatches) {
             return [...existingTurn.messages];
         }
-        return [{ role: 'user', content: uiUserText }];
+        return [{ role: 'user', content: desiredUserContent }];
     }
 
     if (nonEmptyAssistants.length === 1) {
@@ -172,14 +297,14 @@ function reconcileTurnMessages(
 
         if (canPreserveTail) {
             const existingAssistantText = contentToPlainText(lastExisting.content);
-            if (existingUserText === uiUserText && existingAssistantText === finalUiAssistant.content) {
+            if (userMatches && existingAssistantText === finalUiAssistant.content) {
                 return [...existingTurn.messages];
             }
             const nextMsgs = [...existingTurn.messages];
-            if (existingUserText !== uiUserText) {
+            if (!userMatches) {
                 nextMsgs[0] = {
                     ...canonicalClone(firstExisting),
-                    content: uiUserText,
+                    content: canonicalClone(desiredUserContent),
                 };
             }
             if (existingAssistantText !== finalUiAssistant.content) {
@@ -203,6 +328,10 @@ function contentToPlainText(content: string | CanonicalContentPart[]): string {
         .map((part) => {
             if (part.type === 'text') return part.text;
             if (part.type === 'image_url') return `[image:${part.imageUrl}]`;
+            if (part.type === 'input_audio') return `[audio:${part.filename ?? part.format}]`;
+            if (part.type === 'video_url') {
+                return `[video:${part.filename ?? part.mimeType ?? 'video'}]`;
+            }
             return `[file:${part.filename ?? part.mimeType ?? 'attachment'}]`;
         })
         .join('\n');
@@ -538,15 +667,24 @@ export class AssistantSessionStore {
                 const needle = contentToPlainText(firstExistingUser.content);
                 const approxStart = Math.max(0, uiTurns.length - existingTurns.length - 2);
                 let offset = -1;
+                const matchesTurnUser = (turn: UiTurnGroup): boolean => {
+                    if (!turn.user) {
+                        return false;
+                    }
+                    const turnPlain = contentToPlainText(
+                        buildAssistantUserContent(turn.user.content, turn.user.attachments),
+                    );
+                    return turnPlain === needle || turn.user.content === needle;
+                };
                 for (let i = approxStart; i < uiTurns.length; i += 1) {
-                    if (uiTurns[i].user?.content === needle) {
+                    if (matchesTurnUser(uiTurns[i])) {
                         offset = i;
                         break;
                     }
                 }
                 if (offset < 0) {
                     for (let i = 0; i < approxStart; i += 1) {
-                        if (uiTurns[i].user?.content === needle) {
+                        if (matchesTurnUser(uiTurns[i])) {
                             offset = i;
                             break;
                         }

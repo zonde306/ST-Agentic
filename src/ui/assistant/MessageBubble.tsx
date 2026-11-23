@@ -1,6 +1,11 @@
-import type { TargetedKeyboardEvent } from 'preact';
+import type {
+    TargetedKeyboardEvent,
+    TargetedMouseEvent,
+    TargetedPointerEvent,
+} from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import type {
+    AssistantAttachment,
     AssistantMessage,
     AssistantToolCallRecord,
     PendingApproval,
@@ -9,18 +14,21 @@ import type {
 import { AttachedApprovalCard } from './AttachedApprovalCard';
 import {
     formatAssistantTime,
+    formatFileSize,
     renderRedactedText,
     renderSimpleMarkdown,
 } from './assistant-helpers';
 
 export interface MessageBubbleProps {
     message: AssistantMessage;
+    isMobile?: boolean;
     isStreaming?: boolean;
     isLastMessage?: boolean;
     canRegenerate?: boolean;
     isSessionStreaming?: boolean;
     isEditing?: boolean;
     isSyntheticStreaming?: boolean;
+    actionsOpen?: boolean;
     approvalsById: ReadonlyMap<string, PendingApproval>;
     undoById: ReadonlyMap<string, UndoRecord>;
     busyApprovalId?: string | null;
@@ -33,6 +41,9 @@ export interface MessageBubbleProps {
     onRetryApproval: (approvalId: string, feedback?: string) => void | Promise<void>;
     onApplyUndo: (undoId: string) => void | Promise<void>;
     onPreviewFile: (path: string) => void;
+    onPreviewImage?: (attachment: AssistantAttachment) => void;
+    onToggleActions?: (messageId: string) => void;
+    onCloseActions?: () => void;
     onStartEdit?: (messageId: string) => void;
     onCancelEdit?: () => void;
     onSaveEdit?: (messageId: string, newContent: string) => void | Promise<void>;
@@ -124,12 +135,14 @@ function ToolCallItem({ toolCall, undoRecord, busyUndoId, onApplyUndo }: ToolCal
  */
 export function MessageBubble({
     message,
+    isMobile = false,
     isStreaming = false,
     isLastMessage: _isLastMessage = false,
     canRegenerate = false,
     isSessionStreaming = false,
     isEditing = false,
     isSyntheticStreaming = false,
+    actionsOpen = false,
     approvalsById,
     undoById,
     busyApprovalId = null,
@@ -138,6 +151,9 @@ export function MessageBubble({
     onRetryApproval,
     onApplyUndo,
     onPreviewFile,
+    onPreviewImage,
+    onToggleActions,
+    onCloseActions,
     onStartEdit,
     onCancelEdit,
     onSaveEdit,
@@ -152,7 +168,11 @@ export function MessageBubble({
     const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
     const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const latestContentRef = useRef<string>(message.content);
+    const lastPointerTypeRef = useRef<string>('mouse');
     latestContentRef.current = message.content;
+
+    const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+    const hasAttachments = attachments.length > 0;
 
     useEffect(() => {
         return () => {
@@ -179,8 +199,40 @@ export function MessageBubble({
         }
     }, [isEditing, message.id]);
 
+    const handlePointerDown = (event: TargetedPointerEvent<HTMLDivElement>) => {
+        if (event.pointerType) {
+            lastPointerTypeRef.current = event.pointerType;
+        }
+    };
+
+    const handleBubbleTap = (event: TargetedMouseEvent<HTMLDivElement>) => {
+        const selected = typeof window !== 'undefined' ? window.getSelection()?.toString() : '';
+        if (selected && selected.length > 0) {
+            return;
+        }
+        const target = event.target as HTMLElement | null;
+        if (
+            target
+            && typeof target.closest === 'function'
+            && target.closest('button, a, input, textarea, select, audio, video, [data-approval-id]')
+        ) {
+            return;
+        }
+        if (
+            isMobile
+            || lastPointerTypeRef.current === 'touch'
+            || lastPointerTypeRef.current === 'pen'
+        ) {
+            onToggleActions?.(message.id);
+        }
+    };
+
     const handleCopyClick = async () => {
-        await onCopy?.(message.content);
+        onCloseActions?.();
+        const copyPayload =
+            message.content
+            || (hasAttachments ? attachments.map((att) => `[附件: ${att.name}]`).join('\n') : '');
+        await onCopy?.(copyPayload);
         setCopied(true);
         if (copyTimerRef.current) {
             clearTimeout(copyTimerRef.current);
@@ -201,7 +253,7 @@ export function MessageBubble({
             (event.ctrlKey || event.metaKey)
             && event.key === 'Enter'
             && !event.isComposing
-            && editDraft.trim()
+            && (editDraft.trim().length > 0 || hasAttachments)
             && !isSessionStreaming
         ) {
             event.preventDefault();
@@ -225,6 +277,7 @@ export function MessageBubble({
                 class="ag-ast-msg-row ag-ast-msg-row-user"
                 data-assistant-message={message.id}
                 data-message-role="user"
+                data-actions-open={actionsOpen ? 'true' : 'false'}
             >
                 <div
                     class={
@@ -245,6 +298,11 @@ export function MessageBubble({
                                 onKeyDown={handleEditKeyDown}
                                 onKeyUp={handleEditKeyUp}
                             />
+                            {hasAttachments ? (
+                                <div class="ag-ast-edit-att-hint">
+                                    📎 保留原消息中的 {attachments.length} 个附件
+                                </div>
+                            ) : null}
                             <div class="ag-ast-edit-actions">
                                 <button
                                     type="button"
@@ -258,7 +316,7 @@ export function MessageBubble({
                                     type="button"
                                     class="ag-btn ag-btn-secondary ag-btn-sm"
                                     data-assistant-edit-save={message.id}
-                                    disabled={!editDraft.trim() || isSessionStreaming}
+                                    disabled={(!editDraft.trim() && !hasAttachments) || isSessionStreaming}
                                     onClick={() => void onSaveEdit?.(message.id, editDraft)}
                                 >
                                     仅保存
@@ -267,7 +325,7 @@ export function MessageBubble({
                                     type="button"
                                     class="ag-btn ag-btn-primary ag-btn-sm"
                                     data-assistant-edit-resend={message.id}
-                                    disabled={!editDraft.trim() || isSessionStreaming}
+                                    disabled={(!editDraft.trim() && !hasAttachments) || isSessionStreaming}
                                     onClick={() => void onSaveAndResendEdit?.(message.id, editDraft)}
                                 >
                                     保存并发送
@@ -275,10 +333,116 @@ export function MessageBubble({
                             </div>
                         </div>
                     ) : (
-                        <div class="ag-ast-bubble-user">
-                            <div class="ag-ast-bubble-content" data-assistant-message-content={message.id}>
-                                {renderSimpleMarkdown(message.content)}
-                            </div>
+                        <div
+                            class="ag-ast-bubble-user"
+                            onPointerDown={handlePointerDown}
+                            onClick={handleBubbleTap}
+                        >
+                            {hasAttachments ? (
+                                <div
+                                    class="ag-ast-msg-attachments"
+                                    data-assistant-msg-attachments={message.id}
+                                >
+                                    {attachments.map((att) => {
+                                        if (att.kind === 'image') {
+                                            return (
+                                                <button
+                                                    key={att.id}
+                                                    type="button"
+                                                    class="ag-ast-att-image-btn"
+                                                    title={`预览图片：${att.name}`}
+                                                    aria-label={`预览图片 ${att.name}`}
+                                                    data-assistant-attachment-id={att.id}
+                                                    data-attachment-kind="image"
+                                                    onClick={() => onPreviewImage?.(att)}
+                                                >
+                                                    <img
+                                                        src={att.dataUrl}
+                                                        alt={att.name}
+                                                        class="ag-ast-att-image"
+                                                    />
+                                                </button>
+                                            );
+                                        }
+                                        if (att.kind === 'audio') {
+                                            return (
+                                                <div
+                                                    key={att.id}
+                                                    class="ag-ast-att-media-card"
+                                                    data-assistant-attachment-id={att.id}
+                                                    data-attachment-kind="audio"
+                                                >
+                                                    <div class="ag-ast-att-media-header">
+                                                        <span class="ag-ast-att-media-name">
+                                                            🎵 {att.name}
+                                                        </span>
+                                                        <span>{formatFileSize(att.size)}</span>
+                                                    </div>
+                                                    <audio
+                                                        controls
+                                                        preload="metadata"
+                                                        src={att.dataUrl}
+                                                        class="ag-ast-att-audio"
+                                                    />
+                                                </div>
+                                            );
+                                        }
+                                        if (att.kind === 'video') {
+                                            return (
+                                                <div
+                                                    key={att.id}
+                                                    class="ag-ast-att-media-card"
+                                                    data-assistant-attachment-id={att.id}
+                                                    data-attachment-kind="video"
+                                                >
+                                                    <div class="ag-ast-att-media-header">
+                                                        <span class="ag-ast-att-media-name">
+                                                            🎬 {att.name}
+                                                        </span>
+                                                        <span>{formatFileSize(att.size)}</span>
+                                                    </div>
+                                                    <video
+                                                        controls
+                                                        playsInline
+                                                        preload="metadata"
+                                                        src={att.dataUrl}
+                                                        class="ag-ast-att-video"
+                                                    />
+                                                </div>
+                                            );
+                                        }
+                                        return (
+                                            <div
+                                                key={att.id}
+                                                class="ag-ast-att-file-card"
+                                                data-assistant-attachment-id={att.id}
+                                                data-attachment-kind="file"
+                                            >
+                                                <span aria-hidden="true">📄</span>
+                                                <span class="ag-ast-att-media-name">{att.name}</span>
+                                                <span
+                                                    style={{
+                                                        fontSize: '10px',
+                                                        color: 'var(--muted-foreground)',
+                                                        flexShrink: 0,
+                                                    }}
+                                                >
+                                                    {formatFileSize(att.size)}
+                                                </span>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            ) : null}
+
+                            {message.content ? (
+                                <div
+                                    class="ag-ast-bubble-content"
+                                    data-assistant-message-content={message.id}
+                                >
+                                    {renderSimpleMarkdown(message.content)}
+                                </div>
+                            ) : null}
                         </div>
                     )}
 
@@ -287,51 +451,62 @@ export function MessageBubble({
                             class="ag-ast-msg-actions ag-ast-msg-actions-user"
                             data-assistant-msg-actions={message.id}
                         >
-                            <button
-                                type="button"
-                                class="ag-ast-action-btn"
-                                data-msg-action="copy"
-                                title={copied ? '已复制' : '复制'}
-                                aria-label="复制消息"
-                                onClick={() => void handleCopyClick()}
-                            >
-                                {copied ? '✅' : '📋'}
-                            </button>
-                            <button
-                                type="button"
-                                class="ag-ast-action-btn"
-                                data-msg-action="edit"
-                                title="改写消息"
-                                aria-label="改写消息"
-                                disabled={isSessionStreaming}
-                                onClick={() => onStartEdit?.(message.id)}
-                            >
-                                ✏️
-                            </button>
-                            {canRegenerate ? (
+                            <div class="ag-ast-msg-actions-inner">
                                 <button
                                     type="button"
                                     class="ag-ast-action-btn"
-                                    data-msg-action="regenerate"
-                                    title="重新生成"
-                                    aria-label="重新生成末尾消息"
-                                    disabled={isSessionStreaming}
-                                    onClick={() => void onRegenerate?.()}
+                                    data-msg-action="copy"
+                                    title={copied ? '已复制' : '复制'}
+                                    aria-label="复制消息"
+                                    onClick={() => void handleCopyClick()}
                                 >
-                                    🔄
+                                    {copied ? '✅' : '📋'}
                                 </button>
-                            ) : null}
-                            <button
-                                type="button"
-                                class="ag-ast-action-btn ag-ast-action-btn-danger"
-                                data-msg-action="retract"
-                                title="撤回消息"
-                                aria-label="撤回消息"
-                                disabled={isSessionStreaming}
-                                onClick={() => void onRetract?.(message.id)}
-                            >
-                                ↩️
-                            </button>
+                                <button
+                                    type="button"
+                                    class="ag-ast-action-btn"
+                                    data-msg-action="edit"
+                                    title="改写消息"
+                                    aria-label="改写消息"
+                                    disabled={isSessionStreaming}
+                                    onClick={() => {
+                                        onCloseActions?.();
+                                        onStartEdit?.(message.id);
+                                    }}
+                                >
+                                    ✏️
+                                </button>
+                                {canRegenerate ? (
+                                    <button
+                                        type="button"
+                                        class="ag-ast-action-btn"
+                                        data-msg-action="regenerate"
+                                        title="重新生成"
+                                        aria-label="重新生成末尾消息"
+                                        disabled={isSessionStreaming}
+                                        onClick={() => {
+                                            onCloseActions?.();
+                                            void onRegenerate?.();
+                                        }}
+                                    >
+                                        🔄
+                                    </button>
+                                ) : null}
+                                <button
+                                    type="button"
+                                    class="ag-ast-action-btn ag-ast-action-btn-danger"
+                                    data-msg-action="retract"
+                                    title="撤回消息"
+                                    aria-label="撤回消息"
+                                    disabled={isSessionStreaming}
+                                    onClick={() => {
+                                        onCloseActions?.();
+                                        void onRetract?.(message.id);
+                                    }}
+                                >
+                                    ↩️
+                                </button>
+                            </div>
                         </div>
                     ) : null}
                 </div>
@@ -380,9 +555,14 @@ export function MessageBubble({
             class="ag-ast-msg-row ag-ast-msg-row-assistant"
             data-assistant-message={message.id}
             data-message-role="assistant"
+            data-actions-open={actionsOpen ? 'true' : 'false'}
         >
             <div class="ag-ast-msg-col ag-ast-msg-col-assistant">
-                <div class="ag-ast-bubble-assistant">
+                <div
+                    class="ag-ast-bubble-assistant"
+                    onPointerDown={handlePointerDown}
+                    onClick={handleBubbleTap}
+                >
                     {hasActivity ? (
                         <div class="ag-ast-activity" data-assistant-activity={message.id}>
                             <div class="ag-ast-activity-bar">
@@ -559,51 +739,62 @@ export function MessageBubble({
                         class="ag-ast-msg-actions ag-ast-msg-actions-assistant"
                         data-assistant-msg-actions={message.id}
                     >
-                        <button
-                            type="button"
-                            class="ag-ast-action-btn"
-                            data-msg-action="copy"
-                            title={copied ? '已复制' : '复制'}
-                            aria-label="复制消息"
-                            onClick={() => void handleCopyClick()}
-                        >
-                            {copied ? '✅' : '📋'}
-                        </button>
-                        {canRegenerate ? (
+                        <div class="ag-ast-msg-actions-inner">
                             <button
                                 type="button"
                                 class="ag-ast-action-btn"
-                                data-msg-action="regenerate"
-                                title="重新生成"
-                                aria-label="重新生成末尾消息"
-                                disabled={isSessionStreaming}
-                                onClick={() => void onRegenerate?.()}
+                                data-msg-action="copy"
+                                title={copied ? '已复制' : '复制'}
+                                aria-label="复制消息"
+                                onClick={() => void handleCopyClick()}
                             >
-                                🔄
+                                {copied ? '✅' : '📋'}
                             </button>
-                        ) : null}
-                        <button
-                            type="button"
-                            class="ag-ast-action-btn"
-                            data-msg-action="edit"
-                            title="改写消息"
-                            aria-label="改写消息"
-                            disabled={isSessionStreaming}
-                            onClick={() => onStartEdit?.(message.id)}
-                        >
-                            ✏️
-                        </button>
-                        <button
-                            type="button"
-                            class="ag-ast-action-btn ag-ast-action-btn-danger"
-                            data-msg-action="retract"
-                            title="撤回消息"
-                            aria-label="撤回消息"
-                            disabled={isSessionStreaming}
-                            onClick={() => void onRetract?.(message.id)}
-                        >
-                            ↩️
-                        </button>
+                            {canRegenerate ? (
+                                <button
+                                    type="button"
+                                    class="ag-ast-action-btn"
+                                    data-msg-action="regenerate"
+                                    title="重新生成"
+                                    aria-label="重新生成末尾消息"
+                                    disabled={isSessionStreaming}
+                                    onClick={() => {
+                                        onCloseActions?.();
+                                        void onRegenerate?.();
+                                    }}
+                                >
+                                    🔄
+                                </button>
+                            ) : null}
+                            <button
+                                type="button"
+                                class="ag-ast-action-btn"
+                                data-msg-action="edit"
+                                title="改写消息"
+                                aria-label="改写消息"
+                                disabled={isSessionStreaming}
+                                onClick={() => {
+                                    onCloseActions?.();
+                                    onStartEdit?.(message.id);
+                                }}
+                            >
+                                ✏️
+                            </button>
+                            <button
+                                type="button"
+                                class="ag-ast-action-btn ag-ast-action-btn-danger"
+                                data-msg-action="retract"
+                                title="撤回消息"
+                                aria-label="撤回消息"
+                                disabled={isSessionStreaming}
+                                onClick={() => {
+                                    onCloseActions?.();
+                                    void onRetract?.(message.id);
+                                }}
+                            >
+                                ↩️
+                            </button>
+                        </div>
                     </div>
                 ) : null}
             </div>

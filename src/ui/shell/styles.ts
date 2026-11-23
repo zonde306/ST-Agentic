@@ -1627,7 +1627,7 @@ select {
     min-width: 0;
     overflow-y: auto;
     overflow-x: hidden;
-    padding: 14px;
+    padding: 14px 14px 38px;
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -1648,6 +1648,7 @@ select {
 }
 
 .ag-ast-msg-col {
+    position: relative;
     display: flex;
     flex-direction: column;
     min-width: 0;
@@ -1679,6 +1680,9 @@ select {
     font-size: 13px;
     line-height: 1.55;
     word-break: break-word;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
 }
 
 .ag-ast-bubble-assistant {
@@ -1697,39 +1701,66 @@ select {
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
 }
 
-/* DeepSeek-style Below-Message Action Bar & Inline Rewrite Editor */
+/* DeepSeek-style Hover/Tap Below-Message Action Bar & Inline Rewrite Editor */
 .ag-ast-msg-actions {
-    display: flex;
-    flex-wrap: wrap;
+    display: none;
+    position: absolute;
+    top: 100%;
+    z-index: 8;
+    padding-top: 3px;
     align-items: center;
-    gap: 2px;
-    margin-top: 2px;
     max-width: 100%;
 }
 
 .ag-ast-msg-actions-user {
+    right: 0;
     justify-content: flex-end;
 }
 
 .ag-ast-msg-actions-assistant {
+    left: 0;
     justify-content: flex-start;
+}
+
+.ag-ast-msg-actions-inner {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 2px;
+    border-radius: 8px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.16);
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .ag-ast-msg-row:hover .ag-ast-msg-actions {
+        display: flex;
+    }
+}
+
+.ag-ast-msg-row:focus-within .ag-ast-msg-actions,
+.ag-ast-msg-row[data-actions-open="true"] .ag-ast-msg-actions {
+    display: flex;
 }
 
 .ag-ast-action-btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    min-width: 40px;
-    min-height: 40px;
-    padding: 0 8px;
-    border-radius: 8px;
+    width: 28px;
+    height: 28px;
+    min-width: 28px;
+    min-height: 28px;
+    padding: 0;
+    border-radius: 6px;
     border: 1px solid transparent;
     background: transparent;
     color: var(--muted-foreground);
-    font-size: 15px;
+    font-size: 13px;
     line-height: 1;
     cursor: pointer;
-    opacity: 0.78;
+    opacity: 0.84;
     transition: background-color 0.15s, color 0.15s, opacity 0.15s, border-color 0.15s;
 }
 
@@ -1749,6 +1780,103 @@ select {
 .ag-ast-action-btn:disabled {
     opacity: 0.35;
     cursor: not-allowed;
+}
+
+/* Multimodal Attachments inside User Bubbles */
+.ag-ast-msg-attachments {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.ag-ast-att-image-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 40px;
+    min-height: 40px;
+    max-width: 100%;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--content);
+    overflow: hidden;
+    cursor: pointer;
+    align-self: flex-start;
+}
+
+.ag-ast-att-image {
+    display: block;
+    max-width: min(260px, 100%);
+    max-height: 200px;
+    object-fit: cover;
+}
+
+.ag-ast-att-media-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    min-width: 0;
+    max-width: 100%;
+}
+
+.ag-ast-att-media-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--muted-foreground);
+    min-width: 0;
+}
+
+.ag-ast-att-media-name {
+    font-weight: 600;
+    color: var(--foreground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+
+.ag-ast-att-audio {
+    width: 100%;
+    max-width: 100%;
+    height: 36px;
+}
+
+.ag-ast-att-video {
+    width: 100%;
+    max-width: 100%;
+    max-height: 220px;
+    border-radius: 8px;
+    background: #000000;
+    display: block;
+}
+
+.ag-ast-att-file-card {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    font-size: 12px;
+    color: var(--foreground);
+    max-width: 100%;
+    min-width: 0;
+}
+
+.ag-ast-edit-att-hint {
+    font-size: 11px;
+    color: var(--muted-foreground);
 }
 
 .ag-ast-edit-box {
@@ -2172,6 +2300,142 @@ select {
 
 .ag-ast-composer-box:focus-within {
     border-color: var(--primary);
+}
+
+.ag-ast-composer-box-dragover {
+    border-style: dashed;
+    border-color: var(--primary);
+    background: color-mix(in srgb, var(--primary) 10%, var(--content));
+}
+
+.ag-ast-drop-hint {
+    padding: 6px 10px;
+    border-radius: 10px;
+    border: 1px dashed color-mix(in srgb, var(--primary) 55%, transparent);
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    color: var(--primary);
+    font-size: 12px;
+    font-weight: 600;
+    text-align: center;
+}
+
+.ag-ast-pending-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding-bottom: 4px;
+    max-width: 100%;
+}
+
+.ag-ast-pending-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 4px 4px 6px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    max-width: min(260px, 100%);
+    min-width: 0;
+}
+
+.ag-ast-pending-thumb {
+    width: 40px;
+    height: 40px;
+    border-radius: 6px;
+    object-fit: cover;
+    flex-shrink: 0;
+}
+
+.ag-ast-pending-icon {
+    width: 40px;
+    height: 40px;
+    border-radius: 6px;
+    background: var(--content);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    flex-shrink: 0;
+}
+
+.ag-ast-pending-meta {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.ag-ast-pending-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--foreground);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.ag-ast-pending-size {
+    font-size: 10px;
+    color: var(--muted-foreground);
+}
+
+.ag-ast-pending-remove {
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--muted-foreground);
+    font-size: 13px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.ag-ast-pending-remove:hover {
+    background: color-mix(in srgb, var(--error) 14%, transparent);
+    color: var(--error);
+}
+
+.ag-ast-composer-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.ag-ast-upload-btn {
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0;
+    flex-shrink: 0;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--foreground);
+    font-size: 16px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background-color 0.15s, border-color 0.15s;
+}
+
+.ag-ast-upload-btn:hover:not(:disabled) {
+    background: var(--secondary);
+    border-color: var(--primary);
+}
+
+.ag-ast-upload-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
 }
 
 .ag-ast-composer-input {
@@ -2853,6 +3117,25 @@ select {
     .ag-ast-msg-col-user.ag-ast-msg-col-editing {
         width: 100%;
         max-width: 100%;
+    }
+
+    .ag-ast-msg-actions {
+        position: static;
+        padding-top: 4px;
+        flex-wrap: wrap;
+    }
+
+    .ag-ast-msg-actions-inner {
+        flex-wrap: wrap;
+    }
+
+    .ag-ast-action-btn {
+        width: auto;
+        height: auto;
+        min-width: 40px;
+        min-height: 40px;
+        padding: 0 8px;
+        font-size: 15px;
     }
 
     .ag-ast-composer-wrap {

@@ -103,6 +103,12 @@ function contentToText(content: string | CanonicalContentPart[]): string {
             if (part.type === 'image_url') {
                 return `[image:${part.imageUrl}]`;
             }
+            if (part.type === 'input_audio') {
+                return `[audio:${part.filename ?? part.format}]`;
+            }
+            if (part.type === 'video_url') {
+                return `[video:${part.filename ?? part.mimeType ?? 'video'}]`;
+            }
             return `[file:${part.filename ?? part.mimeType ?? 'attachment'}]`;
         })
         .join('\n');

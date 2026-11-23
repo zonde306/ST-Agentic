@@ -1,7 +1,8 @@
 import { render } from 'preact';
 import { type Mock, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { page } from 'vitest/browser';
+import { page, userEvent } from 'vitest/browser';
 import type {
+    AssistantAttachment,
     AssistantMessage,
     AssistantSession,
     PendingApproval,
@@ -177,6 +178,7 @@ interface MockAssistantController {
     applyUndoSpy: Mock<(...args: unknown[]) => void>;
     nextSendDeferred: Deferred<AssistantMessage | void> | null;
     lastSendOptions: {
+        attachments?: AssistantAttachment[];
         onDelta?: (delta: string) => void;
         onUpdate?: (session: AssistantSession) => void;
         signal?: AbortSignal;
@@ -323,6 +325,9 @@ function createMockAssistantRuntime(options: {
                     id: `user_${Date.now()}_${target.messages.length}`,
                     role: 'user',
                     content: prompt,
+                    ...(sendOpts?.attachments?.length
+                        ? { attachments: structuredClone(sendOpts.attachments) }
+                        : {}),
                     timestamp: Date.now(),
                 });
                 sendOpts?.onUpdate?.(structuredClone(target));
@@ -661,22 +666,27 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
         expect(composerWrap.textContent).not.toContain('附加当前聊天');
         expect(assistantRoot.querySelector('[data-shortcut-bar], [data-attach-context], .ag-ast-shortcuts, .ag-ast-attach-chips')).toBeNull();
 
-        // Composer bar contains strictly: mode button, model button, and send/stop button.
+        // Composer bar contains strictly: mode button, model button, upload button, and send/stop button.
         const composerBarButtons = Array.from(
             composerWrap.querySelectorAll('.ag-ast-composer-bar button'),
         );
-        expect(composerBarButtons.length).toBe(3);
+        expect(composerBarButtons.length).toBe(4);
 
         const modeBtn = composerWrap.querySelector('[data-assistant-mode-btn="true"]') as HTMLButtonElement;
         const modelBtn = composerWrap.querySelector('[data-assistant-model-btn="true"]') as HTMLButtonElement;
+        const uploadBtn = composerWrap.querySelector('[data-assistant-upload-btn="true"]') as HTMLButtonElement;
         const sendBtn = composerWrap.querySelector('[data-assistant-send-btn="true"]') as HTMLButtonElement;
         const draftInput = composerWrap.querySelector('textarea[data-assistant-draft-input="true"]') as HTMLTextAreaElement;
 
         expect(modeBtn).toBeTruthy();
         expect(modelBtn).toBeTruthy();
+        expect(uploadBtn).toBeTruthy();
         expect(sendBtn).toBeTruthy();
         expect(draftInput).toBeTruthy();
         expect(sendBtn.textContent?.trim()).toBe('▶');
+        const uploadRect = uploadBtn.getBoundingClientRect();
+        expect(Math.round(uploadRect.width)).toBe(40);
+        expect(Math.round(uploadRect.height)).toBe(40);
 
         // Compact 40x40px send button & >=16px textarea
         const sendRect = sendBtn.getBoundingClientRect();
@@ -1132,7 +1142,7 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
         expect(toolCard.textContent).not.toContain('sk-proj-');
     });
 
-    it('renders DeepSeek-style emoji action bar below messages, supports inline edit/save/resend & Escape guard across desktop and mobile', async () => {
+    it('renders compact hover/tap-only message action bar below messages, supports inline edit/save/resend & Escape guard across desktop and mobile', async () => {
         for (const vp of [
             { label: 'desktop', width: 1280, height: 800, isMobile: false },
             { label: 'mobile', width: 390, height: 844, isMobile: true },
@@ -1145,6 +1155,12 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
 
             const { dialog, shadowRoot } = getShellElements();
 
+            const msg1Row = shadowRoot.querySelector(
+                '[data-assistant-message="ast_msg_1"]',
+            ) as HTMLDivElement;
+            const msg2Row = shadowRoot.querySelector(
+                '[data-assistant-message="ast_msg_2"]',
+            ) as HTMLDivElement;
             const msg1Actions = shadowRoot.querySelector(
                 '[data-assistant-msg-actions="ast_msg_1"]',
             ) as HTMLDivElement;
@@ -1153,6 +1169,10 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
             ) as HTMLDivElement;
             expect(msg1Actions, `${vp.label}: expected user action bar`).toBeTruthy();
             expect(msg2Actions, `${vp.label}: expected assistant action bar`).toBeTruthy();
+
+            // Hidden by default when idle (zero wasted space)
+            expect(window.getComputedStyle(msg1Actions).display).toBe('none');
+            expect(window.getComputedStyle(msg2Actions).display).toBe('none');
 
             // Regenerate button (🔄) ONLY renders on the last message (ast_msg_2), NOT on ast_msg_1
             expect(msg1Actions.querySelector('[data-msg-action="copy"]')?.textContent?.trim()).toBe('📋');
@@ -1165,8 +1185,28 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
             expect(msg2Actions.querySelector('[data-msg-action="edit"]')?.textContent?.trim()).toBe('✏️');
             expect(msg2Actions.querySelector('[data-msg-action="retract"]')?.textContent?.trim()).toBe('↩️');
 
-            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:msg-actions`);
-            assertTouchTargetsAndTypography(shadowRoot, `${vp.label}:msg-actions`);
+            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:msg-actions-idle`);
+            assertTouchTargetsAndTypography(shadowRoot, `${vp.label}:msg-actions-idle`);
+
+            if (vp.isMobile) {
+                // Tap assistant bubble on mobile -> opens action bar with >= 40x40px touch targets
+                (msg2Row.querySelector('.ag-ast-bubble-assistant') as HTMLDivElement).click();
+                await settleLayout(3);
+                expect(msg2Row.getAttribute('data-actions-open')).toBe('true');
+                expect(window.getComputedStyle(msg2Actions).display).toBe('flex');
+                assertTouchTargetsAndTypography(shadowRoot, 'mobile:msg-actions-open');
+            } else {
+                // Hover message row on desktop -> reveals sleek 28x28px floating action bar
+                const msg2Bubble = msg2Row.querySelector('.ag-ast-bubble-assistant') as HTMLDivElement;
+                await userEvent.hover(msg2Bubble);
+                await settleLayout(3);
+                expect(window.getComputedStyle(msg2Actions).display).toBe('flex');
+                const editRect = (
+                    msg2Actions.querySelector('[data-msg-action="edit"]') as HTMLButtonElement
+                ).getBoundingClientRect();
+                expect(Math.round(editRect.width)).toBe(28);
+                expect(Math.round(editRect.height)).toBe(28);
+            }
 
             // Click ✏️ on assistant message ast_msg_2 -> verify >=16px textarea & Escape cancels without closing dialog
             (msg2Actions.querySelector('[data-msg-action="edit"]') as HTMLButtonElement).click();
@@ -1188,6 +1228,13 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
             expect(shadowRoot.querySelector('[data-assistant-edit-box="ast_msg_2"]')).toBeNull();
 
             // Edit assistant message and click 保存改写
+            if (vp.isMobile) {
+                (msg2Row.querySelector('.ag-ast-bubble-assistant') as HTMLDivElement).click();
+                await settleLayout(2);
+            } else {
+                await userEvent.hover(msg2Row.querySelector('.ag-ast-bubble-assistant') as HTMLDivElement);
+                await settleLayout(2);
+            }
             (shadowRoot.querySelector(
                 '[data-assistant-msg-actions="ast_msg_2"] [data-msg-action="edit"]',
             ) as HTMLButtonElement).click();
@@ -1210,6 +1257,13 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
             ).toContain('已手动改写后的助手分析内容');
 
             // Edit user message ast_msg_1 -> verify 仅保存 & 保存并发送 buttons, and trigger 保存并发送 with streaming ■
+            if (vp.isMobile) {
+                (msg1Row.querySelector('.ag-ast-bubble-user') as HTMLDivElement).click();
+                await settleLayout(2);
+            } else {
+                await userEvent.hover(msg1Row.querySelector('.ag-ast-bubble-user') as HTMLDivElement);
+                await settleLayout(2);
+            }
             (shadowRoot.querySelector(
                 '[data-assistant-msg-actions="ast_msg_1"] [data-msg-action="edit"]',
             ) as HTMLButtonElement).click();
@@ -1247,6 +1301,23 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
             await settleLayout(5);
             expect(shadowRoot.querySelector('[data-assistant-send-btn="true"]')).toBeTruthy();
             expect(shadowRoot.textContent).toContain('改写后重发完成的响应');
+
+            if (!vp.isMobile) {
+                // Move pointer to bottom-right send button so :hover hides action bars & stays clear of message thread in mobile/later tests.
+                const sendBtnAfter = shadowRoot.querySelector(
+                    '[data-assistant-send-btn="true"]',
+                ) as HTMLElement | null;
+                if (sendBtnAfter) {
+                    await userEvent.hover(sendBtnAfter);
+                    await settleLayout(2);
+                    const remainingActionBars = Array.from(
+                        shadowRoot.querySelectorAll('.ag-ast-msg-actions'),
+                    );
+                    for (const bar of remainingActionBars) {
+                        expect(window.getComputedStyle(bar).display).toBe('none');
+                    }
+                }
+            }
 
             activeHarness.cleanup();
             activeHarness = null;
@@ -1373,5 +1444,118 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
             'ast_msg_1',
         );
         expect(shadowRoot.querySelectorAll('[data-assistant-message]').length).toBe(0);
+    });
+
+    it('supports file picker and drag-and-drop multimodal uploads (image, audio, video) across desktop and mobile', async () => {
+        for (const vp of [
+            { label: 'desktop', width: 1280, height: 800, isMobile: false },
+            { label: 'mobile', width: 390, height: 844, isMobile: true },
+        ]) {
+            await page.viewport(vp.width, vp.height);
+            activeHarness = mountAssistantHarness({
+                initialMobileAssistantStack: vp.isMobile ? 'detail' : 'list',
+            });
+            await settleLayout(5);
+
+            const { dialog, shadowRoot } = getShellElements();
+            const assistantRoot = shadowRoot.querySelector('[data-view-id="assistant"]') as HTMLDivElement;
+            const fileInput = shadowRoot.querySelector(
+                'input[data-assistant-file-input="true"]',
+            ) as HTMLInputElement;
+            expect(fileInput).toBeTruthy();
+
+            // 1. File picker upload: 1 PNG image + 1 WAV audio
+            const pngBytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+            const imageFile = new File([pngBytes], 'cover.png', { type: 'image/png' });
+            const audioFile = new File(['RIFF'], 'voice.wav', { type: 'audio/wav' });
+            const dtPicker = new DataTransfer();
+            dtPicker.items.add(imageFile);
+            dtPicker.items.add(audioFile);
+            Object.defineProperty(fileInput, 'files', {
+                configurable: true,
+                value: dtPicker.files,
+            });
+            fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+            await settleLayout(6);
+
+            const pendingStrip = shadowRoot.querySelector(
+                '[data-assistant-pending-attachments="true"]',
+            ) as HTMLDivElement;
+            expect(pendingStrip, `${vp.label}: expected pending attachments strip`).toBeTruthy();
+            expect(pendingStrip.querySelectorAll('[data-pending-attachment]').length).toBe(2);
+            expect(pendingStrip.querySelector('[data-attachment-kind="image"] img')).toBeTruthy();
+            expect(pendingStrip.querySelector('[data-attachment-kind="audio"]')).toBeTruthy();
+
+            // Remove audio attachment via 40x40 remove button
+            const audioChipRemoveBtn = pendingStrip.querySelector(
+                '[data-attachment-kind="audio"] button[data-remove-attachment]',
+            ) as HTMLButtonElement;
+            expect(audioChipRemoveBtn).toBeTruthy();
+            audioChipRemoveBtn.click();
+            await settleLayout(3);
+            expect(pendingStrip.querySelectorAll('[data-pending-attachment]').length).toBe(1);
+
+            // 2. Drag-and-drop upload: MP4 video + audio file
+            const videoFile = new File(['ftypmp42'], 'scene.mp4', { type: 'video/mp4' });
+            const dtDrop = new DataTransfer();
+            dtDrop.items.add(videoFile);
+            dtDrop.items.add(new File(['ID3'], 'bgm.mp3', { type: 'audio/mpeg' }));
+
+            assistantRoot.dispatchEvent(
+                new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dtDrop }),
+            );
+            await settleLayout(2);
+            expect(assistantRoot.getAttribute('data-drag-over')).toBe('true');
+            expect(shadowRoot.querySelector('[data-assistant-drop-hint="true"]')).toBeTruthy();
+
+            assistantRoot.dispatchEvent(
+                new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dtDrop }),
+            );
+            assistantRoot.dispatchEvent(
+                new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dtDrop }),
+            );
+            await settleLayout(6);
+
+            expect(assistantRoot.getAttribute('data-drag-over')).toBe('false');
+            const chipsAfterDrop = shadowRoot.querySelectorAll('[data-pending-attachment]');
+            expect(chipsAfterDrop.length).toBe(3);
+
+            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:pending-attachments`);
+            assertTouchTargetsAndTypography(shadowRoot, `${vp.label}:pending-attachments`);
+
+            // 3. Send media-only (empty text) -> clears pending chips, passes attachments to sendPrompt, renders img/audio/video inside bubble
+            (shadowRoot.querySelector('[data-assistant-send-btn="true"]') as HTMLButtonElement).click();
+            await settleLayout(6);
+
+            expect(shadowRoot.querySelector('[data-assistant-pending-attachments="true"]')).toBeNull();
+            expect(activeHarness.runtime.sendPromptSpy).toHaveBeenCalledTimes(1);
+            expect(activeHarness.runtime.lastSendOptions?.attachments).toHaveLength(3);
+
+            const renderedBubbleAttachments = shadowRoot.querySelector(
+                '[data-assistant-msg-attachments]',
+            ) as HTMLDivElement;
+            expect(renderedBubbleAttachments).toBeTruthy();
+            expect(renderedBubbleAttachments.querySelector('img.ag-ast-att-image')).toBeTruthy();
+            expect(renderedBubbleAttachments.querySelector('audio.ag-ast-att-audio')).toBeTruthy();
+            expect(renderedBubbleAttachments.querySelector('video.ag-ast-att-video')).toBeTruthy();
+
+            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:rendered-attachments`);
+            assertTouchTargetsAndTypography(shadowRoot, `${vp.label}:rendered-attachments`);
+
+            // 4. Click rendered image thumbnail -> opens Shadow DOM lightbox preview modal
+            const imgBtn = renderedBubbleAttachments.querySelector(
+                'button.ag-ast-att-image-btn',
+            ) as HTMLButtonElement;
+            imgBtn.click();
+            await settleLayout(4);
+            const previewModalImg = shadowRoot.querySelector(
+                '[data-assistant-image-preview="true"] img',
+            ) as HTMLImageElement;
+            expect(previewModalImg).toBeTruthy();
+            expect(previewModalImg.getAttribute('alt')).toBe('cover.png');
+
+            activeHarness.cleanup();
+            activeHarness = null;
+        }
     });
 });

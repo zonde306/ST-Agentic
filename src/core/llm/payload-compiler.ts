@@ -455,6 +455,14 @@ function selectBreakpointIndices(
     return [candidates[0], ...candidates.slice(-(maxBreakpoints - 1))];
 }
 
+function stripDataUrlPrefix(value: string): string {
+    if (!value.startsWith('data:')) {
+        return value;
+    }
+    const commaIdx = value.indexOf(',');
+    return commaIdx >= 0 ? value.slice(commaIdx + 1) : value;
+}
+
 function convertPartToOpenAI(part: CanonicalContentPart): Record<string, unknown> {
     if (part.type === 'text') {
         return { type: 'text', text: part.text };
@@ -465,6 +473,23 @@ function convertPartToOpenAI(part: CanonicalContentPart): Record<string, unknown
             image_url: {
                 url: part.imageUrl,
                 ...(part.detail !== undefined ? { detail: part.detail } : {}),
+            },
+        };
+    }
+    if (part.type === 'input_audio') {
+        return {
+            type: 'input_audio',
+            input_audio: {
+                data: stripDataUrlPrefix(part.data),
+                format: part.format || 'mp3',
+            },
+        };
+    }
+    if (part.type === 'video_url') {
+        return {
+            type: 'video_url',
+            video_url: {
+                url: part.videoUrl,
             },
         };
     }
@@ -502,12 +527,15 @@ function attachCacheControlToOpenAIMessage(msg: Record<string, unknown>): boolea
     return true;
 }
 
-function parseAnthropicImageSource(imageUrl: string): Record<string, unknown> {
-    if (imageUrl.startsWith('data:')) {
-        const commaIdx = imageUrl.indexOf(',');
-        const meta = commaIdx >= 0 ? imageUrl.slice(5, commaIdx) : '';
-        const data = commaIdx >= 0 ? imageUrl.slice(commaIdx + 1) : '';
-        const mimeType = meta.split(';')[0] || 'image/png';
+function parseAnthropicMediaSource(
+    mediaUrl: string,
+    fallbackMimeType: string,
+): Record<string, unknown> {
+    if (mediaUrl.startsWith('data:')) {
+        const commaIdx = mediaUrl.indexOf(',');
+        const meta = commaIdx >= 0 ? mediaUrl.slice(5, commaIdx) : '';
+        const data = commaIdx >= 0 ? mediaUrl.slice(commaIdx + 1) : '';
+        const mimeType = meta.split(';')[0] || fallbackMimeType;
         return {
             type: 'base64',
             media_type: mimeType,
@@ -516,7 +544,7 @@ function parseAnthropicImageSource(imageUrl: string): Record<string, unknown> {
     }
     return {
         type: 'url',
-        url: imageUrl,
+        url: mediaUrl,
     };
 }
 
@@ -527,7 +555,23 @@ function convertPartToAnthropic(part: CanonicalContentPart): Record<string, unkn
     if (part.type === 'image_url') {
         return {
             type: 'image',
-            source: parseAnthropicImageSource(part.imageUrl),
+            source: parseAnthropicMediaSource(part.imageUrl, 'image/png'),
+        };
+    }
+    if (part.type === 'input_audio') {
+        return {
+            type: 'document',
+            source: {
+                type: 'base64',
+                media_type: part.mimeType ?? `audio/${part.format || 'mpeg'}`,
+                data: stripDataUrlPrefix(part.data),
+            },
+        };
+    }
+    if (part.type === 'video_url') {
+        return {
+            type: 'document',
+            source: parseAnthropicMediaSource(part.videoUrl, part.mimeType ?? 'video/mp4'),
         };
     }
     return {
@@ -535,7 +579,7 @@ function convertPartToAnthropic(part: CanonicalContentPart): Record<string, unkn
         source: {
             type: 'base64',
             media_type: part.mimeType ?? 'application/pdf',
-            data: part.data,
+            data: stripDataUrlPrefix(part.data),
         },
     };
 }
