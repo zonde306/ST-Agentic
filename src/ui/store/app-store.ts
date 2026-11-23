@@ -68,6 +68,7 @@ export interface AssistantRuntimeBridge {
         connectionId?: string;
         stAdminEnabled?: boolean;
         autoApproveAuthor?: boolean;
+        autoApproveChatDelete?: boolean;
     }): Promise<AssistantSession>;
     deleteSession?(sessionId: string): Promise<boolean>;
     updateSessionConfig?(
@@ -75,7 +76,12 @@ export interface AssistantRuntimeBridge {
         patch: Partial<
             Pick<
                 AssistantSession,
-                'title' | 'mode' | 'stAdminEnabled' | 'autoApproveAuthor' | 'connectionId'
+                | 'title'
+                | 'mode'
+                | 'stAdminEnabled'
+                | 'autoApproveAuthor'
+                | 'autoApproveChatDelete'
+                | 'connectionId'
             >
         >,
     ): Promise<AssistantSession | null>;

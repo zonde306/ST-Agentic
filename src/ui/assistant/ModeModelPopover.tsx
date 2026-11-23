@@ -15,6 +15,7 @@ export interface ModeModelPopoverProps {
     currentConnectionId: string;
     onSelectMode: (mode: AssistantMode) => void;
     onToggleAutoApproveAuthor: (checked: boolean) => void;
+    onToggleAutoApproveChatDelete?: (checked: boolean) => void;
     onRequestToggleStAdmin: () => void;
     onSelectConnection: (connectionId: string) => void;
     onClose: () => void;
@@ -30,6 +31,7 @@ export function ModeModelPopover({
     currentConnectionId,
     onSelectMode,
     onToggleAutoApproveAuthor,
+    onToggleAutoApproveChatDelete,
     onRequestToggleStAdmin,
     onSelectConnection,
     onClose,
@@ -40,6 +42,7 @@ export function ModeModelPopover({
 
     if (kind === 'mode') {
         const scopePills = getEffectiveModePills(session);
+        const showAutoApproveChatDelete = session.mode === 'adjust';
         const showAutoApprove = session.mode === 'author' || session.mode === 'full';
         const showStAdmin = session.mode === 'full';
 
@@ -114,6 +117,35 @@ export function ModeModelPopover({
                     })}
                 </div>
 
+                {showAutoApproveChatDelete ? (
+                    <label
+                        class="ag-ast-popover-checkbox-row"
+                        data-assistant-auto-approve-chat-delete-row="true"
+                    >
+                        <div class="ag-min-w-0">
+                            <div style={{ fontWeight: 600, fontSize: '12px' }}>
+                                本会话自动批准删除消息
+                            </div>
+                            <div style={{ fontSize: '10px', color: 'var(--muted-foreground)' }}>
+                                未勾选时删除消息需气泡确认；均保留快照可撤销
+                            </div>
+                        </div>
+                        <input
+                            type="checkbox"
+                            data-assistant-auto-approve-chat-delete-checkbox="true"
+                            checked={Boolean(session.autoApproveChatDelete)}
+                            onChange={(e) => onToggleAutoApproveChatDelete?.(e.currentTarget.checked)}
+                            style={{
+                                width: '18px',
+                                height: '18px',
+                                flexShrink: 0,
+                                accentColor: 'var(--primary)',
+                                cursor: 'pointer',
+                            }}
+                        />
+                    </label>
+                ) : null}
+
                 {showAutoApprove ? (
                     <label
                         class="ag-ast-popover-checkbox-row"
@@ -124,7 +156,7 @@ export function ModeModelPopover({
                                 本会话自动批准写卡
                             </div>
                             <div style={{ fontSize: '10px', color: 'var(--muted-foreground)' }}>
-                                常规写卡直接落盘；高危仍强制确认
+                                常规写卡/删消息直接执行；永久删除与高危仍强制确认
                             </div>
                         </div>
                         <input

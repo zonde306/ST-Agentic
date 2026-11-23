@@ -721,4 +721,107 @@ describe('AssistantRunner & AssistantSessionStore (TS2.1)', () => {
             { type: 'image_url', imageUrl: 'data:image/png;base64,iVBORw0KGgo=' },
         ]);
     });
+
+    it('supports chat_create_message and chat_delete_message in adjust mode with autoApproveChatDelete toggle, inline confirmation, and full undo', async () => {
+        const { bridge, runner } = createRunnerHarness([
+            // Turn 1: adjust mode directly executes chat_create_message
+            {
+                toolCalls: [
+                    {
+                        id: 'call_create_1',
+                        name: 'chat_create_message',
+                        arguments: JSON.stringify({
+                            role: 'assistant',
+                            content: '新插入的码头线索消息',
+                        }),
+                    },
+                ],
+            },
+            {
+                content: '已在对话末尾创建新消息 #2。',
+            },
+            // Turn 2: autoApproveChatDelete=false -> chat_delete_message suspends for inline bubble confirmation
+            {
+                content: '我将删除第 1 楼消息，请先确认。',
+                toolCalls: [
+                    {
+                        id: 'call_delete_pending',
+                        name: 'chat_delete_message',
+                        arguments: JSON.stringify({
+                            messageId: 1,
+                        }),
+                    },
+                ],
+            },
+            // Turn 3: after toggling autoApproveChatDelete=true -> chat_delete_message executes directly
+            {
+                toolCalls: [
+                    {
+                        id: 'call_delete_auto',
+                        name: 'chat_delete_message',
+                        arguments: JSON.stringify({
+                            messageId: 1,
+                        }),
+                    },
+                ],
+            },
+            {
+                content: '已自动批准并删除消息 #1。',
+            },
+        ]);
+
+        const session = await runner.createSession({
+            title: '调整模式增删消息测试',
+            mode: 'adjust',
+            autoApproveChatDelete: false,
+        });
+
+        // 1. chat_create_message executes directly in adjust mode
+        const createBubble = await runner.sendPrompt(session.id, '帮我在末尾加一条回复');
+        expect(createBubble.approvalIds).toBeUndefined();
+        expect(bridge.chat).toHaveLength(3);
+        expect(bridge.chat[2].mes).toBe('新插入的码头线索消息');
+        const createUndoId = createBubble.toolCalls![0].undoId!;
+        expect(createUndoId).toBeTruthy();
+
+        // Undo removes newly created message, then re-create for deletion test
+        await runner.undo(createUndoId);
+        expect(bridge.chat).toHaveLength(2);
+
+        // 2. chat_delete_message suspends when autoApproveChatDelete === false
+        const beforeDeleteContent = bridge.chat[1].mes;
+        const deleteBubble = await runner.sendPrompt(session.id, '帮我删掉第 1 条消息');
+        expect(deleteBubble.approvalIds).toHaveLength(1);
+        const approvalId = deleteBubble.approvalIds![0];
+        const pending = runner.getApproval(approvalId)!;
+        expect(pending.status).toBe('pending');
+        expect(pending.mandatoryConfirm).toBe(false);
+        expect(pending.riskLevel).toBe('medium');
+        expect(pending.diffLines.some((l) => l.type === 'del')).toBe(true);
+        // Message MUST NOT be deleted before approval
+        expect(bridge.chat).toHaveLength(2);
+
+        // Approve -> deletes message and attaches undoId
+        const approved = await runner.decideApproval(approvalId, 'approve');
+        expect(approved?.status).toBe('approved');
+        expect(approved?.undoId).toBeDefined();
+        expect(bridge.chat).toHaveLength(1);
+
+        // Undo restores deleted message
+        await runner.undo(approved!.undoId!);
+        expect(bridge.chat).toHaveLength(2);
+        expect(bridge.chat[1].mes).toBe(beforeDeleteContent);
+
+        // 3. Toggle autoApproveChatDelete ON -> deletes directly without approval card
+        await runner.updateSessionConfig(session.id, { autoApproveChatDelete: true });
+        const autoDeleteBubble = await runner.sendPrompt(session.id, '直接删除第 1 条消息');
+        expect(autoDeleteBubble.approvalIds).toBeUndefined();
+        expect(autoDeleteBubble.toolCalls![0].status).toBe('ok');
+        expect(bridge.chat).toHaveLength(1);
+
+        const autoUndoId = autoDeleteBubble.toolCalls![0].undoId!;
+        await runner.undo(autoUndoId);
+        expect(bridge.chat).toHaveLength(2);
+        expect(bridge.chat[1].mes).toBe(beforeDeleteContent);
+    });
 });

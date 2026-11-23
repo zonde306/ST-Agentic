@@ -2089,6 +2089,12 @@ jQuery(async () => {
             syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
             scheduleSideGenUiRefresh();
         });
+        if (event_types.MESSAGE_SENT) {
+            eventSource.on(event_types.MESSAGE_SENT, (messageId: unknown) => {
+                syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
+                scheduleSideGenUiRefresh();
+            });
+        }
         eventSource.on(event_types.MESSAGE_UPDATED, (messageId: unknown) => {
             syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
             scheduleSideGenUiRefresh();

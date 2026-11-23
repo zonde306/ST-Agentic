@@ -247,20 +247,52 @@ describe('policy.ts — 4-Mode Permission Matrix & Mandatory Confirm', () => {
         }
     });
 
-    it('allows current-chat writes in adjust mode with strict VFS path scoping and no diff approval', () => {
+    it('allows current-chat writes in adjust mode with strict VFS path scoping and opt-in chat delete approval', () => {
         const allowedList = getAllowedToolsForMode('adjust', false);
         expect(allowedList).toEqual([...CHAT_READONLY_TOOLS, ...ADJUST_WRITE_TOOLS]);
 
         for (const tool of ADJUST_WRITE_TOOLS) {
             const args = ['write_file', 'append_file', 'edit_file'].includes(tool)
                 ? { path: '/workspace/notes.md' }
-                : { messageId: 1 };
+                : tool === 'chat_create_message'
+                  ? { role: 'assistant', content: '新增对白' }
+                  : { messageId: 1 };
             const res = evaluateToolPolicy(tool, args, { mode: 'adjust' });
             expect(res.allowed, `adjust should allow ${tool}`).toBe(true);
             expect(res.mutating).toBe(true);
-            expect(res.requiresApproval).toBe(false);
             expect(res.mandatoryConfirm).toBe(false);
+            if (tool === 'chat_delete_message') {
+                expect(res.requiresApproval).toBe(true);
+                expect(res.baseRequiresApproval).toBe(true);
+                expect(res.riskLevel).toBe('medium');
+            } else {
+                expect(res.requiresApproval).toBe(false);
+            }
         }
+
+        // chat_delete_message auto-approve gating in adjust / author / full
+        const deleteAdjustDefault = evaluateToolPolicy(
+            'chat_delete_message',
+            { messageId: 1 },
+            { mode: 'adjust', autoApproveChatDelete: false, autoApproveAuthor: true },
+        );
+        expect(deleteAdjustDefault.requiresApproval).toBe(true);
+        expect(shouldRequireApproval(deleteAdjustDefault, false)).toBe(true);
+
+        const deleteAdjustAuto = evaluateToolPolicy(
+            'chat_delete_message',
+            { messageId: 1 },
+            { mode: 'adjust', autoApproveChatDelete: true },
+        );
+        expect(deleteAdjustAuto.requiresApproval).toBe(false);
+        expect(shouldRequireApproval(deleteAdjustAuto, true)).toBe(false);
+
+        const deleteAuthorAuto = evaluateToolPolicy(
+            'chat_delete_message',
+            { messageId: 1 },
+            { mode: 'author', autoApproveAuthor: true },
+        );
+        expect(deleteAuthorAuto.requiresApproval).toBe(false);
 
         // VFS path scoping checks
         expect(isVfsWritePathAllowed('/workspace/draft.md')).toBe(true);
@@ -447,6 +479,27 @@ describe('policy.ts — 4-Mode Permission Matrix & Mandatory Confirm', () => {
             { mode: 'adjust' },
         );
         expect(chatPolicy.scopeLabel).toBe('Chat: #12#0');
+
+        const createInsertPolicy = evaluateToolPolicy(
+            'chat_create_message',
+            { role: 'assistant', content: '插入消息', insertAt: 2 },
+            { mode: 'adjust' },
+        );
+        expect(createInsertPolicy.scopeLabel).toBe('Chat: insert #2');
+
+        const deleteSinglePolicy = evaluateToolPolicy(
+            'chat_delete_message',
+            { messageId: 3 },
+            { mode: 'adjust' },
+        );
+        expect(deleteSinglePolicy.scopeLabel).toBe('Chat: #3');
+
+        const deleteBatchPolicy = evaluateToolPolicy(
+            'chat_delete_message',
+            { messageIds: [1, 2, 3, 4] },
+            { mode: 'adjust' },
+        );
+        expect(deleteBatchPolicy.scopeLabel).toBe('Chat: #1, #2, #3 (+1)');
     });
 });
 

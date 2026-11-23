@@ -1,4 +1,4 @@
-import type { HostBridge, LLMRequest, LLMTransport } from '@/core/bridge';
+import type { ChatMessageRole, HostBridge, LLMRequest, LLMTransport } from '@/core/bridge';
 import { createDefaultSettings, resolveConnection } from '@/core/config';
 import { TrajectoryStore } from '@/core/context';
 import type { TraceLogger } from '@/core/logger';
@@ -15,6 +15,7 @@ import type {
     CanonicalMessage,
     CanonicalToolCall,
     CanonicalToolSchema,
+    ChatMessageSnapshot,
     HostCharacterCreatePayload,
     HostCharacterPatch,
     HostRegexScript,
@@ -32,6 +33,7 @@ import { ApprovalGate, shouldRequireApproval } from './approval';
 import {
     evaluateToolPolicy,
     getAllowedToolsForMode,
+    isToolAutoApproved,
     type ToolPolicyResult,
 } from './policy';
 import { redactString, redactWithReport } from './redact';
@@ -183,7 +185,7 @@ function buildAssistantSystemPrompt(mode: AssistantMode, stAdminEnabled: boolean
         lines.push('Mode rule: STRICTLY READ-ONLY. Never attempt mutations.');
     } else if (mode === 'adjust') {
         lines.push(
-            'Mode rule: Current-chat adjustments allowed (/workspace/**, /state/**, /lorebooks/**, /side/**, chat messages). Pre-write UndoRecords are captured automatically.',
+            'Mode rule: Current-chat adjustments allowed (/workspace/**, /state/**, /lorebooks/**, /side/**, and creating, editing, deleting, hiding, or display-overriding chat messages via chat_create_message, chat_edit_message, chat_delete_message, chat_toggle_hide_message, message_override_display). Deleting chat messages asks for inline confirmation unless auto-approved in this session. Pre-write UndoRecords are captured automatically.',
         );
     } else if (mode === 'author') {
         lines.push(
@@ -215,6 +217,64 @@ export function createAssistantUndoExecutor(deps: {
         chat_message: async (record: UndoRecord) => {
             const snap = record.snapshot;
             const action = snap.action;
+            if (action === 'create') {
+                if (!bridge.deleteChatMessage) {
+                    throw new Error('HostBridge.deleteChatMessage is required to undo chat_create_message.');
+                }
+                const messageId = Number(snap.messageId ?? record.target?.messageId);
+                const chat = bridge.getChat();
+                if (!Number.isInteger(messageId) || messageId < 0 || messageId >= chat.length) {
+                    throw new Error(
+                        `Cannot undo chat_create_message: message #${String(messageId)} not found in chat (length=${chat.length}).`,
+                    );
+                }
+                await bridge.deleteChatMessage(messageId, { emitEvent: true });
+                return;
+            }
+            if (action === 'delete') {
+                if (!bridge.createChatMessage) {
+                    throw new Error('HostBridge.createChatMessage is required to undo chat_delete_message.');
+                }
+                const deletedMessages = Array.isArray(snap.deletedMessages)
+                    ? (snap.deletedMessages as Array<{
+                          messageId: number;
+                          snapshot: ChatMessageSnapshot;
+                          rawMessage?: Record<string, unknown>;
+                      }>)
+                    : [];
+                if (deletedMessages.length === 0) {
+                    throw new Error('Missing deletedMessages in chat_delete_message undo snapshot.');
+                }
+                const sorted = [...deletedMessages].sort((a, b) => a.messageId - b.messageId);
+                for (const item of sorted) {
+                    const msgSnap = item.snapshot;
+                    const role: ChatMessageRole = msgSnap.isUser
+                        ? 'user'
+                        : msgSnap.isSystem
+                          ? 'system'
+                          : 'assistant';
+                    const currentLen = bridge.getChat().length;
+                    const insertAt = Math.max(0, Math.min(item.messageId, currentLen));
+                    await bridge.createChatMessage(
+                        {
+                            role,
+                            content: msgSnap.mes,
+                            name: msgSnap.name,
+                            insertAt,
+                            hidden: Boolean(msgSnap.isSystem),
+                            ...(msgSnap.swipeId !== undefined ? { swipeId: msgSnap.swipeId } : {}),
+                            ...(msgSnap.swipes ? { swipes: msgSnap.swipes } : {}),
+                            ...(msgSnap.swipeInfo ? { swipeInfo: msgSnap.swipeInfo } : {}),
+                            ...(msgSnap.sendDate !== undefined ? { sendDate: msgSnap.sendDate } : {}),
+                            ...(msgSnap.extra ? { extra: msgSnap.extra } : {}),
+                            ...(msgSnap.variables ? { variables: msgSnap.variables } : {}),
+                            ...(item.rawMessage ? { rawFields: item.rawMessage } : {}),
+                        },
+                        { emitEvent: true },
+                    );
+                }
+                return;
+            }
             if (action === 'edit') {
                 const target = (snap.target ?? record.target) as MessageTarget | undefined;
                 if (!target) {
@@ -1071,6 +1131,7 @@ export class AssistantRunner {
                         mode: liveSession.mode,
                         stAdminEnabled: liveSession.stAdminEnabled,
                         autoApproveAuthor: liveSession.autoApproveAuthor,
+                        autoApproveChatDelete: liveSession.autoApproveChatDelete,
                     });
 
                     const redactedArgsSummary = truncateSummary(
@@ -1135,7 +1196,13 @@ export class AssistantRunner {
                     });
 
                     // 2. Requires approval (including non-bypassable mandatoryConfirm) -> suspend into bubble PendingApproval
-                    if (shouldRequireApproval(policy, liveSession.autoApproveAuthor)) {
+                    const effectiveAutoApprove = isToolAutoApproved(toolCall.name, {
+                        mode: liveSession.mode,
+                        stAdminEnabled: liveSession.stAdminEnabled,
+                        autoApproveAuthor: liveSession.autoApproveAuthor,
+                        autoApproveChatDelete: liveSession.autoApproveChatDelete,
+                    });
+                    if (shouldRequireApproval(policy, effectiveAutoApprove)) {
                         const validated = toolDef.parameters.safeParse(parsedArgs);
                         if (!validated.success) {
                             const errResult = await executeAssistantTool(toolDef, parsedArgs, toolCtx);
@@ -1295,6 +1362,7 @@ export class AssistantRunner {
             mode: session.mode,
             stAdminEnabled: session.stAdminEnabled,
             autoApproveAuthor: session.autoApproveAuthor,
+            autoApproveChatDelete: session.autoApproveChatDelete,
         });
         if (!policy.allowed) {
             throw new Error(policy.reason ?? `Tool "${existing.toolName}" is no longer allowed.`);
@@ -1481,6 +1549,7 @@ export class AssistantRunner {
                     mode: session.mode,
                     stAdminEnabled: session.stAdminEnabled,
                     autoApproveAuthor: session.autoApproveAuthor,
+                    autoApproveChatDelete: session.autoApproveChatDelete,
                 });
 
                 if (toolDef && policy.allowed) {

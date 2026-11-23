@@ -111,6 +111,7 @@ export interface AssistantSession {
     mode: AssistantMode;
     stAdminEnabled: boolean;
     autoApproveAuthor: boolean;
+    autoApproveChatDelete?: boolean;
     connectionId: string; // 'inherit' | connection.id
     updatedAt: number;
     messages: AssistantMessage[];

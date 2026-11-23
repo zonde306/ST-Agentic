@@ -1,19 +1,23 @@
 import {
     addCopyToCodeBlocks,
+    addOneMessage,
     appendMediaToMessage,
     characters,
     chat,
     chat_metadata,
+    deleteMessage,
     getCharacterCardFields,
     messageFormatting,
     name1,
     name2,
+    refreshSwipeButtons,
     saveChatDebounced,
     saveSettingsDebounced,
     substituteParams,
     syncMesToSwipe,
     this_chid,
     updateMessageBlock,
+    updateViewMessageIds,
 } from '@st/script.js';
 import { MEDIA_SOURCE, MEDIA_TYPE } from '@st/scripts/constants.js';
 import { eventSource, event_types } from '@st/scripts/events.js';
@@ -30,6 +34,10 @@ import {
 } from '@st/scripts/world-info.js';
 
 import type {
+    CreateChatMessageInput,
+    CreateChatMessageOptions,
+    DeleteChatMessageOptions,
+    DeletedChatMessageSnapshot,
     HostAdminBridge,
     HostAuthorBridge,
     HostBridge,
@@ -227,6 +235,48 @@ function wrapWithJQuery(element: HTMLElement): JQuery<HTMLElement> | null {
     return null;
 }
 
+function cloneHostValue<T>(value: T): T {
+    if (value === null || value === undefined || typeof value !== 'object') {
+        return value;
+    }
+    try {
+        return structuredClone(value);
+    } catch {
+        return JSON.parse(JSON.stringify(value)) as T;
+    }
+}
+
+function getDisplayedChatFirstId(): number | null {
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') {
+        return null;
+    }
+    const ids = Array.from(document.querySelectorAll<HTMLElement>('#chat .mes'))
+        .map((el) => Number(el.getAttribute('mesid')))
+        .filter((id) => Number.isFinite(id));
+    return ids.length > 0 ? Math.min(...ids) : null;
+}
+
+function renumberDisplayedChatMessages(startIndex: number): void {
+    if (typeof updateViewMessageIds === 'function') {
+        // SillyTavern's JS lacks a @param JSDoc for `startIndex`, inferring `null | undefined`.
+        (updateViewMessageIds as unknown as (startIndex?: number | null) => void)(startIndex);
+        return;
+    }
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') {
+        return;
+    }
+    const elements = Array.from(document.querySelectorAll<HTMLElement>('#chat .mes'));
+    elements.forEach((el, index) => {
+        const nextId = startIndex + index;
+        el.setAttribute('mesid', String(nextId));
+        const idEl = el.querySelector<HTMLElement>('.mesIDDisplay');
+        if (idEl) {
+            idEl.textContent = `#${nextId}`;
+        }
+        el.classList.toggle('last_mes', index === elements.length - 1);
+    });
+}
+
 /**
  * Thin SillyTavern implementation of `HostBridge`.
  * Isolates all `@st/*` runtime dependencies behind the core bridge contract.
@@ -391,6 +441,243 @@ export class STHostBridge implements HostBridge {
         if (options?.emitEvent && event_types.MESSAGE_UPDATED) {
             await eventSource.emit(event_types.MESSAGE_UPDATED, target.messageId);
         }
+    }
+
+    async createChatMessage(
+        input: CreateChatMessageInput,
+        options?: CreateChatMessageOptions,
+    ): Promise<ChatMessageSnapshot> {
+        if (!Array.isArray(chat)) {
+            throw new Error('SillyTavern chat array is not available.');
+        }
+
+        const targetIndex = input.insertAt === undefined ? chat.length : Math.floor(input.insertAt);
+        if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex > chat.length) {
+            throw new Error(
+                `Invalid insertAt index ${String(input.insertAt)} for chat length ${chat.length}.`,
+            );
+        }
+
+        const identity = this.getActiveIdentity();
+        const isUser = input.role === 'user';
+        const isSystem = input.hidden !== undefined ? Boolean(input.hidden) : input.role === 'system';
+        const resolvedName =
+            input.name?.trim()
+            || (isUser
+                ? identity.userName || 'User'
+                : input.role === 'system'
+                  ? 'System'
+                  : identity.charName || 'Assistant');
+        const sendDate = input.sendDate ?? new Date().toISOString();
+        const swipes =
+            Array.isArray(input.swipes) && input.swipes.length > 0
+                ? input.swipes.map((s) => String(s ?? ''))
+                : [input.content];
+        const swipeId =
+            input.swipeId !== undefined && Number.isInteger(input.swipeId)
+                ? Math.max(0, Math.min(input.swipeId, swipes.length - 1))
+                : 0;
+        const activeMes = swipes[swipeId] ?? input.content;
+
+        let rawMsg: Record<string, unknown>;
+        if (input.rawFields && typeof input.rawFields === 'object') {
+            rawMsg = cloneHostValue(input.rawFields);
+            if (typeof rawMsg.name !== 'string') {
+                rawMsg.name = resolvedName;
+            }
+            if (rawMsg.is_user === undefined) {
+                rawMsg.is_user = isUser;
+            }
+            if (rawMsg.is_system === undefined) {
+                rawMsg.is_system = isSystem;
+            }
+            if (typeof rawMsg.mes !== 'string') {
+                rawMsg.mes = activeMes;
+            }
+            if (rawMsg.send_date === undefined) {
+                rawMsg.send_date = sendDate;
+            }
+        } else {
+            const extra =
+                input.extra && typeof input.extra === 'object' ? cloneHostValue(input.extra) : {};
+            const swipeInfo: Array<Record<string, unknown>> = Array.isArray(input.swipeInfo)
+                ? input.swipeInfo.map((info) =>
+                      info && typeof info === 'object'
+                          ? cloneHostValue(info as Record<string, unknown>)
+                          : {},
+                  )
+                : [];
+            while (swipeInfo.length < swipes.length) {
+                swipeInfo.push({
+                    send_date: sendDate,
+                    extra: cloneHostValue(extra),
+                });
+            }
+
+            rawMsg = {
+                name: resolvedName,
+                is_user: isUser,
+                is_system: isSystem,
+                send_date: sendDate,
+                mes: activeMes,
+                swipe_id: swipeId,
+                swipes,
+                swipe_info: swipeInfo,
+                extra,
+                ...(Array.isArray(input.variables)
+                    ? { variables: cloneHostValue(input.variables) }
+                    : {}),
+            };
+        }
+
+        const isAppend = targetIndex === chat.length;
+        const hasQuerySelector =
+            typeof document !== 'undefined' && typeof document.querySelector === 'function';
+        const firstDisplayedId = !isAppend && hasQuerySelector ? getDisplayedChatFirstId() : null;
+        const hasAnchorEl =
+            !isAppend && hasQuerySelector
+                ? Boolean(document.querySelector(`#chat .mes[mesid="${targetIndex}"]`))
+                : false;
+
+        if (isAppend) {
+            chat.push(rawMsg);
+        } else {
+            chat.splice(targetIndex, 0, rawMsg);
+        }
+
+        if (chat_metadata && typeof chat_metadata === 'object') {
+            (chat_metadata as Record<string, unknown>).tainted = true;
+        }
+
+        // Update ST chat DOM in-place without reloadCurrentChat() (which emits CHAT_CHANGED and aborts the assistant).
+        if (isAppend) {
+            if (typeof addOneMessage === 'function') {
+                addOneMessage(rawMsg, { scroll: true, showSwipes: true });
+            }
+        } else if (typeof document !== 'undefined') {
+            if (hasAnchorEl) {
+                if (typeof addOneMessage === 'function') {
+                    addOneMessage(rawMsg, {
+                        insertBefore: targetIndex,
+                        forceId: targetIndex,
+                        scroll: false,
+                        showSwipes: true,
+                    });
+                }
+                renumberDisplayedChatMessages(firstDisplayedId ?? targetIndex);
+            } else if (firstDisplayedId !== null && targetIndex < firstDisplayedId) {
+                renumberDisplayedChatMessages(firstDisplayedId + 1);
+            } else if (typeof addOneMessage === 'function') {
+                addOneMessage(rawMsg, {
+                    forceId: targetIndex,
+                    scroll: false,
+                    showSwipes: true,
+                });
+            }
+        } else {
+            if (typeof addOneMessage === 'function') {
+                addOneMessage(rawMsg, {
+                    insertBefore: targetIndex,
+                    forceId: targetIndex,
+                    scroll: false,
+                    showSwipes: true,
+                });
+            }
+            renumberDisplayedChatMessages(0);
+        }
+
+        if (collectDisplayRegexRules(this.getSettingsFn?.()).length > 0) {
+            this.renderDisplayView(
+                targetIndex,
+                rawMsg,
+                typeof rawMsg.mes === 'string' ? rawMsg.mes : '',
+            );
+        }
+
+        saveChatDebounced();
+
+        if (options?.emitEvent !== false && typeof eventSource?.emit === 'function') {
+            if (rawMsg.is_user) {
+                if (event_types?.MESSAGE_SENT) {
+                    await eventSource.emit(event_types.MESSAGE_SENT, targetIndex);
+                }
+            } else if (event_types?.MESSAGE_RECEIVED) {
+                // Intentionally emit MESSAGE_RECEIVED (not CHARACTER_MESSAGE_RENDERED) so post-turn companion agents do not fire.
+                await eventSource.emit(event_types.MESSAGE_RECEIVED, targetIndex, 'extension');
+            }
+        }
+
+        return cloneChatSnapshot(rawMsg, targetIndex);
+    }
+
+    async deleteChatMessage(
+        messageId: number,
+        options?: DeleteChatMessageOptions,
+    ): Promise<DeletedChatMessageSnapshot | null> {
+        if (
+            !Array.isArray(chat) ||
+            !Number.isInteger(messageId) ||
+            messageId < 0 ||
+            messageId >= chat.length
+        ) {
+            return null;
+        }
+        const rawMsg = chat[messageId] as Record<string, unknown> | undefined;
+        if (!rawMsg) {
+            return null;
+        }
+
+        const snapshot = cloneChatSnapshot(rawMsg, messageId);
+        const rawMessage = cloneHostValue(rawMsg);
+
+        const mesEl =
+            typeof document !== 'undefined' && typeof document.querySelector === 'function'
+                ? document.querySelector<HTMLElement>(`#chat .mes[mesid="${messageId}"]`)
+                : null;
+
+        if (mesEl && options?.emitEvent !== false && typeof deleteMessage === 'function') {
+            const prevLen = chat.length;
+            await deleteMessage(messageId, undefined, false, false);
+            if (chat.length === prevLen - 1) {
+                return { messageId, snapshot, rawMessage };
+            }
+        }
+
+        const firstDisplayedId =
+            typeof document !== 'undefined' && typeof document.querySelectorAll === 'function'
+                ? getDisplayedChatFirstId()
+                : null;
+
+        chat.splice(messageId, 1);
+
+        if (typeof document !== 'undefined') {
+            mesEl?.remove();
+            if (firstDisplayedId !== null) {
+                const nextStart =
+                    messageId < firstDisplayedId
+                        ? Math.max(0, firstDisplayedId - 1)
+                        : firstDisplayedId;
+                renumberDisplayedChatMessages(nextStart);
+            }
+        }
+
+        if (chat_metadata && typeof chat_metadata === 'object') {
+            (chat_metadata as Record<string, unknown>).tainted = true;
+        }
+        if (typeof refreshSwipeButtons === 'function') {
+            refreshSwipeButtons();
+        }
+        saveChatDebounced();
+
+        if (
+            options?.emitEvent !== false &&
+            event_types?.MESSAGE_DELETED &&
+            typeof eventSource?.emit === 'function'
+        ) {
+            await eventSource.emit(event_types.MESSAGE_DELETED, chat.length);
+        }
+
+        return { messageId, snapshot, rawMessage };
     }
 
     getActiveIdentity(): HostIdentity {

@@ -287,6 +287,7 @@ function createMockAssistantRuntime(options: {
                 mode: createOpts?.mode ?? 'chat',
                 stAdminEnabled: Boolean(createOpts?.stAdminEnabled),
                 autoApproveAuthor: Boolean(createOpts?.autoApproveAuthor),
+                autoApproveChatDelete: Boolean(createOpts?.autoApproveChatDelete),
                 connectionId: createOpts?.connectionId ?? 'inherit',
                 updatedAt: Date.now(),
                 messages: [],
@@ -765,7 +766,7 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
         );
         expect(getModeBtn().textContent).toContain('交流');
 
-        // Popover closes on chat/adjust; reopen to select adjust
+        // Popover closes on chat; reopen to select adjust
         getModeBtn().click();
         await settleLayout(3);
         (shadowRoot.querySelector('[data-assistant-mode-option="adjust"]') as HTMLButtonElement).click();
@@ -776,15 +777,39 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
         );
         expect(getModeBtn().textContent).toContain('调整');
 
-        // Reopen and switch to author -> popover stays open and exposes autoApproveAuthor checkbox
-        getModeBtn().click();
+        // Selecting adjust keeps popover open and exposes autoApproveChatDelete checkbox (unchecked by default)
+        const chatDeleteCheckbox = shadowRoot.querySelector(
+            'input[data-assistant-auto-approve-chat-delete-checkbox="true"]',
+        ) as HTMLInputElement;
+        expect(chatDeleteCheckbox).toBeTruthy();
+        expect(chatDeleteCheckbox.checked).toBe(false);
+        expect(shadowRoot.querySelector('input[data-assistant-auto-approve-checkbox="true"]')).toBeNull();
+
+        // Toggle autoApproveChatDelete ON
+        chatDeleteCheckbox.click();
         await settleLayout(3);
+        expect(activeHarness.runtime.updateSessionConfigSpy).toHaveBeenLastCalledWith(
+            'ast_session_1',
+            { autoApproveChatDelete: true },
+        );
+        expect(
+            (
+                shadowRoot.querySelector(
+                    'input[data-assistant-auto-approve-chat-delete-checkbox="true"]',
+                ) as HTMLInputElement
+            ).checked,
+        ).toBe(true);
+
+        // Switch directly to author (popover stayed open) -> exposes autoApproveAuthor checkbox and hides chat-delete checkbox
         (shadowRoot.querySelector('[data-assistant-mode-option="author"]') as HTMLButtonElement).click();
         await settleLayout(3);
         expect(activeHarness.runtime.updateSessionConfigSpy).toHaveBeenLastCalledWith(
             'ast_session_1',
             { mode: 'author', stAdminEnabled: false },
         );
+        expect(
+            shadowRoot.querySelector('input[data-assistant-auto-approve-chat-delete-checkbox="true"]'),
+        ).toBeNull();
 
         const autoApproveCheckbox = shadowRoot.querySelector(
             'input[data-assistant-auto-approve-checkbox="true"]',

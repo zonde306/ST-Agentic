@@ -398,6 +398,166 @@ describe('Assistant 4-Tier Toolsets (TS2.1)', () => {
             await undoStore.revert(patchRes.undoId!, undoExecutor);
             expect((await vfs.readVariables({ target: ctx.target, staged: false })).heat).toBe(2);
         });
+
+        it('chat_create_message creates user/assistant/system messages (append & insertAt) with KV invariance and undo', async () => {
+            const { bridge, trajectoryStore, undoStore, undoExecutor, ctx, allTools } = setupToolEnv({
+                mode: 'adjust',
+                stAdminEnabled: false,
+            });
+
+            trajectoryStore.setFrozenPrefix(
+                {
+                    tools: [],
+                    messages: [{ role: 'system', content: 'MAIN_STATIC_PREFIX' }],
+                    layer0EndIndex: 0,
+                },
+                DEFAULT_MAIN_AGENT_ID,
+            );
+            trajectoryStore.appendTurn(
+                [
+                    { role: 'user', content: 'u0' },
+                    { role: 'assistant', content: 'a1' },
+                ],
+                DEFAULT_MAIN_AGENT_ID,
+            );
+            const beforeMainTrajectory = canonicalStringify(trajectoryStore.serialize());
+            const initialLen = bridge.getChat().length;
+
+            // 1. Append assistant message (defaults to syncTrajectory: 'none')
+            const appendRes = await executeAssistantTool(
+                allTools.get('chat_create_message')!,
+                { role: 'assistant', content: '雾港钟楼响起三声钟鸣。' },
+                ctx,
+            );
+            expect(appendRes.ok).toBe(true);
+            expect(appendRes.undoId).toBeDefined();
+            expect((appendRes.data as any).messageId).toBe(initialLen);
+            expect((appendRes.data as any).syncTrajectory).toBe('none');
+            expect(bridge.chat).toHaveLength(initialLen + 1);
+            expect(bridge.chat[initialLen].mes).toBe('雾港钟楼响起三声钟鸣。');
+            expect(canonicalStringify(trajectoryStore.serialize())).toBe(beforeMainTrajectory);
+
+            // Undo removes appended message
+            const undoAppend = await undoStore.revert(appendRes.undoId!, undoExecutor);
+            expect(undoAppend.ok).toBe(true);
+            expect(bridge.chat).toHaveLength(initialLen);
+
+            // 2. Insert system message at index 1 with custom name and syncTrajectory: 'rewrite'
+            const insertRes = await executeAssistantTool(
+                allTools.get('chat_create_message')!,
+                {
+                    role: 'system',
+                    name: 'Narrator',
+                    content: '【旁白】午夜潮水上涨。',
+                    insertAt: 1,
+                    syncTrajectory: 'rewrite',
+                },
+                ctx,
+            );
+            expect(insertRes.ok).toBe(true);
+            expect(bridge.chat[1].name).toBe('Narrator');
+            expect(bridge.chat[1].isSystem).toBe(true);
+            expect(bridge.chat[1].mes).toBe('【旁白】午夜潮水上涨。');
+            expect(trajectoryStore.getMessages(DEFAULT_MAIN_AGENT_ID)).toHaveLength(0);
+
+            // Undo removes inserted message and restores original indices
+            const undoInsert = await undoStore.revert(insertRes.undoId!, undoExecutor);
+            expect(undoInsert.ok).toBe(true);
+            expect(bridge.chat).toHaveLength(initialLen);
+
+            // Out-of-bounds insertAt fails cleanly
+            const badInsert = await executeAssistantTool(
+                allTools.get('chat_create_message')!,
+                { role: 'user', content: 'invalid', insertAt: 999 },
+                ctx,
+            );
+            expect(badInsert.ok).toBe(false);
+            expect(badInsert.error).toContain('Invalid insertAt');
+        });
+
+        it('chat_delete_message validates atomically, supports single & batch deletion with diff preview, KV invariance, and full undo', async () => {
+            const { bridge, trajectoryStore, undoStore, undoExecutor, ctx, allTools } = setupToolEnv({
+                mode: 'adjust',
+                stAdminEnabled: false,
+            });
+            await bridge.createChatMessage({ role: 'user', content: '补充问题' }, { emitEvent: false });
+            await bridge.createChatMessage(
+                {
+                    role: 'assistant',
+                    name: '林晚',
+                    content: '补充回答第二页',
+                    swipeId: 1,
+                    swipes: ['补充回答第一页', '补充回答第二页'],
+                    extra: { customTag: 'keep-me' },
+                },
+                { emitEvent: false },
+            );
+
+            trajectoryStore.setFrozenPrefix(
+                {
+                    tools: [],
+                    messages: [{ role: 'system', content: 'MAIN_STATIC_PREFIX' }],
+                    layer0EndIndex: 0,
+                },
+                DEFAULT_MAIN_AGENT_ID,
+            );
+            trajectoryStore.appendTurn(
+                [
+                    { role: 'user', content: 'u0' },
+                    { role: 'assistant', content: 'a1' },
+                ],
+                DEFAULT_MAIN_AGENT_ID,
+            );
+            const beforeMainTrajectory = canonicalStringify(trajectoryStore.serialize());
+
+            const deleteTool = allTools.get('chat_delete_message')!;
+
+            // Preview produces red deletion diff lines
+            const preview = await deleteTool.preview!(
+                { messageIds: [1, 3], syncTrajectory: 'none' },
+                ctx,
+            );
+            expect(preview.diffLines.some((l) => l.type === 'del')).toBe(true);
+            expect(preview.beforeText).toContain('补充回答第二页');
+
+            // Atomic validation: if any messageId is missing, delete NOTHING
+            const beforeLen = bridge.chat.length;
+            const partialMissing = await executeAssistantTool(
+                deleteTool,
+                { messageIds: [1, 99] },
+                ctx,
+            );
+            expect(partialMissing.ok).toBe(false);
+            expect(bridge.chat).toHaveLength(beforeLen);
+
+            // Batch delete messages #1 and #3 (descending deletion preserves lower index)
+            const snap1 = structuredClone(bridge.chat[1]);
+            const snap3 = structuredClone(bridge.chat[3]);
+            const batchDel = await executeAssistantTool(
+                deleteTool,
+                { messageIds: [1, 3] },
+                ctx,
+            );
+            expect(batchDel.ok).toBe(true);
+            expect(batchDel.undoId).toBeDefined();
+            expect((batchDel.data as any).deletedIds).toEqual([1, 3]);
+            expect(bridge.chat.map((m) => m.mes)).toEqual([
+                '我们今晚在老码头碰头。',
+                '补充问题',
+            ]);
+            // Default syncTrajectory: 'none' -> 0 mainline TrajectoryStore mutation
+            expect(canonicalStringify(trajectoryStore.serialize())).toBe(beforeMainTrajectory);
+
+            // Undo restores both deleted messages to exact original indices with swipes & extra intact
+            const revertDel = await undoStore.revert(batchDel.undoId!, undoExecutor);
+            expect(revertDel.ok).toBe(true);
+            expect(bridge.chat).toHaveLength(4);
+            expect(bridge.chat[1].mes).toBe(snap1.mes);
+            expect(bridge.chat[3].mes).toBe(snap3.mes);
+            expect(bridge.chat[3].swipes).toEqual(['补充回答第一页', '补充回答第二页']);
+            expect(bridge.chat[3].swipeId).toBe(1);
+            expect(bridge.chat[3].extra).toEqual({ customTag: 'keep-me' });
+        });
     });
 
     describe('Tier 3: author tools (raw @@ & EJS preserved without escapeAt + non-blocking syntax lint)', () => {

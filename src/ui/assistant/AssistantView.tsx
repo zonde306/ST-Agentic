@@ -205,6 +205,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                     connectionId: defaultConnId,
                     stAdminEnabled: defaultStAdmin,
                     autoApproveAuthor: false,
+                    autoApproveChatDelete: false,
                 });
                 upsertSessionInStore(created);
                 store.openAssistantSession(created.id);
@@ -222,6 +223,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 mode: defaultMode,
                 stAdminEnabled: defaultStAdmin,
                 autoApproveAuthor: false,
+                autoApproveChatDelete: false,
                 connectionId: defaultConnId,
                 updatedAt: now,
                 messages: [],
@@ -282,7 +284,12 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             patch: Partial<
                 Pick<
                     AssistantSession,
-                    'title' | 'mode' | 'stAdminEnabled' | 'autoApproveAuthor' | 'connectionId'
+                    | 'title'
+                    | 'mode'
+                    | 'stAdminEnabled'
+                    | 'autoApproveAuthor'
+                    | 'autoApproveChatDelete'
+                    | 'connectionId'
                 >
             >,
         ) => {
@@ -325,7 +332,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 `已切换为：${ASSISTANT_MODE_META[mode].fullLabel}`,
                 mode === 'full' ? 'warning' : 'primary',
             );
-            if (mode !== 'author' && mode !== 'full') {
+            if (mode === 'chat') {
                 setOpenPopover(null);
             }
         },
@@ -339,6 +346,19 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 checked
                     ? '已开启「本会话自动批准写卡」（高危仍强制确认）'
                     : '已恢复「写卡前气泡审批」',
+                checked ? 'warning' : 'primary',
+            );
+        },
+        [patchActiveSessionConfig, store],
+    );
+
+    const handleToggleAutoApproveChatDelete = useCallback(
+        (checked: boolean) => {
+            void patchActiveSessionConfig({ autoApproveChatDelete: checked });
+            store.pushToast(
+                checked
+                    ? '已开启「本会话自动批准删除消息」（仍保留写前快照可撤销）'
+                    : '已恢复「删除消息前气泡确认」',
                 checked ? 'warning' : 'primary',
             );
         },
@@ -1390,6 +1410,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                         currentConnectionId={settings.currentConnectionId}
                         onSelectMode={handleSelectMode}
                         onToggleAutoApproveAuthor={handleToggleAutoApproveAuthor}
+                        onToggleAutoApproveChatDelete={handleToggleAutoApproveChatDelete}
                         onRequestToggleStAdmin={handleRequestToggleStAdmin}
                         onSelectConnection={handleSelectConnection}
                         onClose={() => setOpenPopover(null)}

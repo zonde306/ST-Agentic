@@ -49,7 +49,9 @@ export const ADJUST_WRITE_TOOLS = [
     'write_file',
     'append_file',
     'edit_file',
+    'chat_create_message',
     'chat_edit_message',
+    'chat_delete_message',
     'chat_toggle_hide_message',
     'message_override_display',
 ] as const;
@@ -269,6 +271,15 @@ const TOOL_CATALOG: Record<string, ToolPolicySpec> = {
         vfsScoped: true,
         defaultScopeLabel: 'VFS Write',
     },
+    chat_create_message: {
+        requiredMode: 'adjust',
+        requiresAdmin: false,
+        mutating: true,
+        baseRequiresApproval: false,
+        baseMandatoryConfirm: false,
+        baseRiskLevel: 'low',
+        defaultScopeLabel: 'Chat Message',
+    },
     chat_edit_message: {
         requiredMode: 'adjust',
         requiresAdmin: false,
@@ -276,6 +287,15 @@ const TOOL_CATALOG: Record<string, ToolPolicySpec> = {
         baseRequiresApproval: false,
         baseMandatoryConfirm: false,
         baseRiskLevel: 'low',
+        defaultScopeLabel: 'Chat Message',
+    },
+    chat_delete_message: {
+        requiredMode: 'adjust',
+        requiresAdmin: false,
+        mutating: true,
+        baseRequiresApproval: true,
+        baseMandatoryConfirm: false,
+        baseRiskLevel: 'medium',
         defaultScopeLabel: 'Chat Message',
     },
     chat_toggle_hide_message: {
@@ -623,6 +643,23 @@ export interface PolicyEvaluationContext {
     mode: AssistantMode;
     stAdminEnabled?: boolean;
     autoApproveAuthor?: boolean;
+    autoApproveChatDelete?: boolean;
+}
+
+/**
+ * Determine whether the current session auto-approve settings bypass non-mandatory approval
+ * for a specific tool.
+ */
+export function isToolAutoApproved(
+    toolName: string,
+    ctx: PolicyEvaluationContext,
+): boolean {
+    if (toolName === 'chat_delete_message') {
+        return ctx.mode === 'adjust'
+            ? Boolean(ctx.autoApproveChatDelete)
+            : Boolean(ctx.autoApproveAuthor || ctx.autoApproveChatDelete);
+    }
+    return Boolean(ctx.autoApproveAuthor);
 }
 
 export interface ToolPolicyResult {
@@ -686,6 +723,11 @@ export function isMandatoryConfirmTool(
     toolName: string,
     args?: Record<string, unknown>,
 ): boolean {
+    // Current-chat message deletion is gated by per-session opt-in approval (+ UndoRecord),
+    // whereas permanent asset/admin deletes remain non-bypassable mandatoryConfirm.
+    if (toolName === 'chat_delete_message') {
+        return false;
+    }
     if (isDeleteToolName(toolName)) {
         return true;
     }
@@ -782,8 +824,24 @@ function buildScopeLabel(
         }
     }
 
+    if (Array.isArray(args.messageIds)) {
+        const ids = args.messageIds.filter(
+            (id): id is number => typeof id === 'number' && Number.isInteger(id) && id >= 0,
+        );
+        if (ids.length > 0) {
+            const previewIds = ids.slice(0, 3).map((id) => `#${id}`).join(', ');
+            return ids.length > 3
+                ? `Chat: ${previewIds} (+${ids.length - 3})`
+                : `Chat: ${previewIds}`;
+        }
+    }
+
     if (typeof args.messageId === 'number') {
         return `Chat: #${args.messageId}`;
+    }
+
+    if (toolName === 'chat_create_message' && typeof args.insertAt === 'number') {
+        return `Chat: insert #${args.insertAt}`;
     }
 
     if (typeof args.chid === 'number') {
@@ -855,7 +913,7 @@ export function evaluateToolPolicy(
     const scopeLabel = buildScopeLabel(toolName, spec, args);
 
     const stAdminEnabled = Boolean(ctx.stAdminEnabled);
-    const autoApproveAuthor = Boolean(ctx.autoApproveAuthor);
+    const effectiveAutoApprove = isToolAutoApproved(toolName, ctx);
 
     if (MODE_RANK[ctx.mode] < MODE_RANK[spec.requiredMode]) {
         return {
@@ -913,7 +971,7 @@ export function evaluateToolPolicy(
 
     const requiresApproval = mandatoryConfirm
         ? true
-        : baseRequiresApproval && !autoApproveAuthor;
+        : baseRequiresApproval && !effectiveAutoApprove;
 
     return {
         allowed: true,

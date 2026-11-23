@@ -126,6 +126,60 @@ describe('Wave 0 test mocks', () => {
         expect(bridge.saveChatCalls).toBe(3);
     });
 
+    it('MemoryHostBridge createChatMessage and deleteChatMessage handle insertion, re-indexing, roles, and events', async () => {
+        const bridge = new MemoryHostBridge({
+            identity: { userName: '旅人', charName: '艾琳' },
+            chat: [
+                { id: 0, name: '旅人', isUser: true, mes: '第一条', swipeId: 0, swipes: ['第一条'] },
+                { id: 1, name: '艾琳', isUser: false, mes: '第三条', swipeId: 0, swipes: ['第三条'] },
+            ],
+        });
+
+        // Append assistant message
+        const appended = await bridge.createChatMessage({
+            role: 'assistant',
+            content: '第四条回复',
+        });
+        expect(appended.id).toBe(2);
+        expect(appended.name).toBe('艾琳');
+        expect(appended.isUser).toBe(false);
+        expect(appended.isSystem).toBe(false);
+
+        // Insert system message in the middle -> re-indexes subsequent messages
+        const inserted = await bridge.createChatMessage({
+            role: 'system',
+            content: '场景切换：暴雨夜。',
+            insertAt: 1,
+        });
+        expect(inserted.id).toBe(1);
+        expect(inserted.name).toBe('System');
+        expect(inserted.isSystem).toBe(true);
+        expect(bridge.chat.map((m) => [m.id, m.mes])).toEqual([
+            [0, '第一条'],
+            [1, '场景切换：暴雨夜。'],
+            [2, '第三条'],
+            [3, '第四条回复'],
+        ]);
+
+        // Delete middle message -> re-indexes cleanly and returns pre-deletion snapshot
+        const deleted = await bridge.deleteChatMessage(1);
+        expect(deleted?.messageId).toBe(1);
+        expect(deleted?.snapshot.mes).toBe('场景切换：暴雨夜。');
+        expect(bridge.chat.map((m) => [m.id, m.mes])).toEqual([
+            [0, '第一条'],
+            [1, '第三条'],
+            [2, '第四条回复'],
+        ]);
+
+        // Out-of-bounds delete returns null without mutating chat
+        expect(await bridge.deleteChatMessage(99)).toBeNull();
+        expect(bridge.emittedEvents.map((e) => e.event)).toEqual([
+            'MESSAGE_RECEIVED',
+            'MESSAGE_RECEIVED',
+            'MESSAGE_DELETED',
+        ]);
+    });
+
     it('ScriptedLLMTransport streams text, reasoning, incremental tool calls, usage, and honors AbortSignal', async () => {
         const transport = new ScriptedLLMTransport([
             {

@@ -41,6 +41,14 @@ const stMocks = vi.hoisted(() => {
         saveSettingsDebounced: vi.fn(),
         saveMetadata: vi.fn(async () => undefined),
         saveMetadataDebounced: vi.fn(),
+        addOneMessage: vi.fn(),
+        deleteMessage: vi.fn(async (id: number) => {
+            state.chat.splice(id, 1);
+            fns.saveChatDebounced();
+            await fns.eventEmit(event_types.MESSAGE_DELETED, state.chat.length);
+        }),
+        refreshSwipeButtons: vi.fn(),
+        updateViewMessageIds: vi.fn(),
         updateMessageBlock: vi.fn(),
         setExtensionPrompt: vi.fn(),
         substituteParams: vi.fn((text: string) => text),
@@ -144,6 +152,8 @@ const stMocks = vi.hoisted(() => {
         MESSAGE_SWIPED: 'message_swiped',
         MESSAGE_DELETED: 'message_deleted',
         MESSAGE_SWIPE_DELETED: 'message_swipe_deleted',
+        MESSAGE_SENT: 'message_sent',
+        MESSAGE_RECEIVED: 'message_received',
         MESSAGE_UPDATED: 'message_updated',
         CHAT_CHANGED: 'chat_changed',
         CHARACTER_EDITED: 'character_edited',
@@ -188,7 +198,11 @@ vi.mock('@st/script.js', () => ({
     saveCharacterDebounced: stMocks.fns.saveCharacterDebounced,
     saveSettingsDebounced: stMocks.fns.saveSettingsDebounced,
     saveMetadata: stMocks.fns.saveMetadata,
+    addOneMessage: stMocks.fns.addOneMessage,
+    deleteMessage: stMocks.fns.deleteMessage,
+    refreshSwipeButtons: stMocks.fns.refreshSwipeButtons,
     updateMessageBlock: stMocks.fns.updateMessageBlock,
+    updateViewMessageIds: stMocks.fns.updateViewMessageIds,
     setExtensionPrompt: stMocks.fns.setExtensionPrompt,
     substituteParams: stMocks.fns.substituteParams,
     syncMesToSwipe: stMocks.fns.syncMesToSwipe,
@@ -596,6 +610,157 @@ describe('STAuthorBridge', () => {
 
         const missing = await author.toggleChatMessageHidden(99, true);
         expect(missing).toBe(false);
+    });
+
+    it('creates chat messages (append, middle insert, pagination-window insert, rawFields) without reloading chat or triggering CHARACTER_MESSAGE_RENDERED', async () => {
+        const bridge = new STHostBridge();
+
+        // 1. Append assistant message in headless mode
+        const appended = await bridge.createChatMessage({
+            role: 'assistant',
+            content: '灯塔的油灯还亮着。',
+        });
+        expect(appended.id).toBe(1);
+        expect(appended.name).toBe('Alice');
+        expect(appended.isUser).toBe(false);
+        expect(appended.isSystem).toBe(false);
+        expect(stMocks.state.chat).toHaveLength(2);
+        expect(stMocks.state.chat_metadata.tainted).toBe(true);
+        expect(stMocks.fns.addOneMessage).toHaveBeenCalledWith(
+            expect.objectContaining({ mes: '灯塔的油灯还亮着。', name: 'Alice', is_user: false }),
+            expect.objectContaining({ scroll: true, showSwipes: true }),
+        );
+        expect(stMocks.fns.saveChatDebounced).toHaveBeenCalled();
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(
+            stMocks.event_types.MESSAGE_RECEIVED,
+            1,
+            'extension',
+        );
+        expect(stMocks.fns.eventEmit).not.toHaveBeenCalledWith(
+            stMocks.event_types.CHARACTER_MESSAGE_RENDERED,
+            expect.anything(),
+        );
+
+        // 2. Append user message emits MESSAGE_SENT
+        const userCreated = await bridge.createChatMessage({
+            role: 'user',
+            content: '我们走吧。',
+        });
+        expect(userCreated.id).toBe(2);
+        expect(userCreated.name).toBe('Tester');
+        expect(userCreated.isUser).toBe(true);
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(stMocks.event_types.MESSAGE_SENT, 2);
+
+        // 3. Middle insert when rendered DOM anchor exists calls insertBefore + updateViewMessageIds
+        vi.clearAllMocks();
+        const mes0 = { getAttribute: (k: string) => (k === 'mesid' ? '0' : null) };
+        const mes1 = { getAttribute: (k: string) => (k === 'mesid' ? '1' : null) };
+        vi.stubGlobal('document', {
+            querySelector: (selector: string) =>
+                selector === '#chat .mes[mesid="1"]' ? mes1 : null,
+            querySelectorAll: (selector: string) =>
+                selector === '#chat .mes' ? [mes0, mes1] : [],
+        });
+
+        const midInserted = await bridge.createChatMessage({
+            role: 'system',
+            content: '旁白：海风骤起。',
+            insertAt: 1,
+        });
+        expect(midInserted.id).toBe(1);
+        expect(midInserted.isSystem).toBe(true);
+        expect(stMocks.state.chat[1]!.mes).toBe('旁白：海风骤起。');
+        expect(stMocks.fns.addOneMessage).toHaveBeenCalledWith(
+            expect.objectContaining({ mes: '旁白：海风骤起。', is_system: true }),
+            expect.objectContaining({ insertBefore: 1, forceId: 1, scroll: false }),
+        );
+        expect(stMocks.fns.updateViewMessageIds).toHaveBeenCalledWith(0);
+
+        // 4. Insert above ST pagination window (firstDisplayedId = 2, insertAt = 0) shifts rendered IDs without appending DOM node
+        vi.clearAllMocks();
+        const mes2 = { getAttribute: (k: string) => (k === 'mesid' ? '2' : null) };
+        vi.stubGlobal('document', {
+            querySelector: () => null,
+            querySelectorAll: (selector: string) =>
+                selector === '#chat .mes' ? [mes2] : [],
+        });
+        const aboveWindow = await bridge.createChatMessage({
+            role: 'assistant',
+            content: '序幕',
+            insertAt: 0,
+            rawFields: {
+                name: 'CustomSpeaker',
+                is_user: false,
+                is_system: false,
+                mes: '序幕',
+                force_avatar: 'custom.png',
+                swipe_id: 0,
+                swipes: ['序幕'],
+            },
+        });
+        expect(aboveWindow.id).toBe(0);
+        expect((stMocks.state.chat[0] as Record<string, unknown>).force_avatar).toBe('custom.png');
+        expect(stMocks.fns.addOneMessage).not.toHaveBeenCalled();
+        expect(stMocks.fns.updateViewMessageIds).toHaveBeenCalledWith(3);
+    });
+
+    it('deletes chat messages via native deleteMessage when in DOM and splices cleanly when off-DOM or emitEvent=false', async () => {
+        stMocks.state.chat.push(
+            {
+                name: 'Alice',
+                is_user: false,
+                is_system: false,
+                mes: '第二条回复',
+                swipe_id: 0,
+                swipes: ['第二条回复'],
+                force_avatar: 'alice_alt.png',
+            },
+            {
+                name: 'Tester',
+                is_user: true,
+                is_system: false,
+                mes: '第三条发言',
+                swipe_id: 0,
+                swipes: ['第三条发言'],
+            },
+        );
+        const bridge = new STHostBridge();
+
+        // 1. In-DOM deletion delegates to native deleteMessage(1, undefined, false, false)
+        const mes1El = { getAttribute: (k: string) => (k === 'mesid' ? '1' : null), remove: vi.fn() };
+        vi.stubGlobal('document', {
+            querySelector: (selector: string) =>
+                selector === '#chat .mes[mesid="1"]' ? mes1El : null,
+            querySelectorAll: () => [mes1El],
+        });
+
+        const deletedInDom = await bridge.deleteChatMessage(1);
+        expect(deletedInDom?.messageId).toBe(1);
+        expect(deletedInDom?.snapshot.mes).toBe('第二条回复');
+        expect(deletedInDom?.rawMessage?.force_avatar).toBe('alice_alt.png');
+        expect(stMocks.fns.deleteMessage).toHaveBeenCalledWith(1, undefined, false, false);
+        expect(stMocks.state.chat).toHaveLength(2);
+
+        // 2. Off-DOM / paginated deletion (firstDisplayedId = 1, delete index 0) splices & shifts rendered IDs down
+        vi.clearAllMocks();
+        const mes1After = { getAttribute: (k: string) => (k === 'mesid' ? '1' : null), remove: vi.fn() };
+        vi.stubGlobal('document', {
+            querySelector: () => null,
+            querySelectorAll: (selector: string) =>
+                selector === '#chat .mes' ? [mes1After] : [],
+        });
+
+        const deletedOffDom = await bridge.deleteChatMessage(0, { emitEvent: false });
+        expect(deletedOffDom?.snapshot.mes).toBe('今晚我们去老码头灯塔看看');
+        expect(stMocks.fns.deleteMessage).not.toHaveBeenCalled();
+        expect(stMocks.state.chat).toHaveLength(1);
+        expect(stMocks.fns.updateViewMessageIds).toHaveBeenCalledWith(0);
+        expect(stMocks.fns.refreshSwipeButtons).toHaveBeenCalled();
+        expect(stMocks.fns.saveChatDebounced).toHaveBeenCalled();
+        expect(stMocks.fns.eventEmit).not.toHaveBeenCalled();
+
+        // 3. Out-of-bounds returns null
+        expect(await bridge.deleteChatMessage(99)).toBeNull();
     });
 
     it('preserves raw @@ decorators and <% ... %> EJS verbatim in World Info upsert & delete', async () => {

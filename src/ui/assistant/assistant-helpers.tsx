@@ -47,9 +47,9 @@ export const ASSISTANT_MODE_META: Readonly<Record<AssistantMode, AssistantModeMe
         label: '调整',
         fullLabel: '调整模式',
         pillClass: 'ag-pill-success',
-        desc: '允许修改当前 Chat、变量、工作区、分支 WI 覆写与 /side/*',
+        desc: '允许增删改当前 Chat 消息、变量、工作区、分支 WI 覆写与 /side/*',
         pills: [
-            { text: '写: 当前 Chat (可选同步轨迹)', cls: 'ag-pill-success' },
+            { text: '写: 当前 Chat 增删改 (删消息默认确认)', cls: 'ag-pill-success' },
             { text: '写: 变量 / 工作区 / /side/*', cls: 'ag-pill-success' },
             { text: '永久资产: 只读', cls: 'ag-pill-muted' },
         ],
@@ -79,8 +79,15 @@ export const ASSISTANT_MODE_META: Readonly<Record<AssistantMode, AssistantModeMe
 };
 
 export function getEffectiveModePills(
-    session: Pick<AssistantSession, 'mode' | 'stAdminEnabled'>,
+    session: Pick<AssistantSession, 'mode' | 'stAdminEnabled'> & { autoApproveChatDelete?: boolean },
 ): readonly { text: string; cls: string }[] {
+    if (session.mode === 'adjust' && session.autoApproveChatDelete) {
+        return [
+            { text: '写: 当前 Chat 增删改 (自动批准删除)', cls: 'ag-pill-warning' },
+            { text: '写: 变量 / 工作区 / /side/*', cls: 'ag-pill-success' },
+            { text: '永久资产: 只读', cls: 'ag-pill-muted' },
+        ];
+    }
     if (session.mode !== 'full') {
         return ASSISTANT_MODE_META[session.mode].pills;
     }

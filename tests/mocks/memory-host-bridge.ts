@@ -1,4 +1,8 @@
 import type {
+    CreateChatMessageInput,
+    CreateChatMessageOptions,
+    DeleteChatMessageOptions,
+    DeletedChatMessageSnapshot,
     HostAdminBridge,
     HostAuthorBridge,
     HostBridge,
@@ -107,6 +111,16 @@ export class MemoryHostBridge implements HostBridge {
         target: MessageTarget;
         content: string;
         options?: WriteChatMessageOptions;
+    }> = [];
+    public createdMessages: Array<{
+        input: CreateChatMessageInput;
+        createdId: number;
+        options?: CreateChatMessageOptions;
+    }> = [];
+    public deletedMessages: Array<{
+        messageId: number;
+        snapshot: ChatMessageSnapshot;
+        options?: DeleteChatMessageOptions;
     }> = [];
     public mediaAttachments: Array<{ target: MessageTarget; media: MediaAttachment }> = [];
     public refreshedViews: MessageTarget[] = [];
@@ -344,6 +358,154 @@ export class MemoryHostBridge implements HostBridge {
         if (options?.emitEvent) {
             this.emitHostEvent('MESSAGE_UPDATED', target.messageId);
         }
+    }
+
+    async createChatMessage(
+        input: CreateChatMessageInput,
+        options?: CreateChatMessageOptions,
+    ): Promise<ChatMessageSnapshot> {
+        const targetIndex =
+            input.insertAt === undefined ? this.chat.length : Math.floor(input.insertAt);
+        if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex > this.chat.length) {
+            throw new Error(
+                `Invalid insertAt index ${String(input.insertAt)} for chat length ${this.chat.length}.`,
+            );
+        }
+
+        const isUser = input.role === 'user';
+        const isSystem =
+            input.hidden !== undefined ? Boolean(input.hidden) : input.role === 'system';
+        const resolvedName =
+            input.name?.trim()
+            || (isUser
+                ? this.identity.userName || 'User'
+                : input.role === 'system'
+                  ? 'System'
+                  : this.identity.charName || 'Assistant');
+        const swipes =
+            Array.isArray(input.swipes) && input.swipes.length > 0
+                ? input.swipes.map((s) => String(s ?? ''))
+                : [input.content];
+        const swipeId =
+            input.swipeId !== undefined && Number.isInteger(input.swipeId)
+                ? Math.max(0, Math.min(input.swipeId, swipes.length - 1))
+                : 0;
+        const swipeInfo = Array.isArray(input.swipeInfo)
+            ? input.swipeInfo.map((info) => structuredClone(info))
+            : [];
+        while (swipeInfo.length < swipes.length) {
+            swipeInfo.push({});
+        }
+
+        const rawOverrides =
+            input.rawFields && typeof input.rawFields === 'object'
+                ? structuredClone(input.rawFields)
+                : undefined;
+
+        const snapshot: ChatMessageSnapshot = {
+            id: targetIndex,
+            name:
+                typeof rawOverrides?.name === 'string' ? rawOverrides.name : resolvedName,
+            isUser:
+                rawOverrides?.is_user !== undefined ? Boolean(rawOverrides.is_user) : isUser,
+            isSystem:
+                rawOverrides?.is_system !== undefined
+                    ? Boolean(rawOverrides.is_system)
+                    : isSystem,
+            mes:
+                typeof rawOverrides?.mes === 'string'
+                    ? rawOverrides.mes
+                    : swipes[swipeId] ?? input.content,
+            swipeId:
+                typeof rawOverrides?.swipe_id === 'number'
+                    ? rawOverrides.swipe_id
+                    : swipeId,
+            swipes: Array.isArray(rawOverrides?.swipes)
+                ? (rawOverrides.swipes as unknown[]).map((s) => String(s ?? ''))
+                : swipes,
+            swipeInfo: Array.isArray(rawOverrides?.swipe_info)
+                ? (structuredClone(rawOverrides.swipe_info) as ChatMessageSnapshot['swipeInfo'])
+                : swipeInfo,
+            ...(rawOverrides?.send_date !== undefined
+                ? { sendDate: rawOverrides.send_date as string | number }
+                : input.sendDate !== undefined
+                  ? { sendDate: input.sendDate }
+                  : {}),
+            ...(rawOverrides?.extra && typeof rawOverrides.extra === 'object'
+                ? { extra: structuredClone(rawOverrides.extra as Record<string, unknown>) }
+                : input.extra
+                  ? { extra: structuredClone(input.extra) }
+                  : {}),
+            ...(Array.isArray(rawOverrides?.variables)
+                ? { variables: structuredClone(rawOverrides.variables as Record<string, unknown>[]) }
+                : input.variables
+                  ? { variables: structuredClone(input.variables) }
+                  : {}),
+        };
+
+        if (targetIndex === this.chat.length) {
+            this.chat.push(snapshot);
+        } else {
+            this.chat.splice(targetIndex, 0, snapshot);
+        }
+        this.chat.forEach((msg, idx) => {
+            msg.id = idx;
+        });
+
+        this.createdMessages.push({
+            input: structuredClone(input),
+            createdId: targetIndex,
+            ...(options !== undefined ? { options: { ...options } } : {}),
+        });
+        this.saveChatDebounced();
+
+        if (options?.emitEvent !== false) {
+            if (snapshot.isUser) {
+                this.emitHostEvent('MESSAGE_SENT', targetIndex);
+            } else {
+                this.emitHostEvent('MESSAGE_RECEIVED', targetIndex);
+            }
+        }
+
+        return structuredClone(snapshot);
+    }
+
+    async deleteChatMessage(
+        messageId: number,
+        options?: DeleteChatMessageOptions,
+    ): Promise<DeletedChatMessageSnapshot | null> {
+        if (
+            !Number.isInteger(messageId) ||
+            messageId < 0 ||
+            messageId >= this.chat.length
+        ) {
+            return null;
+        }
+        const existing = this.chat[messageId];
+        if (!existing) {
+            return null;
+        }
+        const snapshot = structuredClone(existing);
+        this.chat.splice(messageId, 1);
+        this.chat.forEach((msg, idx) => {
+            msg.id = idx;
+        });
+
+        this.deletedMessages.push({
+            messageId,
+            snapshot: structuredClone(snapshot),
+            ...(options !== undefined ? { options: { ...options } } : {}),
+        });
+        this.saveChatDebounced();
+
+        if (options?.emitEvent !== false) {
+            this.emitHostEvent('MESSAGE_DELETED', this.chat.length);
+        }
+
+        return {
+            messageId,
+            snapshot,
+        };
     }
 
     getActiveIdentity(): HostIdentity {

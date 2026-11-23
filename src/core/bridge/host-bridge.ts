@@ -3,6 +3,7 @@ import type {
     MediaAttachment,
     MessageTarget,
     RawLoreEntry,
+    SwipeDataSnapshot,
 } from '../types';
 import type { HostAdminBridge, HostAuthorBridge } from './host-admin-bridge';
 
@@ -19,6 +20,42 @@ export interface WriteChatMessageOptions {
      * Keep `false` during streaming or internal staging; set `true` on post-turn edits.
      */
     emitEvent?: boolean;
+}
+
+export type ChatMessageRole = 'user' | 'assistant' | 'system';
+
+export interface CreateChatMessageInput {
+    role: ChatMessageRole;
+    content: string;
+    name?: string;
+    /** 0-based insertion index (`0..chat.length`); omit to append at the end. */
+    insertAt?: number;
+    /** Override `is_system`; defaults to `true` for `'system'` role and `false` otherwise. */
+    hidden?: boolean;
+    swipeId?: number;
+    swipes?: string[];
+    swipeInfo?: SwipeDataSnapshot[];
+    sendDate?: string | number;
+    extra?: Record<string, unknown>;
+    variables?: Record<string, unknown>[];
+    /** Optional lossless raw host fields preserved for undo restoration. */
+    rawFields?: Record<string, unknown>;
+}
+
+export interface CreateChatMessageOptions {
+    /** Whether to emit native host creation events (`MESSAGE_SENT` / `MESSAGE_RECEIVED`). Defaults to `true`. */
+    emitEvent?: boolean;
+}
+
+export interface DeleteChatMessageOptions {
+    /** Whether to emit native host deletion events (`MESSAGE_DELETED`). Defaults to `true`. */
+    emitEvent?: boolean;
+}
+
+export interface DeletedChatMessageSnapshot {
+    messageId: number;
+    snapshot: ChatMessageSnapshot;
+    rawMessage?: Record<string, unknown>;
 }
 
 /**
@@ -48,6 +85,25 @@ export interface HostBridge {
         content: string,
         options?: WriteChatMessageOptions,
     ): Promise<void>;
+
+    /**
+     * Create a new native chat message (appending or inserting at `insertAt`),
+     * refresh the host DOM/view, call `saveChatDebounced()`, and optionally emit events.
+     */
+    createChatMessage?(
+        input: CreateChatMessageInput,
+        options?: CreateChatMessageOptions,
+    ): Promise<ChatMessageSnapshot>;
+
+    /**
+     * Physically delete a chat message at `messageId`, renumber subsequent messages,
+     * call `saveChatDebounced()`, and optionally emit `MESSAGE_DELETED`.
+     * Returns the pre-deletion snapshot (and raw host record if available), or `null` if missing.
+     */
+    deleteChatMessage?(
+        messageId: number,
+        options?: DeleteChatMessageOptions,
+    ): Promise<DeletedChatMessageSnapshot | null>;
 
     // 2. Character, persona & World Info assets
     getCharacterFields(): Record<string, string>;

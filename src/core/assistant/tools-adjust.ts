@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { DeletedChatMessageSnapshot } from '@/core/bridge';
 import { DEFAULT_MAIN_AGENT_ID } from '@/core/config';
 import { DATA_NAMESPACES, MESSAGE_OVERRIDE_KEY } from '@/core/store';
 import { VfsVarsAdapter } from '@/core/tools';
@@ -58,6 +59,50 @@ const EDIT_FILE_SCHEMA = z.object({
 const MESSAGE_TARGET_SCHEMA = z.object({
     messageId: z.number().int().min(0),
     swipeId: z.number().int().min(0).optional().default(0),
+});
+
+const CHAT_CREATE_MESSAGE_SCHEMA = z.object({
+    role: z
+        .enum(['user', 'assistant', 'system'])
+        .describe('Message speaker role: "user", "assistant", or "system".'),
+    content: z.string().describe('Raw markdown/text content of the new message.'),
+    name: z
+        .string()
+        .optional()
+        .describe('Optional display name override; defaults to current user, character, or System name.'),
+    insertAt: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('Optional 0-based insertion index (0..chat.length). Omit to append at the end of chat.'),
+    hidden: z
+        .boolean()
+        .optional()
+        .describe('Optional is_system visibility override (defaults to true for "system", false otherwise).'),
+    syncTrajectory: z
+        .enum(['none', 'rewrite'])
+        .optional()
+        .default('none')
+        .describe(
+            'Mainline trajectory sync strategy. Defaults to "none" (zero mutation to mainline TrajectoryStore prefix cache).',
+        ),
+});
+
+const CHAT_DELETE_MESSAGE_SCHEMA = z.object({
+    messageId: z.number().int().min(0).optional().describe('Single 0-based chat message index to delete.'),
+    messageIds: z
+        .array(z.number().int().min(0))
+        .min(1)
+        .optional()
+        .describe('Optional array of 0-based chat message indices to delete atomically.'),
+    syncTrajectory: z
+        .enum(['none', 'rewrite'])
+        .optional()
+        .default('none')
+        .describe(
+            'Mainline trajectory sync strategy. Defaults to "none" (zero mutation to mainline TrajectoryStore prefix cache).',
+        ),
 });
 
 const CHAT_EDIT_MESSAGE_SCHEMA = z.object({
@@ -168,8 +213,26 @@ function assertAllowedAdjustPath(rawPath: string): string {
     return normalizeVfsPath(rawPath);
 }
 
+function resolveDeleteMessageIds(args: {
+    messageId?: number;
+    messageIds?: number[];
+}): number[] {
+    const idSet = new Set<number>();
+    if (typeof args.messageId === 'number' && Number.isInteger(args.messageId) && args.messageId >= 0) {
+        idSet.add(args.messageId);
+    }
+    if (Array.isArray(args.messageIds)) {
+        for (const id of args.messageIds) {
+            if (typeof id === 'number' && Number.isInteger(id) && id >= 0) {
+                idSet.add(id);
+            }
+        }
+    }
+    return Array.from(idSet).sort((a, b) => a - b);
+}
+
 /**
- * Create the 7 `adjust` current-chat mutation tools (`ADJUST_WRITE_TOOLS`).
+ * Create the 9 `adjust` current-chat mutation tools (`ADJUST_WRITE_TOOLS`).
  * Every write enforces scope allowlists and captures a pre-write `UndoRecord`.
  */
 export function createAdjustTools(): AssistantToolDefinition[] {
@@ -406,6 +469,119 @@ export function createAdjustTools(): AssistantToolDefinition[] {
         },
     };
 
+    const chatCreateMessageTool: AssistantToolDefinition<typeof CHAT_CREATE_MESSAGE_SCHEMA> = {
+        name: 'chat_create_message',
+        description:
+            'Create a new chat message (user, assistant, or system) via HostBridge.createChatMessage(..., { emitEvent: true }). Supports appending or inserting at insertAt. Defaults to syncTrajectory: "none". Captures pre-write UndoRecord.',
+        parameters: CHAT_CREATE_MESSAGE_SCHEMA,
+        tier: 'adjust',
+        readOnly: false,
+        async preview(args, ctx) {
+            const chat = ctx.bridge.getChat();
+            const targetIndex = args.insertAt ?? chat.length;
+            const identity = ctx.bridge.getActiveIdentity();
+            const speakerName =
+                args.name?.trim()
+                || (args.role === 'user'
+                    ? identity.userName || 'User'
+                    : args.role === 'system'
+                      ? 'System'
+                      : identity.charName || 'Assistant');
+            const actionLabel =
+                args.insertAt !== undefined
+                    ? `Insert at #${targetIndex}`
+                    : `Append as #${targetIndex}`;
+            return {
+                title: `Create ${args.role} message (${actionLabel})`,
+                summary: `${actionLabel} (${speakerName}, syncTrajectory=${args.syncTrajectory ?? 'none'}).`,
+                targetLabel: `Chat: #${targetIndex}`,
+                beforeText: '',
+                afterText: args.content,
+                rawContent: args.content,
+                diffLines: computeDiffLines('', args.content),
+            };
+        },
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            if (!ctx.bridge.createChatMessage) {
+                return finalizeToolError(
+                    'HostBridge.createChatMessage is not available in this environment.',
+                    ctx.signal,
+                );
+            }
+
+            const chat = ctx.bridge.getChat();
+            if (args.insertAt !== undefined && (args.insertAt < 0 || args.insertAt > chat.length)) {
+                return finalizeToolError(
+                    `Invalid insertAt index ${args.insertAt} for chat length ${chat.length}.`,
+                    ctx.signal,
+                );
+            }
+
+            const syncTrajectory = args.syncTrajectory ?? 'none';
+            const created = await ctx.bridge.createChatMessage(
+                {
+                    role: args.role,
+                    content: args.content,
+                    ...(args.name !== undefined ? { name: args.name } : {}),
+                    ...(args.insertAt !== undefined ? { insertAt: args.insertAt } : {}),
+                    ...(args.hidden !== undefined ? { hidden: args.hidden } : {}),
+                },
+                { emitEvent: true },
+            );
+
+            // Default syncTrajectory: 'none' MUST NOT touch mainline TrajectoryStore prefix cache.
+            if (syncTrajectory === 'rewrite' && ctx.trajectoryStore) {
+                ctx.trajectoryStore.pruneFromMessage(created.id, DEFAULT_MAIN_AGENT_ID);
+            }
+
+            const target: MessageTarget = {
+                messageId: created.id,
+                swipeId: created.swipeId ?? 0,
+            };
+
+            const undoId =
+                ctx.captureUndo === false
+                    ? undefined
+                    : ctx.undoStore.push({
+                          sessionId: ctx.sessionId,
+                          toolCallId: ctx.toolCallId,
+                          toolName: 'chat_create_message',
+                          kind: 'chat_message',
+                          label: `Create ${args.role} message #${created.id}`,
+                          scope: `chat:${created.id}`,
+                          beforeSummary: '(message did not exist)',
+                          afterSummary: truncateSummary(created.mes),
+                          snapshot: {
+                              action: 'create',
+                              messageId: created.id,
+                              role: args.role,
+                              name: created.name,
+                              content: created.mes,
+                              isUser: created.isUser,
+                              isSystem: Boolean(created.isSystem),
+                              syncTrajectory,
+                          },
+                          target,
+                      }).id;
+
+            return finalizeMutationToolResult(
+                {
+                    messageId: created.id,
+                    target,
+                    role: args.role,
+                    name: created.name,
+                    isUser: created.isUser,
+                    isSystem: Boolean(created.isSystem),
+                    content: created.mes,
+                    chatLength: ctx.bridge.getChat().length,
+                    syncTrajectory,
+                },
+                { undoId },
+            );
+        },
+    };
+
     const chatEditMessageTool: AssistantToolDefinition<typeof CHAT_EDIT_MESSAGE_SCHEMA> = {
         name: 'chat_edit_message',
         description:
@@ -498,6 +674,186 @@ export function createAdjustTools(): AssistantToolDefinition[] {
                     target,
                     syncTrajectory,
                     content: nextContent,
+                },
+                { undoId },
+            );
+        },
+    };
+
+    const chatDeleteMessageTool: AssistantToolDefinition<typeof CHAT_DELETE_MESSAGE_SCHEMA> = {
+        name: 'chat_delete_message',
+        description:
+            'Physically delete one or more chat messages (`messageId` or `messageIds`) via HostBridge.deleteChatMessage(..., { emitEvent: true }). Defaults to syncTrajectory: "none". Captures pre-write UndoRecord for atomic restoration.',
+        parameters: CHAT_DELETE_MESSAGE_SCHEMA,
+        tier: 'adjust',
+        readOnly: false,
+        async preview(args, ctx) {
+            const ids = resolveDeleteMessageIds(args);
+            const chat = ctx.bridge.getChat();
+            if (ids.length === 0) {
+                return {
+                    title: 'Delete chat message(s)',
+                    summary: 'No messageId or messageIds specified.',
+                    targetLabel: 'Chat Message',
+                    beforeText: '',
+                    afterText: '',
+                    rawContent: '',
+                    diffLines: [],
+                    warnings: ['Missing messageId or messageIds.'],
+                };
+            }
+
+            if (ids.length === 1) {
+                const id = ids[0];
+                const msg = chat[id];
+                const roleLabel = !msg
+                    ? 'unknown'
+                    : msg.isUser
+                      ? 'user'
+                      : msg.isSystem
+                        ? 'system'
+                        : 'assistant';
+                const swipeCount = msg?.swipes?.length ?? 1;
+                const swipeNote = swipeCount > 1 ? `, ${swipeCount} swipes` : '';
+                const beforeText = msg?.mes ?? '';
+                const summary = msg
+                    ? `Delete #${id} (${msg.name || roleLabel}, ${roleLabel}${swipeNote}, syncTrajectory=${args.syncTrajectory ?? 'none'}).`
+                    : `Target #${id} not found in current chat (length=${chat.length}).`;
+                return {
+                    title: `Delete chat message #${id}`,
+                    summary,
+                    targetLabel: `Chat: #${id}`,
+                    beforeText,
+                    afterText: '',
+                    rawContent: beforeText,
+                    diffLines: computeDiffLines(beforeText, ''),
+                    ...(msg ? {} : { warnings: [`Message #${id} not found.`] }),
+                };
+            }
+
+            const missingIds = ids.filter((id) => !chat[id]);
+            const beforeText = ids
+                .map((id) => {
+                    const msg = chat[id];
+                    if (!msg) {
+                        return `--- #${id} (not found) ---`;
+                    }
+                    const speaker =
+                        msg.name || (msg.isUser ? 'User' : msg.isSystem ? 'System' : 'Assistant');
+                    return `--- #${id} [${speaker}] ---\n${msg.mes}`;
+                })
+                .join('\n\n');
+            const previewLabels = ids.slice(0, 3).map((id) => `#${id}`).join(', ');
+            const targetLabel =
+                ids.length > 3 ? `Chat: ${previewLabels} (+${ids.length - 3})` : `Chat: ${previewLabels}`;
+
+            return {
+                title: `Delete ${ids.length} chat messages (${ids.map((id) => `#${id}`).join(', ')})`,
+                summary: `Delete ${ids.length} messages in chat (syncTrajectory=${args.syncTrajectory ?? 'none'}).`,
+                targetLabel,
+                beforeText,
+                afterText: '',
+                rawContent: beforeText,
+                diffLines: computeDiffLines(beforeText, ''),
+                ...(missingIds.length > 0
+                    ? { warnings: [`Missing message(s): ${missingIds.map((id) => `#${id}`).join(', ')}.`] }
+                    : {}),
+            };
+        },
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            if (!ctx.bridge.deleteChatMessage) {
+                return finalizeToolError(
+                    'HostBridge.deleteChatMessage is not available in this environment.',
+                    ctx.signal,
+                );
+            }
+
+            const ids = resolveDeleteMessageIds(args);
+            if (ids.length === 0) {
+                return finalizeToolError(
+                    'chat_delete_message requires "messageId" or a non-empty "messageIds" array.',
+                    ctx.signal,
+                );
+            }
+
+            const chat = ctx.bridge.getChat();
+            const missingIds = ids.filter((id) => id < 0 || id >= chat.length || !chat[id]);
+            if (missingIds.length > 0) {
+                return finalizeToolError(
+                    `Chat message(s) not found: ${missingIds.map((id) => `#${id}`).join(', ')} (chat length: ${chat.length}).`,
+                    ctx.signal,
+                );
+            }
+
+            // Delete from highest index down so lower indices stay stable during batch deletion.
+            const deletedAscending: DeletedChatMessageSnapshot[] = [];
+            for (const id of [...ids].reverse()) {
+                throwIfAssistantAborted(ctx.signal);
+                const removed = await ctx.bridge.deleteChatMessage(id, { emitEvent: true });
+                if (!removed) {
+                    return finalizeToolError(
+                        `Failed to delete chat message #${id}.`,
+                        ctx.signal,
+                    );
+                }
+                deletedAscending.unshift(removed);
+            }
+
+            const syncTrajectory = args.syncTrajectory ?? 'none';
+            // Default syncTrajectory: 'none' MUST NOT touch mainline TrajectoryStore prefix cache.
+            if (syncTrajectory === 'rewrite' && ctx.trajectoryStore) {
+                ctx.trajectoryStore.pruneFromMessage(ids[0], DEFAULT_MAIN_AGENT_ID);
+            }
+
+            const firstRemoved = deletedAscending[0];
+            const scope = ids.length === 1 ? `chat:${ids[0]}` : `chat:${ids.join(',')}`;
+            const label =
+                ids.length === 1
+                    ? `Delete chat message #${ids[0]}`
+                    : `Delete ${ids.length} chat messages (${ids.map((id) => `#${id}`).join(', ')})`;
+            const beforeSummary =
+                ids.length === 1
+                    ? truncateSummary(firstRemoved.snapshot.mes)
+                    : truncateSummary(
+                          deletedAscending
+                              .map((item) => `#${item.messageId}: ${item.snapshot.mes}`)
+                              .join(' | '),
+                      );
+
+            const undoId =
+                ctx.captureUndo === false
+                    ? undefined
+                    : ctx.undoStore.push({
+                          sessionId: ctx.sessionId,
+                          toolCallId: ctx.toolCallId,
+                          toolName: 'chat_delete_message',
+                          kind: 'chat_message',
+                          label,
+                          scope,
+                          beforeSummary,
+                          afterSummary: `(deleted ${ids.length} message${ids.length === 1 ? '' : 's'})`,
+                          snapshot: {
+                              action: 'delete',
+                              deletedMessages: deletedAscending.map((item) => ({
+                                  messageId: item.messageId,
+                                  snapshot: item.snapshot,
+                                  ...(item.rawMessage ? { rawMessage: item.rawMessage } : {}),
+                              })),
+                              syncTrajectory,
+                          },
+                          target: {
+                              messageId: firstRemoved.messageId,
+                              swipeId: firstRemoved.snapshot.swipeId ?? 0,
+                          },
+                      }).id;
+
+            return finalizeMutationToolResult(
+                {
+                    deletedIds: ids,
+                    deletedCount: ids.length,
+                    remainingChatLength: ctx.bridge.getChat().length,
+                    syncTrajectory,
                 },
                 { undoId },
             );
@@ -671,7 +1027,9 @@ export function createAdjustTools(): AssistantToolDefinition[] {
         writeFileTool,
         appendFileTool,
         editFileTool,
+        chatCreateMessageTool,
         chatEditMessageTool,
+        chatDeleteMessageTool,
         chatToggleHideMessageTool,
         messageOverrideDisplayTool,
     ];

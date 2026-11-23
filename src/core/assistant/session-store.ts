@@ -33,13 +33,19 @@ export interface CreateAssistantSessionOptions {
     mode?: AssistantMode;
     stAdminEnabled?: boolean;
     autoApproveAuthor?: boolean;
+    autoApproveChatDelete?: boolean;
     connectionId?: string;
 }
 
 export type AssistantSessionPatch = Partial<
     Pick<
         AssistantSession,
-        'title' | 'mode' | 'stAdminEnabled' | 'autoApproveAuthor' | 'connectionId'
+        | 'title'
+        | 'mode'
+        | 'stAdminEnabled'
+        | 'autoApproveAuthor'
+        | 'autoApproveChatDelete'
+        | 'connectionId'
     >
 >;
 
@@ -482,6 +488,7 @@ export class AssistantSessionStore {
             mode,
             stAdminEnabled: mode === 'full' ? Boolean(options.stAdminEnabled) : false,
             autoApproveAuthor: Boolean(options.autoApproveAuthor),
+            autoApproveChatDelete: Boolean(options.autoApproveChatDelete),
             connectionId: options.connectionId?.trim() || 'inherit',
             updatedAt: now,
             messages: [],
@@ -525,6 +532,9 @@ export class AssistantSessionStore {
         }
         if (patch.autoApproveAuthor !== undefined) {
             session.autoApproveAuthor = Boolean(patch.autoApproveAuthor);
+        }
+        if (patch.autoApproveChatDelete !== undefined) {
+            session.autoApproveChatDelete = Boolean(patch.autoApproveChatDelete);
         }
         if (patch.connectionId !== undefined) {
             session.connectionId = patch.connectionId.trim() || 'inherit';
