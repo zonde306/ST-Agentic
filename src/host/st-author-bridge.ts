@@ -584,6 +584,40 @@ function findNextWorldInfoUid(entries: Record<string, RawStWorldInfoEntry>): num
     return maxUid + 1;
 }
 
+/**
+ * Normalize `HostRegexScript[]` with SillyTavern `RegexScriptData` required defaults
+ * (`trimStrings`, `placement`, `disabled`, `markdownOnly`, `promptOnly`, `runOnEdit`, `substituteRegex`).
+ */
+export function normalizeStRegexScripts(
+    scripts: readonly HostRegexScript[],
+): Array<HostRegexScript & {
+    trimStrings: string[];
+    placement: number[];
+    disabled: boolean;
+    markdownOnly: boolean;
+    promptOnly: boolean;
+    runOnEdit: boolean;
+    substituteRegex: number;
+    minDepth: number | null;
+    maxDepth: number | null;
+}> {
+    return scripts.map((script) => {
+        const cloned = cloneValue(script);
+        return {
+            ...cloned,
+            trimStrings: Array.isArray(cloned.trimStrings) ? cloned.trimStrings : [],
+            placement: Array.isArray(cloned.placement) ? cloned.placement : [],
+            disabled: cloned.disabled ?? false,
+            markdownOnly: cloned.markdownOnly ?? false,
+            promptOnly: cloned.promptOnly ?? false,
+            runOnEdit: cloned.runOnEdit ?? false,
+            substituteRegex: cloned.substituteRegex ?? 0,
+            minDepth: cloned.minDepth ?? null,
+            maxDepth: cloned.maxDepth ?? null,
+        };
+    });
+}
+
 function collectWorkspaceFiles(
     store: ChatDataStore | undefined,
     filePaths?: string[],
@@ -877,7 +911,11 @@ export class STAuthorBridge implements HostAuthorBridge {
         }
 
         if (typeof stDeleteWorldInfoEntry === 'function') {
-            const deleted = await stDeleteWorldInfoEntry(loaded, Math.floor(uid), { silent: true });
+            const deleted = await stDeleteWorldInfoEntry(
+                loaded as unknown as Parameters<typeof stDeleteWorldInfoEntry>[0],
+                Math.floor(uid),
+                { silent: true },
+            );
             if (deleted === false && key in entriesMap) {
                 delete entriesMap[key];
             }
@@ -922,14 +960,17 @@ export class STAuthorBridge implements HostAuthorBridge {
     }
 
     async saveScopedRegex(scripts: HostRegexScript[]): Promise<void> {
-        const cloned = cloneValue(scripts);
+        const normalized = normalizeStRegexScripts(scripts);
         const resolved = resolveStCharacterById(this_chid);
 
         if (typeof saveScriptsByType === 'function' && SCRIPT_TYPES?.SCOPED !== undefined) {
-            await saveScriptsByType(cloned, SCRIPT_TYPES.SCOPED);
+            await saveScriptsByType(
+                normalized as unknown as Parameters<typeof saveScriptsByType>[0],
+                SCRIPT_TYPES.SCOPED,
+            );
             if (resolved) {
                 syncCharacterThreeWayMirrors(resolved.chid, resolved.character, {
-                    extensions: { regex_scripts: cloned },
+                    extensions: { regex_scripts: normalized },
                 });
             }
             return;
@@ -939,7 +980,7 @@ export class STAuthorBridge implements HostAuthorBridge {
             throw new Error('Cannot save scoped regex scripts: no active character selected');
         }
         await patchStCharacterById(resolved.chid, {
-            extensions: { regex_scripts: cloned },
+            extensions: { regex_scripts: normalized },
         });
     }
 

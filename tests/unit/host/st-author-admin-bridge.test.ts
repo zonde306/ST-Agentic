@@ -645,10 +645,23 @@ describe('STAuthorBridge', () => {
             },
         ];
         await author.saveScopedRegex(scripts);
-        expect(stMocks.fns.saveScriptsByType).toHaveBeenCalledWith(scripts, 1);
+        const expectedScoped = [
+            {
+                ...scripts[0]!,
+                trimStrings: [],
+                disabled: false,
+                markdownOnly: false,
+                promptOnly: false,
+                runOnEdit: false,
+                substituteRegex: 0,
+                minDepth: null,
+                maxDepth: null,
+            },
+        ];
+        expect(stMocks.fns.saveScriptsByType).toHaveBeenCalledWith(expectedScoped, 1);
 
         const listed = await author.listScopedRegex();
-        expect(listed).toEqual(scripts);
+        expect(listed).toEqual(expectedScoped);
 
         const embedRes = await author.embedAgenticPayload({
             includePreset: true,
@@ -759,8 +772,22 @@ describe('STAdminBridge', () => {
             { id: 'gr-1', scriptName: 'Global Rule', findRegex: '/foo/g', replaceString: 'bar' },
         ];
         await admin.saveGlobalRegex(globalScripts);
-        expect(stMocks.fns.saveScriptsByType).toHaveBeenCalledWith(globalScripts, 0);
-        expect(await admin.listGlobalRegex()).toEqual(globalScripts);
+        const expectedGlobal = [
+            {
+                ...globalScripts[0]!,
+                trimStrings: [],
+                placement: [],
+                disabled: false,
+                markdownOnly: false,
+                promptOnly: false,
+                runOnEdit: false,
+                substituteRegex: 0,
+                minDepth: null,
+                maxDepth: null,
+            },
+        ];
+        expect(stMocks.fns.saveScriptsByType).toHaveBeenCalledWith(expectedGlobal, 0);
+        expect(await admin.listGlobalRegex()).toEqual(expectedGlobal);
 
         const slashOut = await admin.executeSlashCommand('/echo hi');
         expect(slashOut).toBe('ran:/echo hi');

@@ -45,6 +45,7 @@ import { executeStSlashCommand } from './slash-bridge';
 import {
     buildCharacterFullSnapshot,
     convertRawStLoreEntry,
+    normalizeStRegexScripts,
     patchStCharacterById,
     resolveStCharacterById,
 } from './st-author-bridge';
@@ -749,13 +750,16 @@ export class STAdminBridge implements HostAdminBridge {
     }
 
     async saveGlobalRegex(scripts: HostRegexScript[]): Promise<void> {
-        const cloned = cloneValue(scripts);
+        const normalized = normalizeStRegexScripts(scripts);
         if (typeof saveScriptsByType === 'function' && SCRIPT_TYPES?.GLOBAL !== undefined) {
-            await saveScriptsByType(cloned, SCRIPT_TYPES.GLOBAL);
+            await saveScriptsByType(
+                normalized as unknown as Parameters<typeof saveScriptsByType>[0],
+                SCRIPT_TYPES.GLOBAL,
+            );
             return;
         }
         const ext = extension_settings as Record<string, unknown>;
-        ext.regex = cloned;
+        ext.regex = normalized;
         saveSettingsDebounced();
     }
 
