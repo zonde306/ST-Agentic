@@ -1,0 +1,2436 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ST-Agentic 助手 &amp; 线外协作 UI 原型</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    select, input, textarea {
+      max-width: 100%;
+      min-width: 0;
+    }
+    .thin-scroll::-webkit-scrollbar { width: 5px; height: 5px; }
+    .thin-scroll::-webkit-scrollbar-track { background: transparent; }
+    .thin-scroll::-webkit-scrollbar-thumb {
+      background: color-mix(in srgb, var(--muted-foreground) 28%, transparent);
+      border-radius: 9999px;
+    }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
+
+    .pill-soft-primary {
+      background: color-mix(in srgb, var(--primary) 14%, transparent);
+      color: var(--primary);
+      border-color: color-mix(in srgb, var(--primary) 34%, transparent);
+    }
+    .pill-soft-success {
+      background: color-mix(in srgb, var(--success) 14%, transparent);
+      color: var(--success);
+      border-color: color-mix(in srgb, var(--success) 34%, transparent);
+    }
+    .pill-soft-warning {
+      background: color-mix(in srgb, var(--warning) 14%, transparent);
+      color: var(--warning);
+      border-color: color-mix(in srgb, var(--warning) 34%, transparent);
+    }
+    .pill-soft-error {
+      background: color-mix(in srgb, var(--error) 14%, transparent);
+      color: var(--error);
+      border-color: color-mix(in srgb, var(--error) 34%, transparent);
+    }
+    .pill-soft-muted {
+      background: color-mix(in srgb, var(--muted-foreground) 12%, transparent);
+      color: var(--muted-foreground);
+      border-color: color-mix(in srgb, var(--border) 85%, transparent);
+    }
+    .diff-del {
+      background: color-mix(in srgb, var(--error) 15%, transparent);
+      color: var(--error);
+    }
+    .diff-add {
+      background: color-mix(in srgb, var(--success) 15%, transparent);
+      color: var(--success);
+    }
+    .diff-ctx {
+      color: var(--muted-foreground);
+    }
+    .shadow-boundary-badge {
+      background: color-mix(in srgb, var(--primary) 10%, transparent);
+      border: 1px dashed color-mix(in srgb, var(--primary) 42%, transparent);
+    }
+    .mobile-shell {
+      width: 390px;
+      height: 844px;
+      max-width: 100%;
+      border-radius: 28px;
+      border: 6px solid var(--border);
+      overflow: hidden;
+      box-shadow: 0 24px 60px color-mix(in srgb, var(--foreground) 16%, transparent);
+    }
+    .mobile-control {
+      font-size: 16px !important;
+      min-height: 40px;
+    }
+    .touch-target {
+      min-height: 40px;
+      min-width: 40px;
+    }
+
+    /* Shadow DOM 独立 Dark / Light 双主题色板（与 src/ui/shell/styles.ts 一致） */
+    #theme-scope[data-theme="dark"] {
+      --background: #14161b;
+      --sidebar: #1b1e25;
+      --content: #101216;
+      --card: #20242c;
+      --border: #2f3542;
+      --card-border: #2a303c;
+      --foreground: #e6e9ef;
+      --muted-foreground: #9aa3b2;
+      --primary: #6c8cff;
+      --primary-foreground: #ffffff;
+      --secondary: #2a303c;
+      --secondary-foreground: #e6e9ef;
+      --success: #34d399;
+      --warning: #fbbf24;
+      --error: #f87171;
+      color-scheme: dark;
+    }
+    #theme-scope[data-theme="light"] {
+      --background: #f4f6fa;
+      --sidebar: #eef1f6;
+      --content: #f8fafc;
+      --card: #ffffff;
+      --border: #dbe1eb;
+      --card-border: #e5eaf2;
+      --foreground: #181c24;
+      --muted-foreground: #5f697a;
+      --primary: #3b66f5;
+      --primary-foreground: #ffffff;
+      --secondary: #e8edf5;
+      --secondary-foreground: #181c24;
+      --success: #10b981;
+      --warning: #d97706;
+      --error: #dc2626;
+      color-scheme: light;
+    }
+  </style>
+</head>
+<body class="m-0 p-0 antialiased">
+<div id="theme-scope" data-theme="dark" class="bg-[var(--background)] text-[var(--foreground)] min-h-screen flex flex-col transition-colors duration-150">
+
+  <!-- 顶部原型场景切换栏 -->
+  <header class="shrink-0 bg-[var(--sidebar)] border-b border-[var(--border)] px-3 sm:px-5 py-2 flex flex-wrap items-center justify-between gap-2">
+    <div class="flex items-center gap-2 min-w-0">
+      <div class="w-7 h-7 rounded-lg bg-[var(--primary)] text-[var(--primary-foreground)] flex items-center justify-center shadow-sm shrink-0">
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+      </div>
+      <div class="min-w-0">
+        <div class="text-sm font-semibold leading-tight flex items-center gap-2 flex-wrap">
+          <span>ST-Agentic 助手 &amp; 线外协作 UI 原型</span>
+          <span class="text-[11px] px-1.5 py-0.5 rounded border border-[var(--border)] bg-[var(--content)] text-[var(--muted-foreground)] font-normal">极简输入组版</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex flex-wrap items-center gap-2">
+      <div class="flex items-center gap-1 bg-[var(--content)] p-1 rounded-lg border border-[var(--border)] text-xs">
+        <button id="theme-btn-dark" onclick="setTheme('dark')" class="px-2 py-1 rounded-md cursor-pointer flex items-center gap-1 transition">🌙 深色</button>
+        <button id="theme-btn-light" onclick="setTheme('light')" class="px-2 py-1 rounded-md cursor-pointer flex items-center gap-1 transition">☀️ 浅色</button>
+      </div>
+
+      <div class="flex items-center gap-1 bg-[var(--content)] p-1 rounded-lg border border-[var(--border)]">
+        <button id="scene-desktop" onclick="switchScene('desktop')" class="px-2.5 py-1.5 rounded-md text-xs font-medium transition cursor-pointer flex items-center gap-1.5">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          <span>桌面控制台</span>
+        </button>
+        <button id="scene-mobile" onclick="switchScene('mobile')" class="px-2.5 py-1.5 rounded-md text-xs font-medium transition cursor-pointer flex items-center gap-1.5">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+          <span>移动端 390×844</span>
+        </button>
+        <button id="scene-host" onclick="switchScene('host')" class="px-2.5 py-1.5 rounded-md text-xs font-medium transition cursor-pointer flex items-center gap-1.5">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          <span>ST 宿主入口</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Toast 通知浮层 -->
+  <div id="toast-box" class="fixed bottom-4 right-4 z-50 flex flex-col gap-2 pointer-events-none"></div>
+
+  <!-- 通用交互模态框 -->
+  <div id="modal-overlay" onclick="if(event.target===this) closeModal();" class="hidden fixed inset-0 z-40 bg-black/65 backdrop-blur-sm items-center justify-center p-3 sm:p-4">
+    <div class="bg-[var(--card)] border border-[var(--border)] rounded-2xl max-w-2xl w-full shadow-2xl overflow-hidden flex flex-col max-h-[85vh]">
+      <div class="px-4 py-3 border-b border-[var(--border)] bg-[var(--sidebar)] flex items-center justify-between gap-2 shrink-0">
+        <div id="modal-title" class="font-semibold text-sm flex items-center gap-2 min-w-0 truncate">面板</div>
+        <button onclick="closeModal()" class="touch-target px-2.5 py-1.5 rounded-lg hover:bg-[var(--secondary)] text-[var(--muted-foreground)] cursor-pointer text-xs shrink-0">✕ 关闭</button>
+      </div>
+      <div id="modal-body" class="p-4 text-xs space-y-3 overflow-y-auto thin-scroll flex-1"></div>
+      <div id="modal-footer" class="px-4 py-2.5 border-t border-[var(--border)] bg-[var(--content)] flex justify-end gap-2 shrink-0">
+        <button onclick="closeModal()" class="touch-target px-3 py-1.5 rounded-lg border border-[var(--border)] bg-[var(--card)] text-xs cursor-pointer hover:bg-[var(--secondary)]">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 主渲染容器 -->
+  <main id="app-root" class="flex-1 p-2.5 sm:p-4 flex justify-center items-start overflow-auto"></main>
+</div>
+
+<script>
+// =========================================================================
+// 1. 基础常量与权限矩阵定义
+// =========================================================================
+const NAV_ITEMS = [
+  { id: 'assistant', group: '线外协作', label: '助手工作台', short: '助手', desc: '4档模式 / 气泡审批 / 撤销' },
+  { id: 'sidegen', group: '线外协作', label: '线外会话与线索', short: '线外线索', desc: 'SideSession / /side/*' },
+  { id: 'files', group: '当前会话', label: '文件与内容覆盖', short: '文件覆盖', desc: '工作区 / 变量 / WI' },
+  { id: 'logs', group: '当前会话', label: '生成与工具日志', short: '生成日志', desc: '调用链 / 缓存命中' },
+  { id: 'cache', group: '当前会话', label: '缓存水位与存档压平', short: '缓存压平', desc: '分块归档 / 冷层压平' },
+  { id: 'agents', group: '预设与系统', label: '智能体', short: '智能体', desc: '提示词积木 / 权限' },
+  { id: 'pipeline', group: '预设与系统', label: '触发管线', short: '触发管线', desc: '四阶段 / 屏障 / @@' },
+  { id: 'tools', group: '预设与系统', label: '工具与脚本', short: '工具脚本', desc: 'defineTool / 模拟' },
+  { id: 'regex', group: '预设与系统', label: '正则清洗', short: '正则清洗', desc: 'display / ingest' },
+  { id: 'wi', group: '预设与系统', label: '世界书路由', short: '世界书', desc: '四类分流 / /preset/*' },
+  { id: 'connections', group: '预设与系统', label: 'API 连接', short: 'API连接', desc: '多模型 / 缓存策略' },
+];
+
+const MODE_META = {
+  chat: {
+    id: 'chat',
+    icon: '💬',
+    label: '交流',
+    fullLabel: '交流模式',
+    pillClass: 'pill-soft-primary',
+    desc: '纯聊天只读 · VFS / Chat / 角色卡 / WI，零写入副作用',
+    pills: [
+      { text: '读: VFS / Chat / 角色卡 / WI / 日志', cls: 'pill-soft-primary' },
+      { text: '写: 禁止写入', cls: 'pill-soft-muted' },
+    ],
+  },
+  adjust: {
+    id: 'adjust',
+    icon: '🔧',
+    label: '调整',
+    fullLabel: '调整模式',
+    pillClass: 'pill-soft-success',
+    desc: '允许修改当前 Chat、变量、工作区、分支 WI 覆写与 /side/*',
+    pills: [
+      { text: '写: 当前 Chat (可选同步轨迹)', cls: 'pill-soft-success' },
+      { text: '写: 变量 / 工作区 / /side/*', cls: 'pill-soft-success' },
+      { text: '永久资产: 只读', cls: 'pill-soft-muted' },
+    ],
+  },
+  author: {
+    id: 'author',
+    icon: '✍️',
+    label: '写卡',
+    fullLabel: '写卡模式',
+    pillClass: 'pill-soft-warning',
+    desc: '含调整能力 + 当前角色卡、主世界书、绑定正则（支持 @@ 与 EJS）',
+    pills: [
+      { text: '写: 当前角色卡 & 主世界书 (@@ / EJS)', cls: 'pill-soft-warning' },
+      { text: '写: 角色绑定正则 & 当前 Chat', cls: 'pill-soft-warning' },
+      { text: '安全: 气泡审批 + 快照撤销', cls: 'pill-soft-primary' },
+    ],
+  },
+  full: {
+    id: 'full',
+    icon: '⚡',
+    label: '完全控制',
+    fullLabel: '完全控制',
+    pillClass: 'pill-soft-error',
+    desc: '默认读写全部已开启世界书；开「ST 全权管家」解锁全库资产与设置',
+    pills: [],
+  },
+};
+
+const CONNECTION_OPTIONS = [
+  { id: 'inherit', label: '跟随主连接 (Claude Sonnet 4.5)', shortLabel: '跟随主连接' },
+  { id: 'conn_claude', label: 'Claude Sonnet 4.5 (写卡推荐 · 显式缓存)', shortLabel: 'Claude 4.5' },
+  { id: 'conn_pro', label: 'Gemini 2.5 Pro (长上下文推理)', shortLabel: 'Gemini Pro' },
+  { id: 'conn_flash', label: 'Gemini 2.5 Flash (低开销快速修错)', shortLabel: 'Gemini Flash' },
+];
+
+const DELIVERY_OPTIONS = [
+  { value: 'none', label: '不入主线 (none)', short: '不入主线', cls: 'pill-soft-muted' },
+  { value: 'vfs_only', label: '仅 VFS 可查 (vfs_only)', short: '仅 VFS', cls: 'pill-soft-primary' },
+  { value: 'radar_hint', label: 'TailRadar 雷达触发 (radar_hint · 默认)', short: '雷达触发', cls: 'pill-soft-success' },
+  { value: 'next_turn_brief', label: '下轮一次性简报 (next_turn_brief)', short: '下轮简报', cls: 'pill-soft-warning' },
+];
+
+// =========================================================================
+// 2. 状态模型
+// =========================================================================
+const state = {
+  theme: 'dark',
+  scene: 'desktop',            // 'desktop' | 'mobile' | 'host'
+  activeTab: 'assistant',      // 'assistant' | 'sidegen' | ...
+  runMode: 'takeover',         // 'off' | 'companion' | 'takeover'
+  currentPreset: '群像通用 Agent 预设',
+  mobileViewStack: 'detail',   // 'list' | 'detail'
+  mobileSideStack: 'list',     // 'list' | 'detail'
+
+  // 统一弹出层控制：null | 'mode' | 'model' | 'sessions'
+  openPopover: null,
+
+  selectedSessionId: 'ast_author',
+  draft: '',
+  streamingTimer: null,
+  streamingSessionId: null,
+  expandedActivity: {},        // msgId -> boolean
+  expandedTools: {},           // toolId -> boolean
+  expandedApprovalDetail: {},  // approvalId -> boolean
+  approvalViewMode: {},        // approvalId -> 'diff' | 'raw'
+
+  previewFiles: {
+    '/state/variables.json': JSON.stringify({
+      时间: '永历三年 · 秋分 戌时',
+      地点: '听竹小筑 · 后院',
+      女主好感: 62,
+      灵力: 84,
+      石井机关状态: '已显露半截铜环',
+    }, null, 2),
+    '/lorebooks/玄幻世界/银莲花结社-12.md': '# 银莲花结社\n关键词：银莲花, 密道, 铜环\n\n前朝遗留的暗桩组织，标志为三瓣倒垂银莲花刻痕。听竹小筑枯井三寸处藏有暗门机括。',
+    '/side/comms/linwan.md': '# 与林晚的加密通讯记录\n- [18:10 User]: 今晚十点老码头见，带上门禁卡。\n- [18:11 林晚]: 收到，东区巡逻九点半换防，我提前二十分钟在旧仓库灯塔下等你。',
+  },
+
+  sessions: [
+    {
+      id: 'ast_chat',
+      title: '剧情复盘与设定答疑',
+      mode: 'chat',
+      stAdminEnabled: false,
+      autoApproveAuthor: false,
+      connectionId: 'inherit',
+      updatedAt: '09:14',
+      messages: [
+        {
+          id: 'm_c1',
+          role: 'user',
+          content: '帮我查一下当前第12楼石井刻痕关联了哪些设定？为什么系统里显示缓存命中 96%？',
+          timestamp: '09:12',
+        },
+        {
+          id: 'm_c2',
+          role: 'assistant',
+          think: '用户处于交流模式（只读）。自主检索 /state/variables.json 与 /lorebooks/玄幻世界/银莲花结社-12.md 确认现状，再核查第 12 楼的 TailRadar 命中记录。',
+          content:
+            '已为你自主检索相关档案（独立助手轨运行，**未占用主线任何 Token**）：\n\n' +
+            '1. **石井刻痕线索**：第 12 楼提及“银莲花”关键词后，`TailRadar` 在 Layer 2 尾部注入了 1 条 `<lore-hint>`，主 Agent 按需读取了 `银莲花结社-12.md`。\n' +
+            '2. **好感与机关变量**：`/state/variables.json` 中 `女主好感` 为 **62**、`石井机关状态` 为 **“已显露半截铜环”**。\n' +
+            '3. **缓存为何高达 96%**：`Layer 0` 与 `Layer 1` 严格保持 Append-Only 逐字节不变，只有尾部动态区增量计算。',
+          fileRefs: ['/lorebooks/玄幻世界/银莲花结社-12.md', '/state/variables.json'],
+          toolCalls: [
+            {
+              id: 't_chat_1',
+              name: 'read_variables',
+              scopeLabel: '只读变量',
+              status: 'ok',
+              durationMs: 14,
+              args: '{}',
+              result: '{"时间":"永历三年 · 秋分 戌时","女主好感":62,"灵力":84,"石井机关状态":"已显露半截铜环"}',
+            },
+            {
+              id: 't_chat_2',
+              name: 'read_file',
+              scopeLabel: '只读 VFS',
+              status: 'ok',
+              durationMs: 19,
+              args: '{"path":"/lorebooks/玄幻世界/银莲花结社-12.md"}',
+              result: '# 银莲花结社\n前朝遗留的暗桩组织，听竹小筑枯井三寸处藏有暗门机括。',
+            },
+          ],
+          usage: { inputTokens: 1840, cachedTokens: 1730, outputTokens: 215, cacheRate: '94.0%' },
+          timestamp: '09:13',
+        },
+      ],
+    },
+    {
+      id: 'ast_adjust',
+      title: '修正 #12 楼灵力与错别字',
+      mode: 'adjust',
+      stAdminEnabled: false,
+      autoApproveAuthor: false,
+      connectionId: 'conn_flash',
+      updatedAt: '09:20',
+      messages: [
+        {
+          id: 'm_a1',
+          role: 'user',
+          content: '第12楼“半截铜环”其实是上锁的铜环，顺便把灵力错扣的 4 点加回到 88。注意别改错别字破坏主线缓存。',
+          timestamp: '09:18',
+        },
+        {
+          id: 'm_a2',
+          role: 'assistant',
+          think: '自主读取第 12 楼与变量后，chat_edit_message 传参 syncTrajectory: "none" 避免破坏主线 KV Cache；变量直接 patch_variables。两者均已保存写前快照。',
+          content:
+            '已完成两项当前会话调整（均已保存写前快照，可随时一键撤销）：\n\n' +
+            '- **消息微调 (`#12#0`)**：将“半截铜环的棱角”更新为“刻有锁孔的铜环”，使用 **`syncTrajectory: "none"`**，**主线 KV Cache 100% 保留**。\n' +
+            '- **变量修正 (`/state/variables.json`)**：已将 `灵力` 从 `84` 修正为 `88`。',
+          toolCalls: [
+            {
+              id: 't_adj_1',
+              name: 'chat_edit_message',
+              scopeLabel: '当前 Chat',
+              status: 'ok',
+              durationMs: 28,
+              args: '{"target":{"messageId":12,"swipeId":0},"oldText":"半截铜环的棱角","newText":"刻有锁孔的铜环","syncTrajectory":"none"}',
+              result: '已原地更新 ST 消息 #12#0（syncTrajectory=none，主线持久前缀未变动，KV Cache 0 击穿）。',
+              undoId: 'undo_adj_1',
+            },
+            {
+              id: 't_adj_2',
+              name: 'patch_variables',
+              scopeLabel: '当前分支变量',
+              status: 'ok',
+              durationMs: 16,
+              args: '{"ops":{"灵力":88}}',
+              result: '已更新 #12#0 层 /state/variables.json：灵力 84 -> 88',
+              undoId: 'undo_adj_2',
+            },
+          ],
+          usage: { inputTokens: 1420, cachedTokens: 1180, outputTokens: 168, cacheRate: '83.1%' },
+          timestamp: '09:20',
+        },
+      ],
+    },
+    {
+      id: 'ast_author',
+      title: '写卡：好感 EJS 条目与绑定正则',
+      mode: 'author',
+      stAdminEnabled: false,
+      autoApproveAuthor: false,
+      connectionId: 'conn_claude',
+      updatedAt: '09:32',
+      messages: [
+        {
+          id: 'm_w1',
+          role: 'user',
+          content: '帮我给主世界书《玄幻世界》加一个好感度阶段 EJS 条目（好感>=60 解锁隐藏对话），再加一条角色绑定正则把 <status> 折叠美化。',
+          timestamp: '09:30',
+        },
+        {
+          id: 'm_w2',
+          role: 'assistant',
+          think: '自主读取当前角色绑定主世界书并跑通 ejs_validate_template 干跑校验；随后生成 wi_upsert_primary_entry 与 regex_upsert_scoped 变更请求附着于气泡底部。',
+          content:
+            '已读取《林婉儿》绑定的主世界书 **`玄幻世界`** 并完成 EJS 干跑校验，拟定以下 2 项永久资产修改，请确认：',
+          toolCalls: [
+            {
+              id: 't_author_read',
+              name: 'card_read_active',
+              scopeLabel: '只读当前卡',
+              status: 'ok',
+              durationMs: 15,
+              args: '{}',
+              result: '角色: 林婉儿 (chid=3) | 主世界书: 玄幻世界 | 绑定正则: 1 条 (scopedAllowed=true)',
+            },
+            {
+              id: 't_author_ejs',
+              name: 'ejs_validate_template',
+              scopeLabel: 'EJS 沙箱校验',
+              status: 'ok',
+              durationMs: 22,
+              args: '{"template":"@@system ... <% if ((getvar(\'女主好感\') || 0) >= 60) { %> ...","mockVars":{"女主好感":62}}',
+              result: '✓ EJS 语法与变量求值校验通过（干跑输出 118 字，无异常）',
+            },
+          ],
+          approvals: ['appr_wi_18', 'appr_rx_status'],
+          usage: { inputTokens: 2950, cachedTokens: 2560, outputTokens: 390, cacheRate: '86.8%' },
+          timestamp: '09:32',
+        },
+      ],
+    },
+    {
+      id: 'ast_full',
+      title: 'ST 全权管家：跨书整理与导入',
+      mode: 'full',
+      stAdminEnabled: true,
+      autoApproveAuthor: true,
+      connectionId: 'conn_claude',
+      updatedAt: '09:38',
+      messages: [
+        {
+          id: 'm_f1',
+          role: 'user',
+          content: '检查现在的 API 与预设设置，然后从 URL 导入《古代称谓参考》世界书。',
+          timestamp: '09:36',
+        },
+        {
+          id: 'm_f2',
+          role: 'assistant',
+          think: '已启用 ST 全权管家。调用 st_settings_read_redacted 检查设置（所有 API Key 与 Token 自动脱敏），随后发起 st_import_asset（高危强制审批，不可自动跳过）。',
+          content:
+            '已核查 ST 与 Agentic 配置（敏感凭证已脱敏为 `***REDACTED***`）：主模型 `Claude Sonnet 4.5` 已启用显式缓存，`scopedAllowed` 已开启。\n\n' +
+            '外部 URL 导入属于 **高危全权操作**（不可自动跳过），请确认：',
+          toolCalls: [
+            {
+              id: 't_full_read_settings',
+              name: 'st_settings_read_redacted',
+              scopeLabel: 'ST 只读 · 强制脱敏',
+              status: 'ok',
+              durationMs: 18,
+              args: '{"sections":["connections","power_user"]}',
+              result: JSON.stringify({
+                activeConnection: {
+                  id: 'conn_claude',
+                  baseUrl: 'https://openrouter.ai/api/v1',
+                  apiKey: '***REDACTED***',
+                  cachePolicy: 'anthropic_explicit',
+                },
+                power_user: {
+                  allowScopedScripts: true,
+                  authToken: '***REDACTED***',
+                },
+              }, null, 2),
+              hasSecretRedaction: true,
+            },
+          ],
+          approvals: ['appr_full_import'],
+          usage: { inputTokens: 2180, cachedTokens: 1790, outputTokens: 280, cacheRate: '82.1%' },
+          timestamp: '09:38',
+        },
+      ],
+    },
+  ],
+
+  approvals: {
+    appr_wi_18: {
+      id: 'appr_wi_18',
+      sessionId: 'ast_author',
+      toolName: 'wi_upsert_primary_entry',
+      riskLevel: 'medium',
+      mandatoryConfirm: false,
+      revision: 1,
+      title: '《玄幻世界》· 女主好感阶段事件 (UID 18)',
+      summary: '直写原生 @@system 与 EJS <% if (...) %>，绕过运行时 escapeAt',
+      targetLabel: '当前主世界书 · 永久资产',
+      status: 'pending', // 'pending' | 'approved' | 'rejected'
+      undoId: null,
+      rawContent:
+`@@system
+# 女主好感阶段动态指引
+<% if ((getvar('女主好感') || 0) >= 60) { %>
+- [亲密阶段] 林婉儿已卸下防备，面对你的试探会给予暗示或私下传递密信。
+<% } else { %>
+- [戒备阶段] 林婉儿仍对你的来历保持疏离与试探。
+<% } %>`,
+      diffLines: [
+        { type: 'ctx', text: '  # 女主好感阶段动态指引 (UID 18 · 蓝灯 @D0)' },
+        { type: 'del', text: '- 女主当前态度：普通相识，保持客套。' },
+        { type: 'add', text: '+ @@system' },
+        { type: 'add', text: "+ <% if ((getvar('女主好感') || 0) >= 60) { %>" },
+        { type: 'add', text: '+ - [亲密阶段] 林婉儿已卸下防备，面对你的试探会给予暗示或私下传递密信。' },
+        { type: 'add', text: '+ <% } else { %>' },
+        { type: 'add', text: '+ - [戒备阶段] 林婉儿仍对你的来历保持疏离与试探。' },
+        { type: 'add', text: '+ <% } %>' },
+      ],
+    },
+    appr_rx_status: {
+      id: 'appr_rx_status',
+      sessionId: 'ast_author',
+      toolName: 'regex_upsert_scoped',
+      riskLevel: 'medium',
+      mandatoryConfirm: false,
+      revision: 1,
+      title: '角色绑定正则：状态栏折叠美化',
+      summary: '通过 saveScriptsByType(SCOPED) 写入角色卡 regex_scripts',
+      targetLabel: '当前角色绑定正则 · 永久资产',
+      status: 'pending',
+      undoId: null,
+      rawContent:
+`{
+  "scriptName": "状态栏折叠美化",
+  "findRegex": "/<status>([\\\\s\\\\S]*?)<\\\\/status>/g",
+  "replaceString": "<details class=\\"ag-status\\"><summary>✦ 当前状态面板</summary>$1</details>",
+  "markdownOnly": true
+}`,
+      diffLines: [
+        { type: 'ctx', text: '  角色绑定正则 (scopedAllowed=true):' },
+        { type: 'add', text: '+ [新增] 状态栏折叠美化' },
+        { type: 'add', text: '+   findRegex: /<status>([\\s\\S]*?)<\\/status>/g' },
+        { type: 'add', text: '+   replace:   <details class="ag-status"><summary>✦ 当前状态面板</summary>$1</details>' },
+      ],
+    },
+    appr_full_import: {
+      id: 'appr_full_import',
+      sessionId: 'ast_full',
+      toolName: 'st_import_asset',
+      riskLevel: 'high',
+      mandatoryConfirm: true,
+      revision: 1,
+      title: '从 URL 导入世界书：《古代称谓参考》',
+      summary: '拉取远程 JSON 并保存至 ST 全局世界书库',
+      targetLabel: 'ST 全权管家 · 外部导入',
+      status: 'pending',
+      undoId: null,
+      rawContent:
+`{
+  "kind": "worldinfo",
+  "name": "古代称谓参考",
+  "url": "https://raw.githubusercontent.com/example/st-lore/main/titles.json"
+}`,
+      diffLines: [
+        { type: 'ctx', text: '  目标：ST 全局世界书目录' },
+        { type: 'add', text: '+ 新建世界书: 古代称谓参考.json' },
+        { type: 'add', text: '+ 来源 URL:   https://raw.githubusercontent.com/example/st-lore/main/titles.json' },
+      ],
+    },
+  },
+
+  undoStack: [
+    {
+      id: 'undo_adj_2',
+      sessionId: 'ast_adjust',
+      toolCallId: 't_adj_2',
+      toolName: 'patch_variables',
+      label: '调整 #12#0 变量：灵力 84 → 88',
+      scope: '当前分支变量',
+      beforeSummary: '灵力: 84',
+      afterSummary: '灵力: 88',
+      timestamp: '09:20:04',
+      reverted: false,
+    },
+    {
+      id: 'undo_adj_1',
+      sessionId: 'ast_adjust',
+      toolCallId: 't_adj_1',
+      toolName: 'chat_edit_message',
+      label: '修改 #12#0 正文文本（保留 KV Cache）',
+      scope: '当前 Chat 消息',
+      beforeSummary: '隐约露出半截铜环的棱角。',
+      afterSummary: '隐约露出刻有锁孔的铜环。',
+      timestamp: '09:19:52',
+      reverted: false,
+    },
+  ],
+
+  sideSubTab: 'clues',
+  selectedClueId: 'clue_linwan',
+  sideClues: [
+    {
+      id: 'clue_linwan',
+      path: '/side/comms/linwan.md',
+      kind: 'comm',
+      title: '与林晚的加密通讯记录',
+      summary: '主角已通过手机约林晚今晚十点在老码头旧仓库灯塔下碰面并带上门禁卡。',
+      content: '# 与林晚的加密通讯记录\n- [18:10 User]: 今晚十点老码头见，带上门禁卡。\n- [18:11 林晚]: 收到，东区巡逻九点半换防，我提前二十分钟在旧仓库灯塔下等你。',
+      keywords: ['林晚', '晚姐', '老码头', '门禁卡'],
+      delivery: 'radar_hint',
+      status: 'dormant',
+      radarStatus: 'updated',
+      scope: 'branch',
+      anchor: '#12#0',
+      sourceSessionId: 'phone:linwan',
+      updatedAt: '09:34',
+    },
+    {
+      id: 'clue_rumor',
+      path: '/side/world/blackmarket-rumor-01.md',
+      kind: 'rumor',
+      title: '黑市药剂涨价与卫兵暗查',
+      summary: '主角离开黑市后，药剂价格翻倍，城防卫兵正在暗中盘查陌生买家。',
+      content: '【暗线推演 · 亥时初】\n黑市摊主在主角离开半刻后悄然撤去半数陈列药剂，仅余高阶存货翻倍售卖；两队便衣卫兵开始记录近期购入解毒剂的陌生面孔。',
+      keywords: ['黑市', '药剂', '卫兵', '解毒剂'],
+      delivery: 'radar_hint',
+      status: 'dormant',
+      radarStatus: 'unread',
+      scope: 'branch',
+      anchor: '#11#0',
+      sourceSessionId: 'world:rumors',
+      updatedAt: '09:15',
+    },
+    {
+      id: 'clue_brief',
+      path: '/side/interlude/watchtower-note.md',
+      kind: 'interlude',
+      title: '塔楼守望者手记（已排入下轮简报）',
+      summary: '东门钟楼换防信号比平时提前了一刻钟，疑似有人调动守备。',
+      content: '钟楼值夜官在交接簿边缘划了一道红线，注明“戌时三刻南门灯火异常”。',
+      keywords: ['钟楼', '守备'],
+      delivery: 'next_turn_brief',
+      status: 'dormant',
+      radarStatus: 'unread',
+      scope: 'branch',
+      anchor: '#12#0',
+      sourceSessionId: 'runOnce',
+      updatedAt: '09:28',
+    },
+    {
+      id: 'clue_private',
+      path: '/side/clues/villains-secret.md',
+      kind: 'world_event',
+      title: '幕后反派密谋（仅作者记录 · 不入主线）',
+      summary: '纯暗线推演存档，暂时设为 none，防止主线角色全知穿帮。',
+      content: '沈长老决定在三日后的宗门大比前夜截断南麓水脉，目前尚未有任何外部风声走漏。',
+      keywords: ['沈长老', '水脉'],
+      delivery: 'none',
+      status: 'dormant',
+      radarStatus: 'unread',
+      scope: 'chat',
+      anchor: '全局聊天级',
+      sourceSessionId: 'world:secret',
+      updatedAt: '08:55',
+    },
+  ],
+  sideSessions: [
+    {
+      id: 'phone:linwan',
+      title: '林晚（加密通讯）',
+      namespace: 'comms',
+      scope: 'branch',
+      anchor: '#12#0',
+      turns: 4,
+      tokens: 1850,
+      watermarkHigh: 24000,
+      cacheHit: '93.5%',
+      bridgePath: '/side/comms/linwan.md',
+      delivery: 'radar_hint',
+      transcript: [
+        { role: 'user', text: '晚上行动有变化吗？我这边刚拿到了旧院铜环线索。' },
+        { role: 'assistant', text: '暂未惊动东区守备。如果你今晚去老码头，我把备用门禁卡带上，老地方灯塔下见。' },
+        { role: 'user', text: '今晚十点老码头见，带上门禁卡。' },
+        { role: 'assistant', text: '收到，东区巡逻九点半换防，我提前二十分钟在旧仓库灯塔下等你。' },
+      ],
+    },
+    {
+      id: 'world:rumors',
+      title: '城防与黑市暗线推演轨',
+      namespace: 'world',
+      scope: 'branch',
+      anchor: '#11#0',
+      turns: 2,
+      tokens: 920,
+      watermarkHigh: 16000,
+      cacheHit: '88.0%',
+      bridgePath: '/side/world/blackmarket-rumor-01.md',
+      delivery: 'radar_hint',
+      transcript: [
+        { role: 'user', text: '基于主角刚才在黑市暴露银莲花徽记，推演一小时后黑市反应。' },
+        { role: 'assistant', text: '黑市摊主迅速收起常规货物并抬高药价，便衣卫兵开始暗中盘查陌生买家。' },
+      ],
+    },
+    {
+      id: 'notes:detective',
+      title: '作者/侦探跨分支推理备忘',
+      namespace: 'clues',
+      scope: 'chat',
+      anchor: '跨 Swipe 持久',
+      turns: 3,
+      tokens: 1340,
+      watermarkHigh: 24000,
+      cacheHit: '91.2%',
+      bridgePath: '未自动桥接',
+      delivery: 'none',
+      transcript: [
+        { role: 'user', text: '整理目前所有指向前朝银莲花结社的物证清单。' },
+        { role: 'assistant', text: '1. 竹院枯井三寸处的铜环刻痕；2. 林婉儿回避旧玉佩时的反应；3. 黑市解毒剂异动。' },
+      ],
+    },
+  ],
+  sdkTestMode: 'send',
+  sdkTargetSession: 'phone:linwan',
+  sdkSystemPrompt: '你是林晚，正通过加密手机与对方发消息。你不在主线现场，不知晓未告知你的私密细节。',
+  sdkUserPrompt: '刚确认了井壁下藏着暗道钥匙，十点见面时带上工具。',
+  sdkOutput: '',
+};
+
+// =========================================================================
+// 3. 工具与辅助函数
+// =========================================================================
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function getActiveSession() {
+  return state.sessions.find(s => s.id === state.selectedSessionId) || state.sessions[0];
+}
+
+function getConnectionMeta(connId) {
+  return CONNECTION_OPTIONS.find(c => c.id === connId) || CONNECTION_OPTIONS[0];
+}
+
+function countPendingApprovals(session) {
+  let count = 0;
+  for (const m of session.messages) {
+    if (Array.isArray(m.approvals)) {
+      for (const aid of m.approvals) {
+        if (state.approvals[aid]?.status === 'pending') count += 1;
+      }
+    }
+  }
+  return count;
+}
+
+function countAllPendingApprovals() {
+  return Object.values(state.approvals).filter(a => a.status === 'pending').length;
+}
+
+function showToast(msg, tone = 'primary') {
+  const box = document.getElementById('toast-box');
+  const el = document.createElement('div');
+  const toneCls =
+    tone === 'success' ? 'pill-soft-success' :
+    tone === 'warning' ? 'pill-soft-warning' :
+    tone === 'error' ? 'pill-soft-error' : 'pill-soft-primary';
+  el.className = `pointer-events-auto px-3.5 py-2 rounded-xl border text-xs font-medium shadow-lg bg-[var(--card)] ${toneCls} max-w-sm`;
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => el.remove(), 2600);
+}
+
+function openModal(title, bodyHtml, footerHtml = null) {
+  document.getElementById('modal-title').innerHTML = title;
+  document.getElementById('modal-body').innerHTML = bodyHtml;
+  document.getElementById('modal-footer').innerHTML = footerHtml || `
+    <button onclick="closeModal()" class="touch-target px-3.5 py-1.5 rounded-lg border border-[var(--border)] bg-[var(--card)] text-xs cursor-pointer hover:bg-[var(--secondary)]">关闭</button>
+  `;
+  const ov = document.getElementById('modal-overlay');
+  ov.classList.remove('hidden');
+  ov.classList.add('flex');
+}
+
+function closeModal() {
+  const ov = document.getElementById('modal-overlay');
+  ov.classList.add('hidden');
+  ov.classList.remove('flex');
+}
+
+function formatSimpleMarkdown(text) {
+  const escaped = esc(text);
+  return escaped
+    .replace(/`([^`]+)`/g, '<code class="px-1 py-0.5 rounded bg-[var(--content)] border border-[var(--card-border)] font-mono text-[11px] text-[var(--primary)] break-all">$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong class="font-semibold text-[var(--foreground)]">$1</strong>')
+    .replace(/\n/g, '<br/>');
+}
+
+function highlightRedacted(text) {
+  return esc(text).replace(
+    /\*\*\*REDACTED\*\*\*/g,
+    '<span class="px-1 py-0.2 rounded bg-[var(--warning)]/20 text-[var(--warning)] font-semibold">***REDACTED***</span>',
+  );
+}
+
+function getEffectivePills(session) {
+  if (session.mode !== 'full') {
+    return MODE_META[session.mode].pills;
+  }
+  if (session.stAdminEnabled) {
+    return [
+      { text: '写: 全库世界书 / 角色卡 / 人设 / 正则', cls: 'pill-soft-error' },
+      { text: '系统: ST 设置 / 预设 / 斜杠 / URL 导入', cls: 'pill-soft-error' },
+      { text: '红线: 高危强制确认 + Key 脱敏 + 撤销', cls: 'pill-soft-warning' },
+    ];
+  }
+  return [
+    { text: '写: 全部已开启的世界书', cls: 'pill-soft-warning' },
+    { text: '写: 含写卡 & 调整模式全部能力', cls: 'pill-soft-primary' },
+    { text: 'ST 全局管家: 未启用', cls: 'pill-soft-muted' },
+  ];
+}
+
+// =========================================================================
+// 4. 交互行为控制器
+// =========================================================================
+function setTheme(theme) {
+  state.theme = theme;
+  render();
+}
+
+function switchScene(scene) {
+  state.scene = scene;
+  state.openPopover = null;
+  render();
+}
+
+function switchTab(tabId) {
+  state.activeTab = tabId;
+  state.openPopover = null;
+  if (tabId === 'assistant') state.mobileViewStack = 'list';
+  if (tabId === 'sidegen') state.mobileSideStack = 'list';
+  render();
+}
+
+function togglePopover(name) {
+  state.openPopover = state.openPopover === name ? null : name;
+  render();
+}
+
+function closePopover() {
+  if (state.openPopover) {
+    state.openPopover = null;
+    render();
+  }
+}
+
+function setRunMode(mode) {
+  state.runMode = mode;
+  const label = mode === 'takeover' ? '完全接管' : mode === 'companion' ? '伴生模式' : '已关闭';
+  showToast(`主线运行模式：${label}`, mode === 'off' ? 'warning' : 'success');
+  render();
+}
+
+function createNewAssistantSession() {
+  const cur = getActiveSession();
+  const id = 'ast_' + Date.now();
+  const newSess = {
+    id,
+    title: `新助手对话 (${MODE_META[cur.mode].label})`,
+    mode: cur.mode,
+    stAdminEnabled: cur.mode === 'full' ? cur.stAdminEnabled : false,
+    autoApproveAuthor: false,
+    connectionId: cur.connectionId || 'inherit',
+    updatedAt: '刚刚',
+    messages: [
+      {
+        id: 'm_init_' + id,
+        role: 'assistant',
+        content:
+          `已开启新的 **${MODE_META[cur.mode].fullLabel}** 会话（独立上下文，0 占用主线）。\n` +
+          '直接输入你的要求即可，我会根据当前权限自主读取所需档案与聊天状态。',
+        toolCalls: [],
+        timestamp: '刚刚',
+      },
+    ],
+  };
+  state.sessions.unshift(newSess);
+  state.selectedSessionId = id;
+  state.mobileViewStack = 'detail';
+  state.openPopover = null;
+  showToast('已新建助手会话', 'success');
+  render();
+}
+
+function selectAssistantSession(sessionId) {
+  state.selectedSessionId = sessionId;
+  state.mobileViewStack = 'detail';
+  state.openPopover = null;
+  render();
+}
+
+function setAssistantMode(mode) {
+  const s = getActiveSession();
+  s.mode = mode;
+  if (mode !== 'full') {
+    s.stAdminEnabled = false;
+  }
+  showToast(`已切换为：${MODE_META[mode].fullLabel}`, mode === 'full' ? 'warning' : 'primary');
+  if (mode !== 'full' && mode !== 'author') {
+    state.openPopover = null;
+  }
+  render();
+}
+
+function setAssistantConnection(connId) {
+  const s = getActiveSession();
+  s.connectionId = connId;
+  state.openPopover = null;
+  showToast(`模型已切换为：${getConnectionMeta(connId).shortLabel}`, 'primary');
+  render();
+}
+
+function toggleAutoApproveAuthor(checked) {
+  const s = getActiveSession();
+  s.autoApproveAuthor = checked;
+  showToast(
+    checked
+      ? '已开启「本会话自动批准写卡」（ST 高危仍强制确认）'
+      : '已恢复「写卡前气泡审批」',
+    checked ? 'warning' : 'primary',
+  );
+  render();
+}
+
+function handleToggleStAdmin() {
+  const s = getActiveSession();
+  if (s.stAdminEnabled) {
+    s.stAdminEnabled = false;
+    showToast('已关闭「ST 全权管家」，权限收口为仅已开启世界书', 'primary');
+    render();
+    return;
+  }
+  state.openPopover = null;
+  openModal(
+    '🛡️ 确认开启「ST 全权管家」能力？',
+    `
+      <div class="space-y-3">
+        <div class="p-3 rounded-xl border pill-soft-error leading-relaxed">
+          开启后，当前助手会话将获得完整 SillyTavern 管理权限：读写全库世界书与角色卡、修改人设与 ST 全局设置、切换预设、执行斜杠命令以及从 URL 导入资源。
+        </div>
+        <div class="p-3 rounded-xl border border-[var(--border)] bg-[var(--content)] space-y-1.5">
+          <div class="font-semibold text-[var(--foreground)]">强制安全红线（不可关闭）：</div>
+          <ul class="list-disc pl-4 space-y-1 text-[var(--muted-foreground)]">
+            <li>删除、修改设置/预设、斜杠命令、URL 导入与跨卡批量操作 <strong>永远强制人工审批</strong>；</li>
+            <li>所有读工具返回的设置与连接中，<code>apiKey</code> / <code>token</code> / <code>secret</code> 一律脱敏为 <code>***REDACTED***</code>；</li>
+            <li>每次写入均保留写前快照，支持随时一键撤销。</li>
+          </ul>
+        </div>
+      </div>
+    `,
+    `
+      <button onclick="closeModal()" class="touch-target px-3.5 py-1.5 rounded-lg border border-[var(--border)] bg-[var(--card)] text-xs cursor-pointer hover:bg-[var(--secondary)]">取消</button>
+      <button onclick="confirmEnableStAdmin()" class="touch-target px-3.5 py-1.5 rounded-lg bg-[var(--error)] text-white text-xs font-semibold cursor-pointer hover:opacity-90">确认开启 ST 全权管家</button>
+    `,
+  );
+}
+
+function confirmEnableStAdmin() {
+  const s = getActiveSession();
+  s.stAdminEnabled = true;
+  closeModal();
+  showToast('已启用 ST 全权管家（高危强制审批 + Secret 脱敏已激活）', 'warning');
+  render();
+}
+
+function toggleActivityExpand(msgId) {
+  state.expandedActivity[msgId] = !state.expandedActivity[msgId];
+  render();
+}
+
+function toggleToolExpand(toolId) {
+  state.expandedTools[toolId] = !state.expandedTools[toolId];
+  render();
+}
+
+function toggleApprovalExpand(approvalId) {
+  state.expandedApprovalDetail[approvalId] = !state.expandedApprovalDetail[approvalId];
+  render();
+}
+
+function toggleApprovalView(approvalId, view) {
+  state.approvalViewMode[approvalId] = view;
+  render();
+}
+
+function approveAction(approvalId) {
+  const appr = state.approvals[approvalId];
+  if (!appr || appr.status !== 'pending') return;
+  appr.status = 'approved';
+  state.expandedApprovalDetail[approvalId] = false;
+
+  const undoId = 'undo_' + Date.now() + '_' + Math.floor(Math.random() * 100);
+  appr.undoId = undoId;
+
+  state.undoStack.unshift({
+    id: undoId,
+    sessionId: appr.sessionId,
+    toolCallId: appr.id,
+    toolName: appr.toolName,
+    label: appr.title,
+    scope: appr.targetLabel,
+    beforeSummary: appr.diffLines.filter(l => l.type === 'del').map(l => l.text.slice(2)).join(' / ') || '（新增资产：写入前为空）',
+    afterSummary: appr.diffLines.filter(l => l.type === 'add').map(l => l.text.slice(2)).slice(0, 2).join(' / ') || appr.summary,
+    timestamp: '刚刚',
+    reverted: false,
+  });
+
+  showToast(`✓ 已接受并落盘：${appr.title}`, 'success');
+  render();
+}
+
+function rejectAction(approvalId) {
+  const appr = state.approvals[approvalId];
+  if (!appr || appr.status !== 'pending') return;
+  appr.status = 'rejected';
+  state.expandedApprovalDetail[approvalId] = false;
+  showToast(`✕ 已拒绝：${appr.title}（可随时点击重试重新生成）`, 'warning');
+  render();
+}
+
+function retryApproval(approvalId) {
+  const appr = state.approvals[approvalId];
+  if (!appr) return;
+  appr.revision = (appr.revision || 1) + 1;
+  appr.status = 'pending';
+  appr.undoId = null;
+  state.expandedApprovalDetail[approvalId] = true;
+
+  // 在模拟 Diff 中体现重试后的改进版本
+  const revTag = `[第 ${appr.revision} 版] `;
+  if (!appr.title.startsWith('[')) {
+    appr.title = revTag + appr.title;
+  } else {
+    appr.title = appr.title.replace(/^\[第 \d+ 版\]\s*/, revTag);
+  }
+  if (appr.toolName === 'wi_upsert_primary_entry') {
+    appr.diffLines = [
+      { type: 'ctx', text: `  # 女主好感阶段动态指引 (UID 18 · 第 ${appr.revision} 版优化)` },
+      { type: 'del', text: '- 女主当前态度：普通相识，保持客套。' },
+      { type: 'add', text: '+ @@system' },
+      { type: 'add', text: `+ <% if ((getvar('女主好感') || 0) >= ${60 + (appr.revision - 1) * 5}) { %>` },
+      { type: 'add', text: '+ - [亲密阶段] 林婉儿已卸下防备，主动传递密信线索（避免过度主动抢话）。' },
+      { type: 'add', text: '+ <% } else { %>' },
+      { type: 'add', text: '+ - [戒备阶段] 林婉儿仍保持疏离试探。' },
+      { type: 'add', text: '+ <% } %>' },
+    ];
+  } else if (appr.diffLines.length > 0) {
+    const last = appr.diffLines[appr.diffLines.length - 1];
+    if (!last.text.includes('优化版')) {
+      appr.diffLines.push({ type: 'add', text: `+ // 第 ${appr.revision} 版精简优化` });
+    }
+  }
+
+  showToast(`↻ 已重新生成修改方案（第 ${appr.revision} 版），请确认`, 'primary');
+  render();
+}
+
+function applyUndo(undoId) {
+  const rec = state.undoStack.find(u => u.id === undoId);
+  if (!rec || rec.reverted) return;
+  rec.reverted = true;
+
+  for (const appr of Object.values(state.approvals)) {
+    if (appr.undoId === undoId) {
+      appr.reverted = true;
+    }
+  }
+  showToast(`↩ 已还原写前快照：${rec.label}`, 'success');
+  render();
+}
+
+function openUndoDrawer() {
+  state.openPopover = null;
+  const session = getActiveSession();
+  const list = state.undoStack;
+  const html = list.length === 0
+    ? `<div class="p-6 text-center text-[var(--muted-foreground)]">当前暂无可撤销的修改记录。</div>`
+    : `
+      <div class="space-y-2.5">
+        <div class="p-2.5 rounded-xl border pill-soft-primary text-[11px]">
+          所有通过调整 / 写卡 / 全权管家执行的写入均在执行前留存完整写前快照（当前会话 ${list.filter(u => u.sessionId === session.id).length} 条，全局 ${list.length} 条）。
+        </div>
+        ${list.map(u => `
+          <div class="p-3 rounded-xl border ${u.reverted ? 'border-[var(--card-border)] opacity-65' : 'border-[var(--border)]'} bg-[var(--content)] space-y-2">
+            <div class="flex items-start justify-between gap-2">
+              <div class="min-w-0">
+                <div class="font-semibold text-[var(--foreground)] flex items-center gap-1.5 flex-wrap">
+                  <span>${esc(u.label)}</span>
+                  <span class="px-1.5 py-0.5 rounded border text-[10px] pill-soft-muted">${esc(u.scope)}</span>
+                  ${u.reverted ? `<span class="px-1.5 py-0.5 rounded border text-[10px] pill-soft-warning">已还原</span>` : ''}
+                </div>
+                <div class="text-[11px] text-[var(--muted-foreground)] font-mono mt-0.5">${esc(u.toolName)} · ${esc(u.timestamp)}</div>
+              </div>
+              <button ${u.reverted ? 'disabled' : ''} onclick="applyUndo('${u.id}');openUndoDrawer();" class="touch-target shrink-0 px-2.5 py-1.5 rounded-lg border text-xs font-medium cursor-pointer ${u.reverted ? 'border-[var(--border)] text-[var(--muted-foreground)] cursor-not-allowed' : 'border-[var(--warning)]/50 pill-soft-warning hover:opacity-85'}">
+                ${u.reverted ? '已还原' : '↩ 一键撤销'}
+              </button>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px]">
+              <div class="p-2 rounded-lg diff-del border border-[var(--error)]/25 truncate">写前：${esc(u.beforeSummary)}</div>
+              <div class="p-2 rounded-lg diff-add border border-[var(--success)]/25 truncate">写后：${esc(u.afterSummary)}</div>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    `;
+  openModal(`↩ 写前快照撤销栈 (${list.filter(u => !u.reverted).length} 项可撤销)`, html);
+}
+
+function openFilePreviewModal(path) {
+  const content = state.previewFiles[path] || '（示例只读文件快照）';
+  openModal(
+    `📄 只读文件预览 · <span class="font-mono text-[var(--primary)]">${esc(path)}</span>`,
+    `<pre class="p-3 rounded-xl bg-[var(--content)] border border-[var(--border)] font-mono text-[11px] leading-relaxed whitespace-pre-wrap">${esc(content)}</pre>`,
+  );
+}
+
+function sendAssistantPrompt() {
+  if (state.streamingTimer) {
+    stopSimulatedStream();
+    return;
+  }
+  const session = getActiveSession();
+  const text = (state.draft || '').trim();
+  if (!text) {
+    showToast('请输入指令后再发送', 'warning');
+    return;
+  }
+
+  state.draft = '';
+  state.openPopover = null;
+
+  session.messages.push({
+    id: 'm_u_' + Date.now(),
+    role: 'user',
+    content: text,
+    timestamp: '刚刚',
+  });
+  session.updatedAt = '刚刚';
+
+  const replyId = 'm_ai_' + Date.now();
+  const script = buildSimulatedReplyScript(session, text, replyId);
+
+  const aiMsg = {
+    id: replyId,
+    role: 'assistant',
+    think: script.think,
+    content: '',
+    toolCalls: script.toolCalls,
+    approvals: [],
+    streaming: true,
+    usage: null,
+    timestamp: '生成中...',
+  };
+  session.messages.push(aiMsg);
+  state.streamingSessionId = session.id;
+  render(true);
+
+  const tokens = script.fullContent.split('');
+  let cursor = 0;
+  state.streamingTimer = setInterval(() => {
+    const step = Math.max(2, Math.ceil(tokens.length / 26));
+    cursor = Math.min(tokens.length, cursor + step);
+    aiMsg.content = tokens.slice(0, cursor).join('');
+    if (cursor >= tokens.length) {
+      clearInterval(state.streamingTimer);
+      state.streamingTimer = null;
+      state.streamingSessionId = null;
+      aiMsg.streaming = false;
+      aiMsg.timestamp = '刚刚';
+      aiMsg.usage = script.usage;
+      if (script.newApprovals) {
+        for (const appr of script.newApprovals) {
+          state.approvals[appr.id] = appr;
+          aiMsg.approvals.push(appr.id);
+        }
+      }
+      if (script.newUndo) {
+        state.undoStack.unshift(script.newUndo);
+      }
+      render(true);
+    } else {
+      const streamEl = document.getElementById(`msg-content-${replyId}`);
+      if (streamEl) {
+        streamEl.innerHTML = formatSimpleMarkdown(aiMsg.content) + '<span class="inline-block w-1.5 h-3.5 ml-0.5 bg-[var(--primary)] animate-pulse align-middle"></span>';
+      }
+    }
+  }, 35);
+}
+
+function stopSimulatedStream() {
+  if (!state.streamingTimer) return;
+  clearInterval(state.streamingTimer);
+  state.streamingTimer = null;
+  const sess = state.sessions.find(s => s.id === state.streamingSessionId);
+  if (sess) {
+    const last = sess.messages[sess.messages.length - 1];
+    if (last && last.streaming) {
+      last.streaming = false;
+      last.content += '\n\n*[已手动中止流式生成]*';
+      last.timestamp = '已中止';
+    }
+  }
+  state.streamingSessionId = null;
+  showToast('已停止当前助手生成', 'warning');
+  render();
+}
+
+function buildSimulatedReplyScript(session, userText, replyId) {
+  const mode = session.mode;
+  if (mode === 'chat') {
+    return {
+      think: '当前为交流模式（只读），自主检索当前上下文与 Layer 0/1/2 状态后给出解答。',
+      fullContent:
+        `已自主检索当前会话状态（只读安全，无任何写入）：\n\n` +
+        `针对你的指令“${userText.slice(0, 26)}${userText.length > 26 ? '…' : ''}”，` +
+        '当前 `Layer 0` 静态前缀保持冻结，主线上一轮缓存命中 **96.1%**，所有 `/side/*` 潜伏线索均未占用固定前缀。',
+      toolCalls: [
+        {
+          id: 'tc_' + replyId,
+          name: 'agentic_read_status',
+          scopeLabel: '只读状态',
+          status: 'ok',
+          durationMs: 12,
+          args: '{"includeCache":true}',
+          result: 'runMode=takeover | 主线活跃Tokens=14,200 / 48,000 | 线外潜伏线索=4条',
+        },
+      ],
+      usage: { inputTokens: 1520, cachedTokens: 1410, outputTokens: 112, cacheRate: '92.8%' },
+    };
+  }
+
+  if (mode === 'adjust') {
+    const undoId = 'undo_' + Date.now();
+    const isMsgEdit = /#12|铜环|正文|错别字|消息/.test(userText);
+    if (isMsgEdit) {
+      return {
+        think: '自主读取第 12 楼后执行局部文本微调，传入 syncTrajectory: "none" 以保证主线 KV Cache 0 击穿，同时留存写前快照。',
+        fullContent:
+          '已原地修正 `#12#0` 消息正文（使用 `syncTrajectory: "none"`，**主线前缀缓存 100% 保持不变**），可点击上方摘要行 `↩ 撤销` 回滚。',
+        toolCalls: [
+          {
+            id: 'tc_' + replyId,
+            name: 'chat_edit_message',
+            scopeLabel: '当前 Chat',
+            status: 'ok',
+            durationMs: 21,
+            args: '{"target":{"messageId":12,"swipeId":0},"oldText":"半截铜环的棱角","newText":"刻有锁孔的铜环","syncTrajectory":"none"}',
+            result: '已更新 #12#0 消息并刷新原生楼层视图（KV Cache 0 击穿）',
+            undoId,
+          },
+        ],
+        newUndo: {
+          id: undoId,
+          sessionId: session.id,
+          toolCallId: 'tc_' + replyId,
+          toolName: 'chat_edit_message',
+          label: '修正 #12#0 铜环描写（无损缓存）',
+          scope: '当前 Chat 消息',
+          beforeSummary: '半截铜环的棱角',
+          afterSummary: '刻有锁孔的铜环',
+          timestamp: '刚刚',
+          reverted: false,
+        },
+        usage: { inputTokens: 1580, cachedTokens: 1410, outputTokens: 102, cacheRate: '89.2%' },
+      };
+    }
+    return {
+      think: '自主读取变量后执行 patch_variables 并保存写前快照支持撤销。',
+      fullContent:
+        '已完成当前聊天变量微调：将 `/state/variables.json` 的 `女主好感` 校准为 **58**（仅作用于当前分支 `#12#0`，已保存写前快照）。',
+      toolCalls: [
+        {
+          id: 'tc_' + replyId,
+          name: 'patch_variables',
+          scopeLabel: '当前分支变量',
+          status: 'ok',
+          durationMs: 17,
+          args: '{"ops":{"女主好感":58}}',
+          result: '已更新 #12#0 /state/variables.json：女主好感 62 -> 58',
+          undoId,
+        },
+      ],
+      newUndo: {
+        id: undoId,
+        sessionId: session.id,
+        toolCallId: 'tc_' + replyId,
+        toolName: 'patch_variables',
+        label: '调整 #12#0 变量：女主好感 62 → 58',
+        scope: '当前分支变量',
+        beforeSummary: '女主好感: 62',
+        afterSummary: '女主好感: 58',
+        timestamp: '刚刚',
+        reverted: false,
+      },
+      usage: { inputTokens: 1680, cachedTokens: 1490, outputTokens: 126, cacheRate: '88.7%' },
+    };
+  }
+
+  if (mode === 'author') {
+    const apprId = 'appr_sim_' + Date.now();
+    const auto = session.autoApproveAuthor;
+    const undoId = auto ? 'undo_auto_' + Date.now() : null;
+    const isRegexReq = /正则|regex|<note>/i.test(userText);
+
+    const appr = isRegexReq ? {
+      id: apprId,
+      sessionId: session.id,
+      toolName: 'regex_upsert_scoped',
+      riskLevel: 'medium',
+      mandatoryConfirm: false,
+      revision: 1,
+      title: '角色绑定正则：侧边批注折叠卡 (<note>)',
+      summary: '通过 saveScriptsByType(SCOPED) 写入角色卡 regex_scripts',
+      targetLabel: '当前角色绑定正则 · 永久资产',
+      status: auto ? 'approved' : 'pending',
+      undoId,
+      rawContent: '{\n  "scriptName": "侧边批注折叠卡",\n  "findRegex": "/<note>([\\\\s\\\\S]*?)<\\\\/note>/g",\n  "replaceString": "<aside class=\\"ag-note\\">$1</aside>",\n  "markdownOnly": true\n}',
+      diffLines: [
+        { type: 'ctx', text: '  角色绑定正则 (scopedAllowed=true):' },
+        { type: 'add', text: '+ [新增] 侧边批注折叠卡' },
+        { type: 'add', text: '+   findRegex: /<note>([\\s\\S]*?)<\\/note>/g' },
+      ],
+    } : {
+      id: apprId,
+      sessionId: session.id,
+      toolName: 'card_patch_active',
+      riskLevel: 'medium',
+      mandatoryConfirm: false,
+      revision: 1,
+      title: '《林婉儿》· creator_notes',
+      summary: '通过 /api/characters/merge-attributes 更新并同步三处镜像',
+      targetLabel: '当前角色卡 · 永久资产',
+      status: auto ? 'approved' : 'pending',
+      undoId,
+      rawContent: '本卡已接入 ST-Agentic /side/comms/* 加密通讯与女主好感 EJS 动态分支。',
+      diffLines: [
+        { type: 'del', text: '- 原版说明：标准古风悬疑角色卡。' },
+        { type: 'add', text: '+ 本卡已接入 ST-Agentic /side/comms/* 加密通讯与女主好感 EJS 动态分支。' },
+      ],
+    };
+
+    return {
+      think: auto
+        ? '写卡模式且已开启本会话自动批准，直接落盘永久写卡资产并生成写前快照。'
+        : '写卡模式默认开启气泡审批，生成变更卡附着于输出气泡内等待确认。',
+      fullContent: auto
+        ? `已自动接受并持久化 \`${appr.title}\`（三处镜像同步完成，可随时一键撤销）。`
+        : '已生成永久资产修改预览，请直接选择接受、拒绝或重试：',
+      toolCalls: [],
+      newApprovals: [appr],
+      newUndo: auto ? {
+        id: undoId,
+        sessionId: session.id,
+        toolCallId: apprId,
+        toolName: appr.toolName,
+        label: appr.title,
+        scope: appr.targetLabel,
+        beforeSummary: appr.diffLines.filter(l => l.type === 'del').map(l => l.text.slice(2)).join(' / ') || '（新增资产）',
+        afterSummary: appr.diffLines.filter(l => l.type === 'add').map(l => l.text.slice(2))[0] || appr.summary,
+        timestamp: '刚刚',
+        reverted: false,
+      } : null,
+      usage: { inputTokens: 2150, cachedTokens: 1940, outputTokens: 118, cacheRate: '90.2%' },
+    };
+  }
+
+  const isAdmin = session.stAdminEnabled;
+  const isEnabledBookOnly = /已开启|世界书|合并/.test(userText) && !/设置|power_user|导入/i.test(userText);
+
+  if (isEnabledBookOnly) {
+    const apprId = 'appr_full_wi_' + Date.now();
+    const auto = session.autoApproveAuthor;
+    const undoId = auto ? 'undo_wi_auto_' + Date.now() : null;
+    const appr = {
+      id: apprId,
+      sessionId: session.id,
+      toolName: 'wi_upsert_enabled_entry',
+      riskLevel: 'medium',
+      mandatoryConfirm: false,
+      revision: 1,
+      title: '《古风文风规范》UID 4 规则合并',
+      summary: '无需开启 ST 全权管家即可读写已开启的世界书',
+      targetLabel: '全局已开启世界书 · 永久资产',
+      status: auto ? 'approved' : 'pending',
+      undoId,
+      rawContent: '@@system\n- 合并后文风规则：严格使用古风白描，禁止现代词汇与抢话。',
+      diffLines: [
+        { type: 'del', text: '- 规则A：禁用现代网络用语。' },
+        { type: 'add', text: '+ @@system' },
+        { type: 'add', text: '+ - 合并后文风规则：严格使用古风白描，禁止现代词汇与抢话。' },
+      ],
+    };
+    return {
+      think: '完全控制默认包含读写全部已开启世界书权限。若未勾自动批准则弹出气泡审批卡。',
+      fullContent: auto
+        ? '已自动接受并合并已开启世界书《古风文风规范》条目（写前快照已加入撤销栈）。'
+        : '已整理全局已开启世界书《古风文风规范》的合并 Diff，请确认：',
+      toolCalls: [],
+      newApprovals: [appr],
+      newUndo: auto ? {
+        id: undoId,
+        sessionId: session.id,
+        toolCallId: apprId,
+        toolName: appr.toolName,
+        label: appr.title,
+        scope: appr.targetLabel,
+        beforeSummary: '规则A：禁用现代网络用语。',
+        afterSummary: '合并后文风规则：严格使用古风白描',
+        timestamp: '刚刚',
+        reverted: false,
+      } : null,
+      usage: { inputTokens: 1890, cachedTokens: 1620, outputTokens: 110, cacheRate: '85.7%' },
+    };
+  }
+
+  if (!isAdmin) {
+    return {
+      think: '完全控制模式默认未开启 ST 全权管家，拒绝执行 ST 全局设置修改并引导作者开启开关。',
+      fullContent:
+        '当前处于 **完全控制（默认范围）**：仅开放读写**全部已开启的世界书**。\n\n' +
+        '该请求涉及 ST 全局设置或导入，请在左下角模式选择器中开启 **`🛡️ ST 全权管家`** 后再试。',
+      toolCalls: [],
+      usage: { inputTokens: 1310, cachedTokens: 1180, outputTokens: 96, cacheRate: '90.1%' },
+    };
+  }
+
+  const apprId = 'appr_full_sim_' + Date.now();
+  return {
+    think: 'ST 全权管家已开启，请求修改 power_user 配置属于高危强制审批项，弹出不可跳过审批卡。',
+    fullContent: '检测到涉及 ST 全局配置修改（高危操作，**不可自动跳过**），请确认：',
+    toolCalls: [],
+    newApprovals: [
+      {
+        id: apprId,
+        sessionId: session.id,
+        toolName: 'st_settings_patch',
+        riskLevel: 'high',
+        mandatoryConfirm: true,
+        revision: 1,
+        title: '修改 ST 全局设置 (power_user)',
+        summary: '调整 allowScopedScripts 与 fast_ui_mode',
+        targetLabel: 'ST 全权管家 · 全局设置',
+        status: 'pending',
+        undoId: null,
+        rawContent: '{\n  "allowScopedScripts": true,\n  "fast_ui_mode": false\n}',
+        diffLines: [
+          { type: 'del', text: '- "fast_ui_mode": true' },
+          { type: 'add', text: '+ "fast_ui_mode": false' },
+          { type: 'ctx', text: '  "allowScopedScripts": true' },
+        ],
+      },
+    ],
+    usage: { inputTokens: 2290, cachedTokens: 1980, outputTokens: 115, cacheRate: '86.5%' },
+  };
+}
+
+// =========================================================================
+// 5. 助手工作台视图渲染 (`assistant`) — 极简顶栏 + 底部合并输入组
+// =========================================================================
+function renderSessionListPanel(isMobile) {
+  const active = getActiveSession();
+  const undoCount = state.undoStack.filter(u => !u.reverted).length;
+  return `
+    <div class="flex flex-col h-full bg-[var(--sidebar)]">
+      <div class="p-2.5 border-b border-[var(--border)] flex items-center justify-between gap-2 shrink-0">
+        <button onclick="createNewAssistantSession()" class="flex-1 touch-target px-3 py-1.5 rounded-xl bg-[var(--primary)] text-[var(--primary-foreground)] text-xs font-semibold flex items-center justify-center gap-1 cursor-pointer hover:opacity-90 shadow-sm">
+          <span>＋ 新建助手会话</span>
+        </button>
+        ${!isMobile ? `<button onclick="closePopover()" class="touch-target px-2.5 py-1.5 rounded-xl border border-[var(--border)] bg-[var(--card)] text-xs cursor-pointer hover:bg-[var(--secondary)]">✕</button>` : ''}
+      </div>
+
+      <div class="flex-1 overflow-y-auto thin-scroll p-2 space-y-1.5">
+        ${state.sessions.map(s => {
+          const meta = MODE_META[s.mode];
+          const pending = countPendingApprovals(s);
+          const selected = s.id === active.id;
+          return `
+            <button onclick="selectAssistantSession('${s.id}')" class="w-full text-left p-2.5 rounded-xl border transition cursor-pointer touch-target ${selected ? 'bg-[var(--card)] border-[var(--primary)]/60 shadow-sm' : 'border-[var(--card-border)] bg-[var(--content)]/60 hover:bg-[var(--secondary)]'}">
+              <div class="flex items-center justify-between gap-1.5">
+                <span class="text-xs font-semibold truncate text-[var(--foreground)]">${esc(s.title)}</span>
+                ${pending > 0 ? `<span class="shrink-0 px-1.5 py-0.5 rounded-full text-[10px] font-semibold border pill-soft-warning">待审 ${pending}</span>` : ''}
+              </div>
+              <div class="mt-1.5 flex items-center justify-between gap-1.5 text-[11px]">
+                <span class="px-1.5 py-0.5 rounded border text-[10px] font-medium ${meta.pillClass}">${meta.icon} ${meta.label}${s.mode === 'full' && s.stAdminEnabled ? ' · 管家' : ''}</span>
+                <span class="text-[10px] text-[var(--muted-foreground)]">${s.messages.length} 条 · ${esc(s.updatedAt)}</span>
+              </div>
+            </button>
+          `;
+        }).join('')}
+      </div>
+
+      <div class="p-2.5 border-t border-[var(--border)] shrink-0 bg-[var(--sidebar)]">
+        <button onclick="openUndoDrawer()" class="w-full touch-target px-3 py-1.5 rounded-xl border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-xs font-medium flex items-center justify-between cursor-pointer">
+          <span>↩ 写前快照撤销历史</span>
+          <span class="px-1.5 py-0.5 rounded-full text-[10px] border ${undoCount > 0 ? 'pill-soft-warning' : 'pill-soft-muted'}">${undoCount}</span>
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+function renderModePopover(session) {
+  const scopePills = getEffectivePills(session);
+  return `
+    <div class="absolute bottom-full left-2.5 right-2.5 sm:left-3 sm:right-auto sm:w-[340px] mb-2 z-30 bg-[var(--card)] border border-[var(--border)] rounded-2xl shadow-2xl p-3 space-y-2.5 text-xs max-h-[430px] overflow-y-auto thin-scroll">
+      <div class="flex items-center justify-between gap-2 pb-1.5 border-b border-[var(--border)]">
+        <span class="font-semibold text-xs">助手权限模式</span>
+        <button onclick="closePopover()" class="px-2 py-0.5 rounded-lg hover:bg-[var(--secondary)] text-[var(--muted-foreground)] cursor-pointer text-xs">✕</button>
+      </div>
+
+      <div class="space-y-1.5">
+        ${['chat', 'adjust', 'author', 'full'].map(m => {
+          const mm = MODE_META[m];
+          const active = session.mode === m;
+          return `
+            <button onclick="setAssistantMode('${m}')" class="w-full touch-target px-2.5 py-2 rounded-xl border text-left transition cursor-pointer flex items-start justify-between gap-2 ${active ? 'bg-[var(--primary)]/12 border-[var(--primary)]/55' : 'bg-[var(--content)] border-[var(--card-border)] hover:bg-[var(--secondary)]'}">
+              <div class="min-w-0">
+                <div class="font-semibold text-xs flex items-center gap-1.5 ${active ? 'text-[var(--primary)]' : 'text-[var(--foreground)]'}">
+                  <span>${mm.icon}</span>
+                  <span>${mm.fullLabel}</span>
+                </div>
+                <div class="text-[11px] text-[var(--muted-foreground)] mt-0.5 leading-snug">${esc(mm.desc)}</div>
+              </div>
+              ${active ? `<span class="text-[var(--primary)] font-bold shrink-0">✓</span>` : ''}
+            </button>
+          `;
+        }).join('')}
+      </div>
+
+      ${(session.mode === 'author' || session.mode === 'full') ? `
+        <label class="touch-target px-2.5 py-2 rounded-xl border border-[var(--border)] bg-[var(--content)] flex items-center justify-between gap-2 cursor-pointer select-none">
+          <div>
+            <div class="font-medium text-xs">本会话自动批准写卡</div>
+            <div class="text-[10px] text-[var(--muted-foreground)]">常规写卡直接落盘；高危仍强制确认</div>
+          </div>
+          <input type="checkbox" ${session.autoApproveAuthor ? 'checked' : ''} onchange="toggleAutoApproveAuthor(this.checked)" class="accent-[var(--primary)] w-4 h-4 shrink-0" />
+        </label>
+      ` : ''}
+
+      ${session.mode === 'full' ? `
+        <button onclick="handleToggleStAdmin()" class="w-full touch-target px-2.5 py-2 rounded-xl border text-left flex items-center justify-between gap-2 cursor-pointer ${session.stAdminEnabled ? 'pill-soft-error' : 'border-[var(--border)] bg-[var(--content)] hover:bg-[var(--secondary)]'}">
+          <div>
+            <div class="font-semibold text-xs">🛡️ ST 全权管家</div>
+            <div class="text-[10px] opacity-85">全库卡片/世界书/设置/预设/斜杠/导入</div>
+          </div>
+          <span class="px-2 py-0.5 rounded-full border text-[10px] font-semibold shrink-0">${session.stAdminEnabled ? '已启用' : '关闭'}</span>
+        </button>
+      ` : ''}
+
+      <div class="flex flex-wrap gap-1 pt-1 border-t border-[var(--card-border)]">
+        ${scopePills.map(p => `<span class="px-1.5 py-0.5 rounded border text-[10px] ${p.cls}">${esc(p.text)}</span>`).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function renderModelPopover(session) {
+  return `
+    <div class="absolute bottom-full left-2.5 right-2.5 sm:left-3 sm:right-auto sm:w-[300px] mb-2 z-30 bg-[var(--card)] border border-[var(--border)] rounded-2xl shadow-2xl p-2.5 space-y-1.5 text-xs max-h-[340px] overflow-y-auto thin-scroll">
+      <div class="px-1 pb-1.5 border-b border-[var(--border)] flex items-center justify-between gap-2">
+        <span class="font-semibold text-xs">助手独立模型连接</span>
+        <button onclick="closePopover()" class="px-2 py-0.5 rounded-lg hover:bg-[var(--secondary)] text-[var(--muted-foreground)] cursor-pointer text-xs">✕</button>
+      </div>
+      ${CONNECTION_OPTIONS.map(c => {
+        const active = session.connectionId === c.id;
+        return `
+          <button onclick="setAssistantConnection('${c.id}')" class="w-full touch-target px-2.5 py-2 rounded-xl border text-left cursor-pointer flex items-center justify-between gap-2 ${active ? 'bg-[var(--primary)]/12 border-[var(--primary)]/55 text-[var(--primary)] font-semibold' : 'bg-[var(--content)] border-[var(--card-border)] hover:bg-[var(--secondary)] text-[var(--foreground)]'}">
+            <span class="truncate">${esc(c.label)}</span>
+            ${active ? '<span class="shrink-0">✓</span>' : ''}
+          </button>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
+
+function renderAssistantTab(isMobile) {
+  const session = getActiveSession();
+  const activeMode = MODE_META[session.mode];
+  const connMeta = getConnectionMeta(session.connectionId);
+  const undoCount = state.undoStack.filter(u => !u.reverted).length;
+  const isStreaming = Boolean(state.streamingTimer && state.streamingSessionId === session.id);
+
+  if (isMobile && state.mobileViewStack === 'list') {
+    return renderSessionListPanel(true);
+  }
+
+  // 1. 超薄单行顶栏（~46px）：仅会话切换 + 标题 + 新建 + 撤销历史
+  const topBarHtml = `
+    <div class="shrink-0 min-h-[46px] py-1 px-2.5 sm:px-3 border-b border-[var(--border)] bg-[var(--sidebar)]/75 flex items-center justify-between gap-2">
+      <div class="flex items-center gap-1.5 min-w-0 flex-1">
+        ${isMobile ? `
+          <button onclick="state.mobileViewStack='list';state.openPopover=null;render();" title="会话列表" class="touch-target px-2 rounded-xl border border-[var(--border)] bg-[var(--card)] text-xs font-medium cursor-pointer flex items-center justify-center shrink-0">←</button>
+        ` : `
+          <button onclick="togglePopover('sessions')" title="打开助手会话列表" class="px-2.5 py-1 rounded-xl border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-xs font-medium cursor-pointer flex items-center gap-1 shrink-0">
+            <span>☰</span>
+            <span>会话 (${state.sessions.length})</span>
+          </button>
+        `}
+        <span class="text-xs font-semibold truncate text-[var(--foreground)]" title="${esc(session.title)}">${esc(session.title)}</span>
+      </div>
+
+      <div class="flex items-center gap-1.5 shrink-0">
+        <button onclick="createNewAssistantSession()" title="新建助手会话" class="touch-target px-2.5 rounded-xl border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-xs font-semibold cursor-pointer flex items-center justify-center">＋</button>
+        <button onclick="openUndoDrawer()" title="写前快照撤销历史" class="touch-target px-2.5 rounded-xl border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-xs font-medium cursor-pointer flex items-center justify-center gap-1">
+          <span>↩</span>
+          ${undoCount > 0 ? `<span class="font-mono text-[11px] text-[var(--warning)] font-semibold">${undoCount}</span>` : ''}
+        </button>
+      </div>
+    </div>
+  `;
+
+  // 2. 主对话流（最大化视口占比）
+  const messagesHtml = `
+    <div id="assistant-scroll-box" class="flex-1 overflow-y-auto thin-scroll p-3 sm:p-4 space-y-3 bg-[var(--content)] min-w-0">
+      ${session.messages.map(m => renderAssistantMessage(m, isMobile)).join('')}
+    </div>
+  `;
+
+  // 3. 底部极简输入组（模型选择 + 模式选择全部合并在内，砍掉快捷指令与手动附带上下文）
+  const popoverBackdropHtml = (state.openPopover === 'mode' || state.openPopover === 'model')
+    ? `<div onclick="closePopover()" class="absolute inset-0 z-20 bg-black/25"></div>`
+    : '';
+
+  const modePillLabel = session.mode === 'full' && session.stAdminEnabled
+    ? '⚡ 管家'
+    : `${activeMode.icon} ${activeMode.label}`;
+  const modePillCls = session.mode === 'full' && session.stAdminEnabled
+    ? 'pill-soft-error'
+    : activeMode.pillClass;
+
+  const composerHtml = `
+    <div class="shrink-0 bg-[var(--sidebar)] px-2 sm:px-3 py-1.5 sm:py-2 border-t border-[var(--border)] relative">
+      ${state.openPopover === 'mode' ? renderModePopover(session) : ''}
+      ${state.openPopover === 'model' ? renderModelPopover(session) : ''}
+      <div class="rounded-2xl border border-[var(--border)] bg-[var(--content)] px-2.5 pt-2 pb-1.5 focus-within:border-[var(--primary)] transition">
+        <textarea
+          id="assistant-draft-input"
+          rows="1"
+          oninput="state.draft=this.value"
+          onkeydown="if(event.key==='Enter' && !event.shiftKey && !event.isComposing && !state.streamingTimer){event.preventDefault();sendAssistantPrompt();}"
+          placeholder="输入指令，让助手自行读取并处理..."
+          class="w-full bg-transparent border-0 focus:outline-none resize-none leading-snug ${isMobile ? 'mobile-control' : 'text-xs py-1'}"
+        >${esc(state.draft)}</textarea>
+
+        <div class="flex items-center justify-between gap-2 pt-1">
+          <div class="flex items-center gap-1.5 min-w-0">
+            <button onclick="togglePopover('mode')" title="切换助手权限模式" class="touch-target px-2.5 rounded-xl border text-xs font-semibold cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0 ${modePillCls}">
+              <span>${modePillLabel}</span>
+              <span class="opacity-70 text-[10px]">▾</span>
+            </button>
+            <button onclick="togglePopover('model')" title="切换助手模型连接" class="touch-target px-2.5 rounded-xl border ${state.openPopover === 'model' ? 'pill-soft-primary' : 'border-[var(--border)] bg-[var(--card)] text-[var(--foreground)] hover:bg-[var(--secondary)]'} text-xs cursor-pointer flex items-center gap-1 min-w-0 truncate">
+              <span class="truncate">${esc(connMeta.shortLabel)}</span>
+              <span class="opacity-70 text-[10px] shrink-0">▾</span>
+            </button>
+          </div>
+
+          ${isStreaming ? `
+            <button onclick="stopSimulatedStream()" title="停止生成" aria-label="停止生成" class="touch-target w-10 h-10 shrink-0 rounded-xl bg-[var(--error)] text-white text-sm font-semibold cursor-pointer hover:opacity-90 shadow-sm flex items-center justify-center"><span class="leading-none">■</span></button>
+          ` : `
+            <button onclick="sendAssistantPrompt()" title="发送 (Enter)" aria-label="发送" class="touch-target w-10 h-10 shrink-0 rounded-xl bg-[var(--primary)] text-[var(--primary-foreground)] text-sm font-semibold cursor-pointer hover:opacity-90 shadow-sm flex items-center justify-center"><span class="leading-none">▶</span></button>
+          `}
+        </div>
+      </div>
+    </div>
+  `;
+
+  const desktopSessionsDrawer = (!isMobile && state.openPopover === 'sessions') ? `
+    <div onclick="if(event.target===this) closePopover();" class="absolute inset-0 z-30 bg-black/35 flex justify-start">
+      <div class="w-72 h-full border-r border-[var(--border)] shadow-2xl overflow-hidden">
+        ${renderSessionListPanel(false)}
+      </div>
+    </div>
+  ` : '';
+
+  return `
+    <div class="relative flex flex-col h-full min-h-0 min-w-0">
+      ${topBarHtml}
+      ${messagesHtml}
+      ${popoverBackdropHtml}
+      ${composerHtml}
+      ${desktopSessionsDrawer}
+    </div>
+  `;
+}
+
+function renderAssistantMessage(m, isMobile) {
+  if (m.role === 'user') {
+    return `
+      <div class="flex justify-end min-w-0">
+        <div class="max-w-[88%] sm:max-w-[78%] min-w-0 rounded-2xl rounded-tr-sm bg-[var(--primary)]/16 border border-[var(--primary)]/35 px-3 py-2 text-xs">
+          <div class="leading-relaxed text-[var(--foreground)] break-words">${formatSimpleMarkdown(m.content)}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  const toolCalls = Array.isArray(m.toolCalls) ? m.toolCalls : [];
+  const hasActivity = Boolean(m.think) || toolCalls.length > 0;
+  const activityExpanded = Boolean(state.expandedActivity[m.id]);
+  const totalMs = toolCalls.reduce((sum, tc) => sum + (tc.durationMs || 0), 0);
+  const redactedAny = toolCalls.some(tc => tc.hasSecretRedaction);
+  const activeUndoTool = toolCalls.find(tc => tc.undoId && state.undoStack.find(u => u.id === tc.undoId));
+  const activeUndoRec = activeUndoTool ? state.undoStack.find(u => u.id === activeUndoTool.undoId) : null;
+  const approvals = Array.isArray(m.approvals) ? m.approvals.map(id => state.approvals[id]).filter(Boolean) : [];
+
+  const summaryParts = [];
+  if (m.think) summaryParts.push('已思考');
+  if (toolCalls.length > 0) {
+    const names = toolCalls.map(tc => tc.name).slice(0, 2).join(', ');
+    summaryParts.push(`${toolCalls.length} 次工具 (${names}${toolCalls.length > 2 ? '…' : ''})`);
+  }
+  if (totalMs > 0) summaryParts.push(`${totalMs}ms`);
+
+  return `
+    <div class="flex justify-start min-w-0">
+      <div class="w-full max-w-[98%] sm:max-w-[92%] min-w-0 rounded-2xl rounded-tl-sm bg-[var(--card)] border border-[var(--card-border)] px-3 py-2.5 text-xs space-y-2 shadow-sm">
+        ${hasActivity ? `
+          <div class="rounded-lg bg-[var(--content)] border border-[var(--card-border)] overflow-hidden min-w-0">
+            <div class="px-2.5 py-1 flex items-center justify-between gap-2 text-[11px]">
+              <button onclick="toggleActivityExpand('${m.id}')" class="flex items-center gap-1.5 min-w-0 text-left text-[var(--muted-foreground)] hover:text-[var(--foreground)] cursor-pointer flex-1">
+                <span class="text-[var(--success)] shrink-0">✓</span>
+                <span class="truncate">${esc(summaryParts.join(' · '))}</span>
+                ${redactedAny ? `<span class="shrink-0 px-1 rounded border text-[10px] pill-soft-warning">🔒 已脱敏</span>` : ''}
+                <span class="shrink-0 opacity-75">${activityExpanded ? '▾' : '▸'}</span>
+              </button>
+              ${activeUndoRec ? `
+                <button ${activeUndoRec.reverted ? 'disabled' : ''} onclick="applyUndo('${activeUndoRec.id}')" class="shrink-0 px-2 py-0.5 rounded border text-[10px] font-medium cursor-pointer ${activeUndoRec.reverted ? 'border-[var(--border)] text-[var(--muted-foreground)] cursor-not-allowed' : 'pill-soft-warning hover:opacity-85'}">
+                  ${activeUndoRec.reverted ? '已还原' : '↩ 撤销'}
+                </button>
+              ` : ''}
+            </div>
+
+            ${activityExpanded ? `
+              <div class="px-2.5 pb-2.5 pt-1.5 border-t border-[var(--card-border)] space-y-1.5">
+                ${m.think ? `<div class="text-[11px] text-[var(--muted-foreground)] leading-relaxed break-words">💭 ${esc(m.think)}</div>` : ''}
+                ${toolCalls.map(tc => renderToolCallCard(tc)).join('')}
+              </div>
+            ` : ''}
+          </div>
+        ` : ''}
+
+        <div id="msg-content-${m.id}" class="leading-relaxed text-[var(--foreground)] break-words">
+          ${m.content ? formatSimpleMarkdown(m.content) : ''}
+          ${m.streaming ? '<span class="inline-block w-1.5 h-3.5 ml-0.5 bg-[var(--primary)] animate-pulse align-middle"></span>' : ''}
+        </div>
+
+        ${Array.isArray(m.fileRefs) && m.fileRefs.length > 0 ? `
+          <div class="flex flex-wrap items-center gap-1.5">
+            ${m.fileRefs.map(fp => `
+              <button onclick="openFilePreviewModal('${esc(fp)}')" class="px-2 py-0.5 rounded-md border border-[var(--border)] bg-[var(--content)] hover:bg-[var(--secondary)] font-mono text-[10px] text-[var(--primary)] cursor-pointer max-w-full truncate">
+                📄 ${esc(fp)}
+              </button>
+            `).join('')}
+          </div>
+        ` : ''}
+
+        <!-- 直接附着在 AI 输出气泡内的审批操作区（接受 / 拒绝 / 重试） -->
+        ${approvals.length > 0 ? `
+          <div class="pt-2 mt-1 border-t border-[var(--card-border)] space-y-2 min-w-0">
+            ${approvals.map(appr => renderAttachedApprovalBlock(appr, isMobile)).join('')}
+          </div>
+        ` : ''}
+
+        <div class="flex items-center justify-between gap-2 text-[10px] text-[var(--muted-foreground)] font-mono pt-0.5">
+          <span>${m.usage ? `缓存 ${m.usage.cacheRate} · ${m.usage.outputTokens} tok` : 'Agentic 助手'}</span>
+          <span>${esc(m.timestamp)}</span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderToolCallCard(tc) {
+  const expanded = Boolean(state.expandedTools[tc.id]);
+  const undoRec = tc.undoId ? state.undoStack.find(u => u.id === tc.undoId) : null;
+  return `
+    <div class="rounded-lg border border-[var(--border)] bg-[var(--sidebar)] overflow-hidden min-w-0">
+      <div class="px-2 py-1 flex flex-wrap items-center justify-between gap-1.5">
+        <button onclick="toggleToolExpand('${tc.id}')" class="flex flex-wrap items-center gap-1.5 text-[11px] cursor-pointer text-left min-w-0">
+          <span class="font-mono font-semibold text-[var(--foreground)]">${esc(tc.name)}</span>
+          <span class="px-1 rounded border text-[10px] pill-soft-primary">${esc(tc.scopeLabel)}</span>
+          ${tc.hasSecretRedaction ? `<span class="px-1 rounded border text-[10px] pill-soft-warning">🔒 Key已脱敏</span>` : ''}
+          <span class="text-[10px] text-[var(--muted-foreground)]">${tc.durationMs}ms ${expanded ? '▾' : '▸'}</span>
+        </button>
+
+        ${undoRec ? `
+          <button ${undoRec.reverted ? 'disabled' : ''} onclick="applyUndo('${undoRec.id}')" class="px-1.5 py-0.5 rounded border text-[10px] font-medium cursor-pointer ${undoRec.reverted ? 'border-[var(--border)] text-[var(--muted-foreground)] cursor-not-allowed' : 'pill-soft-warning hover:opacity-85'}">
+            ${undoRec.reverted ? '✓ 已撤销' : '↩ 撤销此步'}
+          </button>
+        ` : ''}
+      </div>
+
+      ${expanded ? `
+        <div class="px-2 pb-2 pt-1 border-t border-[var(--card-border)] space-y-1 text-[10px] font-mono min-w-0">
+          <pre class="p-1.5 rounded bg-[var(--content)] max-w-full overflow-x-auto whitespace-pre-wrap break-all">Args: ${esc(tc.args)}</pre>
+          <pre class="p-1.5 rounded bg-[var(--content)] max-w-full overflow-x-auto whitespace-pre-wrap break-all">${highlightRedacted(tc.result)}</pre>
+        </div>
+      ` : ''}
+    </div>
+  `;
+}
+
+function renderAttachedApprovalBlock(appr, isMobile) {
+  const undoRec = appr.undoId ? state.undoStack.find(u => u.id === appr.undoId) : null;
+  const detailExpanded = Boolean(state.expandedApprovalDetail[appr.id]);
+
+  // 已处理（接受或拒绝）：自动折叠为 1 行紧凑条
+  if (appr.status !== 'pending' && !detailExpanded) {
+    const isRejected = appr.status === 'rejected';
+    const isReverted = Boolean(undoRec?.reverted);
+    return `
+      <div class="rounded-xl border ${isRejected ? 'border-[var(--error)]/40' : isReverted ? 'border-[var(--warning)]/40' : 'border-[var(--success)]/40'} bg-[var(--content)] px-2.5 py-1.5 flex items-center justify-between gap-2 text-[11px] min-w-0">
+        <div class="flex items-center gap-1.5 min-w-0">
+          <span class="shrink-0 font-bold ${isRejected ? 'text-[var(--error)]' : isReverted ? 'text-[var(--warning)]' : 'text-[var(--success)]'}">
+            ${isRejected ? '✕' : isReverted ? '↩' : '✓'}
+          </span>
+          <span class="truncate font-medium">${isRejected ? `已拒绝：${esc(appr.title)}` : isReverted ? `已还原：${esc(appr.title)}` : `已接受：${esc(appr.title)}`}</span>
+        </div>
+        <div class="flex items-center gap-1 shrink-0">
+          <button onclick="toggleApprovalExpand('${appr.id}')" class="px-2 py-0.5 rounded border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-[10px] cursor-pointer">详情</button>
+          ${isRejected ? `
+            <button onclick="retryApproval('${appr.id}')" class="px-2 py-0.5 rounded border pill-soft-primary text-[10px] font-medium cursor-pointer hover:opacity-85">↻ 重试</button>
+          ` : undoRec ? `
+            <button ${undoRec.reverted ? 'disabled' : ''} onclick="applyUndo('${undoRec.id}')" class="px-2 py-0.5 rounded border text-[10px] font-medium cursor-pointer ${undoRec.reverted ? 'border-[var(--border)] text-[var(--muted-foreground)] cursor-not-allowed' : 'pill-soft-warning hover:opacity-85'}">
+              ${undoRec.reverted ? '已还原' : '↩ 撤销'}
+            </button>
+          ` : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  const viewMode = state.approvalViewMode[appr.id] || 'diff';
+
+  return `
+    <div class="rounded-xl border ${appr.status === 'pending' ? (appr.riskLevel === 'high' ? 'border-[var(--error)]/60' : 'border-[var(--warning)]/60') : 'border-[var(--border)]'} bg-[var(--content)] p-2.5 space-y-2 min-w-0">
+      <div class="flex items-center justify-between gap-1.5">
+        <div class="flex items-center gap-1.5 min-w-0 flex-1">
+          ${appr.riskLevel === 'high' ? `<span class="px-1.5 py-0.2 rounded border text-[10px] font-semibold pill-soft-error shrink-0">🔒 强制确认</span>` : ''}
+          <span class="font-semibold text-xs truncate text-[var(--foreground)]">${esc(appr.title)}</span>
+        </div>
+        <div class="flex items-center gap-1 shrink-0">
+          <div class="flex p-0.5 rounded-md bg-[var(--sidebar)] border border-[var(--border)] text-[10px]">
+            <button onclick="toggleApprovalView('${appr.id}', 'diff')" class="px-1.5 py-0.5 rounded cursor-pointer ${viewMode === 'diff' ? 'bg-[var(--card)] font-medium shadow-sm' : 'text-[var(--muted-foreground)]'}">Diff</button>
+            <button onclick="toggleApprovalView('${appr.id}', 'raw')" class="px-1.5 py-0.5 rounded cursor-pointer ${viewMode === 'raw' ? 'bg-[var(--card)] font-medium shadow-sm' : 'text-[var(--muted-foreground)]'}">原文</button>
+          </div>
+          ${appr.status !== 'pending' ? `<button onclick="toggleApprovalExpand('${appr.id}')" class="px-1.5 py-0.5 rounded border border-[var(--border)] text-[10px] cursor-pointer">收起</button>` : ''}
+        </div>
+      </div>
+
+      ${viewMode === 'diff' ? `
+        <div class="rounded-lg border border-[var(--border)] bg-[var(--sidebar)] font-mono text-[11px] max-w-full overflow-x-auto divide-y divide-[var(--card-border)]/40">
+          ${appr.diffLines.map(line => `
+            <div class="px-2 py-0.5 whitespace-pre-wrap break-all ${line.type === 'del' ? 'diff-del' : line.type === 'add' ? 'diff-add' : 'diff-ctx'}">${esc(line.text)}</div>
+          `).join('')}
+        </div>
+      ` : `
+        <pre class="p-2 rounded-lg border border-[var(--border)] bg-[var(--sidebar)] font-mono text-[11px] max-w-full overflow-x-auto whitespace-pre-wrap break-all">${esc(appr.rawContent)}</pre>
+      `}
+
+      ${appr.status === 'pending' ? `
+        <div class="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+          <span class="text-[10px] text-[var(--muted-foreground)] font-mono truncate">${esc(appr.toolName)}</span>
+          <div class="flex items-center gap-1.5 shrink-0">
+            <button onclick="retryApproval('${appr.id}')" class="touch-target px-2.5 py-1 rounded-lg border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-xs font-medium cursor-pointer">
+              ↻ 重试
+            </button>
+            <button onclick="rejectAction('${appr.id}')" class="touch-target px-2.5 py-1 rounded-lg border border-[var(--error)]/45 pill-soft-error text-xs font-medium cursor-pointer hover:opacity-85">
+              ✕ 拒绝
+            </button>
+            <button onclick="approveAction('${appr.id}')" class="touch-target px-3 py-1 rounded-lg ${appr.riskLevel === 'high' ? 'bg-[var(--error)] text-white' : 'bg-[var(--primary)] text-[var(--primary-foreground)]'} text-xs font-semibold cursor-pointer hover:opacity-90 shadow-sm">
+              ✓ 接受
+            </button>
+          </div>
+        </div>
+      ` : appr.status === 'rejected' ? `
+        <div class="flex justify-end">
+          <button onclick="retryApproval('${appr.id}')" class="touch-target px-3 py-1 rounded-lg border pill-soft-primary text-xs font-medium cursor-pointer">↻ 重试生成方案</button>
+        </div>
+      ` : ''}
+    </div>
+  `;
+}
+
+// =========================================================================
+// 6. SideGen 线外会话与线索管理视图 (`sidegen`)
+// =========================================================================
+function updateClueDelivery(clueId, delivery) {
+  const clue = state.sideClues.find(c => c.id === clueId);
+  if (!clue) return;
+  clue.delivery = delivery;
+  const opt = DELIVERY_OPTIONS.find(d => d.value === delivery);
+  showToast(`已更新投递策略：${opt?.short || delivery}`, 'success');
+  render();
+}
+
+function updateClueStatus(clueId, status) {
+  const clue = state.sideClues.find(c => c.id === clueId);
+  if (!clue) return;
+  clue.status = status;
+  showToast(`线索状态：${status === 'resolved' ? '已回收' : status === 'surfaced' ? '已浮现' : '潜伏中'}`, 'primary');
+  render();
+}
+
+function exportClueToWorldInfo(clueId) {
+  const clue = state.sideClues.find(c => c.id === clueId);
+  if (!clue) return;
+  openModal(
+    '📤 导出线索到 ST 真实世界书',
+    `
+      <div class="space-y-3">
+        <div class="p-2.5 rounded-xl border pill-soft-success">✓ 确认后将写入真实世界书，跨聊天永久生效。</div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          <div>
+            <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">目标世界书</label>
+            <select class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] text-xs">
+              <option>玄幻世界（当前绑定主世界书）</option>
+              <option>现代都市暗线档案</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">触发关键词</label>
+            <input type="text" value="${esc(clue.keywords.join(', '))}" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] text-xs" />
+          </div>
+        </div>
+        <div>
+          <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">导出正文</label>
+          <textarea rows="4" class="w-full p-2.5 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono text-xs">${esc(clue.content)}</textarea>
+        </div>
+      </div>
+    `,
+    `
+      <button onclick="closeModal()" class="touch-target px-3 py-1.5 rounded-lg border border-[var(--border)] bg-[var(--card)] text-xs cursor-pointer">取消</button>
+      <button onclick="closeModal();showToast('已将线索「${esc(clue.title)}」写入世界书','success');" class="touch-target px-3.5 py-1.5 rounded-lg bg-[var(--primary)] text-[var(--primary-foreground)] text-xs font-semibold cursor-pointer">确认写入</button>
+    `,
+  );
+}
+
+function viewSideSessionTranscript(sessionId) {
+  const ss = state.sideSessions.find(s => s.id === sessionId);
+  if (!ss) return;
+  openModal(
+    `💬 只读会话记录 · <span class="font-mono text-[var(--primary)]">${esc(ss.id)}</span>`,
+    `
+      <div class="space-y-2.5">
+        <div class="p-2 rounded-xl border border-[var(--border)] bg-[var(--content)] text-[11px] flex flex-wrap justify-between gap-2">
+          <span>作用域：<strong>${ss.scope === 'branch' ? '因果分支 (branch)' : '聊天级 (chat)'}</strong> · 锚点：<code>${esc(ss.anchor)}</code></span>
+          <span>缓存命中：<strong class="text-[var(--success)]">${esc(ss.cacheHit)}</strong></span>
+        </div>
+        <div class="space-y-2">
+          ${ss.transcript.map(t => `
+            <div class="p-2.5 rounded-xl border ${t.role === 'user' ? 'border-[var(--primary)]/35 bg-[var(--primary)]/10' : 'border-[var(--card-border)] bg-[var(--content)]'}">
+              <div class="text-[10px] font-semibold text-[var(--muted-foreground)] mb-1">${t.role === 'user' ? '写卡脚本 / 输入' : '线外模型输出'}</div>
+              <div class="text-xs leading-relaxed">${esc(t.text)}</div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `,
+  );
+}
+
+function runSdkQuickTest() {
+  if (state.sdkTestMode === 'runOnce') {
+    state.sdkOutput =
+      '[runOnce 完成 · 640ms · 0 残留]\n' +
+      '塔楼飞檐之上，那道玄色身影听见下方井沿微响，指尖轻轻叩了两下石栏：“终于摸到铜环了么……看来十点之前的风声得压一压。”';
+  } else {
+    const sess = state.sideSessions.find(s => s.id === state.sdkTargetSession) || state.sideSessions[0];
+    if (!sess) {
+      state.sdkOutput = '[提示] 当前无可用持久会话，请切换为 runOnce()。';
+      showToast('无可用目标会话', 'warning');
+      render();
+      return;
+    }
+    state.sdkTargetSession = sess.id;
+    sess.turns += 1;
+    sess.tokens += 240;
+    sess.transcript.push({ role: 'user', text: state.sdkUserPrompt });
+    const replyText = '明白，我把撬锁细钩和红外遮罩装进背包，九点四十在老码头灯塔西侧汇合。';
+    sess.transcript.push({ role: 'assistant', text: replyText });
+    const clue = state.sideClues.find(c => c.sourceSessionId === sess.id);
+    if (clue) {
+      clue.content += `\n- [刚刚 User]: ${state.sdkUserPrompt}\n- [刚刚 林晚]: ${replyText}`;
+      clue.radarStatus = 'updated';
+      clue.updatedAt = '刚刚';
+    }
+    state.sdkOutput =
+      `[send("${sess.id}") 完成 · 缓存命中 94.2%]\n` +
+      `回复：${replyText}\n` +
+      `桥接：${clue ? `已更新 ${sess.bridgePath}，xxHash 变更 -> 主线下次提及关键词将触发 [已更新]` : '未开启自动桥接'}`;
+  }
+  showToast('SideGen SDK 模拟调用完成', 'success');
+  render();
+}
+
+function renderSideGenTab(isMobile) {
+  const subTabsHtml = `
+    <div class="shrink-0 h-11 px-2.5 sm:px-3.5 border-b border-[var(--border)] bg-[var(--sidebar)]/70 flex items-center justify-between gap-2">
+      <div class="flex p-0.5 rounded-xl bg-[var(--content)] border border-[var(--border)] overflow-x-auto max-w-full no-scrollbar">
+        ${[
+          ['clues', '线索 (/side/*)'],
+          ['sessions', '线外会话'],
+          ['sdk', 'SDK 试跑'],
+        ].map(([id, lbl]) => `
+          <button onclick="state.sideSubTab='${id}';state.mobileSideStack='list';render();" class="px-3 py-1 rounded-lg text-xs font-medium cursor-pointer whitespace-nowrap ${state.sideSubTab === id ? 'bg-[var(--card)] text-[var(--foreground)] shadow-sm' : 'text-[var(--muted-foreground)]'}">${lbl}</button>
+        `).join('')}
+      </div>
+      ${!isMobile ? `<span class="text-[11px] text-[var(--muted-foreground)] truncate">业务交互 UI 由写卡作者经 <code>Agentic.sideGen</code> 自建</span>` : ''}
+    </div>
+  `;
+
+  if (state.sideSubTab === 'clues') {
+    const active = state.sideClues.find(c => c.id === state.selectedClueId) || state.sideClues[0];
+    const masterHtml = `
+      <div class="p-2.5 space-y-1.5 overflow-y-auto h-full thin-scroll">
+        ${state.sideClues.map(c => {
+          const deliv = DELIVERY_OPTIONS.find(d => d.value === c.delivery) || DELIVERY_OPTIONS[2];
+          return `
+            <button onclick="state.selectedClueId='${c.id}';${isMobile ? "state.mobileSideStack='detail';" : ''}render();" class="w-full text-left p-2.5 rounded-xl border transition cursor-pointer touch-target ${active?.id === c.id && !isMobile ? 'bg-[var(--content)] border-[var(--primary)]/60 shadow-sm' : 'border-[var(--card-border)] hover:bg-[var(--secondary)]'}">
+              <div class="flex items-center justify-between gap-1.5">
+                <span class="text-xs font-semibold truncate">${esc(c.title)}</span>
+                <span class="px-1.5 py-0.5 rounded border text-[10px] shrink-0 ${deliv.cls}">${esc(deliv.short)}</span>
+              </div>
+              <div class="mt-1 text-[10px] font-mono text-[var(--muted-foreground)] truncate">${esc(c.path)}</div>
+              <div class="mt-1 flex items-center justify-between gap-1 text-[10px] text-[var(--muted-foreground)]">
+                <span>${esc(c.anchor)}</span>
+                <span>${c.radarStatus === 'updated' ? '🟠 待读更新' : c.radarStatus === 'synced_silent' ? '🟢 已读静默' : '⚪ 未触发'}</span>
+              </div>
+            </button>
+          `;
+        }).join('')}
+      </div>
+    `;
+
+    const detailHtml = active ? `
+      <div class="p-3.5 space-y-3 overflow-y-auto h-full thin-scroll text-xs">
+        <div class="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-[var(--border)]">
+          <div class="min-w-0">
+            <div class="font-semibold text-sm break-words">${esc(active.title)}</div>
+            <div class="font-mono text-[11px] text-[var(--primary)] break-all">${esc(active.path)}</div>
+          </div>
+          <button onclick="exportClueToWorldInfo('${active.id}')" class="touch-target px-2.5 py-1 rounded-lg border border-[var(--border)] bg-[var(--sidebar)] hover:bg-[var(--secondary)] text-xs font-medium cursor-pointer shrink-0">
+            📤 导出到世界书
+          </button>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          <div>
+            <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">主线投递策略</label>
+            <select onchange="updateClueDelivery('${active.id}', this.value)" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${isMobile ? 'mobile-control' : 'text-xs'}">
+              ${DELIVERY_OPTIONS.map(o => `<option value="${o.value}" ${active.delivery === o.value ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">线索状态</label>
+            <select onchange="updateClueStatus('${active.id}', this.value)" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${isMobile ? 'mobile-control' : 'text-xs'}">
+              <option value="dormant" ${active.status === 'dormant' ? 'selected' : ''}>潜伏中 (dormant)</option>
+              <option value="surfaced" ${active.status === 'surfaced' ? 'selected' : ''}>主线已感知 (surfaced)</option>
+              <option value="resolved" ${active.status === 'resolved' ? 'selected' : ''}>已回收归档 (resolved)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-1.5">
+          <span class="text-[11px] text-[var(--muted-foreground)]">雷达关键词：</span>
+          ${active.keywords.map(k => `<span class="px-2 py-0.5 rounded-md border pill-soft-primary font-mono text-[11px]">${esc(k)}</span>`).join('')}
+        </div>
+
+        <div>
+          <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">精炼摘要</label>
+          <input type="text" value="${esc(active.summary)}" oninput="state.sideClues.find(c=>c.id==='${active.id}').summary=this.value" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${isMobile ? 'mobile-control' : 'text-xs'}" />
+        </div>
+
+        <div>
+          <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">线索正文（主 Agent 按需 read_file 获取）</label>
+          <textarea rows="5" oninput="state.sideClues.find(c=>c.id==='${active.id}').content=this.value" class="w-full p-2.5 rounded-lg bg-[var(--content)] border border-[var(--border)] font-mono ${isMobile ? 'mobile-control' : 'text-xs leading-relaxed'}">${esc(active.content)}</textarea>
+        </div>
+
+        <div class="flex justify-end">
+          <button onclick="showToast('已保存 /side/* 线索','success')" class="touch-target px-3.5 py-1.5 rounded-lg bg-[var(--primary)] text-[var(--primary-foreground)] text-xs font-semibold cursor-pointer">保存修改</button>
+        </div>
+      </div>
+    ` : '';
+
+    const splitContent = isMobile
+      ? (state.mobileSideStack === 'detail'
+          ? `<div class="flex flex-col h-full"><div class="px-3 py-1.5 bg-[var(--sidebar)] border-b border-[var(--border)] flex items-center gap-2 shrink-0"><button onclick="state.mobileSideStack='list';render();" class="touch-target px-2.5 py-1 rounded-lg border border-[var(--border)] bg-[var(--card)] text-xs cursor-pointer shrink-0">← 返回</button><span class="text-xs font-semibold truncate">${esc(active?.title || '')}</span></div><div class="flex-1 min-h-0 overflow-hidden">${detailHtml}</div></div>`
+          : `<div class="h-full overflow-hidden">${masterHtml}</div>`)
+      : `<div class="grid grid-cols-12 h-full min-h-0"><div class="col-span-4 border-r border-[var(--border)] bg-[var(--sidebar)]/40 overflow-hidden">${masterHtml}</div><div class="col-span-8 overflow-hidden">${detailHtml}</div></div>`;
+
+    return `<div class="flex flex-col h-full min-h-0">${subTabsHtml}<div class="flex-1 min-h-0 overflow-hidden">${splitContent}</div></div>`;
+  }
+
+  if (state.sideSubTab === 'sessions') {
+    return `
+      <div class="flex flex-col h-full min-h-0">
+        ${subTabsHtml}
+        <div class="flex-1 overflow-y-auto thin-scroll p-3 space-y-2.5">
+          ${state.sideSessions.length === 0 ? `
+            <div class="p-6 text-center text-xs text-[var(--muted-foreground)] border border-dashed border-[var(--border)] rounded-xl">暂无线外会话</div>
+          ` : state.sideSessions.map((ss, idx) => `
+            <div class="p-3 rounded-xl border border-[var(--border)] bg-[var(--content)] space-y-2 text-xs">
+              <div class="flex flex-wrap items-start justify-between gap-2">
+                <div class="min-w-0">
+                  <div class="font-semibold flex items-center gap-1.5 flex-wrap">
+                    <span>${esc(ss.title)}</span>
+                    <span class="px-1.5 py-0.2 rounded border font-mono text-[10px] pill-soft-primary">${esc(ss.id)}</span>
+                    <span class="px-1.5 py-0.2 rounded border text-[10px] ${ss.scope === 'branch' ? 'pill-soft-success' : 'pill-soft-warning'}">${ss.scope}</span>
+                  </div>
+                  <div class="text-[11px] text-[var(--muted-foreground)] mt-0.5 break-all">
+                    锚点：<code>${esc(ss.anchor)}</code> · 桥接：<code>${esc(ss.bridgePath)}</code>
+                  </div>
+                </div>
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <button onclick="viewSideSessionTranscript('${esc(ss.id)}')" class="touch-target px-2.5 py-1 rounded-lg border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-xs cursor-pointer">查看 (${ss.turns}轮)</button>
+                  <button onclick="showToast('已压缩 ${esc(ss.id)} 水位','success')" class="touch-target px-2.5 py-1 rounded-lg border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-xs cursor-pointer">压缩</button>
+                  <button onclick="state.sideSessions.splice(${idx},1);showToast('已删除 ${esc(ss.id)}','warning');render();" class="touch-target px-2.5 py-1 rounded-lg border border-[var(--error)]/40 pill-soft-error text-xs cursor-pointer">删除</button>
+                </div>
+              </div>
+              <div class="flex justify-between text-[10px] text-[var(--muted-foreground)] font-mono">
+                <span>水位 ${ss.tokens} / ${ss.watermarkHigh}</span>
+                <span class="text-[var(--success)]">缓存 ${esc(ss.cacheHit)}</span>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `;
+  }
+
+  const validTargetSession = state.sideSessions.find(s => s.id === state.sdkTargetSession) || state.sideSessions[0];
+  const effectiveTargetId = validTargetSession ? validTargetSession.id : 'phone:linwan';
+
+  const generatedCode = state.sdkTestMode === 'runOnce'
+    ? `const res = await Agentic.sideGen.runOnce({\n  systemPrompt: ${JSON.stringify(state.sdkSystemPrompt)},\n  prompt: ${JSON.stringify(state.sdkUserPrompt)},\n  mainChatDepth: 4,\n});`
+    : `const res = await Agentic.sideGen.send(${JSON.stringify(effectiveTargetId)}, ${JSON.stringify(state.sdkUserPrompt)});`;
+
+  return `
+    <div class="flex flex-col h-full min-h-0">
+      ${subTabsHtml}
+      <div class="flex-1 overflow-y-auto thin-scroll p-3.5 space-y-3 text-xs">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          <div>
+            <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">调用模式</label>
+            <select onchange="state.sdkTestMode=this.value;state.sdkOutput='';render();" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${isMobile ? 'mobile-control' : 'text-xs'}">
+              <option value="send" ${state.sdkTestMode === 'send' ? 'selected' : ''}>send() — 持久线外会话</option>
+              <option value="runOnce" ${state.sdkTestMode === 'runOnce' ? 'selected' : ''}>runOnce() — 一次性小插曲</option>
+            </select>
+          </div>
+          ${state.sdkTestMode === 'send' ? `
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">目标会话 ID</label>
+              <select onchange="state.sdkTargetSession=this.value;render();" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${isMobile ? 'mobile-control' : 'text-xs'}">
+                ${state.sideSessions.length === 0
+                  ? '<option value="">(无持久会话)</option>'
+                  : state.sideSessions.map(ss => `<option value="${esc(ss.id)}" ${effectiveTargetId === ss.id ? 'selected' : ''}>${esc(ss.id)} (${esc(ss.title)})</option>`).join('')}
+              </select>
+            </div>
+          ` : `
+            <div>
+              <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">系统指令</label>
+              <input type="text" value="${esc(state.sdkSystemPrompt)}" oninput="state.sdkSystemPrompt=this.value" class="w-full px-2.5 py-1.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${isMobile ? 'mobile-control' : 'text-xs'}" />
+            </div>
+          `}
+        </div>
+
+        <div>
+          <label class="text-[11px] text-[var(--muted-foreground)] block mb-1">输入提示词 / 消息</label>
+          <textarea rows="2" oninput="state.sdkUserPrompt=this.value" class="w-full p-2.5 rounded-lg bg-[var(--content)] border border-[var(--border)] ${isMobile ? 'mobile-control' : 'text-xs'}">${esc(state.sdkUserPrompt)}</textarea>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2">
+          <button onclick="runSdkQuickTest()" class="touch-target px-3.5 py-1.5 rounded-lg bg-[var(--primary)] text-[var(--primary-foreground)] text-xs font-semibold cursor-pointer">▶ 模拟执行 SDK</button>
+          <button onclick="navigator.clipboard?.writeText(${esc(JSON.stringify(generatedCode))});showToast('已复制 JS 代码','success');" class="touch-target px-3 py-1.5 rounded-lg border border-[var(--border)] bg-[var(--sidebar)] hover:bg-[var(--secondary)] text-xs cursor-pointer">📋 复制代码</button>
+        </div>
+
+        <pre class="p-2.5 rounded-xl bg-[var(--content)] border border-[var(--border)] font-mono text-[11px] max-w-full overflow-x-auto whitespace-pre-wrap break-all text-[var(--primary)]">${esc(generatedCode)}</pre>
+
+        ${state.sdkOutput ? `
+          <div class="p-3 rounded-xl border pill-soft-success font-mono text-[11px] whitespace-pre-wrap break-words leading-relaxed">${esc(state.sdkOutput)}</div>
+        ` : ''}
+      </div>
+    </div>
+  `;
+}
+
+function renderBaseTabPlaceholder(tabId) {
+  const item = NAV_ITEMS.find(n => n.id === tabId);
+  return `
+    <div class="h-full flex items-center justify-center p-6 bg-[var(--content)]">
+      <div class="max-w-md w-full p-5 rounded-2xl border border-[var(--border)] bg-[var(--card)] text-center space-y-3 shadow-sm">
+        <div class="text-sm font-semibold">${esc(item?.group || '')} · ${esc(item?.label || tabId)}</div>
+        <p class="text-xs text-[var(--muted-foreground)] leading-relaxed">
+          该视图已由主架构原型（<code>docs/ui-prototype.html</code>）覆盖并落地至 <code>src/ui/</code>。本原型聚焦极简版 <strong>「线外协作」</strong> 界面设计。
+        </p>
+        <div class="flex flex-wrap justify-center gap-2 pt-1">
+          <button onclick="switchTab('assistant')" class="touch-target px-3.5 py-1.5 rounded-lg bg-[var(--primary)] text-[var(--primary-foreground)] text-xs font-semibold cursor-pointer">前往助手工作台</button>
+          <button onclick="switchTab('sidegen')" class="touch-target px-3.5 py-1.5 rounded-lg border border-[var(--border)] bg-[var(--sidebar)] hover:bg-[var(--secondary)] text-xs cursor-pointer">前往线外与线索</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// =========================================================================
+// 7. 控制台壳层与三场景渲染
+// =========================================================================
+function renderConsoleHeader(isMobile) {
+  return `
+    <div class="px-3 py-1.5 bg-[var(--sidebar)] border-b border-[var(--border)] flex items-center justify-between gap-2 shrink-0 min-h-[44px]">
+      <div class="flex items-center gap-2 min-w-0">
+        <span class="font-semibold text-sm flex items-center gap-1 whitespace-nowrap">⚡ ST-Agentic</span>
+        ${!isMobile ? `<span class="text-[10px] px-1.5 py-0.5 rounded shadow-boundary-badge text-[var(--primary)] truncate">Shadow DOM 隔离</span>` : ''}
+      </div>
+      <div class="flex items-center gap-1.5 text-xs shrink-0">
+        <div class="flex p-0.5 rounded-lg bg-[var(--content)] border border-[var(--border)]">
+          ${[['off','关'], ['companion','伴生'], ['takeover','接管']].map(([m, lbl]) => `
+            <button onclick="setRunMode('${m}')" class="px-2 py-1 rounded text-[11px] cursor-pointer ${state.runMode === m ? 'bg-[var(--primary)] text-[var(--primary-foreground)] font-medium' : 'text-[var(--muted-foreground)]'}">${lbl}</button>
+          `).join('')}
+        </div>
+        ${!isMobile ? `
+          <select onchange="state.currentPreset=this.value;showToast('已切换预设');" class="px-2 py-1 rounded-lg bg-[var(--content)] border border-[var(--border)] text-xs max-w-[175px]">
+            <option ${state.currentPreset === '群像通用 Agent 预设' ? 'selected' : ''}>群像通用 Agent 预设</option>
+            <option ${state.currentPreset === '单人深度扮演 (低开销)' ? 'selected' : ''}>单人深度扮演 (低开销)</option>
+          </select>
+        ` : ''}
+        <button onclick="setTheme(state.theme === 'dark' ? 'light' : 'dark')" title="切换主题" class="${isMobile ? 'touch-target px-2' : 'px-2 py-1'} rounded-lg border border-[var(--border)] bg-[var(--card)] hover:bg-[var(--secondary)] text-xs cursor-pointer flex items-center justify-center">${state.theme === 'dark' ? '🌙' : '☀️'}</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderActiveTabContent(isMobile) {
+  if (state.activeTab === 'assistant') return renderAssistantTab(isMobile);
+  if (state.activeTab === 'sidegen') return renderSideGenTab(isMobile);
+  return renderBaseTabPlaceholder(state.activeTab);
+}
+
+function renderDesktopConsole() {
+  const groups = ['线外协作', '当前会话', '预设与系统'];
+  const pendingTotal = countAllPendingApprovals();
+  return `
+    <div class="max-w-7xl w-full bg-[var(--card)] border border-[var(--border)] rounded-2xl shadow-2xl overflow-hidden flex flex-col" style="height: 740px;">
+      ${renderConsoleHeader(false)}
+      <div class="flex-1 flex min-h-0">
+        <aside class="w-44 shrink-0 bg-[var(--sidebar)] border-r border-[var(--border)] p-2 overflow-y-auto thin-scroll space-y-3.5">
+          ${groups.map(g => `
+            <div class="space-y-0.5">
+              <div class="px-2 pb-0.5 text-[10px] font-semibold uppercase tracking-wider text-[var(--muted-foreground)] flex items-center justify-between">
+                <span>${g}</span>
+                ${g === '线外协作' ? `<span class="px-1 rounded text-[9px] pill-soft-primary border">NEW</span>` : ''}
+              </div>
+              ${NAV_ITEMS.filter(n => n.group === g).map(n => `
+                <button onclick="switchTab('${n.id}')" class="w-full text-left px-2.5 py-1.5 rounded-lg text-xs transition cursor-pointer flex flex-col ${state.activeTab === n.id ? 'bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm' : 'hover:bg-[var(--secondary)] text-[var(--foreground)]'}">
+                  <div class="flex items-center justify-between gap-1">
+                    <span class="font-medium truncate">${n.label}</span>
+                    ${n.id === 'assistant' && pendingTotal > 0 ? `<span class="px-1.5 rounded-full text-[10px] font-semibold ${state.activeTab === n.id ? 'bg-white/25 text-white' : 'pill-soft-warning border'}">${pendingTotal}</span>` : ''}
+                  </div>
+                  <span class="text-[10px] truncate ${state.activeTab === n.id ? 'opacity-85' : 'text-[var(--muted-foreground)]'}">${n.desc}</span>
+                </button>
+              `).join('')}
+            </div>
+          `).join('')}
+        </aside>
+
+        <section class="flex-1 min-w-0 bg-[var(--card)] overflow-hidden">
+          ${renderActiveTabContent(false)}
+        </section>
+      </div>
+    </div>
+  `;
+}
+
+function renderMobileConsole() {
+  const pendingTotal = countAllPendingApprovals();
+  const hideMobileChrome = state.activeTab === 'assistant' && state.mobileViewStack === 'detail';
+  return `
+    <div class="flex flex-col items-center gap-2 w-full">
+      <div class="text-[11px] text-[var(--muted-foreground)] flex flex-wrap items-center justify-center gap-1.5">
+        <span>📱 390×844 移动端：${hideMobileChrome ? '对话中已隐藏顶部标题与导航（点 ← 回会话列表显示）' : '会话列表与顶部导航视图（点会话进入沉浸对话）'} · 模式/模型合入输入组</span>
+      </div>
+      <div class="mobile-shell bg-[var(--card)] flex flex-col">
+        ${!hideMobileChrome ? `
+          ${renderConsoleHeader(true)}
+          <div class="shrink-0 bg-[var(--content)] border-b border-[var(--border)] px-2 py-1 flex items-center gap-1 overflow-x-auto no-scrollbar">
+            ${NAV_ITEMS.map(n => `
+              <button onclick="switchTab('${n.id}')" class="shrink-0 touch-target px-2.5 py-1 rounded-lg text-xs font-medium cursor-pointer flex items-center gap-1 transition ${state.activeTab === n.id ? 'bg-[var(--primary)]/15 text-[var(--primary)] border border-[var(--primary)]/35 font-semibold' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'}">
+                <span>${n.short}</span>
+                ${n.id === 'assistant' && pendingTotal > 0 ? `<span class="px-1 rounded-full text-[10px] bg-[var(--warning)] text-black font-bold leading-tight">${pendingTotal}</span>` : ''}
+              </button>
+            `).join('')}
+          </div>
+        ` : ''}
+        <div class="flex-1 min-h-0 overflow-hidden bg-[var(--card)]">
+          ${renderActiveTabContent(true)}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderHostEntryScene() {
+  return `
+    <div class="max-w-4xl w-full grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
+      <div class="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 space-y-3 shadow-sm">
+        <div class="text-sm font-semibold flex items-center justify-between gap-2">
+          <span>🪄 ST 魔棒菜单挂载预览 (#extensionsMenu)</span>
+          <span class="text-[10px] px-2 py-0.5 rounded-full border pill-soft-success shrink-0">零侵入深链接</span>
+        </div>
+        <p class="text-xs text-[var(--muted-foreground)]">
+          在 SillyTavern 原生输入框左下角魔棒菜单中新增「打开 Agentic 助手」与「线外会话与线索」入口；点击即可唤起独立 Shadow DOM 控制台并定位到对应视图。
+        </p>
+
+        <div class="w-full max-w-xs bg-[var(--content)] border border-[var(--border)] rounded-xl shadow-xl p-2 space-y-1 text-xs">
+          <div class="px-2.5 py-1 text-[10px] text-[var(--muted-foreground)] font-medium">ST #extensionsMenu</div>
+          <button onclick="state.activeTab='assistant';switchScene('desktop');" class="w-full text-left px-2.5 py-2.5 rounded-lg bg-[var(--primary)]/12 border border-[var(--primary)]/35 hover:bg-[var(--primary)]/20 flex items-center justify-between cursor-pointer">
+            <span class="font-semibold text-[var(--primary)]">🤖 打开 Agentic 助手</span>
+            <span class="text-[10px] px-1.5 py-0.5 rounded pill-soft-primary border">NEW</span>
+          </button>
+          <button onclick="state.activeTab='sidegen';switchScene('desktop');" class="w-full text-left px-2.5 py-2.5 rounded-lg bg-[var(--success)]/10 border border-[var(--success)]/30 hover:bg-[var(--success)]/18 flex items-center justify-between cursor-pointer">
+            <span class="font-semibold text-[var(--success)]">📡 线外会话与线索</span>
+            <span class="text-[10px] px-1.5 py-0.5 rounded pill-soft-success border">NEW</span>
+          </button>
+          <div class="border-t border-[var(--card-border)] my-1"></div>
+          <button onclick="state.activeTab='files';switchScene('desktop');" class="w-full text-left px-2.5 py-2 rounded-lg hover:bg-[var(--secondary)] flex items-center justify-between cursor-pointer">
+            <span>📁 文件与内容覆盖</span><span class="text-[10px] text-[var(--muted-foreground)]">直达①</span>
+          </button>
+          <button onclick="state.activeTab='logs';switchScene('desktop');" class="w-full text-left px-2.5 py-2 rounded-lg hover:bg-[var(--secondary)] flex items-center justify-between cursor-pointer">
+            <span>📜 查看生成日志</span><span class="text-[10px] text-[var(--muted-foreground)]">直达②</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 space-y-3 shadow-sm">
+        <div class="text-sm font-semibold">📱 移动视口快速验证</div>
+        <p class="text-xs text-[var(--muted-foreground)] leading-relaxed">
+          点击下方按钮直接在移动端 <code>390×844</code> 极简布局下体验高屏占比交互：
+        </p>
+        <div class="space-y-2">
+          <button onclick="state.activeTab='assistant';state.mobileViewStack='detail';switchScene('mobile');" class="w-full touch-target px-3 py-2.5 rounded-xl bg-[var(--primary)] text-[var(--primary-foreground)] text-xs font-semibold cursor-pointer">
+            📱 在手机视口打开「助手工作台」
+          </button>
+          <button onclick="state.activeTab='sidegen';state.mobileSideStack='list';switchScene('mobile');" class="w-full touch-target px-3 py-2.5 rounded-xl border border-[var(--border)] bg-[var(--sidebar)] hover:bg-[var(--secondary)] text-xs font-medium cursor-pointer">
+            📱 在手机视口打开「线外会话与线索」
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// =========================================================================
+// 8. 总渲染调度
+// =========================================================================
+function render(scrollChatToBottom = false) {
+  const scope = document.getElementById('theme-scope');
+  if (scope) scope.setAttribute('data-theme', state.theme);
+
+  ['dark', 'light'].forEach(t => {
+    const tb = document.getElementById('theme-btn-' + t);
+    if (tb) {
+      tb.className = `px-2 py-1 rounded-md cursor-pointer flex items-center gap-1 transition ${
+        state.theme === t ? 'bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm font-medium' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+      }`;
+    }
+  });
+
+  ['desktop', 'mobile', 'host'].forEach(s => {
+    const btn = document.getElementById('scene-' + s);
+    if (btn) {
+      btn.className = `px-2.5 py-1.5 rounded-md text-xs font-medium transition cursor-pointer flex items-center gap-1.5 ${
+        state.scene === s ? 'bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+      }`;
+    }
+  });
+
+  const activeEl = document.activeElement;
+  const wasDraftFocused = activeEl && activeEl.id === 'assistant-draft-input';
+  const selStart = wasDraftFocused ? activeEl.selectionStart : null;
+  const selEnd = wasDraftFocused ? activeEl.selectionEnd : null;
+
+  const root = document.getElementById('app-root');
+  if (state.scene === 'desktop') root.innerHTML = renderDesktopConsole();
+  else if (state.scene === 'mobile') root.innerHTML = renderMobileConsole();
+  else root.innerHTML = renderHostEntryScene();
+
+  if (scrollChatToBottom) {
+    const box = document.getElementById('assistant-scroll-box');
+    if (box) box.scrollTop = box.scrollHeight;
+  }
+  if (wasDraftFocused) {
+    const nextInput = document.getElementById('assistant-draft-input');
+    if (nextInput) {
+      nextInput.focus();
+      if (selStart !== null && selEnd !== null) {
+        nextInput.setSelectionRange(selStart, selEnd);
+      }
+    }
+  }
+}
+
+render();
+</script>
+</body>
+</html>
