@@ -26,6 +26,7 @@ const ALL_CONSOLE_TABS: readonly ConsoleTabId[] = [
     'files',
     'logs',
     'cache',
+    'prompts',
     'agents',
     'pipeline',
     'tools',
@@ -506,7 +507,7 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
         }
     });
 
-    it('satisfies desktop (1280x800) layout, overflow, >=40x40px targets, and >=16px inputs across all 11 views', async () => {
+    it('satisfies desktop (1280x800) layout, overflow, >=40x40px targets, and >=16px inputs across all 12 views', async () => {
         await page.viewport(1280, 800);
         activeHarness = createHarness({ initialTab: 'files', initialOpen: true });
         await settleLayout(5);
@@ -549,7 +550,7 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
         }
     });
 
-    it('satisfies mobile (390x844) single-column push-stack navigation, backdrop-filter: none, zero overflow, >=40x40px targets, and >=16px inputs across all 11 views', async () => {
+    it('satisfies mobile (390x844) single-column push-stack navigation, backdrop-filter: none, zero overflow, >=40x40px targets, and >=16px inputs across all 12 views', async () => {
         await page.viewport(390, 844);
         activeHarness = createHarness({ initialTab: 'files', initialOpen: true });
         await settleLayout(5);

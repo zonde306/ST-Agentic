@@ -571,11 +571,12 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
         const card = targetPage.locator('#extensions_settings [data-agentic-settings-mount]');
         const extBlock = targetPage.locator('#rm_extensions_block');
         const extIcon = targetPage.locator('#extensions-settings-button .drawer-icon');
+        const drawerToggle = card.locator('.inline-drawer-toggle');
         const openBtn = card.locator('.ag-ext-open-btn');
         const takeoverBtn = card.locator('.ag-ext-mode-btn[data-mode="takeover"]');
 
         for (let attempt = 0; attempt < 4; attempt += 1) {
-            const hasOpenDrawer = await extBlock
+            let hasOpenDrawer = await extBlock
                 .evaluate((el) => el.classList.contains('openDrawer'))
                 .catch(() => false);
             if (!hasOpenDrawer) {
@@ -589,6 +590,16 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
                         { timeout: 4000 },
                     )
                     .catch(() => undefined);
+                hasOpenDrawer = await extBlock
+                    .evaluate((el) => el.classList.contains('openDrawer'))
+                    .catch(() => false);
+            }
+
+            if (hasOpenDrawer && !(await openBtn.isVisible().catch(() => false))) {
+                if (await drawerToggle.isVisible().catch(() => false)) {
+                    await drawerToggle.click();
+                    await openBtn.waitFor({ state: 'visible', timeout: 4000 }).catch(() => undefined);
+                }
             }
 
             if (await openBtn.isVisible().catch(() => false)) {

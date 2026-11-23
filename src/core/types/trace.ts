@@ -114,6 +114,7 @@ export type ConsoleTabId =
     | 'files'
     | 'logs'
     | 'cache'
+    | 'prompts'
     | 'agents'
     | 'pipeline'
     | 'tools'

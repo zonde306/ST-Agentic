@@ -67,6 +67,14 @@ export const CONSOLE_TABS: readonly ConsoleTabMeta[] = [
         description: '分块归档 / 冷层压平',
     },
     {
+        id: 'prompts',
+        group: 'system',
+        groupLabel: '预设与系统',
+        label: '预设与提示词',
+        shortLabel: '提示词',
+        description: '独立预设 / 提示词排序与编辑',
+    },
+    {
         id: 'agents',
         group: 'system',
         groupLabel: '预设与系统',

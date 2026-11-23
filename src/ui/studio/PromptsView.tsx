@@ -1,0 +1,1095 @@
+import type { TargetedEvent } from 'preact';
+import { useMemo, useRef, useState } from 'preact/hooks';
+import {
+    isPlainRecord,
+    normalizePromptBlock,
+    resolveActivePreset,
+} from '@/core/config';
+import {
+    importSillyTavernOpenAIPreset,
+    isSillyTavernOpenAIPreset,
+} from '@/core/migration';
+import type { AgentProfile, PromptBlock } from '@/core/types';
+import {
+    Badge,
+    Button,
+    Card,
+    CodeEditor,
+    EmptyState,
+    FormField,
+    SelectInput,
+    ShadowModal,
+    TextInput,
+    ToggleSwitch,
+} from '@/ui/components';
+import {
+    IconArrowDown,
+    IconArrowUp,
+    IconCheck,
+    IconCopy,
+    IconDownload,
+    IconPlus,
+    IconTrash,
+    IconUpload,
+} from '@/ui/components/Icons';
+import {
+    type ConsoleViewProps,
+    useAppStore,
+    useAppStoreInstance,
+} from '@/ui/store';
+import { PresetManagerPanel } from './PresetManagerPanel';
+import {
+    allocateUniqueId,
+    copyTextToClipboard,
+    downloadTextFile,
+    moveArrayItem,
+    withUpdatedAgent,
+} from './studio-helpers';
+
+function IconGrip({ size = 14 }: { size?: number }) {
+    return (
+        <svg
+            width={size}
+            height={size}
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={2}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+        >
+            <line x1="4" y1="9" x2="20" y2="9" />
+            <line x1="4" y1="15" x2="20" y2="15" />
+        </svg>
+    );
+}
+
+function IconEditPen({ size = 14 }: { size?: number }) {
+    return (
+        <svg
+            width={size}
+            height={size}
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={1.9}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+        >
+            <path d="M12 20h9" />
+            <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+        </svg>
+    );
+}
+
+interface ParsedPromptImport {
+    blocks: PromptBlock[];
+    skippedCount: number;
+    note?: string;
+}
+
+function parseImportedPromptBlocks(raw: unknown): ParsedPromptImport {
+    if (Array.isArray(raw)) {
+        const blocks = raw
+            .filter(isPlainRecord)
+            .map((item, idx) =>
+                normalizePromptBlock(item, `imported_${idx + 1}`, `提示词 ${idx + 1}`),
+            );
+        if (blocks.length === 0) {
+            throw new Error('数组中未找到有效的提示词对象');
+        }
+        return { blocks, skippedCount: 0 };
+    }
+
+    if (!isPlainRecord(raw)) {
+        throw new Error('JSON 根节点必须是提示词数组或对象');
+    }
+
+    if (isSillyTavernOpenAIPreset(raw)) {
+        const migrated = importSillyTavernOpenAIPreset(raw);
+        const mainAgent =
+            migrated.preset.agents[migrated.preset.mainAgentId]
+            ?? Object.values(migrated.preset.agents)[0];
+        const blocks = mainAgent?.promptBlocks ?? [];
+        if (blocks.length === 0) {
+            throw new Error('该 ST 预设中未包含可导入的自定义提示词条目');
+        }
+        const skippedCount = migrated.report.skippedItems.length;
+        return {
+            blocks,
+            skippedCount,
+            note:
+                skippedCount > 0
+                    ? `已从 ST 预设提取 ${blocks.length} 条提示词（自动跳过 ${skippedCount} 条内置槽位或 @D>=1 深度注入以保持缓存安全）`
+                    : `已从 ST 预设提取 ${blocks.length} 条提示词`,
+        };
+    }
+
+    if (
+        raw.format === 'st-agentic-preset'
+        && isPlainRecord(raw.preset)
+        && isPlainRecord(raw.preset.agents)
+    ) {
+        const mainId =
+            typeof raw.preset.mainAgentId === 'string' ? raw.preset.mainAgentId : '';
+        const targetAgent =
+            (mainId && isPlainRecord(raw.preset.agents[mainId])
+                ? raw.preset.agents[mainId]
+                : Object.values(raw.preset.agents).find(isPlainRecord)) ?? null;
+        if (targetAgent && Array.isArray(targetAgent.promptBlocks)) {
+            const blocks = targetAgent.promptBlocks
+                .filter(isPlainRecord)
+                .map((item, idx) =>
+                    normalizePromptBlock(item, `imported_${idx + 1}`, `提示词 ${idx + 1}`),
+                );
+            if (blocks.length > 0) {
+                return {
+                    blocks,
+                    skippedCount: 0,
+                    note: `已从 ST-Agentic 预设提取 ${blocks.length} 条提示词`,
+                };
+            }
+        }
+    }
+
+    if (Array.isArray(raw.prompts)) {
+        return parseImportedPromptBlocks(raw.prompts);
+    }
+
+    if (Array.isArray(raw.promptBlocks)) {
+        return parseImportedPromptBlocks(raw.promptBlocks);
+    }
+
+    if (isPlainRecord(raw.prompt)) {
+        return {
+            blocks: [normalizePromptBlock(raw.prompt, 'imported_1', '导入提示词')],
+            skippedCount: 0,
+        };
+    }
+
+    if (
+        typeof raw.name === 'string'
+        || typeof raw.content === 'string'
+        || typeof raw.placement === 'string'
+    ) {
+        return {
+            blocks: [normalizePromptBlock(raw, 'imported_1', '导入提示词')],
+            skippedCount: 0,
+        };
+    }
+
+    throw new Error('未能识别的提示词 JSON 格式（支持提示词数组、单个提示词或 ST OpenAI 预设）');
+}
+
+/**
+ * Independent Preset & Prompt List Editor view (`预设与提示词`):
+ * manages prompt blocks strictly inside ST-Agentic's `settings.presets[currentPresetId]`
+ * without mutating SillyTavern's native preset.
+ */
+export function PromptsView({ store: propStore }: ConsoleViewProps) {
+    const ctxStore = useAppStoreInstance();
+    const store = propStore ?? ctxStore;
+    const settings = useAppStore((s) => s.settings);
+
+    const activePreset = useMemo(() => resolveActivePreset(settings), [settings]);
+    const agentList = useMemo(
+        () => Object.values(activePreset.agents),
+        [activePreset.agents],
+    );
+
+    const [selectedAgentId, setSelectedAgentId] = useState<string>('');
+    const activeAgent: AgentProfile | undefined = useMemo(() => {
+        if (selectedAgentId && activePreset.agents[selectedAgentId]) {
+            return activePreset.agents[selectedAgentId];
+        }
+        return (
+            activePreset.agents[activePreset.mainAgentId]
+            ?? agentList[0]
+        );
+    }, [activePreset.agents, activePreset.mainAgentId, agentList, selectedAgentId]);
+
+    const promptBlocks = activeAgent?.promptBlocks ?? [];
+    const enabledPromptCount = useMemo(
+        () => promptBlocks.filter((b) => b.enabled).length,
+        [promptBlocks],
+    );
+    const enabledRegexCount = useMemo(
+        () => activePreset.regexRules.filter((r) => r.enabled).length,
+        [activePreset.regexRules],
+    );
+
+    // Drag & drop state
+    const [dragIndex, setDragIndex] = useState<number | null>(null);
+    const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
+
+    // Edit / Create modal state
+    const [editorMode, setEditorMode] = useState<'create' | 'edit' | null>(null);
+    const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
+    const [draftName, setDraftName] = useState('');
+    const [draftRole, setDraftRole] = useState<PromptBlock['role']>('system');
+    const [draftPlacement, setDraftPlacement] = useState<PromptBlock['placement']>('prefix');
+    const [draftEnabled, setDraftEnabled] = useState(true);
+    const [draftContent, setDraftContent] = useState('');
+    const [editError, setEditError] = useState<string | null>(null);
+
+    // Import modal state
+    const [importOpen, setImportOpen] = useState(false);
+    const [importText, setImportText] = useState('');
+    const [importMode, setImportMode] = useState<'append' | 'replace'>('append');
+    const [importError, setImportError] = useState<string | null>(null);
+    const importFileRef = useRef<HTMLInputElement | null>(null);
+
+    // Export modal state
+    const [exportOpen, setExportOpen] = useState(false);
+    const [exportBlock, setExportBlock] = useState<PromptBlock | null>(null);
+
+    const mutateActiveAgentBlocks = (
+        updater: (blocks: PromptBlock[]) => PromptBlock[],
+    ): void => {
+        if (!activeAgent) {
+            return;
+        }
+        const targetAgentId = activeAgent.id;
+        const targetPresetId = activePreset.id;
+        void store.updateSettings((prev) => {
+            const preset = prev.presets[targetPresetId];
+            if (!preset) {
+                return prev;
+            }
+            return {
+                ...prev,
+                presets: {
+                    ...prev.presets,
+                    [targetPresetId]: {
+                        ...preset,
+                        agents: withUpdatedAgent(preset.agents, targetAgentId, (ag) => ({
+                            ...ag,
+                            promptBlocks: updater(ag.promptBlocks),
+                        })),
+                    },
+                },
+            };
+        });
+    };
+
+    const editingIndex = useMemo(() => {
+        if (editorMode !== 'edit' || !editingBlockId) {
+            return -1;
+        }
+        return promptBlocks.findIndex((b) => b.id === editingBlockId);
+    }, [editingBlockId, editorMode, promptBlocks]);
+
+    const openCreateModal = () => {
+        setEditorMode('create');
+        setEditingBlockId(null);
+        setDraftName('');
+        setDraftRole('system');
+        setDraftPlacement('prefix');
+        setDraftEnabled(true);
+        setDraftContent('');
+        setEditError(null);
+    };
+
+    const openEditModal = (block: PromptBlock) => {
+        setEditorMode('edit');
+        setEditingBlockId(block.id);
+        setDraftName(block.name);
+        setDraftRole(block.role);
+        setDraftPlacement(block.placement);
+        setDraftEnabled(block.enabled);
+        setDraftContent(block.content);
+        setEditError(null);
+    };
+
+    const handleSavePromptModal = () => {
+        const trimmedName = draftName.trim();
+        if (!trimmedName) {
+            setEditError('请输入提示词名称');
+            return;
+        }
+
+        if (editorMode === 'create') {
+            mutateActiveAgentBlocks((blocks) => {
+                const nextId = allocateUniqueId(
+                    trimmedName,
+                    blocks.map((b) => b.id),
+                    'prompt',
+                );
+                const created: PromptBlock = {
+                    id: nextId,
+                    name: trimmedName,
+                    role: draftRole,
+                    placement: draftPlacement,
+                    content: draftContent,
+                    enabled: draftEnabled,
+                };
+                return [...blocks, created];
+            });
+            store.pushToast(`已添加提示词：${trimmedName}`, 'success');
+            setEditorMode(null);
+            return;
+        }
+
+        if (editorMode === 'edit' && editingBlockId) {
+            mutateActiveAgentBlocks((blocks) =>
+                blocks.map((b) =>
+                    b.id === editingBlockId
+                        ? {
+                            ...b,
+                            name: trimmedName,
+                            role: draftRole,
+                            placement: draftPlacement,
+                            enabled: draftEnabled,
+                            content: draftContent,
+                        }
+                        : b,
+                ),
+            );
+            store.pushToast(`已保存提示词：${trimmedName}`, 'success');
+            setEditorMode(null);
+        }
+    };
+
+    const handleDuplicateEditingBlock = () => {
+        if (!editingBlockId) {
+            return;
+        }
+        const trimmedName = draftName.trim() || '提示词';
+        const copyName = `${trimmedName} (副本)`;
+        mutateActiveAgentBlocks((blocks) => {
+            const idx = blocks.findIndex((b) => b.id === editingBlockId);
+            const nextId = allocateUniqueId(
+                `${editingBlockId}_copy`,
+                blocks.map((b) => b.id),
+                'prompt_copy',
+            );
+            const copyBlock: PromptBlock = {
+                id: nextId,
+                name: copyName,
+                role: draftRole,
+                placement: draftPlacement,
+                content: draftContent,
+                enabled: draftEnabled,
+            };
+            if (idx < 0) {
+                return [...blocks, copyBlock];
+            }
+            const next = [...blocks];
+            next.splice(idx + 1, 0, copyBlock);
+            return next;
+        });
+        store.pushToast(`已复制提示词：${copyName}`, 'success');
+        setEditorMode(null);
+    };
+
+    const handleDeleteBlock = (block: PromptBlock) => {
+        store.openModal({
+            kind: 'confirm',
+            title: '删除提示词确认',
+            message: `确定要删除提示词「${block.name}」吗？`,
+            confirmLabel: '确认删除',
+            tone: 'danger',
+            onConfirm: () => {
+                mutateActiveAgentBlocks((blocks) =>
+                    blocks.filter((b) => b.id !== block.id),
+                );
+                if (editingBlockId === block.id) {
+                    setEditorMode(null);
+                    setEditingBlockId(null);
+                }
+                store.pushToast(`已删除提示词：${block.name}`, 'warning');
+            },
+        });
+    };
+
+    const handleDropOnRow = (targetIndex: number) => {
+        if (dragIndex !== null && dragIndex !== targetIndex) {
+            mutateActiveAgentBlocks((blocks) =>
+                moveArrayItem(blocks, dragIndex, targetIndex),
+            );
+        }
+        setDragIndex(null);
+        setDragOverIndex(null);
+    };
+
+    const handleRunImport = (rawText: string) => {
+        setImportError(null);
+        try {
+            const parsed: unknown = JSON.parse(rawText);
+            const result = parseImportedPromptBlocks(parsed);
+            mutateActiveAgentBlocks((existing) => {
+                const baseList = importMode === 'replace' ? [] : [...existing];
+                const usedIds = new Set(baseList.map((b) => b.id));
+                const assigned = result.blocks.map((block) => {
+                    const uniqueId = allocateUniqueId(block.id, usedIds, 'prompt');
+                    usedIds.add(uniqueId);
+                    return { ...block, id: uniqueId };
+                });
+                return [...baseList, ...assigned];
+            });
+            store.pushToast(
+                result.note ?? `已导入 ${result.blocks.length} 条提示词`,
+                'success',
+            );
+            setImportOpen(false);
+            setImportText('');
+        } catch (error) {
+            setImportError(error instanceof Error ? error.message : String(error));
+        }
+    };
+
+    const handleImportFileChange = async (event: TargetedEvent<HTMLInputElement, Event>) => {
+        const file = event.currentTarget.files?.[0];
+        event.currentTarget.value = '';
+        if (!file) {
+            return;
+        }
+        try {
+            const text = await file.text();
+            setImportText(text);
+            setImportError(null);
+        } catch (error) {
+            setImportError(error instanceof Error ? error.message : String(error));
+        }
+    };
+
+    const exportJsonText = useMemo(() => {
+        if (exportBlock) {
+            return JSON.stringify(
+                {
+                    format: 'st-agentic-prompt',
+                    version: 1,
+                    prompt: exportBlock,
+                },
+                null,
+                2,
+            );
+        }
+        return JSON.stringify(
+            {
+                format: 'st-agentic-prompts',
+                version: 1,
+                presetName: activePreset.name,
+                agentId: activeAgent?.id ?? '',
+                prompts: promptBlocks,
+            },
+            null,
+            2,
+        );
+    }, [activeAgent?.id, activePreset.name, exportBlock, promptBlocks]);
+
+    const agentOptions = useMemo(
+        () =>
+            agentList.map((ag) => ({
+                value: ag.id,
+                label:
+                    ag.id === activePreset.mainAgentId
+                        ? `${ag.name}（主叙事）`
+                        : ag.name,
+            })),
+        [activePreset.mainAgentId, agentList],
+    );
+
+    return (
+        <div
+            style={{
+                display: 'flex',
+                flexDirection: 'column',
+                height: '100%',
+                minHeight: 0,
+                minWidth: 0,
+            }}
+        >
+            <PresetManagerPanel
+                store={store}
+                compact
+                onPresetChanged={() => setSelectedAgentId('')}
+            />
+
+            <div class="ag-view-scroll ag-thin-scroll" style={{ flex: '1 1 auto', minHeight: 0 }}>
+                <div class="ag-stack-v">
+                    {/* Independent Preset Summary & Target Agent Bar */}
+                    <div
+                        class="ag-row-wrap"
+                        style={{
+                            justifyContent: 'space-between',
+                            padding: '10px 12px',
+                            borderRadius: '10px',
+                            border: '1px solid var(--border)',
+                            background: 'var(--content)',
+                        }}
+                    >
+                        <div class="ag-stack-v" style={{ gap: '4px', flex: '1 1 220px' }}>
+                            <div class="ag-row-wrap">
+                                <Badge tone="primary">独立预设</Badge>
+                                <span style={{ fontSize: '12px', color: 'var(--muted-foreground)' }}>
+                                    提示词: {promptBlocks.length} (启用: {enabledPromptCount}) · 正则:{' '}
+                                    {activePreset.regexRules.length} (启用: {enabledRegexCount}) · 智能体:{' '}
+                                    {agentList.length} · 触发器: {activePreset.triggers.length}
+                                </span>
+                            </div>
+                            <div class="ag-field-hint">
+                                仅作用于 ST-Agentic 独立预设（不会修改或覆盖 SillyTavern 原生预设）。
+                            </div>
+                        </div>
+
+                        {agentOptions.length > 0 ? (
+                            <div style={{ minWidth: '180px', maxWidth: '100%' }}>
+                                <SelectInput
+                                    ariaLabel="选择目标智能体"
+                                    value={activeAgent?.id ?? ''}
+                                    options={agentOptions}
+                                    onChange={(id) => setSelectedAgentId(id)}
+                                />
+                            </div>
+                        ) : null}
+                    </div>
+
+                    {/* Prompt List Card */}
+                    <Card
+                        title={`提示词 (${promptBlocks.length})`}
+                        subtitle="支持拖拽排序、独立开关与编辑；Prefix 进入 Layer 0 静态前缀缓存，Tail 追加至 Layer 2 当轮尾部"
+                        actions={
+                            <div class="ag-row-wrap">
+                                <Button
+                                    size="sm"
+                                    variant="primary"
+                                    icon={<IconPlus size={14} />}
+                                    disabled={!activeAgent}
+                                    onClick={openCreateModal}
+                                >
+                                    添加
+                                </Button>
+                                <Button
+                                    size="sm"
+                                    variant="secondary"
+                                    icon={<IconUpload size={14} />}
+                                    disabled={!activeAgent}
+                                    onClick={() => {
+                                        setImportError(null);
+                                        setImportOpen(true);
+                                    }}
+                                >
+                                    导入
+                                </Button>
+                                <Button
+                                    size="sm"
+                                    variant="secondary"
+                                    icon={<IconDownload size={14} />}
+                                    disabled={!activeAgent || promptBlocks.length === 0}
+                                    onClick={() => {
+                                        setExportBlock(null);
+                                        setExportOpen(true);
+                                    }}
+                                >
+                                    导出
+                                </Button>
+                            </div>
+                        }
+                    >
+                        {promptBlocks.length === 0 ? (
+                            <EmptyState
+                                title="暂无提示词条目"
+                                description="点击上方「添加」新建独立提示词，或点击「导入」从 ST 预设提取提示词条目。"
+                                action={
+                                    <Button
+                                        size="sm"
+                                        variant="primary"
+                                        icon={<IconPlus size={14} />}
+                                        disabled={!activeAgent}
+                                        onClick={openCreateModal}
+                                    >
+                                        新增提示词
+                                    </Button>
+                                }
+                            />
+                        ) : (
+                            <div class="ag-stack-v" style={{ gap: '8px' }} role="list">
+                                {promptBlocks.map((block, index) => {
+                                    const isDragOver =
+                                        dragOverIndex === index
+                                        && dragIndex !== null
+                                        && dragIndex !== index;
+
+                                    return (
+                                        <div
+                                            key={block.id}
+                                            role="listitem"
+                                            draggable
+                                            onDragStart={(e) => {
+                                                setDragIndex(index);
+                                                setDragOverIndex(index);
+                                                if (e.dataTransfer) {
+                                                    e.dataTransfer.effectAllowed = 'move';
+                                                    e.dataTransfer.setData('text/plain', String(index));
+                                                }
+                                            }}
+                                            onDragOver={(e) => {
+                                                e.preventDefault();
+                                                if (e.dataTransfer) {
+                                                    e.dataTransfer.dropEffect = 'move';
+                                                }
+                                                if (dragOverIndex !== index) {
+                                                    setDragOverIndex(index);
+                                                }
+                                            }}
+                                            onDragLeave={() => {
+                                                if (dragOverIndex === index) {
+                                                    setDragOverIndex(null);
+                                                }
+                                            }}
+                                            onDrop={(e) => {
+                                                e.preventDefault();
+                                                handleDropOnRow(index);
+                                            }}
+                                            onDragEnd={() => {
+                                                setDragIndex(null);
+                                                setDragOverIndex(null);
+                                            }}
+                                            style={{
+                                                display: 'flex',
+                                                flexWrap: 'wrap',
+                                                alignItems: 'center',
+                                                justifyContent: 'space-between',
+                                                gap: '6px 8px',
+                                                padding: '6px 10px',
+                                                borderRadius: '10px',
+                                                border: isDragOver
+                                                    ? '1px solid var(--primary)'
+                                                    : '1px solid var(--border)',
+                                                borderLeft: block.enabled
+                                                    ? '3px solid var(--success)'
+                                                    : '3px solid var(--border)',
+                                                background: isDragOver
+                                                    ? 'color-mix(in srgb, var(--primary) 10%, var(--card))'
+                                                    : 'var(--card)',
+                                                opacity: block.enabled ? 1 : 0.72,
+                                                minWidth: 0,
+                                                transition: 'border-color 0.15s, background-color 0.15s',
+                                            }}
+                                        >
+                                            <div
+                                                style={{
+                                                    display: 'flex',
+                                                    alignItems: 'center',
+                                                    gap: '4px',
+                                                    flex: '1 1 160px',
+                                                    minWidth: 0,
+                                                }}
+                                            >
+                                                <span
+                                                    title="拖拽调整顺序"
+                                                    aria-hidden="true"
+                                                    style={{
+                                                        display: 'inline-flex',
+                                                        alignItems: 'center',
+                                                        justifyContent: 'center',
+                                                        width: '24px',
+                                                        height: '40px',
+                                                        color: 'var(--muted-foreground)',
+                                                        cursor: 'grab',
+                                                        flexShrink: 0,
+                                                    }}
+                                                >
+                                                    <IconGrip size={15} />
+                                                </span>
+
+                                                <button
+                                                    type="button"
+                                                    role="switch"
+                                                    aria-checked={block.enabled}
+                                                    aria-label={`${block.enabled ? '停用' : '启用'} ${block.name}`}
+                                                    title={block.enabled ? '点击停用' : '点击启用'}
+                                                    onClick={() =>
+                                                        mutateActiveAgentBlocks((blocks) =>
+                                                            blocks.map((b) =>
+                                                                b.id === block.id
+                                                                    ? { ...b, enabled: !b.enabled }
+                                                                    : b,
+                                                            ),
+                                                        )
+                                                    }
+                                                    style={{
+                                                        minWidth: '40px',
+                                                        minHeight: '40px',
+                                                        padding: 0,
+                                                        border: 'none',
+                                                        background: 'transparent',
+                                                        display: 'inline-flex',
+                                                        alignItems: 'center',
+                                                        justifyContent: 'center',
+                                                        cursor: 'pointer',
+                                                        flexShrink: 0,
+                                                    }}
+                                                >
+                                                    <span
+                                                        style={{
+                                                            width: '20px',
+                                                            height: '20px',
+                                                            borderRadius: '6px',
+                                                            border: block.enabled
+                                                                ? '1px solid var(--primary)'
+                                                                : '1px solid var(--muted-foreground)',
+                                                            background: block.enabled
+                                                                ? 'var(--primary)'
+                                                                : 'var(--content)',
+                                                            color: 'var(--primary-foreground)',
+                                                            display: 'inline-flex',
+                                                            alignItems: 'center',
+                                                            justifyContent: 'center',
+                                                        }}
+                                                    >
+                                                        {block.enabled ? <IconCheck size={13} /> : null}
+                                                    </span>
+                                                </button>
+
+                                                <div
+                                                    style={{
+                                                        display: 'flex',
+                                                        flexWrap: 'wrap',
+                                                        alignItems: 'center',
+                                                        gap: '6px',
+                                                        minWidth: 0,
+                                                        flex: '1 1 auto',
+                                                    }}
+                                                >
+                                                    <span
+                                                        style={{
+                                                            fontSize: '13px',
+                                                            fontWeight: 600,
+                                                            color: 'var(--foreground)',
+                                                            wordBreak: 'break-word',
+                                                        }}
+                                                    >
+                                                        {block.name}
+                                                    </span>
+                                                    <Badge
+                                                        tone={
+                                                            block.placement === 'prefix'
+                                                                ? 'primary'
+                                                                : 'warning'
+                                                        }
+                                                    >
+                                                        {block.placement === 'prefix'
+                                                            ? 'Prefix'
+                                                            : 'Tail'}
+                                                    </Badge>
+                                                    <Badge tone="neutral">{block.role}</Badge>
+                                                </div>
+                                            </div>
+
+                                            <div
+                                                style={{
+                                                    display: 'flex',
+                                                    alignItems: 'center',
+                                                    gap: '4px',
+                                                    flexShrink: 0,
+                                                }}
+                                            >
+                                                <Button
+                                                    size="sm"
+                                                    variant="ghost"
+                                                    ariaLabel={`编辑提示词 ${block.name}`}
+                                                    title="编辑提示词"
+                                                    icon={<IconEditPen size={15} />}
+                                                    onClick={() => openEditModal(block)}
+                                                />
+                                                <Button
+                                                    size="sm"
+                                                    variant="ghost"
+                                                    ariaLabel={`导出提示词 ${block.name}`}
+                                                    title="导出单条提示词"
+                                                    icon={<IconDownload size={15} />}
+                                                    onClick={() => {
+                                                        setExportBlock(block);
+                                                        setExportOpen(true);
+                                                    }}
+                                                />
+                                                <Button
+                                                    size="sm"
+                                                    variant="danger"
+                                                    ariaLabel={`删除提示词 ${block.name}`}
+                                                    title="删除提示词"
+                                                    icon={<IconTrash size={15} />}
+                                                    onClick={() => handleDeleteBlock(block)}
+                                                />
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        )}
+                    </Card>
+                </div>
+            </div>
+
+            {/* Edit / Create Prompt ShadowModal */}
+            <ShadowModal
+                open={editorMode !== null}
+                title={editorMode === 'create' ? '新增提示词条目' : `编辑提示词：${draftName || '未命名'}`}
+                maxWidth="720px"
+                onClose={() => setEditorMode(null)}
+                footer={
+                    <div
+                        class="ag-row-wrap"
+                        style={{ width: '100%', justifyContent: 'space-between' }}
+                    >
+                        <div class="ag-row-wrap">
+                            {editorMode === 'edit' && editingBlockId ? (
+                                <>
+                                    <Button
+                                        size="sm"
+                                        variant="secondary"
+                                        ariaLabel="上移提示词"
+                                        title="上移"
+                                        disabled={editingIndex <= 0}
+                                        icon={<IconArrowUp size={14} />}
+                                        onClick={() =>
+                                            mutateActiveAgentBlocks((blocks) =>
+                                                moveArrayItem(blocks, editingIndex, editingIndex - 1),
+                                            )
+                                        }
+                                    >
+                                        上移
+                                    </Button>
+                                    <Button
+                                        size="sm"
+                                        variant="secondary"
+                                        ariaLabel="下移提示词"
+                                        title="下移"
+                                        disabled={
+                                            editingIndex < 0 || editingIndex >= promptBlocks.length - 1
+                                        }
+                                        icon={<IconArrowDown size={14} />}
+                                        onClick={() =>
+                                            mutateActiveAgentBlocks((blocks) =>
+                                                moveArrayItem(blocks, editingIndex, editingIndex + 1),
+                                            )
+                                        }
+                                    >
+                                        下移
+                                    </Button>
+                                    <Button
+                                        size="sm"
+                                        variant="secondary"
+                                        icon={<IconCopy size={14} />}
+                                        onClick={handleDuplicateEditingBlock}
+                                    >
+                                        复制条目
+                                    </Button>
+                                </>
+                            ) : null}
+                        </div>
+                        <div class="ag-row-wrap">
+                            <Button variant="secondary" onClick={() => setEditorMode(null)}>
+                                取消
+                            </Button>
+                            <Button
+                                variant="primary"
+                                icon={<IconCheck size={14} />}
+                                onClick={handleSavePromptModal}
+                            >
+                                {editorMode === 'create' ? '添加' : '保存'}
+                            </Button>
+                        </div>
+                    </div>
+                }
+            >
+                <div class="ag-stack-v">
+                    <div class="ag-grid-2">
+                        <FormField label="提示词名称" required error={editError ?? undefined}>
+                            <TextInput
+                                value={draftName}
+                                placeholder="例如：身份定义 / 破甲指令"
+                                onInput={(val) => {
+                                    setDraftName(val);
+                                    if (editError) {
+                                        setEditError(null);
+                                    }
+                                }}
+                            />
+                        </FormField>
+
+                        <FormField label="启用状态">
+                            <ToggleSwitch
+                                checked={draftEnabled}
+                                onChange={setDraftEnabled}
+                                label={draftEnabled ? '已启用' : '已停用'}
+                                description="停用后保留内容，不参与上下文组装"
+                            />
+                        </FormField>
+
+                        <FormField label="注入位置 (缓存安全)">
+                            <SelectInput<PromptBlock['placement']>
+                                ariaLabel="提示词注入位置"
+                                value={draftPlacement}
+                                options={[
+                                    { value: 'prefix', label: 'Layer 0 Prefix (静态前缀缓存)' },
+                                    { value: 'tail', label: 'Layer 2 Tail (当轮尾部追加)' },
+                                ]}
+                                onChange={setDraftPlacement}
+                            />
+                        </FormField>
+
+                        <FormField label="消息角色 (Role)">
+                            <SelectInput<PromptBlock['role']>
+                                ariaLabel="提示词消息角色"
+                                value={draftRole}
+                                options={[
+                                    { value: 'system', label: 'system' },
+                                    { value: 'user', label: 'user' },
+                                    { value: 'assistant', label: 'assistant' },
+                                ]}
+                                onChange={setDraftRole}
+                            />
+                        </FormField>
+                    </div>
+
+                    <CodeEditor
+                        label={`提示词正文 (${draftContent.length} 字符)`}
+                        languageHint="markdown"
+                        rows={10}
+                        minHeight="220px"
+                        value={draftContent}
+                        placeholder="输入提示词内容，支持 {{user}}、{{char}}、{{file::/path}} 等宏..."
+                        onChange={setDraftContent}
+                    />
+                </div>
+            </ShadowModal>
+
+            {/* Import Prompts ShadowModal */}
+            <ShadowModal
+                open={importOpen}
+                title="导入提示词到独立预设"
+                maxWidth="640px"
+                onClose={() => setImportOpen(false)}
+                footer={
+                    <Button variant="secondary" onClick={() => setImportOpen(false)}>
+                        关闭
+                    </Button>
+                }
+            >
+                <div class="ag-stack-v">
+                    <div class="ag-banner ag-banner-primary">
+                        支持导入单条提示词 JSON、提示词数组，或传统 SillyTavern OpenAI 预设 JSON（仅提取到当前 ST-Agentic 独立预设的「{activeAgent?.name ?? ''}」，不会影响酒馆原生预设）。
+                    </div>
+
+                    <input
+                        ref={importFileRef}
+                        type="file"
+                        accept=".json,application/json"
+                        style={{ display: 'none' }}
+                        onChange={handleImportFileChange}
+                    />
+
+                    <FormField label="导入方式">
+                        <SelectInput<'append' | 'replace'>
+                            ariaLabel="提示词导入方式"
+                            value={importMode}
+                            options={[
+                                { value: 'append', label: '追加到当前提示词列表末尾' },
+                                { value: 'replace', label: '替换当前智能体的全部提示词' },
+                            ]}
+                            onChange={setImportMode}
+                        />
+                    </FormField>
+
+                    <div class="ag-row-wrap">
+                        <Button
+                            variant="secondary"
+                            size="sm"
+                            icon={<IconUpload size={14} />}
+                            onClick={() => importFileRef.current?.click()}
+                        >
+                            选择 JSON 文件
+                        </Button>
+                        <Button
+                            variant="primary"
+                            size="sm"
+                            disabled={!importText.trim()}
+                            icon={<IconCheck size={14} />}
+                            onClick={() => handleRunImport(importText)}
+                        >
+                            解析并导入
+                        </Button>
+                    </div>
+
+                    <CodeEditor
+                        label="粘贴提示词或 ST 预设 JSON"
+                        languageHint="json"
+                        rows={8}
+                        minHeight="160px"
+                        showToolbar={false}
+                        placeholder='[{"name": "Main Prompt", "role": "system", "placement": "prefix", "content": "..."}]'
+                        value={importText}
+                        onChange={setImportText}
+                    />
+
+                    {importError ? <div class="ag-banner ag-banner-error">{importError}</div> : null}
+                </div>
+            </ShadowModal>
+
+            {/* Export Prompts ShadowModal */}
+            <ShadowModal
+                open={exportOpen}
+                title={exportBlock ? `导出提示词：${exportBlock.name}` : `导出提示词列表 (${promptBlocks.length})`}
+                maxWidth="620px"
+                onClose={() => setExportOpen(false)}
+                footer={
+                    <Button variant="secondary" onClick={() => setExportOpen(false)}>
+                        关闭
+                    </Button>
+                }
+            >
+                <div class="ag-stack-v">
+                    <div class="ag-row-wrap">
+                        <Button
+                            variant="primary"
+                            size="sm"
+                            icon={<IconDownload size={14} />}
+                            onClick={() => {
+                                const slug = exportBlock
+                                    ? exportBlock.name
+                                    : `${activePreset.name}_${activeAgent?.id ?? 'prompts'}`;
+                                const safeSlug =
+                                    slug.replace(/[^a-zA-Z0-9\u4e00-\u9fff_-]+/g, '_') || 'prompts';
+                                downloadTextFile(`agentic-prompts-${safeSlug}.json`, exportJsonText);
+                                store.pushToast('已下载提示词 JSON 文件', 'success');
+                            }}
+                        >
+                            下载 JSON 文件
+                        </Button>
+                        <Button
+                            variant="secondary"
+                            size="sm"
+                            icon={<IconCopy size={14} />}
+                            onClick={() =>
+                                void copyTextToClipboard(exportJsonText).then((ok) => {
+                                    store.pushToast(
+                                        ok ? '已复制提示词 JSON 到剪贴板' : '剪贴板不可用，请手动复制',
+                                        ok ? 'success' : 'warning',
+                                    );
+                                })
+                            }
+                        >
+                            复制 JSON
+                        </Button>
+                    </div>
+
+                    <CodeEditor
+                        label="JSON 预览"
+                        languageHint="json"
+                        readOnly
+                        rows={10}
+                        minHeight="200px"
+                        showToolbar={false}
+                        value={exportJsonText}
+                        onChange={() => {}}
+                    />
+                </div>
+            </ShadowModal>
+        </div>
+    );
+}
