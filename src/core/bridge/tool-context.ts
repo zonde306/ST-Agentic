@@ -6,6 +6,7 @@ import type {
     VfsSearchHit,
 } from '../types';
 import type { HostIdentity } from './host-bridge';
+import type { ToolSideGenApi } from './host-admin-bridge';
 
 export interface ToolEditResult {
     ok: boolean;
@@ -46,6 +47,7 @@ export interface ToolExecutionContext {
     vars: ToolVarsApi;
     message: ToolMessageApi;
     st: ToolStApi;
+    readonly sideGen?: ToolSideGenApi;
     readonly target: MessageTarget;
     signal: AbortSignal;
     permissions: ScopedPermissions;

@@ -64,6 +64,8 @@ function TabIcon({ tabId }: { tabId: ConsoleTabId }) {
             return <IconBookOpen size={16} />;
         case 'connections':
             return <IconPlug size={16} />;
+        default:
+            return null;
     }
 }
 

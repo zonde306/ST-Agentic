@@ -1,4 +1,5 @@
 import type { WICategory } from './lore';
+import type { OffMainlineSettings } from './off-mainline';
 
 export type RunMode = 'off' | 'companion' | 'takeover';
 export type ThemeMode = 'dark' | 'light' | 'auto';
@@ -171,6 +172,7 @@ export interface Settings {
     currentPresetId: string;
     storage: StorageSettings;
     migrations: Record<string, boolean>;
+    offMainline?: OffMainlineSettings;
 }
 
 export interface MigrationSkippedItem {

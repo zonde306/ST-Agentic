@@ -11,6 +11,11 @@ import hollowChineseCard from '../fixtures/hollow-chinese-card.json';
 import ejsConditionalLore from '../fixtures/ejs-conditional-lore.json';
 import legacyCustomGeneration from '../fixtures/legacy-custom-generation.json';
 import stOpenAiPreset from '../fixtures/st-openai-preset.json';
+import {
+    createOffMainlineTestBridge,
+    SAMPLE_RAW_AUTHOR_WI_ENTRY,
+    SAMPLE_SECRET_PAYLOAD,
+} from '../fixtures/off-mainline-fixtures';
 
 describe('Wave 0 test mocks', () => {
     it('MemoryHostBridge supports macros, variables, lorebooks, spies, and real xxHash', async () => {
@@ -263,5 +268,123 @@ describe('Wave 0 test mocks', () => {
         expect(bridge.getCharacterFields().description.length).toBeLessThan(80);
         expect(legacyCustomGeneration.interceptGenerate).toBe(true);
         expect(stOpenAiPreset.prompts.some((p) => p.injection_depth === 4 && p.injection_position === 1)).toBe(true);
+    });
+
+    it('MemoryHostBridge.author supports character sync, raw @@/EJS WI writes, scoped regex, hide toggle, and embed', async () => {
+        const bridge = createOffMainlineTestBridge();
+        expect(bridge.author).toBeDefined();
+        const author = bridge.author!;
+
+        // Active character full read & patch syncs characterFields + data mirror
+        const activeBefore = await author.getActiveCharacterFull();
+        expect(activeBefore?.name).toBe('林晚');
+        expect(await author.getPrimaryWorldName()).toBe('雾港侦探录');
+
+        const patched = await author.patchActiveCharacter(
+            { description: '更新后的雾港情报联络人设定。' },
+            { sessionId: 'ast_1', toolCallId: 'call_1' },
+        );
+        expect(patched.description).toBe('更新后的雾港情报联络人设定。');
+        expect(bridge.getCharacterFields().description).toBe('更新后的雾港情报联络人设定。');
+        expect(patched.data?.description).toBe('更新后的雾港情报联络人设定。');
+        expect(bridge.characterPatchHistory).toHaveLength(1);
+
+        // Toggle message hidden state
+        expect(await author.toggleChatMessageHidden(1, true)).toBe(true);
+        expect(bridge.chat[1].isSystem).toBe(true);
+        expect(await author.toggleChatMessageHidden(99, true)).toBe(false);
+
+        // Raw WI upsert preserves @@system and <% ... %> EJS verbatim (no escapeAt)
+        const rawEntry = await author.upsertWorldInfoEntry('雾港侦探录', {
+            comment: '新增原始触发规则',
+            content: '@@trigger phase=after\n<% if (getvar("clue")) { %>已触发<% } %>',
+            keys: ['触发'],
+        });
+        expect(rawEntry.content.startsWith('@@trigger')).toBe(true);
+        expect(rawEntry.content).toContain('<% if (getvar("clue")) { %>');
+
+        const book = await author.readWorldInfoBook('雾港侦探录');
+        expect(book?.entries).toHaveLength(2);
+        expect(book?.entries[0].content).toBe(SAMPLE_RAW_AUTHOR_WI_ENTRY.content);
+        expect(await author.deleteWorldInfoEntry('雾港侦探录', rawEntry.uid)).toBe(true);
+        expect((await author.readWorldInfoBook('雾港侦探录'))?.entries).toHaveLength(1);
+
+        // Scoped regex & embed
+        expect(await author.listScopedRegex()).toHaveLength(1);
+        await author.saveScopedRegex([]);
+        expect(await author.listScopedRegex()).toHaveLength(0);
+
+        const embedResult = await author.embedAgenticPayload({
+            includePreset: true,
+            includeFiles: true,
+            files: { '/notes/a.md': 'hello' },
+        });
+        expect(embedResult.ok).toBe(true);
+        expect(embedResult.embeddedPresets).toBe(1);
+        expect(embedResult.embeddedFiles).toBe(1);
+    });
+
+    it('MemoryHostBridge.admin supports global WI/characters/personas/presets/settings with secret samples and URL import', async () => {
+        const bridge = createOffMainlineTestBridge();
+        expect(bridge.admin).toBeDefined();
+        const admin = bridge.admin!;
+
+        // Global WI list, create, bind/unbind
+        expect(await admin.listAllWorldNames()).toEqual(['全局备用设定集', '雾港侦探录']);
+        await admin.createWorldBook('新建世界书');
+        await admin.bindWorldBook('全局备用设定集', true);
+        expect((await bridge.listEnabledLorebooks()).has('全局备用设定集')).toBe(true);
+        await admin.bindWorldBook('全局备用设定集', false);
+        expect((await bridge.listEnabledLorebooks()).has('全局备用设定集')).toBe(false);
+
+        // Characters CRUD & select
+        const createdChar = await admin.createCharacter({
+            name: '沈岸',
+            description: '码头值夜警长',
+        });
+        expect((await admin.listAllCharacters()).length).toBe(2);
+        await admin.patchCharacterById(createdChar.chid, { personality: '铁面无私' });
+        expect((await admin.readCharacterById(createdChar.chid))?.personality).toBe('铁面无私');
+        await admin.selectCharacterById(createdChar.chid);
+        expect(bridge.getActiveIdentity().charName).toBe('沈岸');
+        expect(await admin.deleteCharacterById(createdChar.chid)).toBe(true);
+
+        // Personas & presets
+        await admin.upsertPersona('alt.png', '卧底记者', '林记者');
+        await admin.selectPersona('alt.png');
+        expect(bridge.getPersonaDescription()).toBe('卧底记者');
+        expect(await admin.listPersonas()).toHaveLength(2);
+
+        const presets = await admin.listPresets('openai');
+        expect(presets).toHaveLength(1);
+        const patchedPreset = await admin.patchPreset('Default', { temperature: 0.6 }, 'openai');
+        expect(patchedPreset.data?.temperature).toBe(0.6);
+
+        // Host settings include realistic API keys/tokens for redaction tests
+        const powerUser = await admin.readHostSettings('power_user');
+        expect(String(powerUser.api_key_custom)).toMatch(/^sk-/);
+        expect(String(powerUser.proxy_authorization)).toMatch(/^Bearer /);
+        const extSettings = await admin.readHostSettings('extension_settings');
+        expect((extSettings.agentic as Record<string, unknown>).apiKey).toBeTruthy();
+        expect(SAMPLE_SECRET_PAYLOAD.apiKey).toBeTruthy();
+
+        const patchedSettings = await admin.patchHostSettings('power_user', { fast_ui_mode: false });
+        expect(patchedSettings.fast_ui_mode).toBe(false);
+
+        // Global regex & URL import
+        await admin.saveGlobalRegex([
+            {
+                id: 'g1',
+                scriptName: 'Global Clean',
+                findRegex: '/foo/g',
+                replaceString: 'bar',
+            },
+        ]);
+        expect(await admin.listGlobalRegex()).toHaveLength(1);
+
+        const importRes = await admin.importFromUrl('https://example.test/cards/linwan.png');
+        expect(importRes.ok).toBe(true);
+        expect(importRes.importedType).toBe('character');
+        expect(bridge.importedUrls).toEqual(['https://example.test/cards/linwan.png']);
     });
 });

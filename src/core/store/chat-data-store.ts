@@ -34,6 +34,7 @@ export const DATA_NAMESPACES = {
     MESSAGE: 'message',
     CHARACTER_FILES: 'character-files',
     PERSONA_FILES: 'persona-files',
+    SIDE_FILES: 'side-files',
 } as const;
 
 export interface NamespacePolicy {
@@ -52,6 +53,7 @@ export const NAMESPACE_POLICY: Record<DataNamespace, NamespacePolicy> = {
     message: { layered: false },
     'character-files': { layered: true },
     'persona-files': { layered: true },
+    'side-files': { layered: true },
 };
 
 export interface AgenticPersistedData {

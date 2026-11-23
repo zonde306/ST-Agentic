@@ -4,6 +4,7 @@ import type {
     MessageTarget,
     RawLoreEntry,
 } from '../types';
+import type { HostAdminBridge, HostAuthorBridge } from './host-admin-bridge';
 
 export interface HostIdentity {
     userName: string;
@@ -70,4 +71,8 @@ export interface HostBridge {
     // 6. Optional host UI luminance & event hooks
     getHostLuminance?(): 'dark' | 'light';
     emitHostEvent?(event: string, payload?: unknown): void;
+
+    // 7. Optional off-mainline authoring & ST global administration bridges
+    author?: HostAuthorBridge;
+    admin?: HostAdminBridge;
 }

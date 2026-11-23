@@ -6,7 +6,8 @@ export type DataNamespace =
     | 'worldinfo'
     | 'message'
     | 'character-files'
-    | 'persona-files';
+    | 'persona-files'
+    | 'side-files';
 
 export interface CompactionReport {
     dryRun: boolean;

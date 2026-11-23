@@ -1,9 +1,30 @@
-import type { HostBridge, HostIdentity, WriteChatMessageOptions } from '@/core/bridge';
 import type {
+    HostAdminBridge,
+    HostAuthorBridge,
+    HostBridge,
+    HostIdentity,
+    WriteChatMessageOptions,
+} from '@/core/bridge';
+import type {
+    AuthorUndoMeta,
     ChatMessageSnapshot,
+    EmbedAgenticOptions,
+    EmbedAgenticResult,
+    HostCharacterCreatePayload,
+    HostCharacterFull,
+    HostCharacterPatch,
+    HostCharacterSummary,
+    HostImportUrlResult,
+    HostPersonaEntry,
+    HostPresetInfo,
+    HostRegexScript,
+    HostSettingsScope,
     MediaAttachment,
     MessageTarget,
     RawLoreEntry,
+    UpsertWorldInfoEntryOptions,
+    WorldInfoBookSnapshot,
+    WorldInfoEntryUpsert,
 } from '@/core/types';
 import { hashText as computeXxHash } from '@/core/utils';
 
@@ -17,11 +38,50 @@ export interface MemoryHostBridgeInit {
     characterFields?: Record<string, string>;
     personaDescription?: string;
     lorebooks?: Map<string, RawLoreEntry[]> | Record<string, RawLoreEntry[]>;
+    disabledLorebooks?: Map<string, RawLoreEntry[]> | Record<string, RawLoreEntry[]>;
+    primaryWorldName?: string | null;
+    characters?: HostCharacterFull[];
+    activeCharacterId?: number;
+    scopedRegex?: HostRegexScript[];
+    globalRegex?: HostRegexScript[];
+    personas?: HostPersonaEntry[];
+    presets?: HostPresetInfo[];
+    hostSettings?: Record<string, Record<string, unknown>>;
     extensionData?: Record<string, unknown>;
     ejsEvaluator?: EjsEvaluatorStub;
     slashHandler?: SlashCommandStub;
     hostLuminance?: 'dark' | 'light';
+    enableAuthorBridge?: boolean;
+    enableAdminBridge?: boolean;
 }
+
+const DEFAULT_MOCK_HOST_SETTINGS: Record<string, Record<string, unknown>> = {
+    power_user: {
+        theme: 'Dark',
+        fast_ui_mode: true,
+        api_key_custom: 'sk-test-power-user-secret-1234567890',
+        proxy_authorization: 'Bearer tok_live_mock_9876543210abcdef',
+    },
+    extension_settings: {
+        agentic: {
+            runMode: 'takeover',
+            apiKey: 'sk-ant-mock-agentic-key-abcdef',
+        },
+        tts: {
+            provider: 'elevenlabs',
+            token: 'el_mock_token_secret_xyz',
+            headers: {
+                Authorization: 'Bearer mock_tts_bearer_token_001',
+            },
+        },
+        webhook: {
+            endpoint: 'https://hooks.example.test/st',
+            secret: 'whsec_mock_secret_value_42',
+            password: 'mock-db-password-!@#',
+            cookie: 'session=mock_cookie_secret',
+        },
+    },
+};
 
 export class MemoryHostBridge implements HostBridge {
     public chat: ChatMessageSnapshot[];
@@ -30,6 +90,15 @@ export class MemoryHostBridge implements HostBridge {
     public characterFields: Record<string, string>;
     public personaDescription: string;
     public lorebooks: Map<string, RawLoreEntry[]>;
+    public disabledLorebooks: Map<string, RawLoreEntry[]>;
+    public primaryWorldName: string | null;
+    public characters: HostCharacterFull[];
+    public activeCharacterId: number;
+    public scopedRegex: HostRegexScript[];
+    public globalRegex: HostRegexScript[];
+    public personas: HostPersonaEntry[];
+    public presets: HostPresetInfo[];
+    public hostSettings: Record<string, Record<string, unknown>>;
     public extensionData: Map<string, unknown>;
     public hostLuminance: 'dark' | 'light';
 
@@ -43,9 +112,18 @@ export class MemoryHostBridge implements HostBridge {
     public refreshedViews: MessageTarget[] = [];
     public slashCalls: Array<{ command: string; aborted: boolean }> = [];
     public emittedEvents: Array<{ event: string; payload?: unknown }> = [];
+    public embeddedPayloads: EmbedAgenticOptions[] = [];
+    public importedUrls: string[] = [];
+    public characterPatchHistory: Array<{
+        chid: number;
+        fields: HostCharacterPatch;
+        undoMeta?: AuthorUndoMeta;
+    }> = [];
 
     public evaluateOptionalEjs?: (text: string, vars: Record<string, unknown>) => Promise<string>;
     public executeSlashCommand?: (command: string, signal?: AbortSignal) => Promise<string>;
+    public author?: HostAuthorBridge;
+    public admin?: HostAdminBridge;
 
     private slashHandler?: SlashCommandStub;
 
@@ -64,13 +142,95 @@ export class MemoryHostBridge implements HostBridge {
         this.lorebooks = new Map<string, RawLoreEntry[]>();
         if (init.lorebooks instanceof Map) {
             for (const [world, entries] of init.lorebooks.entries()) {
-                this.lorebooks.set(world, [...entries]);
+                this.lorebooks.set(world, entries.map((e) => structuredClone(e)));
             }
         } else if (init.lorebooks) {
             for (const [world, entries] of Object.entries(init.lorebooks)) {
-                this.lorebooks.set(world, [...entries]);
+                this.lorebooks.set(world, entries.map((e) => structuredClone(e)));
             }
         }
+
+        this.disabledLorebooks = new Map<string, RawLoreEntry[]>();
+        if (init.disabledLorebooks instanceof Map) {
+            for (const [world, entries] of init.disabledLorebooks.entries()) {
+                this.disabledLorebooks.set(world, entries.map((e) => structuredClone(e)));
+            }
+        } else if (init.disabledLorebooks) {
+            for (const [world, entries] of Object.entries(init.disabledLorebooks)) {
+                this.disabledLorebooks.set(world, entries.map((e) => structuredClone(e)));
+            }
+        }
+
+        const firstEnabledWorld = this.lorebooks.keys().next().value ?? null;
+        this.primaryWorldName =
+            init.primaryWorldName !== undefined ? init.primaryWorldName : firstEnabledWorld;
+
+        if (init.characters && init.characters.length > 0) {
+            this.characters = init.characters.map((c) => structuredClone(c));
+            this.activeCharacterId = init.activeCharacterId ?? this.characters[0].chid;
+        } else {
+            this.activeCharacterId = init.activeCharacterId ?? 0;
+            this.characters = [
+                {
+                    chid: this.activeCharacterId,
+                    name: this.identity.charName,
+                    avatar: this.identity.characterAvatar,
+                    description: this.characterFields.description ?? '',
+                    personality: this.characterFields.personality ?? '',
+                    scenario: this.characterFields.scenario ?? '',
+                    first_mes: this.characterFields.first_mes ?? '',
+                    mes_example: this.characterFields.mes_example ?? '',
+                    creator_notes: this.characterFields.creator_notes ?? '',
+                    system_prompt: this.characterFields.system_prompt ?? '',
+                    post_history_instructions:
+                        this.characterFields.post_history_instructions ?? '',
+                    primaryWorld: this.primaryWorldName ?? undefined,
+                    tags: [],
+                    extensions: {
+                        ...(this.primaryWorldName ? { world: this.primaryWorldName } : {}),
+                    },
+                    data: {
+                        name: this.identity.charName,
+                        description: this.characterFields.description ?? '',
+                        personality: this.characterFields.personality ?? '',
+                        scenario: this.characterFields.scenario ?? '',
+                        extensions: {
+                            ...(this.primaryWorldName ? { world: this.primaryWorldName } : {}),
+                        },
+                    },
+                },
+            ];
+        }
+
+        this.scopedRegex = init.scopedRegex ? init.scopedRegex.map((r) => structuredClone(r)) : [];
+        this.globalRegex = init.globalRegex ? init.globalRegex.map((r) => structuredClone(r)) : [];
+        this.personas = init.personas
+            ? init.personas.map((p) => structuredClone(p))
+            : [
+                {
+                    key: this.identity.personaAvatar,
+                    name: this.identity.userName,
+                    title: 'Default Persona',
+                    description: this.personaDescription,
+                    active: true,
+                },
+            ];
+        this.presets = init.presets
+            ? init.presets.map((p) => structuredClone(p))
+            : [
+                {
+                    name: 'Default',
+                    apiType: 'openai',
+                    active: true,
+                    data: {
+                        temperature: 0.8,
+                        openai_max_tokens: 2048,
+                    },
+                },
+            ];
+        this.hostSettings = init.hostSettings
+            ? structuredClone(init.hostSettings)
+            : structuredClone(DEFAULT_MOCK_HOST_SETTINGS);
 
         this.extensionData = new Map<string, unknown>(
             init.extensionData ? Object.entries(init.extensionData) : [],
@@ -85,6 +245,13 @@ export class MemoryHostBridge implements HostBridge {
             this.setSlashHandler(init.slashHandler);
         } else {
             this.setSlashHandler(async () => '');
+        }
+
+        if (init.enableAuthorBridge !== false) {
+            this.author = this.createAuthorBridge();
+        }
+        if (init.enableAdminBridge !== false) {
+            this.admin = this.createAdminBridge();
         }
     }
 
@@ -194,7 +361,7 @@ export class MemoryHostBridge implements HostBridge {
     async listEnabledLorebooks(): Promise<Map<string, RawLoreEntry[]>> {
         const result = new Map<string, RawLoreEntry[]>();
         for (const [world, entries] of this.lorebooks.entries()) {
-            result.set(world, entries.map((entry) => ({ ...entry })));
+            result.set(world, entries.map((entry) => structuredClone(entry)));
         }
         return result;
     }
@@ -290,15 +457,34 @@ export class MemoryHostBridge implements HostBridge {
     }
 
     setLorebook(world: string, entries: RawLoreEntry[]): void {
-        this.lorebooks.set(world, [...entries]);
+        this.lorebooks.set(world, entries.map((e) => structuredClone(e)));
+        this.disabledLorebooks.delete(world);
+    }
+
+    setDisabledLorebook(world: string, entries: RawLoreEntry[]): void {
+        this.disabledLorebooks.set(world, entries.map((e) => structuredClone(e)));
+        this.lorebooks.delete(world);
     }
 
     setCharacterFields(fields: Record<string, string>): void {
         this.characterFields = { ...fields };
+        const active = this.findCharacter(this.activeCharacterId);
+        if (active) {
+            for (const [k, v] of Object.entries(fields)) {
+                active[k] = v;
+                if (active.data && typeof active.data === 'object') {
+                    active.data[k] = v;
+                }
+            }
+        }
     }
 
     setPersonaDescription(desc: string): void {
         this.personaDescription = desc;
+        const active = this.personas.find((p) => p.active);
+        if (active) {
+            active.description = desc;
+        }
     }
 
     setVariable(name: string, value: unknown): void {
@@ -329,6 +515,567 @@ export class MemoryHostBridge implements HostBridge {
             const result = await this.slashHandler!(command, signal);
             this.slashCalls.push({ command, aborted: Boolean(signal?.aborted) });
             return result;
+        };
+    }
+
+    // --- Internal author & admin mock factories ---
+
+    private findCharacter(chid: number): HostCharacterFull | undefined {
+        return this.characters.find((c) => c.chid === chid);
+    }
+
+    private findWorldBookEntries(bookName: string): RawLoreEntry[] | null {
+        if (this.lorebooks.has(bookName)) {
+            return this.lorebooks.get(bookName)!;
+        }
+        if (this.disabledLorebooks.has(bookName)) {
+            return this.disabledLorebooks.get(bookName)!;
+        }
+        return null;
+    }
+
+    private applyCharacterPatch(
+        target: HostCharacterFull,
+        fields: HostCharacterPatch,
+        undoMeta?: AuthorUndoMeta,
+    ): HostCharacterFull {
+        this.characterPatchHistory.push({
+            chid: target.chid,
+            fields: structuredClone(fields),
+            ...(undoMeta ? { undoMeta: { ...undoMeta } } : {}),
+        });
+
+        if (!target.data || typeof target.data !== 'object') {
+            target.data = {};
+        }
+
+        for (const [key, value] of Object.entries(fields)) {
+            if (key === 'extensions' && value && typeof value === 'object' && !Array.isArray(value)) {
+                target.extensions = {
+                    ...(target.extensions ?? {}),
+                    ...(structuredClone(value) as Record<string, unknown>),
+                };
+                target.data.extensions = structuredClone(target.extensions);
+                continue;
+            }
+            if (key === 'data' && value && typeof value === 'object' && !Array.isArray(value)) {
+                target.data = {
+                    ...target.data,
+                    ...(structuredClone(value) as Record<string, unknown>),
+                };
+                continue;
+            }
+            target[key] = structuredClone(value);
+            if (key !== 'chid' && key !== 'avatar' && key !== 'primaryWorld') {
+                target.data[key] = structuredClone(value);
+            }
+        }
+
+        if (target.chid === this.activeCharacterId) {
+            if (typeof fields.name === 'string') {
+                this.identity.charName = fields.name;
+            }
+            for (const fieldKey of [
+                'description',
+                'personality',
+                'scenario',
+                'first_mes',
+                'mes_example',
+                'creator_notes',
+                'system_prompt',
+                'post_history_instructions',
+            ] as const) {
+                const val = target[fieldKey];
+                if (typeof val === 'string') {
+                    this.characterFields[fieldKey] = val;
+                }
+            }
+        }
+
+        this.emitHostEvent('CHARACTER_EDITED', { chid: target.chid });
+        return structuredClone(target);
+    }
+
+    private createAuthorBridge(): HostAuthorBridge {
+        return {
+            getActiveCharacterFull: async (): Promise<HostCharacterFull | null> => {
+                const active = this.findCharacter(this.activeCharacterId);
+                return active ? structuredClone(active) : null;
+            },
+
+            patchActiveCharacter: async (
+                fields: HostCharacterPatch,
+                undoMeta?: AuthorUndoMeta,
+            ): Promise<HostCharacterFull> => {
+                const active = this.findCharacter(this.activeCharacterId);
+                if (!active) {
+                    throw new Error(`No active character selected (chid=${this.activeCharacterId})`);
+                }
+                return this.applyCharacterPatch(active, fields, undoMeta);
+            },
+
+            toggleChatMessageHidden: async (
+                messageId: number,
+                hidden: boolean,
+            ): Promise<boolean> => {
+                if (!Number.isInteger(messageId) || messageId < 0 || messageId >= this.chat.length) {
+                    return false;
+                }
+                const msg = this.chat[messageId];
+                if (!msg) {
+                    return false;
+                }
+                msg.isSystem = hidden;
+                await this.refreshMessageView({ messageId, swipeId: msg.swipeId ?? 0 });
+                this.saveChatDebounced();
+                this.emitHostEvent('MESSAGE_UPDATED', messageId);
+                return true;
+            },
+
+            getPrimaryWorldName: async (): Promise<string | null> => {
+                const active = this.findCharacter(this.activeCharacterId);
+                const extWorld =
+                    active?.extensions && typeof active.extensions.world === 'string'
+                        ? active.extensions.world
+                        : null;
+                return active?.primaryWorld ?? extWorld ?? this.primaryWorldName;
+            },
+
+            readWorldInfoBook: async (bookName: string): Promise<WorldInfoBookSnapshot | null> => {
+                const entries = this.findWorldBookEntries(bookName);
+                if (!entries) {
+                    return null;
+                }
+                return {
+                    name: bookName,
+                    entries: entries.map((e) => structuredClone(e)),
+                };
+            },
+
+            upsertWorldInfoEntry: async (
+                bookName: string,
+                entry: WorldInfoEntryUpsert,
+                _opts?: UpsertWorldInfoEntryOptions,
+            ): Promise<RawLoreEntry> => {
+                let entries = this.findWorldBookEntries(bookName);
+                if (!entries) {
+                    entries = [];
+                    this.lorebooks.set(bookName, entries);
+                }
+
+                const existingIdx =
+                    entry.uid !== undefined
+                        ? entries.findIndex((item) => item.uid === entry.uid)
+                        : -1;
+
+                const nextUid =
+                    entry.uid !== undefined
+                        ? entry.uid
+                        : entries.reduce((max, item) => Math.max(max, item.uid), -1) + 1;
+
+                const existing = existingIdx >= 0 ? entries[existingIdx] : undefined;
+                const saved: RawLoreEntry = {
+                    world: bookName,
+                    uid: nextUid,
+                    comment: entry.comment ?? existing?.comment ?? `Entry #${nextUid}`,
+                    // Raw direct write: preserve `@@` decorators and `<% ... %>` EJS verbatim
+                    content: entry.content,
+                    keys: [...entry.keys],
+                    keysecondary: entry.keysecondary
+                        ? [...entry.keysecondary]
+                        : existing?.keysecondary
+                            ? [...existing.keysecondary]
+                            : [],
+                    constant: entry.constant ?? existing?.constant ?? false,
+                    selective: entry.selective ?? existing?.selective ?? false,
+                    ...(entry.selectiveLogic !== undefined
+                        ? { selectiveLogic: entry.selectiveLogic }
+                        : existing?.selectiveLogic !== undefined
+                            ? { selectiveLogic: existing.selectiveLogic }
+                            : {}),
+                    disable: entry.disable ?? existing?.disable ?? false,
+                    position: entry.position ?? existing?.position ?? 0,
+                    depth: entry.depth ?? existing?.depth ?? 4,
+                    order: entry.order ?? existing?.order ?? 100,
+                    role: entry.role ?? existing?.role ?? 0,
+                    ...(entry.caseSensitive !== undefined
+                        ? { caseSensitive: entry.caseSensitive }
+                        : existing?.caseSensitive !== undefined
+                            ? { caseSensitive: existing.caseSensitive }
+                            : {}),
+                    ...(entry.matchWholeWords !== undefined
+                        ? { matchWholeWords: entry.matchWholeWords }
+                        : existing?.matchWholeWords !== undefined
+                            ? { matchWholeWords: existing.matchWholeWords }
+                            : {}),
+                    ...(entry.probability !== undefined
+                        ? { probability: entry.probability }
+                        : existing?.probability !== undefined
+                            ? { probability: existing.probability }
+                            : {}),
+                    ...(entry.useProbability !== undefined
+                        ? { useProbability: entry.useProbability }
+                        : existing?.useProbability !== undefined
+                            ? { useProbability: existing.useProbability }
+                            : {}),
+                    ...(entry.group !== undefined
+                        ? { group: entry.group }
+                        : existing?.group !== undefined
+                            ? { group: existing.group }
+                            : {}),
+                    ...(entry.groupOverride !== undefined
+                        ? { groupOverride: entry.groupOverride }
+                        : existing?.groupOverride !== undefined
+                            ? { groupOverride: existing.groupOverride }
+                            : {}),
+                    ...(entry.groupWeight !== undefined
+                        ? { groupWeight: entry.groupWeight }
+                        : existing?.groupWeight !== undefined
+                            ? { groupWeight: existing.groupWeight }
+                            : {}),
+                    ...(entry.scanDepth !== undefined
+                        ? { scanDepth: entry.scanDepth }
+                        : existing?.scanDepth !== undefined
+                            ? { scanDepth: existing.scanDepth }
+                            : {}),
+                    ...(entry.extensions !== undefined
+                        ? { extensions: structuredClone(entry.extensions) }
+                        : existing?.extensions !== undefined
+                            ? { extensions: structuredClone(existing.extensions) }
+                            : {}),
+                };
+
+                if (existingIdx >= 0) {
+                    entries[existingIdx] = saved;
+                } else {
+                    entries.push(saved);
+                }
+
+                this.emitHostEvent('WORLDINFO_UPDATED', { bookName, uid: nextUid });
+                return structuredClone(saved);
+            },
+
+            deleteWorldInfoEntry: async (bookName: string, uid: number): Promise<boolean> => {
+                const entries = this.findWorldBookEntries(bookName);
+                if (!entries) {
+                    return false;
+                }
+                const idx = entries.findIndex((item) => item.uid === uid);
+                if (idx < 0) {
+                    return false;
+                }
+                entries.splice(idx, 1);
+                this.emitHostEvent('WORLDINFO_UPDATED', { bookName, deletedUid: uid });
+                return true;
+            },
+
+            listScopedRegex: async (): Promise<HostRegexScript[]> => {
+                return this.scopedRegex.map((s) => structuredClone(s));
+            },
+
+            saveScopedRegex: async (scripts: HostRegexScript[]): Promise<void> => {
+                this.scopedRegex = scripts.map((s) => structuredClone(s));
+                this.emitHostEvent('SCOPED_REGEX_UPDATED', { count: this.scopedRegex.length });
+            },
+
+            embedAgenticPayload: async (
+                options: EmbedAgenticOptions,
+            ): Promise<EmbedAgenticResult> => {
+                this.embeddedPayloads.push(structuredClone(options));
+                const embeddedPresets = options.includePreset ? 1 : 0;
+                const embeddedFiles = options.includeFiles
+                    ? Object.keys(options.files ?? {}).length || (options.filePaths?.length ?? 0)
+                    : 0;
+                return {
+                    ok: true,
+                    embeddedPresets,
+                    embeddedFiles,
+                    message: `Embedded ${embeddedPresets} preset(s) and ${embeddedFiles} file(s)`,
+                };
+            },
+        };
+    }
+
+    private createAdminBridge(): HostAdminBridge {
+        return {
+            listAllWorldNames: async (): Promise<string[]> => {
+                const names = new Set<string>([
+                    ...this.lorebooks.keys(),
+                    ...this.disabledLorebooks.keys(),
+                ]);
+                return Array.from(names).sort();
+            },
+
+            createWorldBook: async (name: string): Promise<WorldInfoBookSnapshot> => {
+                if (!this.lorebooks.has(name) && !this.disabledLorebooks.has(name)) {
+                    this.disabledLorebooks.set(name, []);
+                }
+                const entries = this.findWorldBookEntries(name) ?? [];
+                return {
+                    name,
+                    entries: entries.map((e) => structuredClone(e)),
+                };
+            },
+
+            bindWorldBook: async (name: string, enabled: boolean): Promise<void> => {
+                if (enabled) {
+                    const existing =
+                        this.lorebooks.get(name) ?? this.disabledLorebooks.get(name) ?? [];
+                    this.disabledLorebooks.delete(name);
+                    this.lorebooks.set(name, existing);
+                } else {
+                    const existing =
+                        this.disabledLorebooks.get(name) ?? this.lorebooks.get(name) ?? [];
+                    this.lorebooks.delete(name);
+                    this.disabledLorebooks.set(name, existing);
+                }
+                this.emitHostEvent('WORLDINFO_BINDING_UPDATED', { name, enabled });
+            },
+
+            listAllCharacters: async (): Promise<HostCharacterSummary[]> => {
+                return this.characters.map((c) => ({
+                    chid: c.chid,
+                    name: c.name,
+                    avatar: c.avatar,
+                    ...(c.description !== undefined ? { description: c.description } : {}),
+                    ...(c.tags !== undefined ? { tags: [...c.tags] } : {}),
+                    ...(c.primaryWorld !== undefined ? { primaryWorld: c.primaryWorld } : {}),
+                }));
+            },
+
+            readCharacterById: async (chid: number): Promise<HostCharacterFull | null> => {
+                const found = this.findCharacter(chid);
+                return found ? structuredClone(found) : null;
+            },
+
+            createCharacter: async (
+                payload: HostCharacterCreatePayload,
+            ): Promise<HostCharacterFull> => {
+                const nextChid =
+                    this.characters.reduce((max, c) => Math.max(max, c.chid), -1) + 1;
+                const slug = payload.name.replace(/\s+/g, '_').toLowerCase() || `char_${nextChid}`;
+                const created: HostCharacterFull = {
+                    ...structuredClone(payload),
+                    chid: nextChid,
+                    name: payload.name,
+                    avatar: `${slug}.png`,
+                    extensions: structuredClone(payload.extensions ?? {}),
+                    data: {
+                        name: payload.name,
+                        description: payload.description ?? '',
+                        personality: payload.personality ?? '',
+                        scenario: payload.scenario ?? '',
+                        extensions: structuredClone(payload.extensions ?? {}),
+                    },
+                };
+                this.characters.push(created);
+                this.emitHostEvent('CHARACTER_CREATED', { chid: nextChid });
+                return structuredClone(created);
+            },
+
+            patchCharacterById: async (
+                chid: number,
+                fields: HostCharacterPatch,
+            ): Promise<HostCharacterFull> => {
+                const target = this.findCharacter(chid);
+                if (!target) {
+                    throw new Error(`Character not found: chid=${chid}`);
+                }
+                return this.applyCharacterPatch(target, fields);
+            },
+
+            deleteCharacterById: async (chid: number): Promise<boolean> => {
+                const idx = this.characters.findIndex((c) => c.chid === chid);
+                if (idx < 0) {
+                    return false;
+                }
+                this.characters.splice(idx, 1);
+                this.emitHostEvent('CHARACTER_DELETED', { chid });
+                return true;
+            },
+
+            selectCharacterById: async (chid: number): Promise<void> => {
+                const target = this.findCharacter(chid);
+                if (!target) {
+                    throw new Error(`Character not found: chid=${chid}`);
+                }
+                this.activeCharacterId = chid;
+                this.identity.charName = target.name;
+                this.identity.characterAvatar = target.avatar;
+                this.characterFields = {
+                    ...(target.description !== undefined ? { description: target.description } : {}),
+                    ...(target.personality !== undefined ? { personality: target.personality } : {}),
+                    ...(target.scenario !== undefined ? { scenario: target.scenario } : {}),
+                    ...(target.first_mes !== undefined ? { first_mes: target.first_mes } : {}),
+                    ...(target.mes_example !== undefined ? { mes_example: target.mes_example } : {}),
+                    ...(target.creator_notes !== undefined
+                        ? { creator_notes: target.creator_notes }
+                        : {}),
+                    ...(target.system_prompt !== undefined
+                        ? { system_prompt: target.system_prompt }
+                        : {}),
+                    ...(target.post_history_instructions !== undefined
+                        ? { post_history_instructions: target.post_history_instructions }
+                        : {}),
+                };
+                this.primaryWorldName = target.primaryWorld ?? null;
+                this.emitHostEvent('CHAT_CHANGED', { chid });
+            },
+
+            listPersonas: async (): Promise<HostPersonaEntry[]> => {
+                return this.personas.map((p) => structuredClone(p));
+            },
+
+            upsertPersona: async (
+                key: string,
+                desc: string,
+                title?: string,
+            ): Promise<HostPersonaEntry> => {
+                const existing = this.personas.find((p) => p.key === key);
+                if (existing) {
+                    existing.description = desc;
+                    if (title !== undefined) {
+                        existing.title = title;
+                    }
+                    if (existing.active) {
+                        this.personaDescription = desc;
+                    }
+                    return structuredClone(existing);
+                }
+                const created: HostPersonaEntry = {
+                    key,
+                    name: title ?? key.replace(/\.png$/i, ''),
+                    ...(title !== undefined ? { title } : {}),
+                    description: desc,
+                    active: false,
+                };
+                this.personas.push(created);
+                return structuredClone(created);
+            },
+
+            selectPersona: async (key: string): Promise<void> => {
+                const target = this.personas.find((p) => p.key === key);
+                if (!target) {
+                    throw new Error(`Persona not found: ${key}`);
+                }
+                for (const persona of this.personas) {
+                    persona.active = persona.key === key;
+                }
+                this.identity.personaAvatar = target.key;
+                this.identity.userName = target.name;
+                this.personaDescription = target.description;
+            },
+
+            listPresets: async (apiType?: string): Promise<HostPresetInfo[]> => {
+                const filtered = apiType
+                    ? this.presets.filter((p) => p.apiType === apiType)
+                    : this.presets;
+                return filtered.map((p) => structuredClone(p));
+            },
+
+            selectPreset: async (name: string, apiType?: string): Promise<void> => {
+                const target = this.presets.find(
+                    (p) => p.name === name && (!apiType || p.apiType === apiType),
+                );
+                if (!target) {
+                    throw new Error(`Preset not found: ${name}`);
+                }
+                for (const preset of this.presets) {
+                    if (preset.apiType === target.apiType) {
+                        preset.active = preset.name === target.name;
+                    }
+                }
+            },
+
+            patchPreset: async (
+                name: string,
+                patch: Record<string, unknown>,
+                apiType?: string,
+            ): Promise<HostPresetInfo> => {
+                const target = this.presets.find(
+                    (p) => p.name === name && (!apiType || p.apiType === apiType),
+                );
+                if (!target) {
+                    throw new Error(`Preset not found: ${name}`);
+                }
+                target.data = {
+                    ...(target.data ?? {}),
+                    ...structuredClone(patch),
+                };
+                return structuredClone(target);
+            },
+
+            readHostSettings: async (
+                scope: HostSettingsScope,
+            ): Promise<Record<string, unknown>> => {
+                if (scope === 'all') {
+                    return structuredClone(this.hostSettings);
+                }
+                if (Object.hasOwn(this.hostSettings, scope)) {
+                    return structuredClone(this.hostSettings[scope]);
+                }
+                const extBucket = this.hostSettings.extension_settings;
+                if (extBucket && Object.hasOwn(extBucket, scope)) {
+                    const value = extBucket[scope];
+                    return value && typeof value === 'object'
+                        ? structuredClone(value as Record<string, unknown>)
+                        : { value };
+                }
+                return {};
+            },
+
+            patchHostSettings: async (
+                scope: HostSettingsScope,
+                patch: Record<string, unknown>,
+            ): Promise<Record<string, unknown>> => {
+                if (scope === 'all') {
+                    for (const [k, v] of Object.entries(patch)) {
+                        if (v && typeof v === 'object' && !Array.isArray(v)) {
+                            this.hostSettings[k] = {
+                                ...(this.hostSettings[k] ?? {}),
+                                ...(structuredClone(v) as Record<string, unknown>),
+                            };
+                        }
+                    }
+                    return structuredClone(this.hostSettings);
+                }
+
+                const existing = this.hostSettings[scope] ?? {};
+                const next = {
+                    ...existing,
+                    ...structuredClone(patch),
+                };
+                this.hostSettings[scope] = next;
+                this.emitHostEvent('HOST_SETTINGS_UPDATED', { scope });
+                return structuredClone(next);
+            },
+
+            listGlobalRegex: async (): Promise<HostRegexScript[]> => {
+                return this.globalRegex.map((s) => structuredClone(s));
+            },
+
+            saveGlobalRegex: async (scripts: HostRegexScript[]): Promise<void> => {
+                this.globalRegex = scripts.map((s) => structuredClone(s));
+                this.emitHostEvent('GLOBAL_REGEX_UPDATED', { count: this.globalRegex.length });
+            },
+
+            importFromUrl: async (url: string): Promise<HostImportUrlResult> => {
+                this.importedUrls.push(url);
+                const lower = url.toLowerCase();
+                const importedType = lower.endsWith('.json')
+                    ? 'worldinfo'
+                    : lower.endsWith('.png')
+                        ? 'character'
+                        : 'unknown';
+                const name = url.split('/').pop() || 'imported-resource';
+                return {
+                    ok: true,
+                    url,
+                    importedType,
+                    name,
+                    detail: `Mock imported ${name} from ${url}`,
+                };
+            },
         };
     }
 

@@ -19,11 +19,15 @@ export interface ToolStepLog {
     error?: string;
     durationMs: number;
     startedAt: number;
+    redacted?: boolean;
+    undoId?: string;
 }
 
 export type InterruptedReason = 'user_stop' | 'length' | 'error' | 'empty_output';
 
 export type AgentRunStatus = 'running' | 'completed' | 'interrupted' | 'aborted' | 'error';
+
+export type OffMainlineRunKind = 'assistant' | 'sidegen_once' | 'sidegen_session';
 
 export interface AgentRunTrace {
     runId: string;
@@ -44,6 +48,9 @@ export interface AgentRunTrace {
     outputPreview?: string;
     interruptedReason?: InterruptedReason;
     error?: string;
+    offMainlineKind?: OffMainlineRunKind;
+    offMainlineSessionId?: string;
+    redacted?: boolean;
     requestSnapshot?: {
         messages: CanonicalMessage[];
         tools: CanonicalToolSchema[];
@@ -102,6 +109,8 @@ export interface GenerationEventPayload {
 }
 
 export type ConsoleTabId =
+    | 'assistant'
+    | 'sidegen'
     | 'files'
     | 'logs'
     | 'cache'
