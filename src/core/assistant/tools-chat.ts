@@ -1,0 +1,810 @@
+import { z } from 'zod';
+import type { HostBridge } from '@/core/bridge';
+import { DEFAULT_MAIN_AGENT_ID, resolveActivePreset, resolveConnection } from '@/core/config';
+import { estimateRequestTokens, type TrajectoryStore } from '@/core/context';
+import type { TraceLogger } from '@/core/logger';
+import type { ChatDataStore } from '@/core/store';
+import {
+    formatValidationError,
+    formatZodIssues,
+    schemaToCanonicalJsonSchema,
+    VfsVarsAdapter,
+    type DynamicVariableSchema,
+} from '@/core/tools';
+import type {
+    AssistantMode,
+    CanonicalToolSchema,
+    DiffLine,
+    MessageTarget,
+    RawLoreEntry,
+    Settings,
+} from '@/core/types';
+import { canonicalClone, normalizeVfsPath, stripJsonSchemaMeta } from '@/core/utils';
+import { VfsError, type VirtualFileSystem } from '@/core/vfs';
+import { redactString, redactWithReport } from './redact';
+import type { UndoStore } from './undo-store';
+
+export type AssistantToolTier = 'chat' | 'adjust' | 'author' | 'full' | 'admin';
+
+export interface AssistantToolContext {
+    sessionId: string;
+    toolCallId: string;
+    mode: AssistantMode;
+    stAdminEnabled: boolean;
+    bridge: HostBridge;
+    store: ChatDataStore;
+    vfs: VirtualFileSystem;
+    undoStore: UndoStore;
+    trajectoryStore?: TrajectoryStore;
+    traceLogger?: TraceLogger;
+    settings?: Settings;
+    target: MessageTarget;
+    signal: AbortSignal;
+    getVariableSchema?: () => DynamicVariableSchema | undefined;
+    captureUndo?: boolean;
+    getStatusSnapshot?: () => Record<string, unknown>;
+}
+
+export interface AssistantApprovalPreview {
+    title: string;
+    summary: string;
+    targetLabel: string;
+    beforeText: string;
+    afterText: string;
+    rawContent: string;
+    diffLines: DiffLine[];
+    warnings?: string[];
+}
+
+export interface AssistantToolResult {
+    ok: boolean;
+    output: string;
+    data?: unknown;
+    error?: string;
+    hasSecretRedaction: boolean;
+    redactionCount: number;
+    undoId?: string;
+    warnings?: string[];
+    fileRefs?: string[];
+}
+
+export interface AssistantToolDefinition<TParams extends z.ZodTypeAny = z.ZodTypeAny> {
+    name: string;
+    description: string;
+    parameters: TParams;
+    tier: AssistantToolTier;
+    readOnly: boolean;
+    preview?: (
+        args: z.infer<TParams>,
+        ctx: AssistantToolContext,
+    ) => Promise<AssistantApprovalPreview> | AssistantApprovalPreview;
+    execute: (
+        args: z.infer<TParams>,
+        ctx: AssistantToolContext,
+    ) => Promise<AssistantToolResult> | AssistantToolResult;
+}
+
+export function createAssistantAbortError(message: string = 'Assistant operation aborted'): Error {
+    const err = new Error(message);
+    err.name = 'AbortError';
+    return err;
+}
+
+export function isAssistantAbortError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') {
+        return false;
+    }
+    return (error as { name?: string }).name === 'AbortError';
+}
+
+export function throwIfAssistantAborted(signal?: AbortSignal, message?: string): void {
+    if (signal?.aborted) {
+        throw createAssistantAbortError(message);
+    }
+}
+
+export function truncateSummary(text: string, maxChars: number = 160): string {
+    const clean = text.replace(/\s+/g, ' ').trim();
+    if (clean.length <= maxChars) {
+        return clean;
+    }
+    return `${clean.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
+}
+
+export function finalizeReadToolResult(
+    payload: unknown,
+    extras?: { fileRefs?: string[]; warnings?: string[] },
+): AssistantToolResult {
+    if (typeof payload === 'string') {
+        const report = redactString(payload);
+        return {
+            ok: true,
+            output: report.value,
+            data: report.value,
+            hasSecretRedaction: report.hasSecretRedaction,
+            redactionCount: report.redactionCount,
+            ...(extras?.fileRefs?.length ? { fileRefs: [...extras.fileRefs] } : {}),
+            ...(extras?.warnings?.length ? { warnings: [...extras.warnings] } : {}),
+        };
+    }
+
+    const report = redactWithReport(payload);
+    return {
+        ok: true,
+        output: JSON.stringify(report.value),
+        data: report.value,
+        hasSecretRedaction: report.hasSecretRedaction,
+        redactionCount: report.redactionCount,
+        ...(extras?.fileRefs?.length ? { fileRefs: [...extras.fileRefs] } : {}),
+        ...(extras?.warnings?.length ? { warnings: [...extras.warnings] } : {}),
+    };
+}
+
+export function finalizeMutationToolResult(
+    payload: Record<string, unknown>,
+    extras?: { undoId?: string; warnings?: string[]; fileRefs?: string[] },
+): AssistantToolResult {
+    const combined: Record<string, unknown> = {
+        ok: true,
+        ...payload,
+        ...(extras?.undoId ? { undoId: extras.undoId } : {}),
+        ...(extras?.warnings?.length ? { warnings: extras.warnings } : {}),
+    };
+    const report = redactWithReport(combined);
+    return {
+        ok: true,
+        output: JSON.stringify(report.value),
+        data: report.value,
+        hasSecretRedaction: report.hasSecretRedaction,
+        redactionCount: report.redactionCount,
+        ...(extras?.undoId ? { undoId: extras.undoId } : {}),
+        ...(extras?.warnings?.length ? { warnings: [...extras.warnings] } : {}),
+        ...(extras?.fileRefs?.length ? { fileRefs: [...extras.fileRefs] } : {}),
+    };
+}
+
+export function finalizeToolError(
+    error: unknown,
+    signal?: AbortSignal,
+    extra?: Record<string, unknown>,
+): AssistantToolResult {
+    if (isAssistantAbortError(error) || signal?.aborted) {
+        if (error instanceof Error && isAssistantAbortError(error)) {
+            throw error;
+        }
+        throw createAssistantAbortError();
+    }
+
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const payload: Record<string, unknown> = {
+        ok: false,
+        error: rawMessage,
+        ...(error instanceof VfsError ? { code: error.code, path: error.path } : {}),
+        ...(extra ?? {}),
+    };
+    const report = redactWithReport(payload);
+    const redactedObj = report.value as Record<string, unknown>;
+    return {
+        ok: false,
+        output: JSON.stringify(redactedObj),
+        data: redactedObj,
+        error: String(redactedObj.error ?? rawMessage),
+        hasSecretRedaction: report.hasSecretRedaction,
+        redactionCount: report.redactionCount,
+    };
+}
+
+function compareCodeUnits(a: string, b: string): number {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
+
+/**
+ * Compile assistant tool definitions into deterministically sorted `CanonicalToolSchema[]`
+ * for Layer 0 Prefix KV Cache invariance.
+ */
+export function toCanonicalAssistantToolSchemas(
+    tools: readonly AssistantToolDefinition[],
+): CanonicalToolSchema[] {
+    const sorted = [...tools].sort((a, b) => compareCodeUnits(a.name, b.name));
+    return sorted.map((tool) =>
+        canonicalClone({
+            name: tool.name,
+            description: tool.description,
+            parameters: schemaToCanonicalJsonSchema(tool.parameters),
+        }),
+    );
+}
+
+/**
+ * Validate raw arguments with Zod v4 and execute an `AssistantToolDefinition`.
+ * Propagates `AbortError` when `ctx.signal` is aborted; returns structured redacted errors otherwise.
+ */
+export async function executeAssistantTool(
+    tool: AssistantToolDefinition,
+    rawArgs: Record<string, unknown>,
+    ctx: AssistantToolContext,
+): Promise<AssistantToolResult> {
+    throwIfAssistantAborted(ctx.signal);
+
+    const validated = tool.parameters.safeParse(rawArgs ?? {});
+    if (!validated.success) {
+        const issues = formatZodIssues(validated.error);
+        const error = formatValidationError(`tool "${tool.name}"`, validated.error);
+        return finalizeToolError(error, ctx.signal, { issues });
+    }
+
+    try {
+        const result = await tool.execute(validated.data, ctx);
+        throwIfAssistantAborted(ctx.signal);
+        return result;
+    } catch (error) {
+        return finalizeToolError(error, ctx.signal);
+    }
+}
+
+function normalizeDirectoryInput(rawPath: string | undefined): string {
+    const trimmed = (rawPath ?? '/').trim();
+    if (!trimmed || trimmed === '.') {
+        return '/';
+    }
+    return normalizeVfsPath(trimmed);
+}
+
+function resolveHistoryPath(rawChunk: string): string {
+    const trimmed = rawChunk.trim();
+    if (!trimmed) {
+        throw new VfsError('History chunk path cannot be empty.', 'EINVAL', '/history');
+    }
+    const normalizedRaw = normalizeVfsPath(trimmed);
+    const candidate =
+        trimmed.startsWith('/') || normalizedRaw === '/history' || normalizedRaw.startsWith('/history/')
+            ? normalizedRaw
+            : normalizeVfsPath(`/history/${trimmed}`);
+
+    if (!candidate.startsWith('/history/') || candidate === '/history/') {
+        throw new VfsError(
+            `History path must reside inside /history/: "${rawChunk}"`,
+            'EINVAL',
+            candidate,
+        );
+    }
+    return candidate;
+}
+
+// ============================================================================
+// Zod Parameter Schemas for `chat` Read-Only Base Tools (12 tools)
+// ============================================================================
+
+const LIST_DIR_SCHEMA = z.object({
+    path: z
+        .string()
+        .optional()
+        .default('/')
+        .describe(
+            'VFS directory path to list. "/" lists workspace root and mounts (/character, /persona, /lorebooks, /skills, /preset, /state, /global, /history, /side).',
+        ),
+});
+
+const GLOB_FILES_SCHEMA = z.object({
+    pattern: z.string().min(1).describe('Glob pattern to match VFS paths, e.g. "/side/**/*.md".'),
+    limit: z.number().int().min(1).max(500).optional().default(100),
+});
+
+const GREP_SEARCH_SCHEMA = z.object({
+    query: z.string().min(1).describe('Literal substring or regex to match line-by-line.'),
+    path_prefix: z.string().optional().default('/'),
+    case_sensitive: z.boolean().optional().default(true),
+    regex: z.boolean().optional().default(false),
+    limit: z.number().int().min(1).max(200).optional().default(50),
+});
+
+const SEARCH_FILES_SCHEMA = z.object({
+    query: z.string().describe('Keywords or natural language query for ranked BM25/fuzzy search.'),
+    path_prefix: z.string().optional().default('/'),
+    limit: z.number().int().min(1).max(100).optional().default(25),
+});
+
+const READ_FILE_SCHEMA = z.object({
+    path: z.string().min(1).describe('VFS file path to read.'),
+    start_line: z.number().int().min(1).optional(),
+    end_line: z.number().int().min(1).optional(),
+});
+
+const READ_VARIABLES_SCHEMA = z.object({
+    path: z
+        .string()
+        .optional()
+        .describe('Optional dot-notation or JSON Pointer path (e.g. "player.hp" or "/stats/gold").'),
+    include_schema: z.boolean().optional().default(false),
+    default_value: z.unknown().optional(),
+});
+
+const SEARCH_HISTORY_SCHEMA = z.object({
+    query: z.string().describe('Keywords or phrase to search across /history/* archive chunks.'),
+    mode: z.enum(['fuzzy', 'grep']).optional().default('fuzzy'),
+    case_sensitive: z.boolean().optional().default(false),
+    limit: z.number().int().min(1).max(100).optional().default(20),
+});
+
+const READ_HISTORY_SCHEMA = z.object({
+    chunk: z
+        .string()
+        .min(1)
+        .describe('History file inside /history/, e.g. "chunk-001.md" or "/history/summary.md".'),
+    start_line: z.number().int().min(1).optional(),
+    end_line: z.number().int().min(1).optional(),
+});
+
+const AGENTIC_READ_STATUS_SCHEMA = z.object({});
+
+const AGENTIC_READ_TRACES_SCHEMA = z.object({
+    messageId: z.number().int().min(0).optional(),
+    swipeId: z.number().int().min(0).optional(),
+    phase: z.enum(['before_turn', 'main_turn', 'after_turn', 'maintenance']).optional(),
+    agentProfileId: z.string().optional(),
+    status: z.enum(['running', 'completed', 'error', 'aborted', 'interrupted']).optional(),
+    runId: z.string().optional(),
+    limit: z.number().int().min(1).max(100).optional().default(20),
+});
+
+const CARD_READ_ACTIVE_SCHEMA = z.object({});
+
+const WI_READ_ENABLED_SCHEMA = z.object({
+    bookName: z.string().optional().describe('Optional enabled World Info book name filter.'),
+    query: z.string().optional().describe('Optional keyword/content substring filter.'),
+    includeContent: z.boolean().optional().default(true),
+    limit: z.number().int().min(1).max(500).optional().default(200),
+});
+
+function summarizeLoreEntry(entry: RawLoreEntry, includeContent: boolean): Record<string, unknown> {
+    return {
+        world: entry.world,
+        uid: entry.uid,
+        comment: entry.comment,
+        keys: [...(entry.keys ?? [])],
+        keysecondary: [...(entry.keysecondary ?? [])],
+        constant: Boolean(entry.constant),
+        selective: Boolean(entry.selective),
+        disable: Boolean(entry.disable),
+        position: entry.position,
+        depth: entry.depth,
+        order: entry.order,
+        role: entry.role,
+        ...(includeContent ? { content: entry.content } : {}),
+    };
+}
+
+/**
+ * Create the 12 read-only base tools (`CHAT_READONLY_TOOLS`) inherited by all
+ * four assistant modes. Every output passes through `redactWithReport` / `redactString`.
+ */
+export function createChatReadOnlyTools(): AssistantToolDefinition[] {
+    const listDirTool: AssistantToolDefinition<typeof LIST_DIR_SCHEMA> = {
+        name: 'list_dir',
+        description:
+            'List files and subdirectories in the Virtual File System (VFS). Read-only.',
+        parameters: LIST_DIR_SCHEMA,
+        tier: 'chat',
+        readOnly: true,
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            const dirPath = normalizeDirectoryInput(args.path);
+            const entries = await ctx.vfs.listDir(dirPath, { target: ctx.target, staged: false });
+            return finalizeReadToolResult({ ok: true, path: dirPath, entries });
+        },
+    };
+
+    const globFilesTool: AssistantToolDefinition<typeof GLOB_FILES_SCHEMA> = {
+        name: 'glob_files',
+        description: 'Match VFS file paths against a glob pattern. Read-only.',
+        parameters: GLOB_FILES_SCHEMA,
+        tier: 'chat',
+        readOnly: true,
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            const matched = await ctx.vfs.globFiles(args.pattern, { target: ctx.target, staged: false });
+            return finalizeReadToolResult({
+                ok: true,
+                pattern: args.pattern,
+                total: matched.length,
+                results: matched.slice(0, args.limit),
+            });
+        },
+    };
+
+    const grepSearchTool: AssistantToolDefinition<typeof GREP_SEARCH_SCHEMA> = {
+        name: 'grep_search',
+        description: 'Search VFS files line-by-line for a literal string or regex. Read-only.',
+        parameters: GREP_SEARCH_SCHEMA,
+        tier: 'chat',
+        readOnly: true,
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            const pathPrefix = normalizeDirectoryInput(args.path_prefix);
+            const hits = await ctx.vfs.grepSearch(args.query, {
+                pathPrefix,
+                caseSensitive: args.case_sensitive,
+                regex: args.regex,
+                limit: args.limit,
+                target: ctx.target,
+                staged: false,
+            });
+            return finalizeReadToolResult({
+                ok: true,
+                query: args.query,
+                pathPrefix,
+                total: hits.length,
+                results: hits,
+            });
+        },
+    };
+
+    const searchFilesTool: AssistantToolDefinition<typeof SEARCH_FILES_SCHEMA> = {
+        name: 'search_files',
+        description: 'Ranked full-text and fuzzy search across VFS files. Read-only.',
+        parameters: SEARCH_FILES_SCHEMA,
+        tier: 'chat',
+        readOnly: true,
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            const pathPrefix = normalizeDirectoryInput(args.path_prefix);
+            const hits = await ctx.vfs.searchFiles(args.query, {
+                pathPrefix,
+                limit: args.limit,
+                target: ctx.target,
+                staged: false,
+            });
+            return finalizeReadToolResult({
+                ok: true,
+                query: args.query,
+                pathPrefix,
+                total: hits.length,
+                results: hits,
+            });
+        },
+    };
+
+    const readFileTool: AssistantToolDefinition<typeof READ_FILE_SCHEMA> = {
+        name: 'read_file',
+        description: 'Read a VFS file (supports optional 1-based start_line/end_line). Read-only.',
+        parameters: READ_FILE_SCHEMA,
+        tier: 'chat',
+        readOnly: true,
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            if (
+                args.start_line !== undefined
+                && args.end_line !== undefined
+                && args.start_line > args.end_line
+            ) {
+                return finalizeToolError(
+                    `Invalid line range: start_line (${args.start_line}) must be <= end_line (${args.end_line}).`,
+                    ctx.signal,
+                );
+            }
+            const normalizedPath = normalizeVfsPath(args.path);
+            const content = await ctx.vfs.readFile(normalizedPath, {
+                startLine: args.start_line,
+                endLine: args.end_line,
+                target: ctx.target,
+                staged: false,
+            });
+            return finalizeReadToolResult(content, { fileRefs: [normalizedPath] });
+        },
+    };
+
+    const readVariablesTool: AssistantToolDefinition<typeof READ_VARIABLES_SCHEMA> = {
+        name: 'read_variables',
+        description: 'Read causal branch variables from /state/variables.json. Read-only.',
+        parameters: READ_VARIABLES_SCHEMA,
+        tier: 'chat',
+        readOnly: true,
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            const varsAdapter = new VfsVarsAdapter(ctx.vfs, {
+                target: ctx.target,
+                staged: false,
+                signal: ctx.signal,
+                getSchema: ctx.getVariableSchema,
+            });
+            const value = await varsAdapter.get(args.path);
+            const resolvedValue = value === undefined ? args.default_value : value;
+            const response: Record<string, unknown> = {
+                ok: true,
+                path: args.path ?? '',
+                exists: value !== undefined,
+                value: resolvedValue ?? null,
+                target: ctx.target,
+            };
+
+            if (args.include_schema) {
+                const rawSchema = ctx.getVariableSchema?.();
+                if (rawSchema) {
+                    if (typeof rawSchema === 'string') {
+                        response.schema = rawSchema;
+                    } else if (typeof (rawSchema as z.ZodTypeAny).safeParse === 'function') {
+                        response.schema = stripJsonSchemaMeta(
+                            z.toJSONSchema(rawSchema as z.ZodTypeAny, {
+                                io: 'input',
+                                unrepresentable: 'any',
+                            }),
+                        );
+                    } else {
+                        response.schema = stripJsonSchemaMeta(rawSchema);
+                    }
+                }
+            }
+
+            return finalizeReadToolResult(response, { fileRefs: ['/state/variables.json'] });
+        },
+    };
+
+    const searchHistoryTool: AssistantToolDefinition<typeof SEARCH_HISTORY_SCHEMA> = {
+        name: 'search_history',
+        description: 'Search archived conversation chunks under /history/*. Read-only.',
+        parameters: SEARCH_HISTORY_SCHEMA,
+        tier: 'chat',
+        readOnly: true,
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            const results =
+                args.mode === 'grep' && args.query.trim().length > 0
+                    ? await ctx.vfs.grepSearch(args.query, {
+                        pathPrefix: '/history',
+                        caseSensitive: args.case_sensitive,
+                        limit: args.limit,
+                        target: ctx.target,
+                        staged: false,
+                    })
+                    : await ctx.vfs.searchFiles(args.query, {
+                        pathPrefix: '/history',
+                        limit: args.limit,
+                        target: ctx.target,
+                        staged: false,
+                    });
+            return finalizeReadToolResult({
+                ok: true,
+                query: args.query,
+                mode: args.mode,
+                total: results.length,
+                results,
+            });
+        },
+    };
+
+    const readHistoryTool: AssistantToolDefinition<typeof READ_HISTORY_SCHEMA> = {
+        name: 'read_history',
+        description: 'Read a compacted conversation chunk or summary from /history/*. Read-only.',
+        parameters: READ_HISTORY_SCHEMA,
+        tier: 'chat',
+        readOnly: true,
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            if (
+                args.start_line !== undefined
+                && args.end_line !== undefined
+                && args.start_line > args.end_line
+            ) {
+                return finalizeToolError(
+                    `Invalid line range: start_line (${args.start_line}) must be <= end_line (${args.end_line}).`,
+                    ctx.signal,
+                );
+            }
+            const targetPath = resolveHistoryPath(args.chunk);
+            const content = await ctx.vfs.readFile(targetPath, {
+                startLine: args.start_line,
+                endLine: args.end_line,
+                target: ctx.target,
+                staged: false,
+            });
+            return finalizeReadToolResult(content, { fileRefs: [targetPath] });
+        },
+    };
+
+    const agenticReadStatusTool: AssistantToolDefinition<typeof AGENTIC_READ_STATUS_SCHEMA> = {
+        name: 'agentic_read_status',
+        description:
+            'Inspect ST-Agentic runtime status: runMode, active preset, connection model, mainline watermark, cache hit rate, and causal branch coordinate. Read-only.',
+        parameters: AGENTIC_READ_STATUS_SCHEMA,
+        tier: 'chat',
+        readOnly: true,
+        async execute(_args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            const chat = ctx.bridge.getChat();
+            const identity = ctx.bridge.getActiveIdentity();
+            const activePreset = ctx.settings ? resolveActivePreset(ctx.settings) : undefined;
+            const activeConnection = ctx.settings ? resolveConnection(ctx.settings) : undefined;
+
+            const mainMessages = ctx.trajectoryStore?.getMessages(DEFAULT_MAIN_AGENT_ID) ?? [];
+            const mainPrefix = ctx.trajectoryStore?.getFrozenPrefix(DEFAULT_MAIN_AGENT_ID);
+            const mainEstimatedTokens = ctx.trajectoryStore
+                ? estimateRequestTokens(
+                    [...(mainPrefix?.messages ?? []), ...mainMessages],
+                    mainPrefix?.tools ?? [],
+                )
+                : 0;
+            const mainWatermark = activePreset?.agents?.[DEFAULT_MAIN_AGENT_ID]?.watermark ?? {
+                high: 32000,
+                low: 16000,
+            };
+
+            const recentTraces = ctx.traceLogger?.listTraces({ limit: 20 }) ?? [];
+            let totalInput = 0;
+            let totalCached = 0;
+            for (const trace of recentTraces) {
+                totalInput += trace.usage?.inputTokens ?? 0;
+                totalCached += trace.usage?.cachedTokens ?? 0;
+            }
+            const cacheHitRate =
+                totalInput > 0 ? `${((totalCached / totalInput) * 100).toFixed(1)}%` : '0.0%';
+
+            const statusPayload: Record<string, unknown> = {
+                ok: true,
+                runMode: ctx.settings?.runMode ?? 'takeover',
+                themeMode: ctx.settings?.themeMode ?? 'dark',
+                activePreset: activePreset
+                    ? { id: activePreset.id, name: activePreset.name }
+                    : null,
+                activeConnection: activeConnection
+                    ? {
+                        id: activeConnection.id,
+                        name: activeConnection.name,
+                        providerFormat: activeConnection.providerFormat,
+                        model: activeConnection.model,
+                        baseUrl: activeConnection.baseUrl,
+                    }
+                    : null,
+                target: ctx.target,
+                chatLength: chat.length,
+                identity,
+                mainline: {
+                    messageCount: mainMessages.length,
+                    estimatedTokens: mainEstimatedTokens,
+                    watermark: mainWatermark,
+                    archivedUpToChunk:
+                        ctx.trajectoryStore?.getArchivedUpToChunk(DEFAULT_MAIN_AGENT_ID) ?? 0,
+                    readSetSize:
+                        ctx.trajectoryStore?.getReadSet(DEFAULT_MAIN_AGENT_ID).size ?? 0,
+                },
+                cacheHitRate,
+                recentTraceCount: recentTraces.length,
+                assistantSession: {
+                    sessionId: ctx.sessionId,
+                    mode: ctx.mode,
+                    stAdminEnabled: ctx.stAdminEnabled,
+                },
+                ...(ctx.getStatusSnapshot ? ctx.getStatusSnapshot() : {}),
+            };
+
+            return finalizeReadToolResult(statusPayload);
+        },
+    };
+
+    const agenticReadTracesTool: AssistantToolDefinition<typeof AGENTIC_READ_TRACES_SCHEMA> = {
+        name: 'agentic_read_traces',
+        description:
+            'Read recent ST-Agentic execution traces and tool logs (automatically redacted). Read-only.',
+        parameters: AGENTIC_READ_TRACES_SCHEMA,
+        tier: 'chat',
+        readOnly: true,
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            const traces = ctx.traceLogger
+                ? ctx.traceLogger.listTraces({
+                    messageId: args.messageId,
+                    swipeId: args.swipeId,
+                    phase: args.phase,
+                    agentProfileId: args.agentProfileId,
+                    status: args.status,
+                    runId: args.runId,
+                    limit: args.limit,
+                })
+                : [];
+            return finalizeReadToolResult({
+                ok: true,
+                total: traces.length,
+                traces,
+            });
+        },
+    };
+
+    const cardReadActiveTool: AssistantToolDefinition<typeof CARD_READ_ACTIVE_SCHEMA> = {
+        name: 'card_read_active',
+        description:
+            'Read a read-only snapshot of the currently active character card fields and extensions. Read-only.',
+        parameters: CARD_READ_ACTIVE_SCHEMA,
+        tier: 'chat',
+        readOnly: true,
+        async execute(_args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            if (ctx.bridge.author) {
+                const active = await ctx.bridge.author.getActiveCharacterFull();
+                if (active) {
+                    return finalizeReadToolResult({
+                        ok: true,
+                        character: active,
+                    });
+                }
+            }
+            const identity = ctx.bridge.getActiveIdentity();
+            const fields = ctx.bridge.getCharacterFields();
+            return finalizeReadToolResult({
+                ok: true,
+                character: {
+                    name: identity.charName,
+                    avatar: identity.characterAvatar,
+                    ...fields,
+                },
+            });
+        },
+    };
+
+    const wiReadEnabledTool: AssistantToolDefinition<typeof WI_READ_ENABLED_SCHEMA> = {
+        name: 'wi_read_enabled',
+        description:
+            'Read currently enabled World Info books and their entries (supports bookName/query filters). Read-only.',
+        parameters: WI_READ_ENABLED_SCHEMA,
+        tier: 'chat',
+        readOnly: true,
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            const books = await ctx.bridge.listEnabledLorebooks();
+            const needle = args.query?.trim().toLowerCase() ?? '';
+            const summaries: Array<{
+                bookName: string;
+                totalEntries: number;
+                entries: Record<string, unknown>[];
+            }> = [];
+
+            let remaining = args.limit;
+            for (const [bookName, entries] of books.entries()) {
+                if (args.bookName && bookName !== args.bookName) {
+                    continue;
+                }
+                const filtered = needle
+                    ? entries.filter((entry) => {
+                        const haystack = [
+                            entry.comment ?? '',
+                            ...(entry.keys ?? []),
+                            ...(entry.keysecondary ?? []),
+                            entry.content ?? '',
+                        ]
+                            .join('\n')
+                            .toLowerCase();
+                        return haystack.includes(needle);
+                    })
+                    : entries;
+                const slice = filtered.slice(0, Math.max(0, remaining));
+                remaining -= slice.length;
+                summaries.push({
+                    bookName,
+                    totalEntries: filtered.length,
+                    entries: slice.map((e) => summarizeLoreEntry(e, args.includeContent)),
+                });
+            }
+
+            return finalizeReadToolResult({
+                ok: true,
+                bookCount: summaries.length,
+                books: summaries,
+            });
+        },
+    };
+
+    return [
+        listDirTool,
+        globFilesTool,
+        grepSearchTool,
+        searchFilesTool,
+        readFileTool,
+        readVariablesTool,
+        searchHistoryTool,
+        readHistoryTool,
+        agenticReadStatusTool,
+        agenticReadTracesTool,
+        cardReadActiveTool,
+        wiReadEnabledTool,
+    ];
+}
