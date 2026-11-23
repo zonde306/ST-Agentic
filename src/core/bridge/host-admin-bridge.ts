@@ -81,6 +81,21 @@ export interface HostAuthorBridge {
     embedAgenticPayload(options: EmbedAgenticOptions): Promise<EmbedAgenticResult>;
 }
 
+export interface ReadHostSettingsOptions {
+    /** Dot/slash key path for drill-down reads, e.g. "TavernHelper.scripts" or "power_user.theme". */
+    keyPath?: string;
+    /** When true, return only a top-level manifest (key, type, bytes, itemCount, preview) instead of full nested content. */
+    summaryOnly?: boolean;
+}
+
+export interface ListPresetsOptions {
+    apiType?: string;
+    /** Default false: list returns only metadata ({ name, apiType, active }); load full `data` only when explicitly requested. */
+    includeData?: boolean;
+    /** Filter to a single preset by exact name, typically combined with `includeData: true`. */
+    name?: string;
+}
+
 /**
  * Global SillyTavern administration anti-corruption bridge.
  * Accessible ONLY when assistant `mode === 'full'` AND `stAdminEnabled === true`.
@@ -103,7 +118,7 @@ export interface HostAdminBridge {
     listPersonas(): Promise<HostPersonaEntry[]>;
     upsertPersona(key: string, desc: string, title?: string): Promise<HostPersonaEntry>;
     selectPersona(key: string): Promise<void>;
-    listPresets(apiType?: string): Promise<HostPresetInfo[]>;
+    listPresets(apiTypeOrOptions?: string | ListPresetsOptions): Promise<HostPresetInfo[]>;
     selectPreset(name: string, apiType?: string): Promise<void>;
     patchPreset(
         name: string,
@@ -112,7 +127,10 @@ export interface HostAdminBridge {
     ): Promise<HostPresetInfo>;
 
     // 4. Global settings, global regex & URL resource import
-    readHostSettings(scope: HostSettingsScope): Promise<Record<string, unknown>>;
+    readHostSettings(
+        scope: HostSettingsScope,
+        options?: ReadHostSettingsOptions,
+    ): Promise<Record<string, unknown>>;
     patchHostSettings(
         scope: HostSettingsScope,
         patch: Record<string, unknown>,

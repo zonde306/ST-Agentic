@@ -21,6 +21,7 @@ import {
 import {
     ContextAssembler,
     TrajectoryStore,
+    TransientToolSpillStore,
     WatermarkCompactor,
 } from '@/core/context';
 import { FetchLLMTransport } from '@/core/llm';
@@ -392,6 +393,7 @@ interface RuntimeServicesDeps {
     dataCompactor: DataCompactor;
     vfs: VirtualFileSystem;
     sideGen: ToolSideGenApi;
+    assistantRunner?: AssistantRunner;
     traceLogger: TraceLogger;
     sandbox: IframeJsSandbox;
     toolRegistry: ToolRegistry;
@@ -416,6 +418,7 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
         dataCompactor,
         vfs,
         sideGen,
+        assistantRunner,
         traceLogger,
         sandbox,
         toolRegistry,
@@ -823,12 +826,51 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                 }
             }
 
-            return Array.from(agentMap.values()).map((agent) =>
+            const statuses = Array.from(agentMap.values()).map((agent) =>
                 buildWatermarkStatusForAgent(agent, summaryMode),
             );
+
+            if (assistantRunner) {
+                for (const session of assistantRunner.listSessions()) {
+                    const tokenStatus = assistantRunner.getSessionTokenStatus(session.id);
+                    if (
+                        tokenStatus
+                        && (session.messages.length > 0 || tokenStatus.currentTokens > 0)
+                    ) {
+                        statuses.push({
+                            agentId: `assistant:${session.id}`,
+                            agentName: `助手 · ${session.title}`,
+                            currentTokens: tokenStatus.currentTokens,
+                            lowWatermark: tokenStatus.lowWatermark,
+                            highWatermark: tokenStatus.highWatermark,
+                            archivedChunks: tokenStatus.compactedCount,
+                            summaryMode: 'assistant_compact',
+                        });
+                    }
+                }
+            }
+
+            return statuses;
         },
 
         async compactAgentContext(agentId: string): Promise<AgentWatermarkStatus> {
+            if (agentId.startsWith('assistant:') && assistantRunner) {
+                const sessionId = agentId.slice('assistant:'.length);
+                await assistantRunner.compactSession(sessionId, { mode: 'full' });
+                trajectoryStore.saveToHost(bridge);
+                const session = assistantRunner.getSession(sessionId);
+                const updatedStatus = assistantRunner.getSessionTokenStatus(sessionId);
+                return {
+                    agentId,
+                    agentName: session ? `助手 · ${session.title}` : agentId,
+                    currentTokens: updatedStatus?.currentTokens ?? 0,
+                    lowWatermark: updatedStatus?.lowWatermark ?? 12_000,
+                    highWatermark: updatedStatus?.highWatermark ?? 24_000,
+                    archivedChunks: updatedStatus?.compactedCount ?? 0,
+                    summaryMode: 'assistant_compact',
+                };
+            }
+
             const activePreset = resolveActivePreset(getSettings());
             const lorebooks = await bridge.listEnabledLorebooks();
             const loreEntries = Array.from(lorebooks.values()).flat();
@@ -1281,6 +1323,8 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
         subscribeEvents(listener) {
             return traceLogger.subscribe(listener);
         },
+
+        ...(assistantRunner ? { assistantRuntime: assistantRunner } : {}),
     };
 }
 
@@ -1453,7 +1497,9 @@ jQuery(async () => {
         const traceLogger = new TraceLogger();
         const sandboxLifecycle = new SandboxLifecycleManager();
         const sandbox = new IframeJsSandbox({ lifecycle: sandboxLifecycle });
+        const mainlineSpillStore = new TransientToolSpillStore();
         const toolRegistry = createBuiltinToolRegistry();
+        toolRegistry.setOutputGateOptions({ spillStore: mainlineSpillStore });
 
         const registeredCustomToolNames = new Set<string>();
         let toolSyncGeneration = 0;
@@ -1733,6 +1779,7 @@ jQuery(async () => {
             dataCompactor,
             vfs,
             sideGen: sideGenApi,
+            assistantRunner,
             traceLogger,
             sandbox,
             toolRegistry,
@@ -1993,6 +2040,8 @@ jQuery(async () => {
 
         const handleChatChanged = async (): Promise<void> => {
             assistantRunner.abort();
+            assistantRunner.clearSpillStore();
+            toolRegistry.clearSpillStore();
             rotateSideGenLifecycleAbort('chat_changed');
             sideGenService.abortAll('chat_changed');
             sandboxLifecycle.disposeAll();
@@ -2130,6 +2179,8 @@ jQuery(async () => {
             }
             runtimeDisposed = true;
             assistantRunner.abort();
+            assistantRunner.clearSpillStore();
+            toolRegistry.clearSpillStore();
             rotateSideGenLifecycleAbort('unload');
             sideGenService.abortAll('unload');
             unsubscribeAssistantPersist();

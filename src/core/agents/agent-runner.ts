@@ -16,10 +16,17 @@ import {
 } from '@/core/config';
 import {
     ContextAssembler,
-    type InterruptedTurnCheckpoint,
+    DEFAULT_FOLD_THRESHOLD_CHARS,
+    estimateMessageTokens,
+    estimateRequestTokens,
+    resolveEffectiveContextBudget,
     TrajectoryStore,
+    TransientToolSpillStore,
+    WatermarkCompactor,
+    type InterruptedTurnCheckpoint,
     type RegexSource,
 } from '@/core/context';
+import { parseContextOverflowError, type ContextOverflowInfo } from '@/core/llm';
 import { TraceLogger } from '@/core/logger';
 import {
     DecoratorParser,
@@ -94,6 +101,9 @@ export const REQUIRED_OUTPUT_MODE_TOOLS: readonly string[] = [
 const EMPTY_OUTPUT_CHECK_PROMPT =
     '[System Check] /output.md is still empty. Plain assistant text is NOT displayed to the user. Write the final response to /output.md via write_file and review it before finishing.';
 
+const PREFLIGHT_FOLDED_TOOL_PREFIX = '[已折叠本轮早期工具输出:';
+const OVERFLOW_CROPPED_TOOL_PREFIX = '[输出因触发模型上下文上限';
+
 export interface SubAgentDescriptor {
     name: string;
     toolName: string;
@@ -157,6 +167,8 @@ export interface AgentRunnerDependencies {
     toolRegistry?: ToolRegistry;
     contextAssembler?: ContextAssembler;
     trajectoryStore?: TrajectoryStore;
+    watermarkCompactor?: WatermarkCompactor;
+    spillStore?: TransientToolSpillStore;
     vfs?: VirtualFileSystem;
     store?: ChatDataStore;
     regexPipeline?: RegexPipeline | (() => RegexSource | undefined);
@@ -455,6 +467,181 @@ function buildOutputModePermissions(base: ScopedPermissions): ScopedPermissions 
     };
 }
 
+function measureToolContentChars(content: string | CanonicalContentPart[]): number {
+    if (typeof content === 'string') {
+        return content.length;
+    }
+    let total = 0;
+    for (const part of content) {
+        if (part.type === 'text') {
+            total += part.text.length;
+        } else if (part.type === 'image_url') {
+            total += Math.max(256, part.imageUrl.length);
+        } else if (part.type === 'video_url') {
+            total += Math.max(512, part.videoUrl.length);
+        } else {
+            total += Math.max(512, part.data.length);
+        }
+    }
+    return total;
+}
+
+function isAlreadyCompactedToolContent(
+    content: string | CanonicalContentPart[],
+    prefixes: readonly string[],
+): boolean {
+    if (typeof content !== 'string') {
+        return false;
+    }
+    return prefixes.some((prefix) => content.startsWith(prefix));
+}
+
+function findLatestToolRoundStartIndex(messages: readonly CanonicalMessage[]): number {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const msg = messages[i];
+        if (msg.role === 'assistant' && msg.toolCalls && msg.toolCalls.length > 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+function syncToolContentToCompleted(
+    completedMessages: CanonicalMessage[],
+    toolMsg: CanonicalMessage,
+    replacement: string,
+): void {
+    if (!toolMsg.toolCallId) {
+        return;
+    }
+    for (let i = completedMessages.length - 1; i >= 0; i -= 1) {
+        const candidate = completedMessages[i];
+        if (candidate.role === 'tool' && candidate.toolCallId === toolMsg.toolCallId) {
+            candidate.content = replacement;
+            return;
+        }
+    }
+}
+
+/**
+ * Fold oversized `role === 'tool'` messages in `inFlightMessages` in-place to meet the
+ * pre-flight token threshold. Prioritizes earlier tool rounds first and NEVER deletes
+ * tool nodes or mutates `toolCallId` pairing.
+ */
+function foldInFlightToolMessagesForPreflight(params: {
+    turnMessages: CanonicalMessage[];
+    completedTurnMessages: CanonicalMessage[];
+    currentTokens: number;
+    targetTokens: number;
+    thresholdChars?: number;
+}): { foldedCount: number; freedTokens: number } {
+    const thresholdChars = params.thresholdChars ?? DEFAULT_FOLD_THRESHOLD_CHARS;
+    const latestToolRoundIdx = findLatestToolRoundStartIndex(params.turnMessages);
+
+    interface Candidate {
+        index: number;
+        chars: number;
+        tokens: number;
+        isEarlierRound: boolean;
+    }
+
+    const earlier: Candidate[] = [];
+    const latest: Candidate[] = [];
+
+    for (let i = 0; i < params.turnMessages.length; i += 1) {
+        const msg = params.turnMessages[i];
+        if (msg.role !== 'tool') {
+            continue;
+        }
+        if (isAlreadyCompactedToolContent(msg.content, [PREFLIGHT_FOLDED_TOOL_PREFIX, OVERFLOW_CROPPED_TOOL_PREFIX])) {
+            continue;
+        }
+        const chars = measureToolContentChars(msg.content);
+        if (chars <= thresholdChars) {
+            continue;
+        }
+        const candidate: Candidate = {
+            index: i,
+            chars,
+            tokens: estimateMessageTokens(msg),
+            isEarlierRound: latestToolRoundIdx >= 0 && i < latestToolRoundIdx,
+        };
+        if (candidate.isEarlierRound) {
+            earlier.push(candidate);
+        } else {
+            latest.push(candidate);
+        }
+    }
+
+    earlier.sort((a, b) => b.tokens - a.tokens || a.index - b.index);
+    latest.sort((a, b) => b.tokens - a.tokens || a.index - b.index);
+
+    let remainingTokens = params.currentTokens;
+    let foldedCount = 0;
+    let freedTokens = 0;
+
+    for (const candidate of [...earlier, ...latest]) {
+        if (remainingTokens < params.targetTokens) {
+            break;
+        }
+        const msg = params.turnMessages[candidate.index];
+        const toolLabel = msg.toolName ?? 'tool';
+        const replacement =
+            `${PREFLIGHT_FOLDED_TOOL_PREFIX} ${toolLabel} (原输出约 ${candidate.tokens} tokens / ${candidate.chars} chars)；为满足上下文预算已自动折叠，如需细节请使用精确范围重新查询]`;
+        msg.content = replacement;
+        syncToolContentToCompleted(params.completedTurnMessages, msg, replacement);
+
+        const newTokens = estimateMessageTokens(msg);
+        const delta = Math.max(0, candidate.tokens - newTokens);
+        remainingTokens -= delta;
+        freedTokens += delta;
+        foldedCount += 1;
+    }
+
+    return { foldedCount, freedTokens };
+}
+
+/**
+ * Crop oversized `role === 'tool'` messages in `inFlightMessages` in-place during
+ * emergency `ContextOverflowError` recovery. Replaces `content` only and strictly
+ * preserves `toolCallId` / `assistant.toolCalls` pairing.
+ */
+function cropInFlightToolMessagesForOverflow(params: {
+    turnMessages: CanonicalMessage[];
+    completedTurnMessages: CanonicalMessage[];
+    limitTokens: number;
+    thresholdChars?: number;
+}): { croppedCount: number; freedTokens: number } {
+    const thresholdChars = params.thresholdChars ?? DEFAULT_FOLD_THRESHOLD_CHARS;
+    let croppedCount = 0;
+    let freedTokens = 0;
+
+    for (const msg of params.turnMessages) {
+        if (msg.role !== 'tool') {
+            continue;
+        }
+        if (isAlreadyCompactedToolContent(msg.content, [OVERFLOW_CROPPED_TOOL_PREFIX])) {
+            continue;
+        }
+        const chars = measureToolContentChars(msg.content);
+        if (chars <= thresholdChars) {
+            continue;
+        }
+        const origTokens = estimateMessageTokens(msg);
+        const toolLabel = msg.toolName ?? 'tool';
+        const replacement =
+            `${OVERFLOW_CROPPED_TOOL_PREFIX} (${params.limitTokens} tokens) 已被自动裁剪: ${toolLabel}；原输出约 ${origTokens} tokens (${chars} chars)。请改用指定路径、行号范围 (start_line/end_line) 或更精确的过滤条件分段查询]`;
+        msg.content = replacement;
+        syncToolContentToCompleted(params.completedTurnMessages, msg, replacement);
+
+        const newTokens = estimateMessageTokens(msg);
+        freedTokens += Math.max(0, origTokens - newTokens);
+        croppedCount += 1;
+    }
+
+    return { croppedCount, freedTokens };
+}
+
 /**
  * Multi-round Agent runtime executing `LLMTransport` <-> `ToolRegistry` loops
  * over `ContextAssembler` + `TrajectoryStore`, emitting live events and recording
@@ -467,6 +654,8 @@ export class AgentRunner {
     public readonly vfs: VirtualFileSystem;
     public readonly contextAssembler: ContextAssembler;
     public readonly trajectoryStore: TrajectoryStore;
+    public readonly watermarkCompactor: WatermarkCompactor;
+    public readonly spillStore: TransientToolSpillStore;
     public readonly traceLogger: TraceLogger;
     public readonly baseToolRegistry: ToolRegistry;
     public readonly loreReadEvaluator: LoreReadEvaluator;
@@ -540,6 +729,18 @@ export class AgentRunner {
                 store: this.store,
                 loreReadHook: this.loreReadEvaluator.toLoreReadHook(),
                 getPresetFiles: () => resolveActivePreset(this.settingsProvider()).files,
+            });
+
+        this.spillStore =
+            deps.spillStore
+            ?? this.baseToolRegistry.getSpillStore()
+            ?? new TransientToolSpillStore();
+
+        this.watermarkCompactor =
+            deps.watermarkCompactor
+            ?? new WatermarkCompactor({
+                vfs: this.vfs,
+                bridge: this.bridge,
             });
     }
 
@@ -927,6 +1128,7 @@ export class AgentRunner {
         };
 
         try {
+            let activeRecentChatMessages = recentChatMessages ? [...recentChatMessages] : undefined;
             const baseAssembleInput = {
                 agent: effectiveAgent,
                 connectionId: connection.id,
@@ -939,7 +1141,7 @@ export class AgentRunner {
                 systemBasePrompt: input.systemBasePrompt,
                 promptTriggerContext,
                 trajectoryStore: agent.sessionMode === 'persistent' ? this.trajectoryStore : undefined,
-                recentChatMessages,
+                recentChatMessages: activeRecentChatMessages,
                 hostBridge: this.bridge,
                 regex,
                 vars: workingVars,
@@ -984,44 +1186,214 @@ export class AgentRunner {
                 completedTurnMessages.push(...canonicalClone(initialLayer2));
             }
 
+            const contextBudget = resolveEffectiveContextBudget(
+                connection,
+                agent.watermark ? { configuredWatermark: agent.watermark } : undefined,
+            );
+
+            const reassembleInFlight = () =>
+                this.contextAssembler.assemble({
+                    ...baseAssembleInput,
+                    recentChatMessages: activeRecentChatMessages,
+                    inFlightMessages: turnMessages,
+                });
+
+            const compactHistoryDeterministic = async (params: {
+                high: number;
+                low: number;
+                keepRecentTurns: number;
+                minRetainedTurns: number;
+            }): Promise<boolean> => {
+                throwIfAborted(signal);
+                if (agent.sessionMode === 'persistent') {
+                    const inFlightTokens = estimateRequestTokens(turnMessages);
+                    const historyLow = Math.max(50, params.low - inFlightTokens);
+                    const historyHigh = Math.max(historyLow + 1, params.high);
+                    const result = await this.watermarkCompactor.compact(this.trajectoryStore, {
+                        agentId: agent.id,
+                        watermark: { high: historyHigh, low: historyLow },
+                        keepRecentTurns: params.keepRecentTurns,
+                        minRetainedTurns: params.minRetainedTurns,
+                        layer0Messages: currentAssembled.layer0Messages,
+                        tools: currentAssembled.request.tools,
+                        triggers: preset.triggers,
+                        loreEntries,
+                        force: true,
+                        signal,
+                    });
+                    if (result.evictedReadPaths.length > 0) {
+                        for (const evictedPath of result.evictedReadPaths) {
+                            effectiveReadSet.delete(evictedPath);
+                        }
+                    }
+                    return result.compacted;
+                }
+
+                if (!activeRecentChatMessages || activeRecentChatMessages.length === 0) {
+                    return false;
+                }
+
+                let trimmed = false;
+                while (activeRecentChatMessages.length > 0) {
+                    throwIfAborted(signal);
+                    const dropCount = Math.max(1, Math.ceil(activeRecentChatMessages.length / 2));
+                    activeRecentChatMessages = activeRecentChatMessages.slice(dropCount);
+                    trimmed = true;
+                    const candidate = reassembleInFlight();
+                    if (candidate.stats.estimatedTokens <= params.low) {
+                        break;
+                    }
+                }
+                return trimmed;
+            };
+
+            const runPreflightBudgetGuard = async (): Promise<void> => {
+                const estimated = estimateRequestTokens(
+                    currentAssembled.request.messages,
+                    currentAssembled.request.tools,
+                );
+                if (estimated < contextBudget.preFlightThreshold) {
+                    return;
+                }
+
+                throwIfAborted(signal);
+                const compactedGentle = await compactHistoryDeterministic({
+                    high: contextBudget.autoHighWatermark,
+                    low: contextBudget.autoLowWatermark,
+                    keepRecentTurns: 1,
+                    minRetainedTurns: 1,
+                });
+                if (compactedGentle) {
+                    currentAssembled = reassembleInFlight();
+                }
+
+                if (currentAssembled.stats.estimatedTokens >= contextBudget.preFlightThreshold) {
+                    const folded = foldInFlightToolMessagesForPreflight({
+                        turnMessages,
+                        completedTurnMessages,
+                        currentTokens: currentAssembled.stats.estimatedTokens,
+                        targetTokens: contextBudget.preFlightThreshold,
+                    });
+                    if (folded.foldedCount > 0) {
+                        currentAssembled = reassembleInFlight();
+                    }
+                }
+
+                if (
+                    currentAssembled.stats.estimatedTokens >= contextBudget.preFlightThreshold
+                    && agent.sessionMode === 'persistent'
+                    && this.trajectoryStore.getMessageCount(agent.id) > 0
+                ) {
+                    const compactedDeep = await compactHistoryDeterministic({
+                        high: contextBudget.autoHighWatermark,
+                        low: contextBudget.autoLowWatermark,
+                        keepRecentTurns: 0,
+                        minRetainedTurns: 0,
+                    });
+                    if (compactedDeep) {
+                        currentAssembled = reassembleInFlight();
+                    }
+                }
+            };
+
+            const runEmergencyOverflowRecovery = async (
+                overflow: ContextOverflowInfo,
+            ): Promise<void> => {
+                throwIfAborted(signal);
+                const effectiveLimit = overflow.limitTokens ?? contextBudget.safeInputBudget;
+                const emergencyLowTarget = Math.max(256, Math.floor(effectiveLimit * 0.4));
+                const emergencyHighTarget = Math.max(
+                    emergencyLowTarget + 1,
+                    Math.floor(effectiveLimit * 0.6),
+                );
+
+                // 1. Crop oversized in-flight tool results IN-PLACE (strictly preserving toolCallId).
+                cropInFlightToolMessagesForOverflow({
+                    turnMessages,
+                    completedTurnMessages,
+                    limitTokens: effectiveLimit,
+                });
+
+                // 2. Run deterministic emergency history compaction with ZERO LLM summary calls.
+                await compactHistoryDeterministic({
+                    high: emergencyHighTarget,
+                    low: emergencyLowTarget,
+                    keepRecentTurns: 0,
+                    minRetainedTurns: 0,
+                });
+
+                // 3. Reset any partial streaming buffer from the failed attempt.
+                if (extractor) {
+                    const currentOut = await this.vfs
+                        .readFile(OUTPUT_FILE_PATH, { target, staged })
+                        .catch(() => '');
+                    extractor.resetRound(currentOut);
+                }
+
+                // 4. Re-assemble compacted request before retrying invokeLLM once.
+                currentAssembled = reassembleInFlight();
+            };
+
             const maxToolRounds = Math.max(0, agent.maxToolRounds);
             let toolRoundsExecuted = 0;
             let emptyOutputRetried = false;
+            let overflowRecoveryAttempted = false;
 
             // eslint-disable-next-line no-constant-condition
             while (true) {
                 throwIfAborted(signal);
 
-                const llmRequest: LLMRequest = {
-                    ...currentAssembled.request,
-                    connectionId: connection.id,
-                    connection,
-                    stream: input.stream ?? connection.stream ?? true,
-                    signal,
-                };
+                await runPreflightBudgetGuard();
 
-                lastRequestSnapshot = {
-                    messages: canonicalClone(llmRequest.messages),
-                    tools: canonicalClone(llmRequest.tools),
-                    ...(llmRequest.cacheBreakpoints
-                        ? { cacheBreakpoints: [...llmRequest.cacheBreakpoints] }
-                        : {}),
-                };
+                let turnOutput: Awaited<ReturnType<AgentRunner['invokeLLM']>>;
+                // eslint-disable-next-line no-constant-condition
+                while (true) {
+                    throwIfAborted(signal);
 
-                const turnOutput = await this.invokeLLM({
-                    request: llmRequest,
-                    useStream: Boolean(llmRequest.stream),
-                    target,
-                    phase: input.phase,
-                    runId,
-                    agentId: agent.id,
-                    signal,
-                    onTextDelta: isMainOutputMode ? undefined : input.onTextDelta,
-                    onReasoningDelta: input.onReasoningDelta,
-                    onToolCallDelta: extractor
-                        ? (idx, delta) => extractor.feedToolCallDelta(idx, delta)
-                        : undefined,
-                });
+                    const llmRequest: LLMRequest = {
+                        ...currentAssembled.request,
+                        connectionId: connection.id,
+                        connection,
+                        stream: input.stream ?? connection.stream ?? true,
+                        signal,
+                    };
+
+                    lastRequestSnapshot = {
+                        messages: canonicalClone(llmRequest.messages),
+                        tools: canonicalClone(llmRequest.tools),
+                        ...(llmRequest.cacheBreakpoints
+                            ? { cacheBreakpoints: [...llmRequest.cacheBreakpoints] }
+                            : {}),
+                    };
+
+                    try {
+                        turnOutput = await this.invokeLLM({
+                            request: llmRequest,
+                            useStream: Boolean(llmRequest.stream),
+                            target,
+                            phase: input.phase,
+                            runId,
+                            agentId: agent.id,
+                            signal,
+                            onTextDelta: isMainOutputMode ? undefined : input.onTextDelta,
+                            onReasoningDelta: input.onReasoningDelta,
+                            onToolCallDelta: extractor
+                                ? (idx, delta) => extractor.feedToolCallDelta(idx, delta)
+                                : undefined,
+                        });
+                        break;
+                    } catch (error) {
+                        if (isAbortError(error) || signal.aborted) {
+                            throw error;
+                        }
+                        const overflowInfo = parseContextOverflowError(error);
+                        if (!overflowInfo || overflowRecoveryAttempted) {
+                            throw error;
+                        }
+                        overflowRecoveryAttempted = true;
+                        await runEmergencyOverflowRecovery(overflowInfo);
+                    }
+                }
 
                 roundsCompleted += 1;
                 cumulativeUsage = addUsage(cumulativeUsage, turnOutput.usage);
@@ -1064,10 +1436,7 @@ export class AgentRunner {
                                     canonicalClone(systemCheckMsg),
                                 );
 
-                                currentAssembled = this.contextAssembler.assemble({
-                                    ...baseAssembleInput,
-                                    inFlightMessages: turnMessages,
-                                });
+                                currentAssembled = reassembleInFlight();
                                 continue;
                             }
 
@@ -1235,6 +1604,11 @@ export class AgentRunner {
                         toolCall.name,
                         toolCall.arguments,
                         toolCtx,
+                        {
+                            toolCallId: toolCall.id,
+                            spillStore: registry.getSpillStore() ?? this.spillStore,
+                            scopeId: `${agent.id}:${target.messageId}#${target.swipeId}`,
+                        },
                     );
 
                     if (
@@ -1299,10 +1673,7 @@ export class AgentRunner {
                 }
 
                 // Re-assemble with frozen Layer 0 + frozen Layer 1 + appended inFlightMessages.
-                currentAssembled = this.contextAssembler.assemble({
-                    ...baseAssembleInput,
-                    inFlightMessages: turnMessages,
-                });
+                currentAssembled = reassembleInFlight();
             }
         } catch (error) {
             if (error instanceof MaxToolRoundsError || error instanceof TurnInterruptedError) {

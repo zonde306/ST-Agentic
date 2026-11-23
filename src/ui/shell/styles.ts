@@ -1626,6 +1626,380 @@ select {
     color: var(--warning);
 }
 
+/* Topbar Token Counter Pill (§4.1) */
+@keyframes ag-ast-token-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+}
+
+.ag-ast-token-pill {
+    gap: 5px;
+    padding: 0 10px;
+    min-width: 40px;
+    min-height: 40px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    font-weight: 600;
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+
+.ag-ast-token-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 9999px;
+    flex-shrink: 0;
+    background: var(--muted-foreground);
+}
+
+.ag-ast-token-text {
+    line-height: 1;
+}
+
+.ag-ast-token-normal {
+    border-color: var(--border);
+    background: var(--card);
+    color: var(--muted-foreground);
+}
+
+.ag-ast-token-normal:hover:not(:disabled) {
+    color: var(--foreground);
+}
+
+.ag-ast-token-normal .ag-ast-token-dot {
+    background: var(--success);
+}
+
+.ag-ast-token-warning {
+    border-color: color-mix(in srgb, var(--warning) 62%, var(--border));
+    background: color-mix(in srgb, var(--warning) 12%, var(--card));
+    color: var(--warning);
+}
+
+.ag-ast-token-warning:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--warning) 20%, var(--card));
+}
+
+.ag-ast-token-warning .ag-ast-token-dot {
+    background: var(--warning);
+}
+
+.ag-ast-token-danger {
+    border-color: color-mix(in srgb, var(--error) 68%, var(--border));
+    background: color-mix(in srgb, var(--error) 14%, var(--card));
+    color: var(--error);
+}
+
+.ag-ast-token-danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--error) 22%, var(--card));
+}
+
+.ag-ast-token-danger .ag-ast-token-dot {
+    background: var(--error);
+}
+
+.ag-ast-token-compacting {
+    opacity: 0.82;
+    cursor: progress;
+    animation: ag-ast-token-pulse 1.2s ease-in-out infinite;
+}
+
+.ag-ast-token-compacting .ag-ast-token-dot {
+    background: var(--primary);
+}
+
+/* Compaction Confirmation Modal (§4.2) */
+.ag-compact-modal-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+}
+
+.ag-compact-meter-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--content);
+    min-width: 0;
+}
+
+.ag-compact-meter-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    min-width: 0;
+}
+
+.ag-compact-meter-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--foreground);
+}
+
+.ag-compact-meter-value {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--foreground);
+}
+
+.ag-compact-progress-track {
+    position: relative;
+    height: 10px;
+    border-radius: 9999px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    overflow: hidden;
+}
+
+.ag-compact-progress-fill {
+    height: 100%;
+    border-radius: 9999px;
+    transition: width 0.2s ease;
+}
+
+.ag-compact-progress-normal {
+    background: var(--primary);
+}
+
+.ag-compact-progress-warning {
+    background: var(--warning);
+}
+
+.ag-compact-progress-danger {
+    background: var(--error);
+}
+
+.ag-compact-progress-marker {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--warning);
+}
+
+.ag-compact-stats {
+    font-size: 12px;
+    color: var(--muted-foreground);
+    line-height: 1.45;
+}
+
+.ag-compact-preview-box {
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--content);
+    overflow: hidden;
+    min-width: 0;
+}
+
+.ag-compact-summary-toggle {
+    width: 100%;
+    min-width: 40px;
+    min-height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 12px;
+    border: none;
+    background: transparent;
+    color: var(--foreground);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: left;
+}
+
+.ag-compact-summary-toggle:hover {
+    background: var(--secondary);
+}
+
+.ag-compact-summary-pre {
+    margin: 0;
+    padding: 10px 12px;
+    border-top: 1px solid var(--card-border);
+    max-height: 180px;
+    overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--foreground);
+}
+
+.ag-compact-focus-textarea {
+    width: 100%;
+    min-height: 76px;
+    max-height: 180px;
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--content);
+    color: var(--foreground);
+    font-family: inherit;
+    font-size: 16px;
+    line-height: 1.5;
+    resize: vertical;
+    outline: none;
+    box-sizing: border-box;
+}
+
+.ag-compact-focus-textarea:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 18%, transparent);
+}
+
+.ag-compact-modal-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    width: 100%;
+}
+
+/* Chat-Stream Compaction Separator Pill & Overflow Escape Bar (§4.3) */
+.ag-ast-compaction-sep {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    margin: 2px 0;
+    min-width: 0;
+}
+
+.ag-ast-compaction-line-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    min-width: 0;
+}
+
+.ag-ast-compaction-rule {
+    flex: 1 1 16px;
+    min-width: 8px;
+    height: 1px;
+    background: var(--card-border);
+}
+
+.ag-ast-compaction-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 40px;
+    min-height: 40px;
+    max-width: 100%;
+    padding: 6px 14px;
+    border-radius: 9999px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--muted-foreground);
+    font-size: 11px;
+    line-height: 1.4;
+    font-weight: 500;
+    text-align: center;
+    cursor: pointer;
+    transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.ag-ast-compaction-pill:hover {
+    background: var(--secondary);
+    color: var(--foreground);
+    border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
+}
+
+.ag-ast-compaction-pill-static {
+    cursor: default;
+}
+
+.ag-ast-compaction-pill-static:hover {
+    background: var(--card);
+    color: var(--muted-foreground);
+    border-color: var(--border);
+}
+
+.ag-ast-compaction-pill-text {
+    word-break: break-word;
+    overflow-wrap: anywhere;
+}
+
+.ag-ast-compaction-summary {
+    width: 100%;
+    max-width: 720px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+    box-sizing: border-box;
+}
+
+.ag-ast-compaction-meta {
+    font-size: 11px;
+    color: var(--muted-foreground);
+    line-height: 1.45;
+    word-break: break-word;
+}
+
+.ag-ast-compaction-pre {
+    margin: 0;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--card-border);
+    background: var(--content);
+    color: var(--foreground);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    max-height: 240px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.ag-ast-overflow-escape {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border-radius: 10px;
+    border: 1px solid color-mix(in srgb, var(--error) 55%, var(--border));
+    background: color-mix(in srgb, var(--error) 10%, var(--content));
+    min-width: 0;
+}
+
+.ag-ast-overflow-hint {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--error);
+    line-height: 1.45;
+}
+
+.ag-ast-overflow-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.ag-ast-overflow-btn {
+    min-width: 40px;
+    min-height: 40px;
+}
+
 /* Session List Panel & Desktop Slide-Out Drawer */
 .ag-ast-drawer-backdrop {
     position: absolute;
@@ -3752,6 +4126,31 @@ select {
 
     .ag-ast-topbar {
         padding: 4px 8px;
+        gap: 6px;
+    }
+
+    .ag-ast-topbar-right {
+        gap: 4px;
+    }
+
+    .ag-ast-token-pill {
+        padding: 0 8px;
+        min-width: 40px;
+        min-height: 40px;
+    }
+
+    .ag-ast-compaction-rule {
+        display: none;
+    }
+
+    .ag-ast-compaction-pill {
+        border-radius: 14px;
+        padding: 8px 12px;
+    }
+
+    .ag-ast-overflow-btn {
+        min-width: 40px;
+        min-height: 40px;
     }
 
     .ag-ast-title-rename-btn {

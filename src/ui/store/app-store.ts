@@ -11,9 +11,12 @@ import type {
     AgentRunTrace,
     ApiConnection,
     AssistantAttachment,
+    AssistantCompactOptions,
+    AssistantCompactReport,
     AssistantMessage,
     AssistantMode,
     AssistantSession,
+    AssistantSessionTokenStatus,
     BackgroundTaskStatus,
     ClassifiedLoreEntry,
     CompactionReport,
@@ -141,6 +144,13 @@ export interface AssistantRuntimeBridge {
     listUndoRecords?(sessionId?: string): Promise<UndoRecord[]> | UndoRecord[];
     applyUndo(undoId: string): Promise<boolean | UndoRecord | null | void>;
     readPreviewFile?(path: string): Promise<string | null>;
+    getSessionTokenStatus?(
+        sessionId: string,
+    ): Promise<AssistantSessionTokenStatus | null> | AssistantSessionTokenStatus | null;
+    compactSession?(
+        sessionId: string,
+        options?: AssistantCompactOptions,
+    ): Promise<AssistantCompactReport>;
     subscribe?(listener: () => void): () => void;
 }
 

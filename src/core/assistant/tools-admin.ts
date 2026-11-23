@@ -1,8 +1,10 @@
 import { z } from 'zod';
-import type { HostAdminBridge } from '@/core/bridge';
+import type { HostAdminBridge, ReadHostSettingsOptions } from '@/core/bridge';
+import { utf8ByteLength } from '@/core/context';
 import type {
     HostCharacterCreatePayload,
     HostCharacterPatch,
+    HostCharacterSummary,
     HostSettingsScope,
 } from '@/core/types';
 import { canonicalClone } from '@/core/utils';
@@ -26,6 +28,94 @@ import {
     type AssistantToolContext,
     type AssistantToolDefinition,
 } from './tools-chat';
+
+const SETTINGS_READ_MANIFEST_THRESHOLD_BYTES = 16 * 1024;
+const CARD_DESCRIPTION_PREVIEW_MAX_CHARS = 120;
+const SETTINGS_PREVIEW_MAX_CHARS = 100;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+    return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function formatBoundedPreview(raw: string, maxChars: number): string {
+    const clean = raw.replace(/\s+/g, ' ').trim();
+    if (clean.length <= maxChars) {
+        return clean;
+    }
+    return `${clean.slice(0, Math.max(1, maxChars - 3)).trimEnd()}...`;
+}
+
+function toBoundedCharacterSummary(character: HostCharacterSummary): Record<string, unknown> {
+    const rawDesc = typeof character.description === 'string' ? character.description : undefined;
+    const boundedDesc =
+        rawDesc !== undefined
+            ? formatBoundedPreview(rawDesc, CARD_DESCRIPTION_PREVIEW_MAX_CHARS)
+            : undefined;
+    return {
+        chid: character.chid,
+        name: character.name,
+        avatar: character.avatar,
+        ...(boundedDesc !== undefined
+            ? {
+                description: boundedDesc,
+                descriptionPreview: boundedDesc,
+                descriptionLength: rawDesc!.length,
+            }
+            : { descriptionLength: 0 }),
+        ...(character.tags !== undefined ? { tags: [...character.tags] } : {}),
+        ...(character.primaryWorld !== undefined ? { primaryWorld: character.primaryWorld } : {}),
+    };
+}
+
+function isSettingsSummaryManifest(value: unknown): boolean {
+    if (!isPlainRecord(value)) {
+        return false;
+    }
+    return value.summaryOnly === true && Array.isArray(value.manifest);
+}
+
+function buildAdminSettingsManifest(
+    record: Record<string, unknown>,
+    scope: string,
+    totalBytes: number,
+    keyPath?: string,
+): Record<string, unknown> {
+    const manifest = Object.entries(record)
+        .map(([key, value]) => {
+            const type =
+                value === null || value === undefined
+                    ? 'null'
+                    : Array.isArray(value)
+                        ? 'array'
+                        : typeof value;
+            const serialized = JSON.stringify(value) ?? 'null';
+            const bytes = utf8ByteLength(serialized);
+            const itemCount =
+                type === 'array'
+                    ? (value as unknown[]).length
+                    : type === 'object'
+                        ? Object.keys(value as Record<string, unknown>).length
+                        : undefined;
+            const previewSource = typeof value === 'string' ? value : serialized;
+            return {
+                key,
+                type,
+                bytes,
+                ...(itemCount !== undefined ? { itemCount } : {}),
+                preview: formatBoundedPreview(previewSource, SETTINGS_PREVIEW_MAX_CHARS),
+            };
+        })
+        .sort((a, b) => b.bytes - a.bytes || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+
+    return {
+        scope,
+        ...(keyPath ? { keyPath } : {}),
+        summaryOnly: true,
+        totalBytes,
+        manifest,
+        hint: 'Returned summary manifest to keep context compact. Pass a specific extension scope (e.g. scope: "ST-Agentic") or keyPath (e.g. keyPath: "power_user.theme") to drill down.',
+    };
+}
 
 function requireAdminBridge(ctx: AssistantToolContext): HostAdminBridge {
     if (!ctx.bridge.admin) {
@@ -309,6 +399,18 @@ const ST_SETTINGS_READ_SCHEMA = z.object({
         .optional()
         .default('all')
         .describe('Settings scope: "power_user", "extension_settings", "all", or specific extension key.'),
+    keyPath: z
+        .string()
+        .optional()
+        .describe(
+            'Optional dot/slash key path for drill-down reads (e.g. "TavernHelper.scripts" or "power_user.theme").',
+        ),
+    summaryOnly: z
+        .boolean()
+        .optional()
+        .describe(
+            'When true, return only a descending-byte manifest (key, type, bytes, itemCount, preview) instead of full nested objects.',
+        ),
 });
 
 const ST_SETTINGS_PATCH_SCHEMA = z.object({
@@ -317,7 +419,15 @@ const ST_SETTINGS_PATCH_SCHEMA = z.object({
 });
 
 const ST_PRESET_LIST_SCHEMA = z.object({
-    apiType: z.string().optional(),
+    apiType: z.string().optional().describe('Optional SillyTavern API type filter (e.g. "openai").'),
+    name: z.string().optional().describe('Optional exact preset name to filter by.'),
+    includeData: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+            'Default false: returns only metadata ({ name, apiType, active }). Set true (ideally with name) to load full preset data.',
+        ),
 });
 
 const ST_PRESET_SELECT_SCHEMA = z.object({
@@ -613,18 +723,21 @@ export function createStAdminTools(): AssistantToolDefinition[] {
 
     const cardAdminListAllTool: AssistantToolDefinition<typeof EMPTY_SCHEMA> = {
         name: 'card_admin_list_all',
-        description: 'List all character cards in SillyTavern. Read-only.',
+        description:
+            'List all character cards in SillyTavern with bounded description previews (<= 120 chars). Use card_admin_read(chid) for full card fields. Read-only.',
         parameters: EMPTY_SCHEMA,
         tier: 'admin',
         readOnly: true,
         async execute(_args, ctx) {
             throwIfAssistantAborted(ctx.signal);
             const admin = requireAdminBridge(ctx);
-            const characters = await admin.listAllCharacters();
+            const rawCharacters = await admin.listAllCharacters();
+            const characters = rawCharacters.map((c) => toBoundedCharacterSummary(c));
             return finalizeReadToolResult({
                 ok: true,
                 total: characters.length,
                 characters,
+                hint: 'Descriptions are truncated to <= 120 chars preview. Call card_admin_read(chid) to read a full character card.',
             });
         },
     };
@@ -993,19 +1106,57 @@ export function createStAdminTools(): AssistantToolDefinition[] {
     const stSettingsReadTool: AssistantToolDefinition<typeof ST_SETTINGS_READ_SCHEMA> = {
         name: 'st_settings_read',
         description:
-            'Read SillyTavern global/extension settings (secrets are recursively redacted to ***REDACTED***). Read-only.',
+            'Read SillyTavern global/extension settings (secrets are recursively redacted to ***REDACTED***). Supports keyPath drill-down and summaryOnly manifest; large broad reads automatically return a size manifest. Read-only.',
         parameters: ST_SETTINGS_READ_SCHEMA,
         tier: 'admin',
         readOnly: true,
         async execute(args, ctx) {
             throwIfAssistantAborted(ctx.signal);
             const admin = requireAdminBridge(ctx);
-            const settings = await admin.readHostSettings(args.scope as HostSettingsScope);
-            return finalizeReadToolResult({
+            const readOptions: ReadHostSettingsOptions = {
+                ...(args.keyPath !== undefined ? { keyPath: args.keyPath } : {}),
+                ...(args.summaryOnly !== undefined ? { summaryOnly: args.summaryOnly } : {}),
+            };
+            const rawSettings = await admin.readHostSettings(
+                args.scope as HostSettingsScope,
+                readOptions,
+            );
+
+            // Always redact BEFORE computing summary manifest previews so secrets never leak.
+            const redactedReport = redactWithReport(rawSettings);
+            let finalSettings: Record<string, unknown> = isPlainRecord(redactedReport.value)
+                ? redactedReport.value
+                : { value: redactedReport.value };
+
+            if (!isSettingsSummaryManifest(finalSettings)) {
+                const serializedBytes = utf8ByteLength(JSON.stringify(finalSettings));
+                const shouldDegradeToManifest =
+                    args.summaryOnly === true
+                    || (args.summaryOnly !== false
+                        && !args.keyPath
+                        && serializedBytes > SETTINGS_READ_MANIFEST_THRESHOLD_BYTES);
+                if (shouldDegradeToManifest) {
+                    finalSettings = buildAdminSettingsManifest(
+                        finalSettings,
+                        args.scope,
+                        serializedBytes,
+                        args.keyPath,
+                    );
+                }
+            }
+
+            const finalized = finalizeReadToolResult({
                 ok: true,
                 scope: args.scope,
-                settings,
+                ...(args.keyPath ? { keyPath: args.keyPath } : {}),
+                settings: finalSettings,
             });
+            return {
+                ...finalized,
+                hasSecretRedaction:
+                    finalized.hasSecretRedaction || redactedReport.hasSecretRedaction,
+                redactionCount: finalized.redactionCount + redactedReport.redactionCount,
+            };
         },
     };
 
@@ -1018,7 +1169,9 @@ export function createStAdminTools(): AssistantToolDefinition[] {
         readOnly: false,
         async preview(args, ctx) {
             const admin = requireAdminBridge(ctx);
-            const before = await admin.readHostSettings(args.scope as HostSettingsScope);
+            const before = await admin.readHostSettings(args.scope as HostSettingsScope, {
+                summaryOnly: false,
+            });
             const beforeSubset: Record<string, unknown> = {};
             for (const key of Object.keys(args.patch)) {
                 beforeSubset[key] = before[key];
@@ -1039,7 +1192,7 @@ export function createStAdminTools(): AssistantToolDefinition[] {
             throwIfAssistantAborted(ctx.signal);
             const admin = requireAdminBridge(ctx);
             const scope = args.scope as HostSettingsScope;
-            const before = await admin.readHostSettings(scope);
+            const before = await admin.readHostSettings(scope, { summaryOnly: false });
             const previousValues: Record<string, unknown> = {};
             for (const key of Object.keys(args.patch)) {
                 if (Object.hasOwn(before, key)) {
@@ -1077,17 +1230,35 @@ export function createStAdminTools(): AssistantToolDefinition[] {
 
     const stPresetListTool: AssistantToolDefinition<typeof ST_PRESET_LIST_SCHEMA> = {
         name: 'st_preset_list',
-        description: 'List SillyTavern generation presets. Read-only.',
+        description:
+            'List SillyTavern generation presets (metadata only by default: name, apiType, active; pass name + includeData=true to inspect a single preset body). Read-only.',
         parameters: ST_PRESET_LIST_SCHEMA,
         tier: 'admin',
         readOnly: true,
         async execute(args, ctx) {
             throwIfAssistantAborted(ctx.signal);
             const admin = requireAdminBridge(ctx);
-            const presets = await admin.listPresets(args.apiType);
+            const includeData = args.includeData ?? false;
+            const rawPresets = await admin.listPresets({
+                apiType: args.apiType,
+                includeData,
+                name: args.name,
+            });
+            const filtered = args.name
+                ? rawPresets.filter((p) => p.name === args.name)
+                : rawPresets;
+            // Defense-in-depth: strip heavy `data` field when includeData is false even if a custom bridge returned it.
+            const presets = includeData
+                ? filtered
+                : filtered.map(({ name, apiType, active }) => ({
+                    name,
+                    apiType,
+                    ...(active !== undefined ? { active } : {}),
+                }));
             return finalizeReadToolResult({
                 ok: true,
                 total: presets.length,
+                includeData,
                 presets,
             });
         },
@@ -1102,7 +1273,10 @@ export function createStAdminTools(): AssistantToolDefinition[] {
         readOnly: false,
         async preview(args, ctx) {
             const admin = requireAdminBridge(ctx);
-            const presets = await admin.listPresets(args.apiType);
+            const presets = await admin.listPresets({
+                apiType: args.apiType,
+                includeData: false,
+            });
             const current = presets.find((p) => p.active);
             const beforeText = `activePreset: ${current?.name ?? 'none'}`;
             const afterText = `activePreset: ${args.name}`;
@@ -1119,7 +1293,10 @@ export function createStAdminTools(): AssistantToolDefinition[] {
         async execute(args, ctx) {
             throwIfAssistantAborted(ctx.signal);
             const admin = requireAdminBridge(ctx);
-            const presets = await admin.listPresets(args.apiType);
+            const presets = await admin.listPresets({
+                apiType: args.apiType,
+                includeData: false,
+            });
             const previousName = presets.find((p) => p.active)?.name ?? null;
             await admin.selectPreset(args.name, args.apiType);
 
@@ -1160,7 +1337,11 @@ export function createStAdminTools(): AssistantToolDefinition[] {
         readOnly: false,
         async preview(args, ctx) {
             const admin = requireAdminBridge(ctx);
-            const presets = await admin.listPresets(args.apiType);
+            const presets = await admin.listPresets({
+                apiType: args.apiType,
+                includeData: true,
+                name: args.name,
+            });
             const target = presets.find((p) => p.name === args.name);
             const beforeSubset: Record<string, unknown> = {};
             for (const key of Object.keys(args.patch)) {
@@ -1181,7 +1362,11 @@ export function createStAdminTools(): AssistantToolDefinition[] {
         async execute(args, ctx) {
             throwIfAssistantAborted(ctx.signal);
             const admin = requireAdminBridge(ctx);
-            const presets = await admin.listPresets(args.apiType);
+            const presets = await admin.listPresets({
+                apiType: args.apiType,
+                includeData: true,
+                name: args.name,
+            });
             const existing = presets.find((p) => p.name === args.name);
             const previousData: Record<string, unknown> = {};
             for (const key of Object.keys(args.patch)) {

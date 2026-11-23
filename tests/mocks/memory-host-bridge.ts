@@ -7,8 +7,11 @@ import type {
     HostAuthorBridge,
     HostBridge,
     HostIdentity,
+    ListPresetsOptions,
+    ReadHostSettingsOptions,
     WriteChatMessageOptions,
 } from '@/core/bridge';
+import { utf8ByteLength } from '@/core/context';
 import type {
     AuthorUndoMeta,
     ChatMessageSnapshot,
@@ -1128,11 +1131,33 @@ export class MemoryHostBridge implements HostBridge {
                 this.personaDescription = target.description;
             },
 
-            listPresets: async (apiType?: string): Promise<HostPresetInfo[]> => {
-                const filtered = apiType
-                    ? this.presets.filter((p) => p.apiType === apiType)
-                    : this.presets;
-                return filtered.map((p) => structuredClone(p));
+            listPresets: async (
+                apiTypeOrOptions?: string | ListPresetsOptions,
+            ): Promise<HostPresetInfo[]> => {
+                const options: ListPresetsOptions =
+                    typeof apiTypeOrOptions === 'string'
+                        ? { apiType: apiTypeOrOptions }
+                        : (apiTypeOrOptions ?? {});
+                const apiType = options.apiType;
+                const nameFilter = typeof options.name === 'string' ? options.name.trim() : '';
+                const includeData = options.includeData === true;
+
+                const filtered = this.presets.filter(
+                    (p) =>
+                        (!apiType || p.apiType === apiType)
+                        && (!nameFilter || p.name === nameFilter),
+                );
+                return filtered.map((p) => {
+                    const base: HostPresetInfo = {
+                        name: p.name,
+                        apiType: p.apiType,
+                        ...(p.active !== undefined ? { active: p.active } : {}),
+                    };
+                    if (includeData && p.data !== undefined) {
+                        base.data = structuredClone(p.data);
+                    }
+                    return base;
+                });
             },
 
             selectPreset: async (name: string, apiType?: string): Promise<void> => {
@@ -1169,21 +1194,63 @@ export class MemoryHostBridge implements HostBridge {
 
             readHostSettings: async (
                 scope: HostSettingsScope,
+                options?: ReadHostSettingsOptions,
             ): Promise<Record<string, unknown>> => {
+                let baseObj: Record<string, unknown>;
                 if (scope === 'all') {
-                    return structuredClone(this.hostSettings);
+                    baseObj = structuredClone(this.hostSettings);
+                } else if (Object.hasOwn(this.hostSettings, scope)) {
+                    baseObj = structuredClone(this.hostSettings[scope]);
+                } else {
+                    const extBucket = this.hostSettings.extension_settings;
+                    if (extBucket && Object.hasOwn(extBucket, scope)) {
+                        const value = extBucket[scope];
+                        baseObj =
+                            value && typeof value === 'object' && !Array.isArray(value)
+                                ? structuredClone(value as Record<string, unknown>)
+                                : { value: structuredClone(value) };
+                    } else {
+                        baseObj = {};
+                    }
                 }
-                if (Object.hasOwn(this.hostSettings, scope)) {
-                    return structuredClone(this.hostSettings[scope]);
+
+                const keyPath = typeof options?.keyPath === 'string' ? options.keyPath.trim() : '';
+                if (keyPath) {
+                    const resolved = resolveMockSettingsKeyPath(baseObj, scope, keyPath);
+                    if (!resolved.found) {
+                        return { scope, keyPath, found: false, value: null };
+                    }
+                    if (
+                        resolved.value
+                        && typeof resolved.value === 'object'
+                        && !Array.isArray(resolved.value)
+                    ) {
+                        const rec = resolved.value as Record<string, unknown>;
+                        const bytes = utf8ByteLength(JSON.stringify(rec));
+                        if (
+                            options?.summaryOnly === true
+                            || (options?.summaryOnly !== false && bytes > 16 * 1024)
+                        ) {
+                            return buildMockSettingsManifest(rec, scope, bytes, keyPath);
+                        }
+                        return structuredClone(rec);
+                    }
+                    return {
+                        scope,
+                        keyPath,
+                        found: true,
+                        value: structuredClone(resolved.value),
+                    };
                 }
-                const extBucket = this.hostSettings.extension_settings;
-                if (extBucket && Object.hasOwn(extBucket, scope)) {
-                    const value = extBucket[scope];
-                    return value && typeof value === 'object'
-                        ? structuredClone(value as Record<string, unknown>)
-                        : { value };
+
+                const totalBytes = utf8ByteLength(JSON.stringify(baseObj));
+                if (
+                    options?.summaryOnly === true
+                    || (options?.summaryOnly !== false && totalBytes > 16 * 1024)
+                ) {
+                    return buildMockSettingsManifest(baseObj, scope, totalBytes);
                 }
-                return {};
+                return baseObj;
             },
 
             patchHostSettings: async (
@@ -1277,4 +1344,92 @@ function createAbortError(): Error {
     const err = new Error('Operation aborted');
     err.name = 'AbortError';
     return err;
+}
+
+function resolveMockSettingsKeyPath(
+    root: Record<string, unknown>,
+    scope: string,
+    rawKeyPath: string,
+): { found: boolean; value: unknown } {
+    const segments = rawKeyPath
+        .trim()
+        .replace(/\\/g, '/')
+        .split(/[./]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+    const walk = (segs: string[]): { found: boolean; value: unknown } => {
+        let cursor: unknown = root;
+        for (const seg of segs) {
+            if (seg === '__proto__' || seg === 'constructor' || seg === 'prototype') {
+                return { found: false, value: undefined };
+            }
+            if (Array.isArray(cursor)) {
+                const idx = Number.parseInt(seg, 10);
+                if (!Number.isInteger(idx) || idx < 0 || idx >= cursor.length || String(idx) !== seg) {
+                    return { found: false, value: undefined };
+                }
+                cursor = cursor[idx];
+                continue;
+            }
+            if (cursor && typeof cursor === 'object' && Object.hasOwn(cursor, seg)) {
+                cursor = (cursor as Record<string, unknown>)[seg];
+                continue;
+            }
+            return { found: false, value: undefined };
+        }
+        return { found: true, value: cursor };
+    };
+    const direct = walk(segments);
+    if (direct.found) {
+        return direct;
+    }
+    if (segments[0] === scope && segments.length > 1) {
+        return walk(segments.slice(1));
+    }
+    return { found: false, value: undefined };
+}
+
+function buildMockSettingsManifest(
+    record: Record<string, unknown>,
+    scope: string,
+    totalBytes: number,
+    keyPath?: string,
+): Record<string, unknown> {
+    const manifest = Object.entries(record)
+        .map(([key, value]) => {
+            const type =
+                value === null || value === undefined
+                    ? 'null'
+                    : Array.isArray(value)
+                        ? 'array'
+                        : typeof value;
+            const serialized = JSON.stringify(value) ?? 'null';
+            const bytes = utf8ByteLength(serialized);
+            const itemCount =
+                type === 'array'
+                    ? (value as unknown[]).length
+                    : type === 'object'
+                        ? Object.keys(value as Record<string, unknown>).length
+                        : undefined;
+            const previewSource = typeof value === 'string' ? value : serialized;
+            const clean = previewSource.replace(/\s+/g, ' ').trim();
+            const preview = clean.length <= 100 ? clean : `${clean.slice(0, 97).trimEnd()}...`;
+            return {
+                key,
+                type,
+                bytes,
+                ...(itemCount !== undefined ? { itemCount } : {}),
+                preview,
+            };
+        })
+        .sort((a, b) => b.bytes - a.bytes || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+
+    return {
+        scope,
+        ...(keyPath ? { keyPath } : {}),
+        summaryOnly: true,
+        totalBytes,
+        manifest,
+        hint: 'Returned summary manifest to keep context compact. Pass a specific extension scope or keyPath to drill down.',
+    };
 }

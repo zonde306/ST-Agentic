@@ -1,4 +1,10 @@
-import { createAbortError, isAbortError, LLMTransportError, throwIfAborted } from './errors';
+import {
+    createAbortError,
+    isAbortError,
+    isContextOverflowError,
+    LLMTransportError,
+    throwIfAborted,
+} from './errors';
 
 export interface RetryOptions {
     /** Total attempts including the initial call (default: 3, minimum: 1). */
@@ -48,6 +54,10 @@ export function delayWithAbort(ms: number, signal?: AbortSignal): Promise<void> 
 
 export function defaultShouldRetry(error: unknown): boolean {
     if (isAbortError(error)) {
+        return false;
+    }
+
+    if (isContextOverflowError(error)) {
         return false;
     }
 

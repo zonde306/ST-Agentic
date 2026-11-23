@@ -19,18 +19,28 @@ import {
 import type {
     AgentRunTrace,
     ApiConnection,
+    AssistantCompactOptions,
+    AssistantCompactReport,
+    AssistantCompactionNotice,
+    AssistantMessage,
+    AssistantSession,
+    AssistantSessionTokenStatus,
+    AssistantTokenLevel,
     BackgroundTaskStatus,
     ClassifiedLoreEntry,
     CompactionReport,
     CustomToolConfig,
     GenerationEventPayload,
     MessageTarget,
+    PendingApproval,
     Settings,
+    UndoRecord,
     WICategory,
 } from '@/core/types';
 import type {
     AgentWatermarkStatus,
     AgenticUIServices,
+    AssistantRuntimeBridge,
     ConnectionModelsResult,
     ConnectionTestResult,
     EmbeddedCardStatus,
@@ -701,6 +711,492 @@ function createInitialMockLore(): ClassifiedLoreEntry[] {
     ];
 }
 
+interface MockSessionTokenMeta {
+    currentTokens: number;
+    contextLimit: number;
+    highWatermark: number;
+    lowWatermark: number;
+    activeTurnCount: number;
+    activeMessageCount: number;
+    foldableToolResultCount: number;
+    compactedCount: number;
+    summaryPreview?: string;
+    isCompacting?: boolean;
+}
+
+function computeMockTokenLevel(
+    currentTokens: number,
+    contextLimit: number,
+    highWatermark: number,
+): { usagePercent: number; level: AssistantTokenLevel } {
+    const safeLimit = Math.max(1, contextLimit);
+    const usagePercent = Math.max(0, Math.min(100, Math.round((currentTokens / safeLimit) * 100)));
+    const level: AssistantTokenLevel =
+        usagePercent >= 90 || currentTokens >= highWatermark
+            ? 'danger'
+            : usagePercent >= 70
+                ? 'warning'
+                : 'normal';
+    return { usagePercent, level };
+}
+
+export interface CreateMockAssistantRuntimeOptions {
+    initialSessions?: AssistantSession[];
+    initialTokenMeta?: Record<string, Partial<MockSessionTokenMeta>>;
+}
+
+export function createMockAssistantRuntime(
+    options: CreateMockAssistantRuntimeOptions = {},
+): AssistantRuntimeBridge {
+    const now = Date.now();
+    const sessions: AssistantSession[] = options.initialSessions
+        ? structuredClone(options.initialSessions)
+        : [
+            {
+                id: 'ast_mock_main',
+                title: '世界书路由与状态排查 (Mock)',
+                mode: 'adjust',
+                stAdminEnabled: false,
+                autoApproveAuthor: false,
+                autoApproveChatDelete: false,
+                connectionId: 'inherit',
+                updatedAt: now - 30_000,
+                messages: [
+                    {
+                        id: 'ast_mock_m1',
+                        role: 'user',
+                        content: '请帮我核查当前世界书的触发路由，并确认变量快照与上下文水位。',
+                        timestamp: now - 90_000,
+                    },
+                    {
+                        id: 'ast_mock_m2',
+                        role: 'assistant',
+                        content:
+                            '已核查 `/lorebooks/玄幻世界/` 与 `/state/variables.json`：当前主世界书按需归档路由正常，且已开启工具输出 `32 KB` 防爆闸门。',
+                        think: '读取已启用的世界书目录清单与当前变量快照。',
+                        toolCalls: [
+                            {
+                                id: 'call_mock_wi',
+                                name: 'wi_read_enabled',
+                                scopeLabel: 'World Info',
+                                status: 'ok',
+                                durationMs: 18,
+                                argsSummary: '{"bookName":"玄幻世界"}',
+                                resultSummary: '返回 4 条世界书摘要（~12.4 KB）',
+                            },
+                            {
+                                id: 'call_mock_vars',
+                                name: 'read_file',
+                                scopeLabel: 'VFS',
+                                status: 'ok',
+                                durationMs: 7,
+                                argsSummary: '{"path":"/state/variables.json"}',
+                                resultSummary: '{"地点":"青云宗 · 听竹小筑","林婉儿好感":62}',
+                            },
+                        ],
+                        fileRefs: ['/state/variables.json'],
+                        usage: {
+                            inputTokens: 24800,
+                            cachedTokens: 21400,
+                            outputTokens: 186,
+                            cacheRate: '86.3%',
+                        },
+                        timestamp: now - 60_000,
+                    },
+                ],
+            },
+        ];
+
+    const approvals: PendingApproval[] = [];
+    const undoRecords: UndoRecord[] = [];
+    const listeners = new Set<() => void>();
+    const tokenMetaBySession = new Map<string, MockSessionTokenMeta>();
+
+    const buildDefaultMeta = (session: AssistantSession): MockSessionTokenMeta => {
+        const override = options.initialTokenMeta?.[session.id];
+        const turns = Math.max(
+            1,
+            session.messages.filter((m) => m.role === 'user').length || 1,
+        );
+        const toolCount = session.messages.reduce(
+            (sum, msg) => sum + (msg.toolCalls?.length ?? 0),
+            0,
+        );
+        const estimated = session.messages.length === 0
+            ? 860
+            : Math.max(
+                860,
+                session.messages.reduce((sum, msg) => sum + Math.ceil(msg.content.length * 1.4), 0)
+                    + toolCount * 11_600,
+            );
+        return {
+            currentTokens: override?.currentTokens ?? (session.id === 'ast_mock_main' ? 24_800 : estimated),
+            contextLimit: override?.contextLimit ?? 128_000,
+            highWatermark: override?.highWatermark ?? 96_000,
+            lowWatermark: override?.lowWatermark ?? 32_000,
+            activeTurnCount: override?.activeTurnCount ?? turns,
+            activeMessageCount: override?.activeMessageCount ?? Math.max(1, session.messages.length + toolCount * 2),
+            foldableToolResultCount: override?.foldableToolResultCount ?? Math.max(0, toolCount),
+            compactedCount: override?.compactedCount ?? 0,
+            ...(override?.summaryPreview ? { summaryPreview: override.summaryPreview } : {}),
+            isCompacting: Boolean(override?.isCompacting),
+        };
+    };
+
+    for (const s of sessions) {
+        tokenMetaBySession.set(s.id, buildDefaultMeta(s));
+    }
+
+    const ensureMeta = (session: AssistantSession): MockSessionTokenMeta => {
+        const existing = tokenMetaBySession.get(session.id);
+        if (existing) {
+            return existing;
+        }
+        const created = buildDefaultMeta(session);
+        tokenMetaBySession.set(session.id, created);
+        return created;
+    };
+
+    const notify = () => {
+        for (const listener of Array.from(listeners)) {
+            try {
+                listener();
+            } catch {
+                // Keep mock subscriber loop fault-tolerant.
+            }
+        }
+    };
+
+    return {
+        listSessions: () => structuredClone(sessions),
+        getSession: (sessionId) => {
+            const found = sessions.find((s) => s.id === sessionId);
+            return found ? structuredClone(found) : null;
+        },
+        async createSession(createOpts) {
+            const created: AssistantSession = {
+                id: `ast_mock_${Date.now().toString(36)}_${sessions.length + 1}`,
+                title: createOpts?.title ?? `新助手会话 ${sessions.length + 1}`,
+                mode: createOpts?.mode ?? 'chat',
+                stAdminEnabled: Boolean(createOpts?.stAdminEnabled),
+                autoApproveAuthor: Boolean(createOpts?.autoApproveAuthor),
+                autoApproveChatDelete: Boolean(createOpts?.autoApproveChatDelete),
+                connectionId: createOpts?.connectionId ?? 'inherit',
+                updatedAt: Date.now(),
+                messages: [],
+            };
+            sessions.unshift(created);
+            tokenMetaBySession.set(created.id, buildDefaultMeta(created));
+            notify();
+            return structuredClone(created);
+        },
+        async deleteSession(sessionId) {
+            const idx = sessions.findIndex((s) => s.id === sessionId);
+            if (idx < 0) {
+                return false;
+            }
+            sessions.splice(idx, 1);
+            tokenMetaBySession.delete(sessionId);
+            notify();
+            return true;
+        },
+        async updateSessionConfig(sessionId, patch) {
+            const idx = sessions.findIndex((s) => s.id === sessionId);
+            if (idx < 0) {
+                return null;
+            }
+            sessions[idx] = {
+                ...sessions[idx],
+                ...patch,
+                updatedAt: Date.now(),
+            };
+            notify();
+            return structuredClone(sessions[idx]);
+        },
+        async sendPrompt(sessionId, prompt, sendOpts) {
+            const session = sessions.find((s) => s.id === sessionId);
+            if (!session) {
+                throw new Error(`Session not found: ${sessionId}`);
+            }
+            const ts = Date.now();
+            session.messages.push({
+                id: `ast_mock_u_${ts}_${session.messages.length}`,
+                role: 'user',
+                content: prompt,
+                ...(sendOpts?.attachments?.length
+                    ? { attachments: structuredClone(sendOpts.attachments) }
+                    : {}),
+                timestamp: ts,
+            });
+            sendOpts?.onUpdate?.(structuredClone(session));
+
+            const reply: AssistantMessage = {
+                id: `ast_mock_a_${ts + 1}_${session.messages.length}`,
+                role: 'assistant',
+                content: `已收到指令（Mock）：${prompt}`,
+                timestamp: ts + 1,
+            };
+            session.messages.push(reply);
+            session.updatedAt = ts + 1;
+
+            const meta = ensureMeta(session);
+            meta.currentTokens += Math.max(420, Math.ceil(prompt.length * 1.5) + 320);
+            meta.activeTurnCount += 1;
+            meta.activeMessageCount += 2;
+
+            sendOpts?.onUpdate?.(structuredClone(session));
+            notify();
+            return structuredClone(reply);
+        },
+        async editMessage(sessionId, messageId, newContent) {
+            const session = sessions.find((s) => s.id === sessionId);
+            if (!session) {
+                return null;
+            }
+            const msg = session.messages.find((m) => m.id === messageId);
+            if (!msg) {
+                return null;
+            }
+            msg.content = newContent;
+            if (msg.interrupted) {
+                msg.interrupted = false;
+            }
+            session.updatedAt = Date.now();
+            notify();
+            return structuredClone(session);
+        },
+        async retractMessage(sessionId, messageId) {
+            const session = sessions.find((s) => s.id === sessionId);
+            if (!session) {
+                return null;
+            }
+            const idx = session.messages.findIndex((m) => m.id === messageId);
+            if (idx < 0) {
+                return null;
+            }
+            const removedMessages = structuredClone(session.messages.slice(idx));
+            session.messages = session.messages.slice(0, idx);
+            session.updatedAt = Date.now();
+            const meta = ensureMeta(session);
+            meta.currentTokens = Math.max(860, meta.currentTokens - removedMessages.length * 600);
+            meta.activeTurnCount = Math.max(
+                0,
+                session.messages.filter((m) => m.role === 'user').length,
+            );
+            meta.activeMessageCount = session.messages.length;
+            notify();
+            return {
+                session: structuredClone(session),
+                removedMessages,
+            };
+        },
+        async regenerateLastMessage(sessionId, sendOpts) {
+            const session = sessions.find((s) => s.id === sessionId);
+            if (!session) {
+                throw new Error(`Session not found: ${sessionId}`);
+            }
+            let lastUserIdx = -1;
+            for (let i = session.messages.length - 1; i >= 0; i -= 1) {
+                if (session.messages[i].role === 'user') {
+                    lastUserIdx = i;
+                    break;
+                }
+            }
+            if (lastUserIdx < 0) {
+                throw new Error('No user message available to regenerate.');
+            }
+            const userPrompt = session.messages[lastUserIdx].content;
+            session.messages = session.messages.slice(0, lastUserIdx + 1);
+            sendOpts?.onUpdate?.(structuredClone(session));
+            const reply: AssistantMessage = {
+                id: `ast_mock_regen_${Date.now()}`,
+                role: 'assistant',
+                content: `重新生成完成（Mock）：${userPrompt}`,
+                timestamp: Date.now(),
+            };
+            session.messages.push(reply);
+            session.updatedAt = reply.timestamp;
+            notify();
+            return structuredClone(reply);
+        },
+        abort: () => {
+            // Mock no-op
+        },
+        listApprovals: () => structuredClone(approvals),
+        async decideApproval() {
+            return null;
+        },
+        async retryApproval() {
+            return null;
+        },
+        listUndoRecords: () => structuredClone(undoRecords),
+        async applyUndo() {
+            return null;
+        },
+        async readPreviewFile(path) {
+            return `只读预览（Mock）：${path}`;
+        },
+        getSessionTokenStatus(sessionId): AssistantSessionTokenStatus | null {
+            const session = sessions.find((s) => s.id === sessionId);
+            if (!session) {
+                return null;
+            }
+            const meta = ensureMeta(session);
+            const { usagePercent, level } = computeMockTokenLevel(
+                meta.currentTokens,
+                meta.contextLimit,
+                meta.highWatermark,
+            );
+            return {
+                sessionId,
+                currentTokens: meta.currentTokens,
+                contextLimit: meta.contextLimit,
+                highWatermark: meta.highWatermark,
+                lowWatermark: meta.lowWatermark,
+                usagePercent,
+                level,
+                activeTurnCount: meta.activeTurnCount,
+                activeMessageCount: meta.activeMessageCount,
+                foldableToolResultCount: meta.foldableToolResultCount,
+                compactedCount: meta.compactedCount,
+                ...(meta.summaryPreview ? { summaryPreview: meta.summaryPreview } : {}),
+                isCompacting: Boolean(meta.isCompacting),
+            };
+        },
+        async compactSession(
+            sessionId: string,
+            compactOptions: AssistantCompactOptions = {},
+        ): Promise<AssistantCompactReport> {
+            const session = sessions.find((s) => s.id === sessionId);
+            if (!session) {
+                throw new Error(`Session not found: ${sessionId}`);
+            }
+            const meta = ensureMeta(session);
+            const ts = Date.now();
+            const mode = compactOptions.mode ?? 'auto';
+            const focus = compactOptions.focusInstruction?.trim();
+            const tokensBefore = meta.currentTokens;
+
+            if (mode === 'fold_only') {
+                if (meta.foldableToolResultCount <= 0) {
+                    return {
+                        compacted: false,
+                        reason: 'nothing_to_compact',
+                        tokensBefore,
+                        tokensAfter: tokensBefore,
+                        foldedToolResults: 0,
+                        archivedTurns: 0,
+                        summaryMode: 'none',
+                        timestamp: ts,
+                    };
+                }
+                const folded = meta.foldableToolResultCount;
+                const tokensAfter = Math.max(
+                    860,
+                    Math.round(tokensBefore * 0.58),
+                );
+                meta.foldableToolResultCount = 0;
+                meta.currentTokens = tokensAfter;
+
+                const notice: AssistantCompactionNotice = {
+                    tokensBefore,
+                    tokensAfter,
+                    foldedToolResults: folded,
+                    archivedTurns: 0,
+                    summaryMode: 'fold_only',
+                    timestamp: ts,
+                };
+                if (session.messages.length > 0) {
+                    const last = session.messages[session.messages.length - 1];
+                    session.messages[session.messages.length - 1] = {
+                        ...last,
+                        compactionNotice: notice,
+                    };
+                }
+                session.updatedAt = ts;
+                notify();
+
+                return {
+                    compacted: true,
+                    reason: 'manual',
+                    tokensBefore,
+                    tokensAfter,
+                    foldedToolResults: folded,
+                    archivedTurns: 0,
+                    summaryMode: 'fold_only',
+                    timestamp: ts,
+                };
+            }
+
+            const folded = meta.foldableToolResultCount;
+            const archivedTurns = Math.max(1, meta.activeTurnCount - 1);
+            const nextChunkNum = meta.compactedCount + 1;
+            const archivedChunkPath = `/side/.assistant-archive/${sessionId}/chunk-${String(nextChunkNum).padStart(3, '0')}.md`;
+            const targetLow = compactOptions.targetLowTokens ?? meta.lowWatermark;
+            const tokensAfter = Math.max(
+                860,
+                Math.min(targetLow, Math.round(tokensBefore * 0.16)),
+            );
+
+            const summaryLines = [
+                '1. 用户核心目标与当前进度：持续核查世界书按需路由与上下文防爆闸门状态。',
+                '2. 已修改或读取的关键文件与对象：`/state/variables.json`、`/lorebooks/玄幻世界/`。',
+                ...(focus ? [`3. 用户指定保留重点：${focus}`] : ['3. 已确认的约束与踩坑经验：保持界面聊天记录完整，仅精简模型轨迹上下文。']),
+                '4. 待继续步骤：按精确过滤参数继续读取与调整目标条目。',
+            ];
+            const summaryText = summaryLines.join('\n');
+
+            meta.currentTokens = tokensAfter;
+            meta.foldableToolResultCount = 0;
+            meta.activeTurnCount = 1;
+            meta.activeMessageCount = Math.max(2, Math.min(meta.activeMessageCount, 3));
+            meta.compactedCount = nextChunkNum;
+            meta.summaryPreview = summaryText;
+
+            const notice: AssistantCompactionNotice = {
+                tokensBefore,
+                tokensAfter,
+                foldedToolResults: folded,
+                archivedTurns,
+                summaryMode: compactOptions.useLLMSummary === false ? 'deterministic' : 'llm',
+                summaryText,
+                ...(focus ? { focusInstruction: focus } : {}),
+                archivedChunkPath,
+                timestamp: ts,
+            };
+
+            if (session.messages.length > 0) {
+                const last = session.messages[session.messages.length - 1];
+                session.messages[session.messages.length - 1] = {
+                    ...last,
+                    compactionNotice: notice,
+                };
+            }
+            session.updatedAt = ts;
+            notify();
+
+            return {
+                compacted: true,
+                reason: 'manual',
+                tokensBefore,
+                tokensAfter,
+                foldedToolResults: folded,
+                archivedTurns,
+                archivedChunkPath,
+                summaryMode: notice.summaryMode,
+                summaryText,
+                timestamp: ts,
+            };
+        },
+        subscribe(listener) {
+            listeners.add(listener);
+            return () => {
+                listeners.delete(listener);
+            };
+        },
+    };
+}
+
 export interface MockUIServicesOptions {
     getHostLuminance?: () => ResolvedTheme;
     onToast?: (message: string, tone: ToastTone) => void;
@@ -1228,5 +1724,7 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
                 eventListeners.delete(listener);
             };
         },
+
+        assistantRuntime: createMockAssistantRuntime(),
     };
 }

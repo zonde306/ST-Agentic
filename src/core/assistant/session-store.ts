@@ -3,16 +3,23 @@ import {
     estimateRequestTokens,
     groupLayer1Turns,
     TrajectoryStore,
+    type EffectiveContextBudget,
     type FrozenStaticPrefix,
     type Layer1TurnGroup,
 } from '@/core/context';
 import type {
     AssistantAttachment,
+    AssistantCompactOptions,
+    AssistantCompactReport,
+    AssistantCompactionNotice,
     AssistantMessage,
     AssistantMode,
     AssistantSession,
+    AssistantSessionTokenStatus,
+    AssistantTokenLevel,
     CanonicalContentPart,
     CanonicalMessage,
+    CanonicalToolCall,
     CanonicalToolSchema,
 } from '@/core/types';
 import { canonicalClone, canonicalStringify } from '@/core/utils';
@@ -20,8 +27,15 @@ import { canonicalClone, canonicalStringify } from '@/core/utils';
 export const ASSISTANT_THREAD_PREFIX = 'assistant:';
 export const ASSISTANT_SESSIONS_STORAGE_KEY = 'agentic_assistant_sessions';
 export const DEFAULT_ASSISTANT_WATERMARK = { high: 24000, low: 12000 } as const;
+export const ASSISTANT_FOLD_THRESHOLD_CHARS = 400;
+export const ASSISTANT_DEFAULT_KEEP_RECENT_TURNS = 2;
+export const ASSISTANT_FOLDED_OUTPUT_PREFIX = '[已折叠助手只读输出:';
+export const ASSISTANT_ARCHIVE_DIR = '/side/.assistant-archive';
 
 const ASSISTANT_SUMMARY_TAG = '<assistant-history-summary>';
+const MAX_DETERMINISTIC_SUMMARY_CHARS = 2400;
+const MAX_LLM_SUMMARY_TRANSCRIPT_CHARS = 24000;
+const MAX_SUMMARY_PREVIEW_CHARS = 600;
 
 export function toAssistantThreadId(sessionId: string): string {
     return `${ASSISTANT_THREAD_PREFIX}${sessionId}`;
@@ -51,12 +65,57 @@ export type AssistantSessionPatch = Partial<
 
 export type AssistantPersistenceMode = 'memory' | 'metadata' | 'extension_data';
 
+export type AssistantLLMSummarizer = (input: {
+    transcript: string;
+    previousSummary?: string;
+    focusInstruction?: string;
+    signal?: AbortSignal;
+}) => Promise<string>;
+
+export type AssistantArchiveWriter = (
+    path: string,
+    content: string,
+) => Promise<void> | void;
+
+export interface AssistantUsageAnchor {
+    actualInputTokens: number;
+    estimatedTokensAtCall: number;
+    trajectoryLen: number;
+    updatedAt: number;
+}
+
+export interface AssistantSessionTokenStatusExtra {
+    layer0?: readonly CanonicalMessage[];
+    tools?: readonly CanonicalToolSchema[];
+    inFlightMessages?: readonly CanonicalMessage[];
+    tailMessages?: readonly CanonicalMessage[];
+    isCompacting?: boolean;
+    keepRecentTurns?: number;
+    foldThresholdChars?: number;
+}
+
+export interface AssistantCompactSessionOptions extends AssistantCompactOptions {
+    reason?: AssistantCompactReport['reason'];
+    watermark?: { high: number; low: number };
+    /** Bypass high-watermark gating check (defaults to true unless reason is 'auto_watermark'). */
+    force?: boolean;
+    keepRecentTurns?: number;
+    foldThresholdChars?: number;
+    summarizeWithLLM?: AssistantLLMSummarizer;
+    archiveWriter?: AssistantArchiveWriter;
+    layer0?: readonly CanonicalMessage[];
+    tools?: readonly CanonicalToolSchema[];
+    /** Attach `compactionNotice` onto the latest UI message when compacted (default true). */
+    attachNotice?: boolean;
+}
+
 export interface AssistantSessionStoreOptions {
     bridge?: HostBridge;
     trajectoryStore?: TrajectoryStore;
     persistenceMode?: AssistantPersistenceMode;
     storageKey?: string;
     watermark?: { high: number; low: number };
+    archiveWriter?: AssistantArchiveWriter;
     now?: () => number;
     idGenerator?: () => string;
 }
@@ -355,34 +414,455 @@ function extractExistingSummaryBody(messages: readonly CanonicalMessage[]): stri
     return '';
 }
 
-function summarizeAssistantTurns(turns: readonly Layer1TurnGroup[], priorSummary: string): string {
-    const lines: string[] = [];
-    if (priorSummary) {
-        lines.push(priorSummary);
+function sanitizeArchiveSegment(raw: string): string {
+    const cleaned = raw.trim().replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^\.+/, '');
+    return cleaned || 'session';
+}
+
+function formatArchiveChunkPath(sessionId: string, chunkNumber: number): string {
+    const safeSession = sanitizeArchiveSegment(sessionId);
+    const chunkName = `chunk-${String(chunkNumber).padStart(3, '0')}.md`;
+    return `${ASSISTANT_ARCHIVE_DIR}/${safeSession}/${chunkName}`;
+}
+
+export function isFoldedAssistantToolContent(content: string): boolean {
+    return (
+        content.startsWith(ASSISTANT_FOLDED_OUTPUT_PREFIX)
+        || content.startsWith('[已折叠只读输出:')
+        || content.startsWith('[输出因触发模型上下文上限')
+    );
+}
+
+function parseJsonObjectSafe(raw: string | undefined): Record<string, unknown> {
+    if (!raw || !raw.trim()) {
+        return {};
     }
+    try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return parsed as Record<string, unknown>;
+        }
+    } catch {
+        // Ignore malformed JSON arguments
+    }
+    return {};
+}
+
+function extractToolCallLabel(toolCall?: CanonicalToolCall): string {
+    if (!toolCall) {
+        return 'output';
+    }
+    const args = parseJsonObjectSafe(toolCall.arguments);
+    const preferredKeys = [
+        'path',
+        'keyPath',
+        'bookName',
+        'scope',
+        'name',
+        'query',
+        'pattern',
+        'agentId',
+        'sessionId',
+        'chid',
+        'uid',
+    ];
+    for (const key of preferredKeys) {
+        const val = args[key];
+        if (typeof val === 'string' && val.trim()) {
+            const clean = val.replace(/\s+/g, ' ').trim();
+            return clean.length > 48 ? `${clean.slice(0, 45)}...` : clean;
+        }
+        if (typeof val === 'number' && Number.isFinite(val)) {
+            return `${key}=${val}`;
+        }
+    }
+    for (const [key, val] of Object.entries(args)) {
+        if (typeof val === 'string' && val.trim()) {
+            const clean = `${key}=${val.replace(/\s+/g, ' ').trim()}`;
+            return clean.length > 48 ? `${clean.slice(0, 45)}...` : clean;
+        }
+    }
+    return 'output';
+}
+
+export function formatFoldedAssistantToolPlaceholder(
+    toolName: string,
+    label: string,
+    originalLength: number,
+): string {
+    return `${ASSISTANT_FOLDED_OUTPUT_PREFIX} ${toolName} (${label}, 原长约 ${originalLength} 字)；如需细节可按精确过滤条件重读]`;
+}
+
+function buildToolCallLookup(messages: readonly CanonicalMessage[]): Map<string, CanonicalToolCall> {
+    const map = new Map<string, CanonicalToolCall>();
+    for (const msg of messages) {
+        if (msg.role === 'assistant' && msg.toolCalls?.length) {
+            for (const tc of msg.toolCalls) {
+                if (tc.id) {
+                    map.set(tc.id, tc);
+                }
+            }
+        }
+    }
+    return map;
+}
+
+function foldToolResultsInTurn(
+    turn: Layer1TurnGroup,
+    options: {
+        foldThresholdChars: number;
+        /** Number of trailing tool rounds to keep unfolded within this turn (0 folds all). */
+        keepRecentRounds: number;
+    },
+): { turn: Layer1TurnGroup; foldedCount: number } {
+    const toolCallMap = buildToolCallLookup(turn.messages);
+    let totalToolRounds = 0;
+    const msgRoundIndices: number[] = new Array<number>(turn.messages.length).fill(-1);
+
+    for (let i = 0; i < turn.messages.length; i += 1) {
+        const msg = turn.messages[i];
+        if (msg.role === 'assistant' && msg.toolCalls?.length) {
+            totalToolRounds += 1;
+        } else if (msg.role === 'tool') {
+            msgRoundIndices[i] = Math.max(0, totalToolRounds - 1);
+        }
+    }
+
+    const cutoffRound =
+        options.keepRecentRounds <= 0
+            ? Number.POSITIVE_INFINITY
+            : totalToolRounds - options.keepRecentRounds;
+
+    if (cutoffRound <= 0) {
+        return { turn, foldedCount: 0 };
+    }
+
+    let foldedCount = 0;
+    const nextMessages = turn.messages.map((msg, idx) => {
+        if (msg.role !== 'tool') {
+            return msg;
+        }
+        const msgRound = msgRoundIndices[idx];
+        if (msgRound >= cutoffRound) {
+            return msg;
+        }
+        const rawText = contentToPlainText(msg.content);
+        if (rawText.length <= options.foldThresholdChars || isFoldedAssistantToolContent(rawText)) {
+            return msg;
+        }
+        const matchedCall = msg.toolCallId ? toolCallMap.get(msg.toolCallId) : undefined;
+        const toolName = msg.toolName || matchedCall?.name || 'tool';
+        const label = extractToolCallLabel(matchedCall);
+        foldedCount += 1;
+        return {
+            ...canonicalClone(msg),
+            content: formatFoldedAssistantToolPlaceholder(toolName, label, rawText.length),
+        };
+    });
+
+    if (foldedCount === 0) {
+        return { turn, foldedCount: 0 };
+    }
+
+    return {
+        turn: {
+            index: turn.index,
+            messages: nextMessages,
+        },
+        foldedCount,
+    };
+}
+
+function foldStaleToolResultsAcrossTurns(
+    turns: readonly Layer1TurnGroup[],
+    options: {
+        keepRecentTurns: number;
+        foldThresholdChars: number;
+        /** When true, also fold earlier tool rounds inside recent turns if needed. */
+        urgent?: boolean;
+        /** When true, fold even the latest tool round (emergency overflow recovery). */
+        foldAll?: boolean;
+    },
+): { turns: Layer1TurnGroup[]; foldedCount: number } {
+    if (turns.length === 0) {
+        return { turns: [], foldedCount: 0 };
+    }
+
+    let totalFolded = 0;
+    const nextTurns = turns.map((turn, idx) => {
+        if (options.foldAll) {
+            const res = foldToolResultsInTurn(turn, {
+                foldThresholdChars: options.foldThresholdChars,
+                keepRecentRounds: 0,
+            });
+            totalFolded += res.foldedCount;
+            return res.turn;
+        }
+
+        if (turns.length === 1) {
+            // Single-turn folding: fold earlier tool rounds older than the latest 1 tool round.
+            const res = foldToolResultsInTurn(turn, {
+                foldThresholdChars: options.foldThresholdChars,
+                keepRecentRounds: 1,
+            });
+            totalFolded += res.foldedCount;
+            return res.turn;
+        }
+
+        const staleTurnCutoff = Math.max(0, turns.length - Math.max(0, options.keepRecentTurns));
+        if (idx < staleTurnCutoff) {
+            const res = foldToolResultsInTurn(turn, {
+                foldThresholdChars: options.foldThresholdChars,
+                keepRecentRounds: 0,
+            });
+            totalFolded += res.foldedCount;
+            return res.turn;
+        }
+
+        if (options.urgent) {
+            // Under urgent pressure, fold earlier turns (< last turn) completely and earlier rounds of the last turn.
+            const keepRounds = idx < turns.length - 1 ? 0 : 1;
+            const res = foldToolResultsInTurn(turn, {
+                foldThresholdChars: options.foldThresholdChars,
+                keepRecentRounds: keepRounds,
+            });
+            totalFolded += res.foldedCount;
+            return res.turn;
+        }
+
+        return turn;
+    });
+
+    return { turns: nextTurns, foldedCount: totalFolded };
+}
+
+function countFoldableToolResults(
+    turns: readonly Layer1TurnGroup[],
+    keepRecentTurns: number,
+    foldThresholdChars: number,
+): number {
+    return foldStaleToolResultsAcrossTurns(turns, {
+        keepRecentTurns,
+        foldThresholdChars,
+        urgent: false,
+    }).foldedCount;
+}
+
+function formatArchivedTurnsTranscript(
+    turns: readonly Layer1TurnGroup[],
+    meta: { sessionId: string; chunkNumber: number; timestamp: number },
+): string {
+    const lines: string[] = [
+        '---',
+        'delivery: none',
+        'status: resolved',
+        `title: Assistant Archive Chunk ${String(meta.chunkNumber).padStart(3, '0')}`,
+        '---',
+        '',
+        `# Assistant Archive Chunk ${String(meta.chunkNumber).padStart(3, '0')}`,
+        `- sessionId: ${meta.sessionId}`,
+        `- archivedAt: ${new Date(meta.timestamp).toISOString()}`,
+        `- turns: ${turns.length}`,
+        '',
+    ];
+
+    turns.forEach((turn, idx) => {
+        lines.push(`## Turn ${idx + 1}`);
+        for (const msg of turn.messages) {
+            if (msg.role === 'user') {
+                lines.push(`### User\n${contentToPlainText(msg.content)}`);
+            } else if (msg.role === 'assistant') {
+                const body = contentToPlainText(msg.content);
+                if (body.trim()) {
+                    lines.push(`### Assistant\n${body}`);
+                }
+                if (msg.toolCalls?.length) {
+                    const calls = msg.toolCalls
+                        .map((tc) => `- ${tc.name}(${tc.arguments})`)
+                        .join('\n');
+                    lines.push(`### Assistant Tool Calls\n${calls}`);
+                }
+            } else if (msg.role === 'tool') {
+                lines.push(
+                    `### Tool (${msg.toolName ?? 'tool'} / ${msg.toolCallId ?? ''})\n${contentToPlainText(msg.content)}`,
+                );
+            } else {
+                lines.push(`### System\n${contentToPlainText(msg.content)}`);
+            }
+            lines.push('');
+        }
+    });
+
+    return lines.join('\n');
+}
+
+function formatTranscriptForLLMSummary(turns: readonly Layer1TurnGroup[]): string {
+    const parts: string[] = [];
+    let totalChars = 0;
+
+    for (let i = 0; i < turns.length; i += 1) {
+        const turn = turns[i];
+        const blockLines: string[] = [`[Turn ${i + 1}]`];
+        for (const msg of turn.messages) {
+            const raw = contentToPlainText(msg.content).trim();
+            if (msg.role === 'user') {
+                blockLines.push(`User: ${raw.slice(0, 1200)}`);
+            } else if (msg.role === 'assistant') {
+                if (raw) {
+                    blockLines.push(`Assistant: ${raw.slice(0, 1200)}`);
+                }
+                if (msg.toolCalls?.length) {
+                    const toolList = msg.toolCalls
+                        .map((tc) => `${tc.name}(${extractToolCallLabel(tc)})`)
+                        .join(', ');
+                    blockLines.push(`Assistant Tools: ${toolList}`);
+                }
+            } else if (msg.role === 'tool') {
+                blockLines.push(
+                    `Tool[${msg.toolName ?? 'tool'}]: ${raw.slice(0, 500)}${raw.length > 500 ? '...(truncated)' : ''}`,
+                );
+            }
+        }
+        const block = blockLines.join('\n');
+        if (totalChars + block.length > MAX_LLM_SUMMARY_TRANSCRIPT_CHARS) {
+            const remaining = MAX_LLM_SUMMARY_TRANSCRIPT_CHARS - totalChars;
+            if (remaining > 120) {
+                parts.push(`${block.slice(0, remaining)}\n...[transcript truncated]`);
+            }
+            break;
+        }
+        parts.push(block);
+        totalChars += block.length + 2;
+    }
+
+    return parts.join('\n\n');
+}
+
+/**
+ * Deterministic 0-token structured handoff summary builder used as the guaranteed
+ * fallback whenever LLM summarization is disabled, fails, or times out.
+ */
+export function buildDeterministicSummary(
+    turns: readonly Layer1TurnGroup[],
+    options?: {
+        priorSummary?: string;
+        focusInstruction?: string;
+        archivedChunkPath?: string;
+        maxLength?: number;
+    },
+): string {
+    const maxLength = Math.max(400, options?.maxLength ?? MAX_DETERMINISTIC_SUMMARY_CHARS);
+    const sections: string[] = [];
+    const focus = options?.focusInstruction?.trim();
+    if (focus) {
+        sections.push(`【保留重点】${focus}`);
+    }
+
+    const prior = options?.priorSummary?.trim();
+    if (prior) {
+        const priorBudget = Math.floor(maxLength * 0.45);
+        const trimmedPrior =
+            prior.length > priorBudget
+                ? `…${prior.slice(prior.length - priorBudget + 1)}`
+                : prior;
+        sections.push(trimmedPrior);
+    }
+
+    const touchedObjects = new Set<string>();
+    const errorHints: string[] = [];
+    const turnLines: string[] = [];
+
     for (const turn of turns) {
         const userMsg = turn.messages.find((m) => m.role === 'user');
         const assistantMsgs = turn.messages.filter((m) => m.role === 'assistant');
         const finalAssistant = assistantMsgs[assistantMsgs.length - 1];
         const toolNames = new Set<string>();
+
         for (const msg of turn.messages) {
-            if (msg.toolCalls?.length) {
+            if (msg.role === 'assistant' && msg.toolCalls?.length) {
                 for (const tc of msg.toolCalls) {
                     toolNames.add(tc.name);
+                    const label = extractToolCallLabel(tc);
+                    if (label !== 'output') {
+                        touchedObjects.add(`${tc.name}:${label}`);
+                    }
+                }
+            }
+            if (msg.role === 'tool') {
+                const txt = contentToPlainText(msg.content);
+                if (txt.includes('"ok":false') || txt.includes('[Error]')) {
+                    errorHints.push(
+                        `${msg.toolName ?? 'tool'}: ${txt.replace(/\s+/g, ' ').trim().slice(0, 90)}`,
+                    );
                 }
             }
         }
+
         const userText = userMsg
-            ? contentToPlainText(userMsg.content).replace(/\s+/g, ' ').trim().slice(0, 48)
+            ? contentToPlainText(userMsg.content).replace(/\s+/g, ' ').trim().slice(0, 80)
             : '';
         const assistantText = finalAssistant
-            ? contentToPlainText(finalAssistant.content).replace(/\s+/g, ' ').trim().slice(0, 56)
+            ? contentToPlainText(finalAssistant.content).replace(/\s+/g, ' ').trim().slice(0, 100)
             : '';
+        if (assistantText.includes('[Error]')) {
+            errorHints.push(assistantText.slice(0, 100));
+        }
         const toolsPart = toolNames.size > 0 ? ` [${Array.from(toolNames).join(',')}]` : '';
-        lines.push(`- U: ${userText} -> A${toolsPart}: ${assistantText}`);
+        turnLines.push(`- U: ${userText} -> A${toolsPart}: ${assistantText}`);
     }
-    const combined = lines.join('\n').trim();
-    return combined.length > 1200 ? combined.slice(combined.length - 1200) : combined;
+
+    if (turnLines.length > 0) {
+        sections.push(`【归档回合提要】\n${turnLines.join('\n')}`);
+    }
+    if (touchedObjects.size > 0) {
+        sections.push(
+            `【涉及文件/对象】${Array.from(touchedObjects).slice(0, 12).join('、')}`,
+        );
+    }
+    if (errorHints.length > 0) {
+        sections.push(`【报错线索】${errorHints.slice(-3).join(' | ')}`);
+    }
+    if (options?.archivedChunkPath) {
+        sections.push(`【归档原文】${options.archivedChunkPath}`);
+    }
+
+    const combined = sections.join('\n').trim();
+    if (combined.length <= maxLength) {
+        return combined;
+    }
+
+    // Preserve focus instruction header when trimming oversized summaries.
+    if (focus) {
+        const focusHeader = `【保留重点】${focus}\n`;
+        const bodyBudget = Math.max(120, maxLength - focusHeader.length);
+        const bodyWithoutFocus = combined.startsWith(focusHeader)
+            ? combined.slice(focusHeader.length)
+            : combined;
+        return `${focusHeader}${bodyWithoutFocus.slice(Math.max(0, bodyWithoutFocus.length - bodyBudget))}`;
+    }
+
+    return combined.slice(combined.length - maxLength);
+}
+
+interface CompactionUiAnchor {
+    archivedUiTurnCount: number;
+    archivedTurnFingerprints: string[];
+}
+
+function fingerprintUiTurn(turn: UiTurnGroup): string {
+    const userPart = turn.user
+        ? canonicalStringify(buildAssistantUserContent(turn.user.content, turn.user.attachments))
+        : '';
+    const assistantParts = turn.assistants.map((a) => a.content).join('\u0000');
+    return `${userPart}\u0001${assistantParts}`;
+}
+
+function isAbortErrorLike(error: unknown): boolean {
+    if (!error || typeof error !== 'object') {
+        return false;
+    }
+    const err = error as { name?: unknown; code?: unknown };
+    return err.name === 'AbortError' || err.code === 'ABORT_ERR';
 }
 
 function cloneSession(session: AssistantSession): AssistantSession {
@@ -412,10 +892,15 @@ export class AssistantSessionStore {
     public readonly trajectoryStore: TrajectoryStore;
 
     private readonly sessions = new Map<string, AssistantSession>();
+    private readonly usageAnchors = new Map<string, AssistantUsageAnchor>();
+    private readonly compactionAnchors = new Map<string, CompactionUiAnchor>();
+    private readonly compactionCycleCounts = new Map<string, number>();
     private readonly bridge?: HostBridge;
     private readonly persistenceMode: AssistantPersistenceMode;
     private readonly storageKey: string;
     private readonly defaultWatermark: { high: number; low: number };
+    private readonly customWatermarkConfigured: boolean;
+    private readonly defaultArchiveWriter?: AssistantArchiveWriter;
     private readonly now: () => number;
     private readonly idGenerator: () => string;
     private persistChain: Promise<void> = Promise.resolve();
@@ -427,12 +912,14 @@ export class AssistantSessionStore {
         this.persistenceMode =
             options.persistenceMode ?? (options.bridge ? 'metadata' : 'memory');
         this.storageKey = options.storageKey?.trim() || ASSISTANT_SESSIONS_STORAGE_KEY;
+        this.customWatermarkConfigured = Boolean(options.watermark);
         this.defaultWatermark = options.watermark
             ? {
                 high: Math.max(100, Math.floor(options.watermark.high)),
                 low: Math.max(50, Math.floor(options.watermark.low)),
             }
             : { ...DEFAULT_ASSISTANT_WATERMARK };
+        this.defaultArchiveWriter = options.archiveWriter;
         this.now = options.now ?? (() => Date.now());
         this.idGenerator =
             options.idGenerator ??
@@ -444,6 +931,14 @@ export class AssistantSessionStore {
         if (this.persistenceMode === 'metadata' && this.bridge) {
             this.hydrateFromMetadata();
         }
+    }
+
+    public getDefaultWatermark(): { high: number; low: number } {
+        return { ...this.defaultWatermark };
+    }
+
+    public hasCustomWatermark(): boolean {
+        return this.customWatermarkConfigured;
     }
 
     /** Load persisted sessions from configured storage (metadata or extension_data). */
@@ -546,11 +1041,35 @@ export class AssistantSessionStore {
 
     public deleteSession(sessionId: string): boolean {
         const existed = this.sessions.delete(sessionId);
+        this.usageAnchors.delete(sessionId);
+        this.compactionAnchors.delete(sessionId);
+        this.compactionCycleCounts.delete(sessionId);
         this.trajectoryStore.clearThread(toAssistantThreadId(sessionId));
         if (existed) {
             this.persist();
         }
         return existed;
+    }
+
+    /**
+     * Clear all messages and model trajectory for an existing session while preserving its
+     * configuration (title, mode, connectionId), and reset calibration/compaction anchors.
+     */
+    public clearSession(sessionId: string): AssistantSession | null {
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+            return null;
+        }
+        session.messages = [];
+        session.updatedAt = this.now();
+        this.usageAnchors.delete(sessionId);
+        this.compactionAnchors.delete(sessionId);
+        this.compactionCycleCounts.delete(sessionId);
+        const threadId = toAssistantThreadId(sessionId);
+        this.trajectoryStore.clearThread(threadId);
+        this.trajectoryStore.ensureThread(threadId);
+        this.persist();
+        return cloneSession(session);
     }
 
     public appendMessage(sessionId: string, message: AssistantMessage): AssistantMessage {
@@ -641,7 +1160,9 @@ export class AssistantSessionStore {
 
     /**
      * Reconcile `TrajectoryStore` Layer 1 with `session.messages` (or a prefix up to `upToMessageIndex`),
-     * preserving unmodified prior turns (including tool-call chains) verbatim for KV cache stability.
+     * preserving unmodified prior turns (including tool-call chains and folded outputs) verbatim for KV
+     * cache stability. Safely drops stale compaction headers if archived turns were edited or retracted,
+     * and always resets the calibrated usage anchor.
      */
     public syncTrajectoryToMessages(
         sessionId: string,
@@ -651,6 +1172,9 @@ export class AssistantSessionStore {
         if (!session) {
             return;
         }
+
+        // Always reset calibrated usage anchor whenever the trajectory is rewritten/reconciled.
+        this.resetUsageAnchor(sessionId);
 
         const endIdx =
             options?.upToMessageIndex !== undefined
@@ -670,40 +1194,72 @@ export class AssistantSessionStore {
 
         let retainedHeaders: CanonicalMessage[] = [];
         let reconcileUiTurns: UiTurnGroup[] = uiTurns;
+        let reconcileExistingTurns: readonly Layer1TurnGroup[] = existingTurns;
+        let anchorStillValid = false;
 
-        if (headerMessages.length > 0 && existingTurns.length > 0) {
-            const firstExistingUser = existingTurns[0].messages.find((m) => m.role === 'user');
-            if (firstExistingUser) {
-                const needle = contentToPlainText(firstExistingUser.content);
-                const approxStart = Math.max(0, uiTurns.length - existingTurns.length - 2);
-                let offset = -1;
-                const matchesTurnUser = (turn: UiTurnGroup): boolean => {
-                    if (!turn.user) {
-                        return false;
+        if (headerMessages.length > 0) {
+            const anchor = this.compactionAnchors.get(sessionId);
+            if (anchor && anchor.archivedUiTurnCount > 0) {
+                if (uiTurns.length >= anchor.archivedUiTurnCount) {
+                    let archivedUnchanged = true;
+                    for (let i = 0; i < anchor.archivedUiTurnCount; i += 1) {
+                        if (fingerprintUiTurn(uiTurns[i]) !== anchor.archivedTurnFingerprints[i]) {
+                            archivedUnchanged = false;
+                            break;
+                        }
                     }
-                    const turnPlain = contentToPlainText(
-                        buildAssistantUserContent(turn.user.content, turn.user.attachments),
-                    );
-                    return turnPlain === needle || turn.user.content === needle;
-                };
-                for (let i = approxStart; i < uiTurns.length; i += 1) {
-                    if (matchesTurnUser(uiTurns[i])) {
-                        offset = i;
-                        break;
+                    if (archivedUnchanged) {
+                        retainedHeaders = [...headerMessages];
+                        reconcileUiTurns = uiTurns.slice(anchor.archivedUiTurnCount);
+                        reconcileExistingTurns = existingTurns;
+                        anchorStillValid = true;
                     }
                 }
-                if (offset < 0) {
-                    for (let i = 0; i < approxStart; i += 1) {
+            } else if (existingTurns.length > 0) {
+                const firstExistingUser = existingTurns[0].messages.find((m) => m.role === 'user');
+                if (firstExistingUser) {
+                    const needle = contentToPlainText(firstExistingUser.content);
+                    const approxStart = Math.max(0, uiTurns.length - existingTurns.length - 2);
+                    let offset = -1;
+                    const matchesTurnUser = (turn: UiTurnGroup): boolean => {
+                        if (!turn.user) {
+                            return false;
+                        }
+                        const turnPlain = contentToPlainText(
+                            buildAssistantUserContent(turn.user.content, turn.user.attachments),
+                        );
+                        return turnPlain === needle || turn.user.content === needle;
+                    };
+                    for (let i = approxStart; i < uiTurns.length; i += 1) {
                         if (matchesTurnUser(uiTurns[i])) {
                             offset = i;
                             break;
                         }
                     }
+                    if (offset < 0) {
+                        for (let i = 0; i < approxStart; i += 1) {
+                            if (matchesTurnUser(uiTurns[i])) {
+                                offset = i;
+                                break;
+                            }
+                        }
+                    }
+                    if (offset >= 0 && offset < uiTurns.length) {
+                        retainedHeaders = [...headerMessages];
+                        reconcileUiTurns = uiTurns.slice(offset);
+                        reconcileExistingTurns = existingTurns;
+                        anchorStillValid = true;
+                    }
                 }
-                if (offset >= 0 && offset < uiTurns.length) {
-                    retainedHeaders = [...headerMessages];
-                    reconcileUiTurns = uiTurns.slice(offset);
-                }
+            }
+
+            if (!anchorStillValid) {
+                // Archived turns were edited/retracted: rebuild cleanly from remaining UI turns
+                // without stale summary headers or mismatched existingTurns.
+                this.compactionAnchors.delete(sessionId);
+                retainedHeaders = [];
+                reconcileUiTurns = uiTurns;
+                reconcileExistingTurns = [];
             }
         }
 
@@ -713,7 +1269,8 @@ export class AssistantSessionStore {
 
         for (let i = 0; i < reconcileUiTurns.length; i += 1) {
             const uiTurn = reconcileUiTurns[i];
-            const existingTurn = i < existingTurns.length ? existingTurns[i] : undefined;
+            const existingTurn =
+                i < reconcileExistingTurns.length ? reconcileExistingTurns[i] : undefined;
             const turnMsgs = reconcileTurnMessages(uiTurn, existingTurn);
             if (turnMsgs.length > 0) {
                 compactedMessages.push(...turnMsgs);
@@ -837,8 +1394,501 @@ export class AssistantSessionStore {
     }
 
     /**
-     * Hysteresis watermark compaction for `assistant:<sessionId>`.
-     * Never splits `tool_calls -> tool` turn groups and never writes to mainline `/history/*`.
+     * Record a real upstream `usage.inputTokens` calibration anchor for `sessionId`
+     * so token status & pre-flight checks track actual tokenizer / multimodal costs accurately.
+     */
+    public recordUsageAnchor(
+        sessionId: string,
+        actualInputTokens: number,
+        estimatedTokensAtCall: number,
+        trajectoryLen?: number,
+    ): void {
+        if (!Number.isFinite(actualInputTokens) || actualInputTokens <= 0) {
+            return;
+        }
+        const threadId = toAssistantThreadId(sessionId);
+        this.usageAnchors.set(sessionId, {
+            actualInputTokens: Math.floor(actualInputTokens),
+            estimatedTokensAtCall: Math.max(
+                0,
+                Number.isFinite(estimatedTokensAtCall) ? Math.floor(estimatedTokensAtCall) : 0,
+            ),
+            trajectoryLen:
+                trajectoryLen !== undefined && Number.isFinite(trajectoryLen)
+                    ? Math.max(0, Math.floor(trajectoryLen))
+                    : this.trajectoryStore.getMessageCount(threadId),
+            updatedAt: this.now(),
+        });
+    }
+
+    /** Retrieve the current in-memory usage calibration anchor for `sessionId`, if any. */
+    public getUsageAnchor(sessionId: string): AssistantUsageAnchor | null {
+        const anchor = this.usageAnchors.get(sessionId);
+        return anchor ? { ...anchor } : null;
+    }
+
+    /** Reset the usage calibration anchor (called on compact, edit, retract, regenerate, clear). */
+    public resetUsageAnchor(sessionId: string): void {
+        this.usageAnchors.delete(sessionId);
+    }
+
+    /**
+     * Calibrated token estimate:
+     * `max(estimatedTotal, anchorActual + (estimatedTotal - anchorEstimated))`
+     */
+    public estimateCalibratedTokens(sessionId: string, estimatedTotal: number): number {
+        const base = Math.max(0, Number.isFinite(estimatedTotal) ? Math.floor(estimatedTotal) : 0);
+        const anchor = this.usageAnchors.get(sessionId);
+        if (!anchor) {
+            return base;
+        }
+        const calibrated = anchor.actualInputTokens + (base - anchor.estimatedTokensAtCall);
+        return Math.max(base, calibrated);
+    }
+
+    /**
+     * Compute real-time calibrated token status, severity level, foldable tool count,
+     * and summary preview for `sessionId` against the resolved `EffectiveContextBudget`.
+     */
+    public getSessionTokenStatus(
+        sessionId: string,
+        budget: EffectiveContextBudget,
+        extra?: AssistantSessionTokenStatusExtra,
+    ): AssistantSessionTokenStatus | null {
+        if (!this.sessions.has(sessionId)) {
+            return null;
+        }
+
+        const threadId = toAssistantThreadId(sessionId);
+        const frozen = this.trajectoryStore.getFrozenPrefix(threadId);
+        const layer0 = extra?.layer0 ?? frozen?.messages ?? [];
+        const tools = extra?.tools ?? frozen?.tools ?? [];
+        const layer1 = this.trajectoryStore.getMessages(threadId);
+        const inFlight = extra?.inFlightMessages ?? [];
+        const tail = extra?.tailMessages ?? [];
+
+        const estimatedTotal = estimateRequestTokens(
+            [...layer0, ...layer1, ...inFlight, ...tail],
+            tools,
+        );
+        const currentTokens = this.estimateCalibratedTokens(sessionId, estimatedTotal);
+        const contextLimit = Math.max(1, Math.floor(budget.safeInputBudget));
+        const highWatermark = Math.max(1, Math.floor(budget.autoHighWatermark));
+        const lowWatermark = Math.max(1, Math.floor(budget.autoLowWatermark));
+        const usagePercent = Math.min(
+            100,
+            Math.max(0, Math.round((currentTokens / contextLimit) * 100)),
+        );
+
+        let level: AssistantTokenLevel = 'normal';
+        if (usagePercent >= 90 || currentTokens >= highWatermark) {
+            level = 'danger';
+        } else if (usagePercent >= 70) {
+            level = 'warning';
+        }
+
+        const headerCount = this.trajectoryStore.getCompactionHeaderCount(threadId);
+        const { headerMessages, turns } = groupLayer1Turns(
+            layer1,
+            headerCount > 0 ? headerCount : undefined,
+        );
+
+        const keepRecentTurns = extra?.keepRecentTurns ?? ASSISTANT_DEFAULT_KEEP_RECENT_TURNS;
+        const foldThresholdChars = extra?.foldThresholdChars ?? ASSISTANT_FOLD_THRESHOLD_CHARS;
+        const foldableToolResultCount = countFoldableToolResults(
+            turns,
+            keepRecentTurns,
+            foldThresholdChars,
+        );
+
+        const archivedChunks = this.trajectoryStore.getArchivedUpToChunk(threadId);
+        const compactedCount = Math.max(
+            archivedChunks,
+            this.compactionCycleCounts.get(sessionId) ?? 0,
+        );
+
+        const rawSummary = extractExistingSummaryBody(headerMessages);
+        const summaryPreview = rawSummary
+            ? rawSummary.length > MAX_SUMMARY_PREVIEW_CHARS
+                ? `${rawSummary.slice(0, MAX_SUMMARY_PREVIEW_CHARS - 1).trimEnd()}…`
+                : rawSummary
+            : undefined;
+
+        return {
+            sessionId,
+            currentTokens,
+            contextLimit,
+            highWatermark,
+            lowWatermark,
+            usagePercent,
+            level,
+            activeTurnCount: turns.length,
+            activeMessageCount: layer1.length,
+            foldableToolResultCount,
+            compactedCount,
+            ...(summaryPreview ? { summaryPreview } : {}),
+            ...(extra?.isCompacting !== undefined ? { isCompacting: extra.isCompacting } : {}),
+        };
+    }
+
+    /**
+     * Three-stage lossless compaction for `assistant:<sessionId>`:
+     * - Stage 1: In-place fold stale large (`> 400` chars) `role === 'tool'` results while preserving `toolCallId` pairing.
+     * - Stage 2: Cut earliest complete turns (via `groupLayer1Turns`, keeping >= 1 latest turn), persist raw archive
+     *   to `/side/.assistant-archive/<sessionId>/chunk-NNN.md` when archiver is available, and generate structured
+     *   handoff summary via LLM (with deterministic fallback on any failure/timeout).
+     * - Stage 3: Preserve 100% of UI `session.messages`, attach `compactionNotice`, and reset usage calibration anchor.
+     */
+    public async compactSession(
+        sessionId: string,
+        options: AssistantCompactSessionOptions = {},
+    ): Promise<AssistantCompactReport> {
+        const now = this.now();
+        const threadId = toAssistantThreadId(sessionId);
+        const frozen = this.trajectoryStore.getFrozenPrefix(threadId);
+        const layer0 = options.layer0 ?? frozen?.messages ?? [];
+        const tools = options.tools ?? frozen?.tools ?? [];
+        const layer1 = this.trajectoryStore.getMessages(threadId);
+
+        const mode = options.mode ?? 'auto';
+        const reason: NonNullable<AssistantCompactReport['reason']> =
+            options.reason ?? (options.force === false ? 'auto_watermark' : 'manual');
+        const force = options.force ?? (reason !== 'auto_watermark');
+        const watermark = options.watermark ?? this.defaultWatermark;
+        const targetLowTokens = Math.max(1, Math.floor(options.targetLowTokens ?? watermark.low));
+        const keepRecentTurns = Math.max(
+            0,
+            Math.floor(options.keepRecentTurns ?? ASSISTANT_DEFAULT_KEEP_RECENT_TURNS),
+        );
+        const foldThresholdChars = Math.max(
+            1,
+            Math.floor(options.foldThresholdChars ?? ASSISTANT_FOLD_THRESHOLD_CHARS),
+        );
+        const focusInstruction = options.focusInstruction?.trim() || undefined;
+
+        const estimatedTokensBefore = estimateRequestTokens([...layer0, ...layer1], tools);
+        const tokensBefore = this.estimateCalibratedTokens(sessionId, estimatedTokensBefore);
+
+        if (!force && tokensBefore <= watermark.high) {
+            return {
+                compacted: false,
+                reason: 'below_threshold',
+                tokensBefore,
+                tokensAfter: tokensBefore,
+                foldedToolResults: 0,
+                archivedTurns: 0,
+                summaryMode: 'none',
+                timestamp: now,
+            };
+        }
+
+        const headerCount = this.trajectoryStore.getCompactionHeaderCount(threadId);
+        const prevChunk = this.trajectoryStore.getArchivedUpToChunk(threadId);
+        const { headerMessages, turns } = groupLayer1Turns(
+            layer1,
+            headerCount > 0 ? headerCount : undefined,
+        );
+
+        if (turns.length === 0) {
+            return {
+                compacted: false,
+                reason: 'nothing_to_compact',
+                tokensBefore,
+                tokensAfter: tokensBefore,
+                foldedToolResults: 0,
+                archivedTurns: 0,
+                summaryMode: 'none',
+                timestamp: now,
+            };
+        }
+
+        const isUrgent =
+            reason === 'preflight' || reason === 'overflow_recovery' || mode === 'full';
+
+        // Stage 1: In-place fold stale large tool results without deleting tool nodes or breaking pairing.
+        const stage1 = foldStaleToolResultsAcrossTurns(turns, {
+            keepRecentTurns,
+            foldThresholdChars,
+            urgent: isUrgent,
+            foldAll: false,
+        });
+
+        let workingTurns = stage1.turns;
+        let foldedToolResults = stage1.foldedCount;
+        let tokensAfterStage1 = estimateRequestTokens(
+            [...layer0, ...headerMessages, ...workingTurns.flatMap((t) => t.messages)],
+            tools,
+        );
+
+        if (reason === 'overflow_recovery' && tokensAfterStage1 > targetLowTokens) {
+            const emergencyFold = foldStaleToolResultsAcrossTurns(workingTurns, {
+                keepRecentTurns: 0,
+                foldThresholdChars,
+                urgent: true,
+                foldAll: true,
+            });
+            workingTurns = emergencyFold.turns;
+            foldedToolResults += emergencyFold.foldedCount;
+            tokensAfterStage1 = estimateRequestTokens(
+                [...layer0, ...headerMessages, ...workingTurns.flatMap((t) => t.messages)],
+                tools,
+            );
+        } else if (mode === 'auto' && !isUrgent && tokensAfterStage1 > targetLowTokens) {
+            const urgentFold = foldStaleToolResultsAcrossTurns(workingTurns, {
+                keepRecentTurns,
+                foldThresholdChars,
+                urgent: true,
+                foldAll: false,
+            });
+            workingTurns = urgentFold.turns;
+            foldedToolResults += urgentFold.foldedCount;
+            tokensAfterStage1 = estimateRequestTokens(
+                [...layer0, ...headerMessages, ...workingTurns.flatMap((t) => t.messages)],
+                tools,
+            );
+        }
+
+        const commitFoldOnly = (): AssistantCompactReport => {
+            if (foldedToolResults === 0) {
+                return {
+                    compacted: false,
+                    reason: 'nothing_to_compact',
+                    tokensBefore,
+                    tokensAfter: tokensBefore,
+                    foldedToolResults: 0,
+                    archivedTurns: 0,
+                    summaryMode: 'none',
+                    timestamp: now,
+                };
+            }
+
+            const compactedMessages: CanonicalMessage[] = [
+                ...headerMessages,
+                ...workingTurns.flatMap((t) => t.messages),
+            ];
+            const turnEndCounts: number[] = [];
+            let runningLen = headerMessages.length;
+            for (const turn of workingTurns) {
+                runningLen += turn.messages.length;
+                turnEndCounts.push(runningLen);
+            }
+
+            this.trajectoryStore.applyCompaction(
+                {
+                    compactedMessages,
+                    archivedUpToChunk: prevChunk,
+                    compactionHeaderCount: headerMessages.length,
+                    turnEndCounts,
+                },
+                threadId,
+            );
+
+            this.resetUsageAnchor(sessionId);
+            this.incrementCompactionCycle(sessionId);
+
+            const tokensAfter = estimateRequestTokens([...layer0, ...compactedMessages], tools);
+            const report: AssistantCompactReport = {
+                compacted: true,
+                reason,
+                tokensBefore,
+                tokensAfter,
+                foldedToolResults,
+                archivedTurns: 0,
+                summaryMode: 'fold_only',
+                timestamp: now,
+            };
+
+            if (options.attachNotice !== false) {
+                this.attachCompactionNoticeToLatestMessage(sessionId, {
+                    tokensBefore,
+                    tokensAfter,
+                    foldedToolResults,
+                    archivedTurns: 0,
+                    summaryMode: 'fold_only',
+                    ...(focusInstruction ? { focusInstruction } : {}),
+                    timestamp: now,
+                });
+            }
+
+            return report;
+        };
+
+        // If fold_only, or auto already met targetLowTokens, or only 1 turn exists -> finish after Stage 1.
+        if (
+            mode === 'fold_only'
+            || (mode === 'auto' && tokensAfterStage1 <= targetLowTokens)
+            || workingTurns.length <= 1
+        ) {
+            return commitFoldOnly();
+        }
+
+        // Stage 2: Cut earliest complete turns (keeping at least 1 latest complete turn).
+        const priorSummary = extractExistingSummaryBody(headerMessages);
+        const maxArchive = workingTurns.length - 1;
+        let archiveCount = mode === 'full' ? maxArchive : 1;
+
+        if (mode !== 'full') {
+            const calcProjected = (count: number): number => {
+                const draftSummary = buildDeterministicSummary(workingTurns.slice(0, count), {
+                    priorSummary,
+                    focusInstruction,
+                });
+                const hdr: CanonicalMessage = {
+                    role: 'system',
+                    content: `${ASSISTANT_SUMMARY_TAG}\n${draftSummary}\n</assistant-history-summary>`,
+                };
+                const retained = workingTurns.slice(count).flatMap((t) => t.messages);
+                return estimateRequestTokens([...layer0, hdr, ...retained], tools);
+            };
+
+            let projected = calcProjected(archiveCount);
+            while (projected > targetLowTokens && archiveCount < maxArchive) {
+                archiveCount += 1;
+                projected = calcProjected(archiveCount);
+            }
+        }
+
+        const archivedTurns = workingTurns.slice(0, archiveCount);
+        const retainedTurns = workingTurns.slice(archiveCount);
+        const nextChunkNumber = prevChunk + 1;
+
+        // Persist raw archive transcript when archiveWriter is available.
+        let archivedChunkPath: string | undefined;
+        const archiveWriter = options.archiveWriter ?? this.defaultArchiveWriter;
+        if (archiveWriter) {
+            const candidatePath = formatArchiveChunkPath(sessionId, nextChunkNumber);
+            const rawTranscript = formatArchivedTurnsTranscript(archivedTurns, {
+                sessionId,
+                chunkNumber: nextChunkNumber,
+                timestamp: now,
+            });
+            try {
+                await archiveWriter(candidatePath, rawTranscript);
+                archivedChunkPath = candidatePath;
+            } catch (err) {
+                if (options.signal?.aborted && isAbortErrorLike(err)) {
+                    throw err;
+                }
+                // Non-fatal archive write failure must never block compaction.
+            }
+        }
+
+        // Generate structured handoff summary (LLM with guaranteed deterministic fallback).
+        let summaryText = '';
+        let summaryMode: 'llm' | 'deterministic' = 'deterministic';
+
+        if (
+            options.useLLMSummary !== false
+            && typeof options.summarizeWithLLM === 'function'
+            && reason !== 'overflow_recovery'
+        ) {
+            if (options.signal?.aborted) {
+                const abortErr = new Error('Assistant compaction aborted');
+                abortErr.name = 'AbortError';
+                throw abortErr;
+            }
+            try {
+                const llmSummary = await options.summarizeWithLLM({
+                    transcript: formatTranscriptForLLMSummary(archivedTurns),
+                    ...(priorSummary ? { previousSummary: priorSummary } : {}),
+                    ...(focusInstruction ? { focusInstruction } : {}),
+                    ...(options.signal ? { signal: options.signal } : {}),
+                });
+                const trimmed = typeof llmSummary === 'string' ? llmSummary.trim() : '';
+                if (trimmed) {
+                    summaryText = trimmed;
+                    summaryMode = 'llm';
+                }
+            } catch (err) {
+                if (options.signal?.aborted && isAbortErrorLike(err)) {
+                    throw err;
+                }
+                // Fall back deterministically so compaction never fails due to LLM summary errors.
+            }
+        }
+
+        if (!summaryText) {
+            summaryText = buildDeterministicSummary(archivedTurns, {
+                priorSummary,
+                focusInstruction,
+                archivedChunkPath,
+            });
+            summaryMode = 'deterministic';
+        }
+
+        const archiveFooter =
+            archivedChunkPath && !summaryText.includes(archivedChunkPath)
+                ? `\n\n[Archived transcript: ${archivedChunkPath}]`
+                : '';
+        const summaryMsg: CanonicalMessage = {
+            role: 'system',
+            content: `${ASSISTANT_SUMMARY_TAG}\n${summaryText}${archiveFooter}\n</assistant-history-summary>`,
+        };
+
+        const compactedMessages: CanonicalMessage[] = [
+            summaryMsg,
+            ...retainedTurns.flatMap((t) => t.messages),
+        ];
+        const turnEndCounts: number[] = [];
+        let runningLen = 1;
+        for (const turn of retainedTurns) {
+            runningLen += turn.messages.length;
+            turnEndCounts.push(runningLen);
+        }
+
+        this.trajectoryStore.applyCompaction(
+            {
+                compactedMessages,
+                archivedUpToChunk: nextChunkNumber,
+                compactionHeaderCount: 1,
+                turnEndCounts,
+            },
+            threadId,
+        );
+
+        this.recordCompactionUiAnchor(sessionId, {
+            archiveCount,
+            hadPriorHeader: headerMessages.length > 0,
+            retainedTurns,
+        });
+        this.resetUsageAnchor(sessionId);
+        this.incrementCompactionCycle(sessionId);
+
+        const tokensAfter = estimateRequestTokens([...layer0, ...compactedMessages], tools);
+
+        // Stage 3: NEVER delete UI session.messages; attach compactionNotice metadata.
+        if (options.attachNotice !== false) {
+            this.attachCompactionNoticeToLatestMessage(sessionId, {
+                tokensBefore,
+                tokensAfter,
+                foldedToolResults,
+                archivedTurns: archiveCount,
+                summaryMode,
+                summaryText,
+                ...(focusInstruction ? { focusInstruction } : {}),
+                ...(archivedChunkPath ? { archivedChunkPath } : {}),
+                timestamp: now,
+            });
+        }
+
+        return {
+            compacted: true,
+            reason,
+            tokensBefore,
+            tokensAfter,
+            foldedToolResults,
+            archivedTurns: archiveCount,
+            ...(archivedChunkPath ? { archivedChunkPath } : {}),
+            summaryMode,
+            summaryText,
+            timestamp: now,
+        };
+    }
+
+    /**
+     * Synchronous hysteresis watermark compaction for `assistant:<sessionId>` (backwards-compatible).
+     * Runs Stage 1 tool folding + Stage 2 deterministic turn archiving, never splits `tool_calls -> tool`
+     * turn groups, never deletes UI messages, and resets the calibrated usage anchor.
      */
     public compactIfNeeded(
         sessionId: string,
@@ -863,12 +1913,13 @@ export class AssistantSessionStore {
         }
 
         const headerCount = this.trajectoryStore.getCompactionHeaderCount(threadId);
+        const prevChunk = this.trajectoryStore.getArchivedUpToChunk(threadId);
         const { headerMessages, turns } = groupLayer1Turns(
             layer1,
             headerCount > 0 ? headerCount : undefined,
         );
 
-        if (turns.length <= 1) {
+        if (turns.length === 0) {
             return {
                 compacted: false,
                 estimatedTokensBefore,
@@ -877,30 +1928,90 @@ export class AssistantSessionStore {
             };
         }
 
+        // Stage 1: fold stale large tool outputs first
+        const stage1 = foldStaleToolResultsAcrossTurns(turns, {
+            keepRecentTurns: ASSISTANT_DEFAULT_KEEP_RECENT_TURNS,
+            foldThresholdChars: ASSISTANT_FOLD_THRESHOLD_CHARS,
+            urgent: false,
+        });
+        const workingTurns = stage1.turns;
+        const tokensAfterStage1 = estimateRequestTokens(
+            [...layer0, ...headerMessages, ...workingTurns.flatMap((t) => t.messages)],
+            tools,
+        );
+
+        if (tokensAfterStage1 <= watermark.low || workingTurns.length <= 1) {
+            if (stage1.foldedCount === 0) {
+                return {
+                    compacted: false,
+                    estimatedTokensBefore,
+                    estimatedTokensAfter: estimatedTokensBefore,
+                    archivedTurnCount: 0,
+                };
+            }
+            const compactedMessages: CanonicalMessage[] = [
+                ...headerMessages,
+                ...workingTurns.flatMap((t) => t.messages),
+            ];
+            const turnEndCounts: number[] = [];
+            let runningLen = headerMessages.length;
+            for (const turn of workingTurns) {
+                runningLen += turn.messages.length;
+                turnEndCounts.push(runningLen);
+            }
+            this.trajectoryStore.applyCompaction(
+                {
+                    compactedMessages,
+                    archivedUpToChunk: prevChunk,
+                    compactionHeaderCount: headerMessages.length,
+                    turnEndCounts,
+                },
+                threadId,
+            );
+            this.resetUsageAnchor(sessionId);
+            this.incrementCompactionCycle(sessionId);
+            const estimatedTokensAfter = estimateRequestTokens(
+                [...layer0, ...compactedMessages],
+                tools,
+            );
+            return {
+                compacted: true,
+                estimatedTokensBefore,
+                estimatedTokensAfter,
+                archivedTurnCount: 0,
+            };
+        }
+
         const priorSummary = extractExistingSummaryBody(headerMessages);
-        const maxArchive = turns.length - 1;
+        const maxArchive = workingTurns.length - 1;
         let archiveCount = 1;
+        let summaryText = buildDeterministicSummary(workingTurns.slice(0, archiveCount), {
+            priorSummary,
+        });
         let summaryMsg: CanonicalMessage = {
             role: 'system',
-            content: `${ASSISTANT_SUMMARY_TAG}\n${summarizeAssistantTurns(turns.slice(0, archiveCount), priorSummary)}\n</assistant-history-summary>`,
+            content: `${ASSISTANT_SUMMARY_TAG}\n${summaryText}\n</assistant-history-summary>`,
         };
 
         const calcTokens = (count: number, hdr: CanonicalMessage): number => {
-            const retained = turns.slice(count).flatMap((t) => t.messages);
+            const retained = workingTurns.slice(count).flatMap((t) => t.messages);
             return estimateRequestTokens([...layer0, hdr, ...retained], tools);
         };
 
         let projected = calcTokens(archiveCount, summaryMsg);
         while (projected > watermark.low && archiveCount < maxArchive) {
             archiveCount += 1;
+            summaryText = buildDeterministicSummary(workingTurns.slice(0, archiveCount), {
+                priorSummary,
+            });
             summaryMsg = {
                 role: 'system',
-                content: `${ASSISTANT_SUMMARY_TAG}\n${summarizeAssistantTurns(turns.slice(0, archiveCount), priorSummary)}\n</assistant-history-summary>`,
+                content: `${ASSISTANT_SUMMARY_TAG}\n${summaryText}\n</assistant-history-summary>`,
             };
             projected = calcTokens(archiveCount, summaryMsg);
         }
 
-        const retainedTurns = turns.slice(archiveCount);
+        const retainedTurns = workingTurns.slice(archiveCount);
         const compactedMessages: CanonicalMessage[] = [
             summaryMsg,
             ...retainedTurns.flatMap((t) => t.messages),
@@ -912,7 +2023,6 @@ export class AssistantSessionStore {
             turnEndCounts.push(runningLen);
         }
 
-        const prevChunk = this.trajectoryStore.getArchivedUpToChunk(threadId);
         this.trajectoryStore.applyCompaction(
             {
                 compactedMessages,
@@ -922,6 +2032,14 @@ export class AssistantSessionStore {
             },
             threadId,
         );
+
+        this.recordCompactionUiAnchor(sessionId, {
+            archiveCount,
+            hadPriorHeader: headerMessages.length > 0,
+            retainedTurns,
+        });
+        this.resetUsageAnchor(sessionId);
+        this.incrementCompactionCycle(sessionId);
 
         const estimatedTokensAfter = estimateRequestTokens(
             [...layer0, ...compactedMessages],
@@ -934,6 +2052,103 @@ export class AssistantSessionStore {
             estimatedTokensAfter,
             archivedTurnCount: archiveCount,
         };
+    }
+
+    private recordCompactionUiAnchor(
+        sessionId: string,
+        params: {
+            archiveCount: number;
+            hadPriorHeader: boolean;
+            retainedTurns: readonly Layer1TurnGroup[];
+        },
+    ): void {
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+            return;
+        }
+        const uiTurns = groupUiMessagesIntoTurns(session.messages);
+        if (uiTurns.length === 0) {
+            return;
+        }
+
+        const prevAnchor = this.compactionAnchors.get(sessionId);
+        let newArchivedCount: number;
+
+        if (prevAnchor) {
+            newArchivedCount = prevAnchor.archivedUiTurnCount + params.archiveCount;
+        } else if (!params.hadPriorHeader) {
+            newArchivedCount = params.archiveCount;
+        } else {
+            // Hydrated trajectory with an existing header and no in-memory anchor:
+            // locate the first retained turn in uiTurns to compute exact archived offset.
+            const firstRetainedUser = params.retainedTurns[0]?.messages.find((m) => m.role === 'user');
+            let offset = -1;
+            if (firstRetainedUser) {
+                const needle = contentToPlainText(firstRetainedUser.content);
+                const approxStart = Math.max(0, uiTurns.length - params.retainedTurns.length - 2);
+                const matchesTurnUser = (turn: UiTurnGroup): boolean => {
+                    if (!turn.user) {
+                        return false;
+                    }
+                    const turnPlain = contentToPlainText(
+                        buildAssistantUserContent(turn.user.content, turn.user.attachments),
+                    );
+                    return turnPlain === needle || turn.user.content === needle;
+                };
+                for (let i = approxStart; i < uiTurns.length; i += 1) {
+                    if (matchesTurnUser(uiTurns[i])) {
+                        offset = i;
+                        break;
+                    }
+                }
+                if (offset < 0) {
+                    for (let i = 0; i < approxStart; i += 1) {
+                        if (matchesTurnUser(uiTurns[i])) {
+                            offset = i;
+                            break;
+                        }
+                    }
+                }
+            }
+            newArchivedCount =
+                offset >= 0
+                    ? offset
+                    : Math.max(0, uiTurns.length - params.retainedTurns.length);
+        }
+
+        const clampedCount = Math.min(Math.max(0, newArchivedCount), uiTurns.length);
+        if (clampedCount <= 0) {
+            return;
+        }
+
+        this.compactionAnchors.set(sessionId, {
+            archivedUiTurnCount: clampedCount,
+            archivedTurnFingerprints: uiTurns.slice(0, clampedCount).map(fingerprintUiTurn),
+        });
+    }
+
+    private incrementCompactionCycle(sessionId: string): void {
+        this.compactionCycleCounts.set(
+            sessionId,
+            (this.compactionCycleCounts.get(sessionId) ?? 0) + 1,
+        );
+    }
+
+    private attachCompactionNoticeToLatestMessage(
+        sessionId: string,
+        notice: AssistantCompactionNotice,
+    ): void {
+        const session = this.sessions.get(sessionId);
+        if (!session || session.messages.length === 0) {
+            return;
+        }
+        const lastIdx = session.messages.length - 1;
+        session.messages[lastIdx] = {
+            ...session.messages[lastIdx],
+            compactionNotice: canonicalClone(notice),
+        };
+        session.updatedAt = this.now();
+        this.persist();
     }
 
     private hydrateFromMetadata(): void {

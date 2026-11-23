@@ -5,6 +5,8 @@ import type {
     AssistantMessage,
     AssistantMode,
     AssistantSession,
+    AssistantSessionTokenStatus,
+    AssistantTokenLevel,
     PendingApproval,
     UndoRecord,
 } from '@/core/types';
@@ -36,6 +38,34 @@ interface FilePreviewState {
     path: string;
     content: string;
     loading: boolean;
+}
+
+function formatCompactTokens(tokens: number): string {
+    const safe = Number.isFinite(tokens) ? Math.max(0, Math.round(tokens)) : 0;
+    if (safe < 1_000) {
+        return `${safe} tok`;
+    }
+    if (safe < 100_000) {
+        return `${(safe / 1_000).toFixed(1).replace(/\.0$/, '')}k`;
+    }
+    if (safe < 1_000_000) {
+        return `${Math.round(safe / 1_000)}k`;
+    }
+    return `${(safe / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+}
+
+function resolveEffectiveTokenLevel(status: AssistantSessionTokenStatus): AssistantTokenLevel {
+    if (
+        status.level === 'danger'
+        || status.usagePercent >= 90
+        || status.currentTokens >= status.highWatermark
+    ) {
+        return 'danger';
+    }
+    if (status.level === 'warning' || status.usagePercent >= 70) {
+        return 'warning';
+    }
+    return 'normal';
 }
 
 /**
@@ -79,8 +109,15 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     const [topbarRenameRevealed, setTopbarRenameRevealed] = useState<boolean>(false);
     const [isRenamingTopbarTitle, setIsRenamingTopbarTitle] = useState<boolean>(false);
     const [topbarTitleDraft, setTopbarTitleDraft] = useState<string>('');
+    const [tokenStatus, setTokenStatus] = useState<AssistantSessionTokenStatus | null>(null);
+    const [isCompacting, setIsCompacting] = useState<boolean>(false);
+    const [compactModalOpen, setCompactModalOpen] = useState<boolean>(false);
+    const [compactFocusDraft, setCompactFocusDraft] = useState<string>('');
+    const [compactError, setCompactError] = useState<string | null>(null);
+    const [compactSummaryPreviewOpen, setCompactSummaryPreviewOpen] = useState<boolean>(false);
 
     const abortControllerRef = useRef<AbortController | null>(null);
+    const tokenFetchSeqRef = useRef<number>(0);
     const threadRef = useRef<HTMLDivElement | null>(null);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -147,7 +184,54 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
         setIsRenamingTopbarTitle(false);
         setTopbarRenameRevealed(false);
         setTopbarTitleDraft('');
+        setCompactModalOpen(false);
+        setCompactError(null);
+        setCompactSummaryPreviewOpen(false);
     }, [activeSession?.id]);
+
+    const refreshTokenStatus = useCallback(
+        async (targetSessionId?: string | null) => {
+            const sid = targetSessionId ?? activeSession?.id ?? null;
+            const getter = store.assistantRuntime?.getSessionTokenStatus;
+            if (!sid || !getter) {
+                setTokenStatus(null);
+                return;
+            }
+            const seq = ++tokenFetchSeqRef.current;
+            try {
+                const nextStatus = await getter(sid);
+                if (tokenFetchSeqRef.current === seq) {
+                    setTokenStatus(nextStatus ?? null);
+                }
+            } catch {
+                if (tokenFetchSeqRef.current === seq) {
+                    setTokenStatus(null);
+                }
+            }
+        },
+        [activeSession?.id, store],
+    );
+
+    const activeSessionMessageCount = activeSession?.messages.length ?? 0;
+    const activeSessionUpdatedAt = activeSession?.updatedAt ?? 0;
+    const activeSessionConnectionId = activeSession?.connectionId ?? '';
+    const activeSessionMode = activeSession?.mode ?? 'chat';
+    const activeSessionStAdmin = Boolean(activeSession?.stAdminEnabled);
+
+    useEffect(() => {
+        void refreshTokenStatus(activeSession?.id ?? null);
+    }, [
+        activeSession?.id,
+        activeSessionMessageCount,
+        activeSessionUpdatedAt,
+        activeSessionConnectionId,
+        activeSessionMode,
+        activeSessionStAdmin,
+        isStreamingCurrent,
+        pendingApprovals.length,
+        settings.currentConnectionId,
+        refreshTokenStatus,
+    ]);
 
     useEffect(() => {
         if (!isRenamingTopbarTitle) {
@@ -612,9 +696,10 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 } catch {
                     // Keep UI responsive even if refresh fails after abort.
                 }
+                await refreshTokenStatus(sessionId);
             }
         },
-        [store, upsertSessionInStore],
+        [refreshTokenStatus, store, upsertSessionInStore],
     );
 
     const handleAddFiles = useCallback(
@@ -745,12 +830,13 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 }
                 setEditingMessageId(null);
                 setActiveActionsMessageId(null);
+                await refreshTokenStatus(activeSession.id);
                 store.pushToast('已保存消息改写', 'success');
             } catch (err) {
                 store.pushToast(`保存改写失败：${formatErrorMessage(err)}`, 'error');
             }
         },
-        [activeSession, isStreamingCurrent, store, upsertSessionInStore],
+        [activeSession, isStreamingCurrent, refreshTokenStatus, store, upsertSessionInStore],
     );
 
     const handleSaveAndResendMessage = useCallback(
@@ -855,6 +941,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                             : '已撤回消息',
                         'warning',
                     );
+                    await refreshTokenStatus(sessionId);
                 } catch (err) {
                     store.pushToast(`撤回消息失败：${formatErrorMessage(err)}`, 'error');
                 }
@@ -875,7 +962,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 onConfirm: executeRetract,
             });
         },
-        [activeSession, draft, isStreamingCurrent, store, upsertSessionInStore],
+        [activeSession, draft, isStreamingCurrent, refreshTokenStatus, store, upsertSessionInStore],
     );
 
     const handleRegenerateLastMessage = useCallback(async () => {
@@ -902,6 +989,105 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             '重新生成失败',
         );
     }, [activeSession, isStreamingCurrent, runStreamingOperation, store]);
+
+    const handleOpenCompactModal = useCallback(() => {
+        if (!activeSession || isCompacting || tokenStatus?.isCompacting) {
+            return;
+        }
+        setTopbarRenameRevealed(false);
+        setOpenPopover(null);
+        setCompactError(null);
+        setCompactSummaryPreviewOpen(false);
+        setCompactModalOpen(true);
+        void refreshTokenStatus(activeSession.id);
+    }, [activeSession, isCompacting, refreshTokenStatus, tokenStatus?.isCompacting]);
+
+    const handleRunCompaction = useCallback(
+        async (mode: 'fold_only' | 'full') => {
+            if (!activeSession || isCompacting || tokenStatus?.isCompacting) {
+                return;
+            }
+            const runtime = store.assistantRuntime;
+            if (!runtime?.compactSession) {
+                setCompactError('当前运行时不支持上下文压缩');
+                return;
+            }
+            setIsCompacting(true);
+            setCompactError(null);
+            const sessionId = activeSession.id;
+            try {
+                const focus = mode === 'full' ? compactFocusDraft.trim() : '';
+                const report = await runtime.compactSession(sessionId, {
+                    mode,
+                    ...(focus ? { focusInstruction: focus } : {}),
+                });
+                await store.refreshAssistantState();
+                await refreshTokenStatus(sessionId);
+                setCompactModalOpen(false);
+                setCompactFocusDraft('');
+                if (report.compacted) {
+                    store.pushToast(
+                        `已压缩上下文：${formatCompactTokens(report.tokensBefore)} → ${formatCompactTokens(report.tokensAfter)}`,
+                        'success',
+                    );
+                } else {
+                    store.pushToast('当前上下文无需进一步压缩', 'primary');
+                }
+            } catch (err) {
+                setCompactError(`压缩失败：${formatErrorMessage(err)}`);
+            } finally {
+                setIsCompacting(false);
+            }
+        },
+        [
+            activeSession,
+            compactFocusDraft,
+            isCompacting,
+            refreshTokenStatus,
+            store,
+            tokenStatus?.isCompacting,
+        ],
+    );
+
+    const handleCompactAndRetryOverflow = useCallback(async () => {
+        if (!activeSession || isStreamingCurrent || isCompacting || tokenStatus?.isCompacting) {
+            return;
+        }
+        const runtime = store.assistantRuntime;
+        if (!runtime) {
+            store.pushToast('助手运行时未连接，暂时无法重试', 'warning');
+            return;
+        }
+        const sessionId = activeSession.id;
+        if (runtime.compactSession) {
+            setIsCompacting(true);
+            try {
+                const report = await runtime.compactSession(sessionId, { mode: 'full' });
+                await store.refreshAssistantState();
+                await refreshTokenStatus(sessionId);
+                if (report.compacted) {
+                    store.pushToast(
+                        `已压缩历史上下文（${formatCompactTokens(report.tokensBefore)} → ${formatCompactTokens(report.tokensAfter)}），正在重试...`,
+                        'primary',
+                    );
+                }
+            } catch (err) {
+                store.pushToast(`压缩历史失败：${formatErrorMessage(err)}`, 'error');
+                return;
+            } finally {
+                setIsCompacting(false);
+            }
+        }
+        await handleRegenerateLastMessage();
+    }, [
+        activeSession,
+        handleRegenerateLastMessage,
+        isCompacting,
+        isStreamingCurrent,
+        refreshTokenStatus,
+        store,
+        tokenStatus?.isCompacting,
+    ]);
 
     const handleDecideApproval = useCallback(
         async (approvalId: string, decision: 'approve' | 'reject', feedback?: string) => {
@@ -963,13 +1149,14 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                         : `✕ 已拒绝：${target.title}`,
                     decision === 'approve' ? 'success' : 'warning',
                 );
+                await refreshTokenStatus(target.sessionId);
             } catch (err) {
                 store.pushToast(`审批操作失败：${formatErrorMessage(err)}`, 'error');
             } finally {
                 setBusyApprovalId(null);
             }
         },
-        [approvalsById, store],
+        [approvalsById, refreshTokenStatus, store],
     );
 
     const handleRetryApproval = useCallback(
@@ -1031,13 +1218,14 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 }
 
                 store.pushToast(`↻ 已重新生成修改方案（第 ${nextRevision} 版），请确认`, 'primary');
+                await refreshTokenStatus(target.sessionId);
             } catch (err) {
                 store.pushToast(`重试方案失败：${formatErrorMessage(err)}`, 'error');
             } finally {
                 setBusyApprovalId(null);
             }
         },
-        [approvalsById, store],
+        [approvalsById, refreshTokenStatus, store],
     );
 
     const handleApplyUndo = useCallback(
@@ -1316,6 +1504,16 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     );
 
     const renderedMessages: AssistantMessage[] = activeSession ? activeSession.messages : [];
+    const effectiveCompacting = isCompacting || Boolean(tokenStatus?.isCompacting);
+    const effectiveTokenLevel: AssistantTokenLevel = tokenStatus
+        ? resolveEffectiveTokenLevel(tokenStatus)
+        : 'normal';
+    const tokenPillTitle = tokenStatus
+        ? effectiveCompacting
+            ? '正在压缩当前会话上下文...'
+            : `当前上下文约 ${tokenStatus.currentTokens.toLocaleString()} / ${tokenStatus.contextLimit.toLocaleString()} tok (${tokenStatus.usagePercent}%) · 点击管理/压缩上下文`
+        : '';
+    const canCompactRuntime = Boolean(store.assistantRuntime?.compactSession);
     const lastMsg = renderedMessages[renderedMessages.length - 1];
     const showSyntheticStreamingBubble = Boolean(
         isStreamingCurrent
@@ -1463,6 +1661,38 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
 
                 {!(isMobile && isRenamingTopbarTitle) ? (
                     <div class="ag-ast-topbar-right">
+                        {activeSession && tokenStatus ? (
+                            <button
+                                type="button"
+                                data-assistant-token-pill="true"
+                                data-token-level={effectiveTokenLevel}
+                                data-token-compacting={effectiveCompacting ? 'true' : 'false'}
+                                aria-label={
+                                    effectiveCompacting
+                                        ? '正在压缩上下文'
+                                        : `上下文占用 ${formatCompactTokens(tokenStatus.currentTokens)}，点击管理或压缩上下文`
+                                }
+                                title={tokenPillTitle}
+                                disabled={effectiveCompacting}
+                                class={[
+                                    'ag-ast-topbar-btn',
+                                    'ag-ast-token-pill',
+                                    `ag-ast-token-${effectiveTokenLevel}`,
+                                    effectiveCompacting ? 'ag-ast-token-compacting' : '',
+                                ]
+                                    .filter(Boolean)
+                                    .join(' ')}
+                                onClick={handleOpenCompactModal}
+                            >
+                                <span class="ag-ast-token-dot" aria-hidden="true" />
+                                <span class="ag-ast-token-text">
+                                    {effectiveCompacting
+                                        ? '压缩中...'
+                                        : formatCompactTokens(tokenStatus.currentTokens)}
+                                </span>
+                            </button>
+                        ) : null}
+
                         <button
                             type="button"
                             data-assistant-new-session-btn="true"
@@ -1566,6 +1796,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                     isLastMessage={isLastMessage}
                                     canRegenerate={canRegenerate}
                                     isSessionStreaming={isStreamingCurrent}
+                                    isCompacting={effectiveCompacting}
                                     isEditing={editingMessageId === msg.id}
                                     actionsOpen={activeActionsMessageId === msg.id}
                                     approvalsById={approvalsById}
@@ -1591,6 +1822,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                     onSaveAndResendEdit={handleSaveAndResendMessage}
                                     onRetract={handleRetractMessage}
                                     onRegenerate={handleRegenerateLastMessage}
+                                    onCompactAndRetryOverflow={handleCompactAndRetryOverflow}
                                     onCopy={handleCopyMessage}
                                 />
                             );
@@ -1848,6 +2080,169 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                     </div>
                 </div>
             ) : null}
+
+            {/* In-Shadow-DOM Context Compaction Confirmation Modal */}
+            <ShadowModal
+                open={compactModalOpen && activeSession !== null}
+                title="压缩当前会话上下文"
+                maxWidth="540px"
+                onClose={() => {
+                    if (!effectiveCompacting) {
+                        setCompactModalOpen(false);
+                        setCompactError(null);
+                    }
+                }}
+                footer={
+                    <div class="ag-compact-modal-footer">
+                        <button
+                            type="button"
+                            class="ag-btn ag-btn-secondary ag-btn-sm"
+                            data-assistant-compact-cancel="true"
+                            disabled={effectiveCompacting}
+                            onClick={() => {
+                                setCompactModalOpen(false);
+                                setCompactError(null);
+                            }}
+                        >
+                            取消
+                        </button>
+                        <button
+                            type="button"
+                            class="ag-btn ag-btn-secondary ag-btn-sm"
+                            data-assistant-compact-fold="true"
+                            disabled={
+                                effectiveCompacting
+                                || isStreamingCurrent
+                                || !canCompactRuntime
+                                || (tokenStatus?.foldableToolResultCount ?? 0) <= 0
+                            }
+                            onClick={() => void handleRunCompaction('fold_only')}
+                        >
+                            仅折叠旧工具
+                        </button>
+                        <button
+                            type="button"
+                            class="ag-btn ag-btn-primary ag-btn-sm"
+                            data-assistant-compact-confirm="true"
+                            disabled={effectiveCompacting || isStreamingCurrent || !canCompactRuntime}
+                            aria-busy={effectiveCompacting || undefined}
+                            onClick={() => void handleRunCompaction('full')}
+                        >
+                            {effectiveCompacting ? '压缩中...' : '确认压缩'}
+                        </button>
+                    </div>
+                }
+            >
+                <div class="ag-compact-modal-body" data-assistant-compact-modal="true">
+                    {tokenStatus ? (
+                        <div class="ag-compact-meter-card">
+                            <div class="ag-compact-meter-row">
+                                <span class="ag-compact-meter-label">当前上下文占用</span>
+                                <span
+                                    class="ag-mono ag-compact-meter-value"
+                                    data-assistant-compact-usage="true"
+                                >
+                                    {tokenStatus.currentTokens.toLocaleString()} /{' '}
+                                    {tokenStatus.contextLimit.toLocaleString()} tok (
+                                    {tokenStatus.usagePercent}%)
+                                </span>
+                            </div>
+
+                            <div class="ag-compact-progress-track">
+                                <div
+                                    class={`ag-compact-progress-fill ag-compact-progress-${effectiveTokenLevel}`}
+                                    style={{
+                                        width: `${Math.min(100, Math.max(0, tokenStatus.usagePercent))}%`,
+                                    }}
+                                />
+                                {tokenStatus.contextLimit > 0
+                                && tokenStatus.highWatermark > 0
+                                && tokenStatus.highWatermark < tokenStatus.contextLimit ? (
+                                    <span
+                                        class="ag-compact-progress-marker"
+                                        title={`自动高水位线：${tokenStatus.highWatermark.toLocaleString()} tok`}
+                                        style={{
+                                            left: `${Math.min(
+                                                98,
+                                                Math.max(
+                                                    2,
+                                                    Math.round(
+                                                        (tokenStatus.highWatermark
+                                                            / tokenStatus.contextLimit)
+                                                            * 100,
+                                                    ),
+                                                ),
+                                            )}%`,
+                                        }}
+                                    />
+                                ) : null}
+                            </div>
+
+                            <div class="ag-compact-stats" data-assistant-compact-stats="true">
+                                当前活跃 {tokenStatus.activeTurnCount} 轮 · 包含{' '}
+                                {tokenStatus.foldableToolResultCount} 条可折叠旧工具输出 · 已归档{' '}
+                                {tokenStatus.compactedCount} 块
+                            </div>
+                        </div>
+                    ) : null}
+
+                    <div class="ag-banner ag-banner-primary">
+                        仅精简发给模型的轨迹上下文，界面聊天记录、审批卡与写前撤销记录将完整保留。
+                    </div>
+
+                    {tokenStatus?.summaryPreview ? (
+                        <div class="ag-compact-preview-box">
+                            <button
+                                type="button"
+                                class="ag-compact-summary-toggle"
+                                data-assistant-compact-preview-toggle="true"
+                                aria-expanded={compactSummaryPreviewOpen}
+                                onClick={() => setCompactSummaryPreviewOpen((prev) => !prev)}
+                            >
+                                <span>已有交接摘要预览</span>
+                                <span>{compactSummaryPreviewOpen ? '▾' : '▸'}</span>
+                            </button>
+                            {compactSummaryPreviewOpen ? (
+                                <pre
+                                    class="ag-compact-summary-pre ag-thin-scroll"
+                                    data-assistant-compact-preview-body="true"
+                                >
+                                    {tokenStatus.summaryPreview}
+                                </pre>
+                            ) : null}
+                        </div>
+                    ) : null}
+
+                    <div class="ag-field">
+                        <label class="ag-field-label" for="ag-ast-compact-focus">
+                            保留重点（可选）
+                        </label>
+                        <textarea
+                            id="ag-ast-compact-focus"
+                            rows={3}
+                            class="ag-compact-focus-textarea ag-thin-scroll"
+                            data-assistant-compact-focus="true"
+                            aria-label="保留重点"
+                            placeholder="可选：输入需要重点保留的规则、文件或上下文目标（例如：保留世界书路由改造细节）"
+                            value={compactFocusDraft}
+                            disabled={effectiveCompacting}
+                            onInput={(e) => setCompactFocusDraft(e.currentTarget.value)}
+                            onKeyDown={(e) => e.stopPropagation()}
+                            onKeyUp={(e) => e.stopPropagation()}
+                            onKeyPress={(e) => e.stopPropagation()}
+                        />
+                    </div>
+
+                    {compactError ? (
+                        <div
+                            class="ag-banner ag-banner-error"
+                            data-assistant-compact-error="true"
+                        >
+                            {compactError}
+                        </div>
+                    ) : null}
+                </div>
+            </ShadowModal>
 
             {/* In-Shadow-DOM Secondary Confirmation Modal for ST 全权管家 */}
             <StAdminConfirmModal

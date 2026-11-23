@@ -1,5 +1,10 @@
 import { z } from 'zod';
 import type { ToolExecutionContext } from '@/core/bridge';
+import {
+    applyToolOutputGate,
+    DEFAULT_MAX_TOOL_RESULT_BYTES,
+    type TransientToolSpillStore,
+} from '@/core/context';
 import type { BuiltinToolConfig, CanonicalToolSchema } from '@/core/types';
 import { canonicalClone, stripJsonSchemaMeta } from '@/core/utils';
 import { createAbortError, isAbortError, throwIfAborted } from './script-sandbox';
@@ -27,6 +32,32 @@ export interface ToolExecutionResult {
     output: string;
     error?: string;
     durationMs: number;
+    truncated?: boolean;
+    originalBytes?: number;
+    spillPath?: string;
+}
+
+export interface ToolRegistryOutputGateOptions {
+    /** Single-tool-result UTF-8 byte ceiling (defaults to `DEFAULT_MAX_TOOL_RESULT_BYTES` = 32 KB). */
+    maxToolResultBytes?: number;
+    /** Optional in-memory LRU spill store holding full outputs of truncated calls. */
+    spillStore?: TransientToolSpillStore;
+    /** Whether to enforce the output size gate on `executeToolCall` (defaults to `true`). */
+    enableOutputGate?: boolean;
+    /** Default scope ID used when spilling outputs into `spillStore`. */
+    scopeId?: string;
+}
+
+export interface ToolCallExecutionOptions extends ToolRegistryOutputGateOptions {
+    /** Tool call identifier used to key spill entries (`/tmp/tool-spill/<toolCallId>.*`). */
+    toolCallId?: string;
+}
+
+function normalizeMaxToolResultBytes(value: number | undefined): number {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+        return Math.max(128, Math.floor(value));
+    }
+    return DEFAULT_MAX_TOOL_RESULT_BYTES;
 }
 
 function compareCodeUnits(a: string, b: string): number {
@@ -192,9 +223,65 @@ function serializeToolOutput(rawResult: unknown): string {
  */
 export class ToolRegistry {
     private readonly tools = new Map<string, ToolDefinition>();
+    private maxToolResultBytes: number;
+    private spillStore?: TransientToolSpillStore;
+    private enableOutputGate: boolean;
+    private defaultScopeId?: string;
+    private callSequence = 0;
 
-    constructor(initialTools: readonly ToolDefinition[] = []) {
+    constructor(
+        initialTools: readonly ToolDefinition[] = [],
+        options: ToolRegistryOutputGateOptions = {},
+    ) {
+        this.maxToolResultBytes = normalizeMaxToolResultBytes(options.maxToolResultBytes);
+        this.spillStore = options.spillStore;
+        this.enableOutputGate = options.enableOutputGate ?? true;
+        this.defaultScopeId = options.scopeId;
         this.registerAll(initialTools);
+    }
+
+    /** Configure output size gating and optional transient spill storage for this registry. */
+    setOutputGateOptions(options: ToolRegistryOutputGateOptions): this {
+        if ('maxToolResultBytes' in options) {
+            this.maxToolResultBytes = normalizeMaxToolResultBytes(options.maxToolResultBytes);
+        }
+        if ('spillStore' in options) {
+            this.spillStore = options.spillStore;
+        }
+        if ('enableOutputGate' in options && options.enableOutputGate !== undefined) {
+            this.enableOutputGate = options.enableOutputGate;
+        }
+        if ('scopeId' in options) {
+            this.defaultScopeId = options.scopeId;
+        }
+        return this;
+    }
+
+    /** Inspect the current output gate configuration. */
+    getOutputGateOptions(): ToolRegistryOutputGateOptions {
+        return {
+            maxToolResultBytes: this.maxToolResultBytes,
+            ...(this.spillStore ? { spillStore: this.spillStore } : {}),
+            enableOutputGate: this.enableOutputGate,
+            ...(this.defaultScopeId !== undefined ? { scopeId: this.defaultScopeId } : {}),
+        };
+    }
+
+    /** Return the attached transient spill store, if configured. */
+    getSpillStore(): TransientToolSpillStore | undefined {
+        return this.spillStore;
+    }
+
+    /** Clear spilled tool outputs for a specific scope, or clear the entire spill store. */
+    clearSpillStore(scopeId?: string): void {
+        if (!this.spillStore) {
+            return;
+        }
+        if (scopeId !== undefined) {
+            this.spillStore.clearScope(scopeId);
+        } else {
+            this.spillStore.clearAll();
+        }
     }
 
     register(tool: ToolDefinition, options: { replace?: boolean } = {}): this {
@@ -237,7 +324,12 @@ export class ToolRegistry {
     }
 
     clone(): ToolRegistry {
-        return new ToolRegistry(this.list());
+        return new ToolRegistry(this.list(), {
+            maxToolResultBytes: this.maxToolResultBytes,
+            spillStore: this.spillStore,
+            enableOutputGate: this.enableOutputGate,
+            scopeId: this.defaultScopeId,
+        });
     }
 
     /**
@@ -294,6 +386,7 @@ export class ToolRegistry {
         name: string,
         rawArgs: string | Record<string, unknown>,
         ctx: ToolExecutionContext,
+        options?: ToolCallExecutionOptions,
     ): Promise<ToolExecutionResult> {
         throwIfAborted(ctx.signal);
         const start = Date.now();
@@ -335,19 +428,59 @@ export class ToolRegistry {
             };
         }
 
+        const effectiveEnableOutputGate = options?.enableOutputGate ?? this.enableOutputGate;
+        const effectiveMaxBytes =
+            options?.maxToolResultBytes !== undefined
+                ? normalizeMaxToolResultBytes(options.maxToolResultBytes)
+                : this.maxToolResultBytes;
+        const effectiveSpillStore =
+            options && 'spillStore' in options ? options.spillStore : this.spillStore;
+        const effectiveScopeId =
+            options && 'scopeId' in options ? options.scopeId : this.defaultScopeId;
+        const toolCallId =
+            options?.toolCallId && options.toolCallId.trim().length > 0
+                ? options.toolCallId.trim()
+                : `${name}_${++this.callSequence}`;
+
+        const gateOutput = (serialized: string, rawData?: unknown) => {
+            if (!effectiveEnableOutputGate) {
+                return null;
+            }
+            return applyToolOutputGate(serialized, {
+                toolName: name,
+                toolCallId,
+                maxBytes: effectiveMaxBytes,
+                ...(rawData !== undefined && rawData !== null && typeof rawData === 'object'
+                    ? { rawData }
+                    : {}),
+                ...(effectiveSpillStore ? { spillStore: effectiveSpillStore } : {}),
+                ...(effectiveScopeId !== undefined ? { scopeId: effectiveScopeId } : {}),
+            });
+        };
+
         try {
             const rawResult = await tool.execute(validated.data, ctx);
             if (ctx.signal.aborted) {
                 throw createAbortError(`Tool "${name}" aborted`);
             }
 
-            const output = serializeToolOutput(rawResult);
-            const embeddedError = extractEmbeddedToolError(output);
+            const serialized = serializeToolOutput(rawResult);
+            const embeddedError = extractEmbeddedToolError(serialized);
+            const gated = gateOutput(serialized, rawResult);
+            const finalOutput = gated ? gated.output : serialized;
+
             return {
                 ok: embeddedError === undefined,
                 toolName: name,
-                output,
+                output: finalOutput,
                 ...(embeddedError !== undefined ? { error: embeddedError } : {}),
+                ...(gated?.truncated
+                    ? {
+                        truncated: true,
+                        originalBytes: gated.originalBytes,
+                        ...(gated.spillPath ? { spillPath: gated.spillPath } : {}),
+                    }
+                    : {}),
                 durationMs: Math.max(0, Date.now() - start),
             };
         } catch (error) {
@@ -358,11 +491,21 @@ export class ToolRegistry {
                 throw createAbortError(`Tool "${name}" aborted`);
             }
             const message = error instanceof Error ? error.message : String(error);
+            const errorPayload = { ok: false, error: message };
+            const serializedError = JSON.stringify(errorPayload);
+            const gatedError = gateOutput(serializedError, errorPayload);
             return {
                 ok: false,
                 toolName: name,
-                output: JSON.stringify({ ok: false, error: message }),
+                output: gatedError ? gatedError.output : serializedError,
                 error: message,
+                ...(gatedError?.truncated
+                    ? {
+                        truncated: true,
+                        originalBytes: gatedError.originalBytes,
+                        ...(gatedError.spillPath ? { spillPath: gatedError.spillPath } : {}),
+                    }
+                    : {}),
                 durationMs: Math.max(0, Date.now() - start),
             };
         }
@@ -373,8 +516,9 @@ export class ToolRegistry {
         name: string,
         rawArgs: string | Record<string, unknown>,
         ctx: ToolExecutionContext,
+        options?: ToolCallExecutionOptions,
     ): Promise<string> {
-        const result = await this.executeToolCall(name, rawArgs, ctx);
+        const result = await this.executeToolCall(name, rawArgs, ctx, options);
         return result.output;
     }
 }

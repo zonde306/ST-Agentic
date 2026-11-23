@@ -1,11 +1,13 @@
-import type {
-    TargetedKeyboardEvent,
-    TargetedMouseEvent,
-    TargetedPointerEvent,
+import {
+    Fragment,
+    type TargetedKeyboardEvent,
+    type TargetedMouseEvent,
+    type TargetedPointerEvent,
 } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import type {
     AssistantAttachment,
+    AssistantCompactionNotice,
     AssistantMessage,
     AssistantToolCallRecord,
     PendingApproval,
@@ -27,6 +29,7 @@ export interface MessageBubbleProps {
     isLastMessage?: boolean;
     canRegenerate?: boolean;
     isSessionStreaming?: boolean;
+    isCompacting?: boolean;
     isEditing?: boolean;
     isSyntheticStreaming?: boolean;
     actionsOpen?: boolean;
@@ -51,7 +54,93 @@ export interface MessageBubbleProps {
     onSaveAndResendEdit?: (messageId: string, newContent: string) => void | Promise<void>;
     onRetract?: (messageId: string) => void | Promise<void>;
     onRegenerate?: () => void | Promise<void>;
+    onCompactAndRetryOverflow?: () => void | Promise<void>;
     onCopy?: (content: string) => void | Promise<void>;
+}
+
+function formatTokenCountShort(tokens: number): string {
+    const safe = Number.isFinite(tokens) ? Math.max(0, Math.round(tokens)) : 0;
+    if (safe < 1_000) {
+        return String(safe);
+    }
+    if (safe < 100_000) {
+        return `${(safe / 1_000).toFixed(1).replace(/\.0$/, '')}k`;
+    }
+    if (safe < 1_000_000) {
+        return `${Math.round(safe / 1_000)}k`;
+    }
+    return `${(safe / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+}
+
+function CompactionNoticePill({
+    messageId,
+    notice,
+}: {
+    messageId: string;
+    notice: AssistantCompactionNotice;
+}) {
+    const [expanded, setExpanded] = useState<boolean>(false);
+    const hasDetails = Boolean(
+        notice.summaryText?.trim()
+        || notice.focusInstruction?.trim()
+        || notice.archivedChunkPath?.trim(),
+    );
+    const beforeLabel = formatTokenCountShort(notice.tokensBefore);
+    const afterLabel = formatTokenCountShort(notice.tokensAfter);
+    const coreLabel = `已压缩上下文：${beforeLabel} → ${afterLabel} tok（归档 ${notice.archivedTurns} 轮 · 折叠 ${notice.foldedToolResults} 条工具输出）`;
+
+    return (
+        <div
+            class="ag-ast-compaction-sep"
+            data-assistant-compaction-notice={messageId}
+        >
+            <div class="ag-ast-compaction-line-row">
+                <span class="ag-ast-compaction-rule" aria-hidden="true" />
+                {hasDetails ? (
+                    <button
+                        type="button"
+                        class="ag-ast-compaction-pill"
+                        data-assistant-compaction-toggle={messageId}
+                        aria-expanded={expanded}
+                        onClick={() => setExpanded((prev) => !prev)}
+                    >
+                        <span class="ag-ast-compaction-pill-text">
+                            {coreLabel} · {expanded ? '收起交接摘要 ▴' : '查看交接摘要 ▾'}
+                        </span>
+                    </button>
+                ) : (
+                    <span class="ag-ast-compaction-pill ag-ast-compaction-pill-static">
+                        {coreLabel}
+                    </span>
+                )}
+                <span class="ag-ast-compaction-rule" aria-hidden="true" />
+            </div>
+
+            {expanded && hasDetails ? (
+                <div
+                    class="ag-ast-compaction-summary"
+                    data-assistant-compaction-summary={messageId}
+                >
+                    {notice.focusInstruction?.trim() ? (
+                        <div class="ag-ast-compaction-meta">
+                            <strong>保留重点：</strong>
+                            <span>{notice.focusInstruction.trim()}</span>
+                        </div>
+                    ) : null}
+                    {notice.archivedChunkPath?.trim() ? (
+                        <div class="ag-ast-compaction-meta ag-mono">
+                            归档路径：{notice.archivedChunkPath.trim()}
+                        </div>
+                    ) : null}
+                    {notice.summaryText?.trim() ? (
+                        <pre class="ag-ast-compaction-pre ag-thin-scroll">
+                            {notice.summaryText.trim()}
+                        </pre>
+                    ) : null}
+                </div>
+            ) : null}
+        </div>
+    );
 }
 
 interface ToolCallItemProps {
@@ -141,6 +230,7 @@ export function MessageBubble({
     isLastMessage: _isLastMessage = false,
     canRegenerate = false,
     isSessionStreaming = false,
+    isCompacting = false,
     isEditing = false,
     isSyntheticStreaming = false,
     actionsOpen = false,
@@ -161,6 +251,7 @@ export function MessageBubble({
     onSaveAndResendEdit,
     onRetract,
     onRegenerate,
+    onCompactAndRetryOverflow,
     onCopy,
 }: MessageBubbleProps) {
     const [activityExpanded, setActivityExpanded] = useState<boolean>(false);
@@ -274,12 +365,13 @@ export function MessageBubble({
 
     if (message.role === 'user') {
         return (
-            <div
-                class="ag-ast-msg-row ag-ast-msg-row-user"
-                data-assistant-message={message.id}
-                data-message-role="user"
-                data-actions-open={actionsOpen ? 'true' : 'false'}
-            >
+            <Fragment>
+                <div
+                    class="ag-ast-msg-row ag-ast-msg-row-user"
+                    data-assistant-message={message.id}
+                    data-message-role="user"
+                    data-actions-open={actionsOpen ? 'true' : 'false'}
+                >
                 <div
                     class={
                         isEditing
@@ -512,6 +604,13 @@ export function MessageBubble({
                     ) : null}
                 </div>
             </div>
+                {message.compactionNotice ? (
+                    <CompactionNoticePill
+                        messageId={message.id}
+                        notice={message.compactionNotice}
+                    />
+                ) : null}
+            </Fragment>
         );
     }
 
@@ -552,12 +651,13 @@ export function MessageBubble({
     const fileRefs = Array.isArray(message.fileRefs) ? message.fileRefs : [];
 
     return (
-        <div
-            class="ag-ast-msg-row ag-ast-msg-row-assistant"
-            data-assistant-message={message.id}
-            data-message-role="assistant"
-            data-actions-open={actionsOpen ? 'true' : 'false'}
-        >
+        <Fragment>
+            <div
+                class="ag-ast-msg-row ag-ast-msg-row-assistant"
+                data-assistant-message={message.id}
+                data-message-role="assistant"
+                data-actions-open={actionsOpen ? 'true' : 'false'}
+            >
             <div class="ag-ast-msg-col ag-ast-msg-col-assistant">
                 <div
                     class="ag-ast-bubble-assistant"
@@ -720,12 +820,45 @@ export function MessageBubble({
                         </div>
                     ) : null}
 
+                    {message.interrupted && message.errorCode === 'context_overflow' && !isEditing && !isStreaming ? (
+                        <div
+                            class="ag-ast-overflow-escape"
+                            data-assistant-overflow-escape={message.id}
+                        >
+                            <div class="ag-ast-overflow-hint">
+                                ⚠️ 上下文超出模型最大 Token 上限，可压缩历史后重试或撤回本轮消息：
+                            </div>
+                            <div class="ag-ast-overflow-actions">
+                                <button
+                                    type="button"
+                                    class="ag-btn ag-btn-primary ag-btn-sm ag-ast-overflow-btn"
+                                    data-overflow-action="compact-retry"
+                                    disabled={isSessionStreaming || isCompacting}
+                                    onClick={() => void onCompactAndRetryOverflow?.()}
+                                >
+                                    {isCompacting ? '压缩中...' : '压缩历史后重试'}
+                                </button>
+                                <button
+                                    type="button"
+                                    class="ag-btn ag-btn-danger ag-btn-sm ag-ast-overflow-btn"
+                                    data-overflow-action="retract"
+                                    disabled={isSessionStreaming || isCompacting}
+                                    onClick={() => void onRetract?.(message.id)}
+                                >
+                                    撤回本轮消息
+                                </button>
+                            </div>
+                        </div>
+                    ) : null}
+
                     <div class="ag-ast-bubble-footer">
                         <span>
                             {message.usage
                                 ? `缓存 ${message.usage.cacheRate} · ${message.usage.outputTokens} tok`
                                 : message.interrupted
-                                    ? '已手动中止'
+                                    ? message.errorCode === 'context_overflow'
+                                        ? '上下文超限已中止'
+                                        : '已手动中止'
                                     : 'Agentic 助手'}
                         </span>
                         <span>
@@ -803,5 +936,12 @@ export function MessageBubble({
                 ) : null}
             </div>
         </div>
+            {message.compactionNotice ? (
+                <CompactionNoticePill
+                    messageId={message.id}
+                    notice={message.compactionNotice}
+                />
+            ) : null}
+        </Fragment>
     );
 }

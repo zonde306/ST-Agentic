@@ -91,6 +91,80 @@ export interface AssistantAttachment {
     textContent?: string;
 }
 
+export type AssistantTokenLevel = 'normal' | 'warning' | 'danger';
+
+export interface AssistantSessionTokenStatus {
+    sessionId: string;
+    /** Estimated input tokens for the active model trajectory (calibrated from latest usage.inputTokens when available). */
+    currentTokens: number;
+    /** Effective context input limit for the active connection. */
+    contextLimit: number;
+    /** Adaptive auto-compaction high/low watermarks. */
+    highWatermark: number;
+    lowWatermark: number;
+    /** Usage percentage (0-100) and visual severity level (<70% normal, 70%-89% warning, >=90% danger). */
+    usagePercent: number;
+    level: AssistantTokenLevel;
+    /** Number of active turns and messages in the model trajectory. */
+    activeTurnCount: number;
+    activeMessageCount: number;
+    /** Number of stale large (>400 chars) read-only tool_result messages eligible for folding. */
+    foldableToolResultCount: number;
+    /** Number of completed compaction cycles / archived chunks. */
+    compactedCount: number;
+    /** Preview of the latest handoff summary text, if any. */
+    summaryPreview?: string;
+    /** Whether a compaction operation is currently in progress. */
+    isCompacting?: boolean;
+}
+
+export interface AssistantCompactOptions {
+    /** Optional user-provided focus instruction describing what must be preserved in the summary. */
+    focusInstruction?: string;
+    /**
+     * - auto: fold stale large tool outputs first, then archive & summarize early turns if still above target
+     * - fold_only: only fold stale large tool outputs without archiving turns
+     * - full: fold stale tool outputs and condense early turns into a structured handoff summary
+     */
+    mode?: 'auto' | 'fold_only' | 'full';
+    /** Whether to invoke the LLM to generate a handoff summary; forced to false during emergency overflow recovery. */
+    useLLMSummary?: boolean;
+    /** Target post-compaction token budget (defaults to the connection's adaptive low watermark). */
+    targetLowTokens?: number;
+    signal?: AbortSignal;
+}
+
+export interface AssistantCompactReport {
+    compacted: boolean;
+    reason?:
+        | 'below_threshold'
+        | 'nothing_to_compact'
+        | 'manual'
+        | 'auto_watermark'
+        | 'preflight'
+        | 'overflow_recovery';
+    tokensBefore: number;
+    tokensAfter: number;
+    foldedToolResults: number;
+    archivedTurns: number;
+    archivedChunkPath?: string;
+    summaryMode: 'llm' | 'deterministic' | 'fold_only' | 'none';
+    summaryText?: string;
+    timestamp: number;
+}
+
+export interface AssistantCompactionNotice {
+    tokensBefore: number;
+    tokensAfter: number;
+    foldedToolResults: number;
+    archivedTurns: number;
+    summaryMode: 'llm' | 'deterministic' | 'fold_only';
+    summaryText?: string;
+    focusInstruction?: string;
+    archivedChunkPath?: string;
+    timestamp: number;
+}
+
 export interface AssistantMessage {
     id: string;
     role: 'user' | 'assistant';
@@ -102,6 +176,8 @@ export interface AssistantMessage {
     fileRefs?: string[];
     usage?: AssistantMessageUsage;
     interrupted?: boolean;
+    compactionNotice?: AssistantCompactionNotice;
+    errorCode?: 'context_overflow' | 'generic';
     timestamp: number;
 }
 

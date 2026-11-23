@@ -1,7 +1,15 @@
 import { z } from 'zod';
 import type { HostBridge } from '@/core/bridge';
 import { DEFAULT_MAIN_AGENT_ID, resolveActivePreset, resolveConnection } from '@/core/config';
-import { estimateRequestTokens, type TrajectoryStore } from '@/core/context';
+import {
+    applyToolOutputGate,
+    DEFAULT_MAX_TOOL_RESULT_BYTES,
+    estimateRequestTokens,
+    isSpillPath,
+    utf8ByteLength,
+    type TrajectoryStore,
+    type TransientToolSpillStore,
+} from '@/core/context';
 import type { TraceLogger } from '@/core/logger';
 import type { ChatDataStore } from '@/core/store';
 import {
@@ -43,6 +51,8 @@ export interface AssistantToolContext {
     getVariableSchema?: () => DynamicVariableSchema | undefined;
     captureUndo?: boolean;
     getStatusSnapshot?: () => Record<string, unknown>;
+    spillStore?: TransientToolSpillStore;
+    maxToolResultBytes?: number;
 }
 
 export interface AssistantApprovalPreview {
@@ -56,6 +66,14 @@ export interface AssistantApprovalPreview {
     warnings?: string[];
 }
 
+export interface AssistantToolOutputGateConfig {
+    toolName: string;
+    toolCallId: string;
+    maxBytes?: number;
+    spillStore?: TransientToolSpillStore;
+    scopeId?: string;
+}
+
 export interface AssistantToolResult {
     ok: boolean;
     output: string;
@@ -66,6 +84,8 @@ export interface AssistantToolResult {
     undoId?: string;
     warnings?: string[];
     fileRefs?: string[];
+    truncated?: boolean;
+    spillPath?: string;
 }
 
 export interface AssistantToolDefinition<TParams extends z.ZodTypeAny = z.ZodTypeAny> {
@@ -113,36 +133,70 @@ export function truncateSummary(text: string, maxChars: number = 160): string {
 
 export function finalizeReadToolResult(
     payload: unknown,
-    extras?: { fileRefs?: string[]; warnings?: string[] },
+    extras?: {
+        fileRefs?: string[];
+        warnings?: string[];
+        gate?: AssistantToolOutputGateConfig;
+    },
 ): AssistantToolResult {
     if (typeof payload === 'string') {
         const report = redactString(payload);
+        const gated = extras?.gate
+            ? applyToolOutputGate(report.value, {
+                toolName: extras.gate.toolName,
+                toolCallId: extras.gate.toolCallId,
+                maxBytes: extras.gate.maxBytes ?? DEFAULT_MAX_TOOL_RESULT_BYTES,
+                spillStore: extras.gate.spillStore,
+                scopeId: extras.gate.scopeId,
+            })
+            : null;
+        const finalOutput = gated ? gated.output : report.value;
         return {
             ok: true,
-            output: report.value,
-            data: report.value,
+            output: finalOutput,
+            data: finalOutput,
             hasSecretRedaction: report.hasSecretRedaction,
             redactionCount: report.redactionCount,
             ...(extras?.fileRefs?.length ? { fileRefs: [...extras.fileRefs] } : {}),
             ...(extras?.warnings?.length ? { warnings: [...extras.warnings] } : {}),
+            ...(gated?.truncated ? { truncated: true } : {}),
+            ...(gated?.spillPath ? { spillPath: gated.spillPath } : {}),
         };
     }
 
     const report = redactWithReport(payload);
+    const serialized = JSON.stringify(report.value);
+    const gated = extras?.gate
+        ? applyToolOutputGate(serialized, {
+            toolName: extras.gate.toolName,
+            toolCallId: extras.gate.toolCallId,
+            maxBytes: extras.gate.maxBytes ?? DEFAULT_MAX_TOOL_RESULT_BYTES,
+            rawData: report.value,
+            spillStore: extras.gate.spillStore,
+            scopeId: extras.gate.scopeId,
+        })
+        : null;
     return {
         ok: true,
-        output: JSON.stringify(report.value),
+        output: gated ? gated.output : serialized,
         data: report.value,
         hasSecretRedaction: report.hasSecretRedaction,
         redactionCount: report.redactionCount,
         ...(extras?.fileRefs?.length ? { fileRefs: [...extras.fileRefs] } : {}),
         ...(extras?.warnings?.length ? { warnings: [...extras.warnings] } : {}),
+        ...(gated?.truncated ? { truncated: true } : {}),
+        ...(gated?.spillPath ? { spillPath: gated.spillPath } : {}),
     };
 }
 
 export function finalizeMutationToolResult(
     payload: Record<string, unknown>,
-    extras?: { undoId?: string; warnings?: string[]; fileRefs?: string[] },
+    extras?: {
+        undoId?: string;
+        warnings?: string[];
+        fileRefs?: string[];
+        gate?: AssistantToolOutputGateConfig;
+    },
 ): AssistantToolResult {
     const combined: Record<string, unknown> = {
         ok: true,
@@ -151,15 +205,28 @@ export function finalizeMutationToolResult(
         ...(extras?.warnings?.length ? { warnings: extras.warnings } : {}),
     };
     const report = redactWithReport(combined);
+    const serialized = JSON.stringify(report.value);
+    const gated = extras?.gate
+        ? applyToolOutputGate(serialized, {
+            toolName: extras.gate.toolName,
+            toolCallId: extras.gate.toolCallId,
+            maxBytes: extras.gate.maxBytes ?? DEFAULT_MAX_TOOL_RESULT_BYTES,
+            rawData: report.value,
+            spillStore: extras.gate.spillStore,
+            scopeId: extras.gate.scopeId,
+        })
+        : null;
     return {
         ok: true,
-        output: JSON.stringify(report.value),
+        output: gated ? gated.output : serialized,
         data: report.value,
         hasSecretRedaction: report.hasSecretRedaction,
         redactionCount: report.redactionCount,
         ...(extras?.undoId ? { undoId: extras.undoId } : {}),
         ...(extras?.warnings?.length ? { warnings: [...extras.warnings] } : {}),
         ...(extras?.fileRefs?.length ? { fileRefs: [...extras.fileRefs] } : {}),
+        ...(gated?.truncated ? { truncated: true } : {}),
+        ...(gated?.spillPath ? { spillPath: gated.spillPath } : {}),
     };
 }
 
@@ -220,6 +287,8 @@ export function toCanonicalAssistantToolSchemas(
 /**
  * Validate raw arguments with Zod v4 and execute an `AssistantToolDefinition`.
  * Propagates `AbortError` when `ctx.signal` is aborted; returns structured redacted errors otherwise.
+ * Enforces post-redaction `applyToolOutputGate` centrally so every tool (built-in & extraTools)
+ * stays within `ctx.maxToolResultBytes` (default 32 KB) and never spills unredacted secrets.
  */
 export async function executeAssistantTool(
     tool: AssistantToolDefinition,
@@ -238,7 +307,58 @@ export async function executeAssistantTool(
     try {
         const result = await tool.execute(validated.data, ctx);
         throwIfAssistantAborted(ctx.signal);
-        return result;
+
+        // Ensure secrets are ALWAYS redacted before touching spillStore or output gate,
+        // even for custom extraTools that construct AssistantToolResult directly.
+        const outputRedaction = redactString(result.output);
+        const safeOutput = outputRedaction.value;
+        const hasSecretRedaction = result.hasSecretRedaction || outputRedaction.hasSecretRedaction;
+        const redactionCount = result.redactionCount + outputRedaction.redactionCount;
+
+        const maxBytes = ctx.maxToolResultBytes ?? DEFAULT_MAX_TOOL_RESULT_BYTES;
+        if (result.truncated && utf8ByteLength(safeOutput) <= maxBytes) {
+            return {
+                ...result,
+                output: safeOutput,
+                hasSecretRedaction,
+                redactionCount,
+            };
+        }
+
+        const safeRawData =
+            !outputRedaction.hasSecretRedaction
+            && result.data !== undefined
+            && result.data !== null
+            && typeof result.data === 'object'
+                ? result.data
+                : undefined;
+
+        const gated = applyToolOutputGate(safeOutput, {
+            toolName: tool.name,
+            toolCallId: ctx.toolCallId,
+            maxBytes,
+            rawData: safeRawData,
+            spillStore: ctx.spillStore,
+            scopeId: ctx.sessionId,
+        });
+
+        if (!gated.truncated) {
+            return {
+                ...result,
+                output: safeOutput,
+                hasSecretRedaction,
+                redactionCount,
+            };
+        }
+
+        return {
+            ...result,
+            output: gated.output,
+            hasSecretRedaction,
+            redactionCount,
+            truncated: true,
+            ...(gated.spillPath ? { spillPath: gated.spillPath } : {}),
+        };
     } catch (error) {
         return finalizeToolError(error, ctx.signal);
     }
@@ -351,14 +471,23 @@ const AGENTIC_READ_TRACES_SCHEMA = z.object({
 
 const CARD_READ_ACTIVE_SCHEMA = z.object({});
 
+const WI_READ_ENABLED_MAX_CONTENT_BYTES = 24 * 1024;
+
 const WI_READ_ENABLED_SCHEMA = z.object({
     bookName: z.string().optional().describe('Optional enabled World Info book name filter.'),
     query: z.string().optional().describe('Optional keyword/content substring filter.'),
-    includeContent: z.boolean().optional().default(true),
+    includeContent: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe(
+            'Include entry content when filtered and total matched content is <= 24 KB; automatically degrades to a catalog summary when unfiltered or > 24 KB.',
+        ),
     limit: z.number().int().min(1).max(500).optional().default(200),
 });
 
 function summarizeLoreEntry(entry: RawLoreEntry, includeContent: boolean): Record<string, unknown> {
+    const content = entry.content ?? '';
     return {
         world: entry.world,
         uid: entry.uid,
@@ -372,7 +501,8 @@ function summarizeLoreEntry(entry: RawLoreEntry, includeContent: boolean): Recor
         depth: entry.depth,
         order: entry.order,
         role: entry.role,
-        ...(includeContent ? { content: entry.content } : {}),
+        contentLength: content.length,
+        ...(includeContent ? { content } : {}),
     };
 }
 
@@ -416,12 +546,49 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
 
     const grepSearchTool: AssistantToolDefinition<typeof GREP_SEARCH_SCHEMA> = {
         name: 'grep_search',
-        description: 'Search VFS files line-by-line for a literal string or regex. Read-only.',
+        description:
+            'Search VFS files (or /tmp/tool-spill/* transient spilled tool outputs) line-by-line for a literal string or regex. Read-only.',
         parameters: GREP_SEARCH_SCHEMA,
         tier: 'chat',
         readOnly: true,
         async execute(args, ctx) {
             throwIfAssistantAborted(ctx.signal);
+            const rawPrefix = (args.path_prefix ?? '/').trim();
+            if (isSpillPath(rawPrefix)) {
+                const pathPrefix = normalizeDirectoryInput(rawPrefix);
+                if (!ctx.spillStore) {
+                    return finalizeToolError(
+                        `Spill path not found or expired: "${pathPrefix}" (no active spill store).`,
+                        ctx.signal,
+                    );
+                }
+                if (pathPrefix !== '/tmp/tool-spill') {
+                    const hasExact = ctx.spillStore.get(pathPrefix) !== null;
+                    const prefixWithSlash = `${pathPrefix}/`;
+                    const hasPrefix = ctx.spillStore
+                        .listPaths()
+                        .some((p) => p.startsWith(prefixWithSlash));
+                    if (!hasExact && !hasPrefix) {
+                        return finalizeToolError(
+                            `Spill entry not found or expired: "${pathPrefix}". It may have been evicted or cleared.`,
+                            ctx.signal,
+                        );
+                    }
+                }
+                const hits = ctx.spillStore.grep(pathPrefix, args.query, {
+                    caseSensitive: args.case_sensitive,
+                    regex: args.regex,
+                    limit: args.limit,
+                });
+                return finalizeReadToolResult({
+                    ok: true,
+                    query: args.query,
+                    pathPrefix,
+                    total: hits.length,
+                    results: hits,
+                });
+            }
+
             const pathPrefix = normalizeDirectoryInput(args.path_prefix);
             const hits = await ctx.vfs.grepSearch(args.query, {
                 pathPrefix,
@@ -468,7 +635,8 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
 
     const readFileTool: AssistantToolDefinition<typeof READ_FILE_SCHEMA> = {
         name: 'read_file',
-        description: 'Read a VFS file (supports optional 1-based start_line/end_line). Read-only.',
+        description:
+            'Read a VFS file or /tmp/tool-spill/* spilled tool output (supports optional 1-based start_line/end_line). Read-only.',
         parameters: READ_FILE_SCHEMA,
         tier: 'chat',
         readOnly: true,
@@ -485,6 +653,27 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
                 );
             }
             const normalizedPath = normalizeVfsPath(args.path);
+            if (isSpillPath(args.path)) {
+                if (!ctx.spillStore) {
+                    return finalizeToolError(
+                        `Spill entry not found or expired: "${normalizedPath}" (no active spill store).`,
+                        ctx.signal,
+                    );
+                }
+                const slice = ctx.spillStore.readSlice(
+                    normalizedPath,
+                    args.start_line,
+                    args.end_line,
+                );
+                if (slice === null) {
+                    return finalizeToolError(
+                        `Spill entry not found or expired: "${normalizedPath}". It may have been evicted or cleared.`,
+                        ctx.signal,
+                    );
+                }
+                return finalizeReadToolResult(slice, { fileRefs: [normalizedPath] });
+            }
+
             const content = await ctx.vfs.readFile(normalizedPath, {
                 startLine: args.start_line,
                 endLine: args.end_line,
@@ -744,23 +933,28 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
     const wiReadEnabledTool: AssistantToolDefinition<typeof WI_READ_ENABLED_SCHEMA> = {
         name: 'wi_read_enabled',
         description:
-            'Read currently enabled World Info books and their entries (supports bookName/query filters). Read-only.',
+            'Read currently enabled World Info books and their entries (supports bookName/query filters). Returns a catalog summary automatically when unfiltered or when matched content exceeds 24 KB. Read-only.',
         parameters: WI_READ_ENABLED_SCHEMA,
         tier: 'chat',
         readOnly: true,
         async execute(args, ctx) {
             throwIfAssistantAborted(ctx.signal);
             const books = await ctx.bridge.listEnabledLorebooks();
+            const bookFilter = args.bookName?.trim() ?? '';
             const needle = args.query?.trim().toLowerCase() ?? '';
-            const summaries: Array<{
+            const hasFilter = bookFilter.length > 0 || needle.length > 0;
+
+            const matchedBooks: Array<{
                 bookName: string;
                 totalEntries: number;
-                entries: Record<string, unknown>[];
+                entries: RawLoreEntry[];
             }> = [];
 
             let remaining = args.limit;
+            let totalContentBytes = 0;
+
             for (const [bookName, entries] of books.entries()) {
-                if (args.bookName && bookName !== args.bookName) {
+                if (bookFilter && bookName !== bookFilter) {
                     continue;
                 }
                 const filtered = needle
@@ -778,16 +972,41 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
                     : entries;
                 const slice = filtered.slice(0, Math.max(0, remaining));
                 remaining -= slice.length;
-                summaries.push({
+                for (const entry of slice) {
+                    totalContentBytes += utf8ByteLength(entry.content ?? '');
+                }
+                matchedBooks.push({
                     bookName,
                     totalEntries: filtered.length,
-                    entries: slice.map((e) => summarizeLoreEntry(e, args.includeContent)),
+                    entries: slice,
                 });
             }
+
+            const autoDegraded =
+                args.includeContent
+                && (!hasFilter || totalContentBytes > WI_READ_ENABLED_MAX_CONTENT_BYTES);
+            const effectiveIncludeContent = args.includeContent && !autoDegraded;
+
+            const summaries = matchedBooks.map((book) => ({
+                bookName: book.bookName,
+                totalEntries: book.totalEntries,
+                entries: book.entries.map((entry) =>
+                    summarizeLoreEntry(entry, effectiveIncludeContent),
+                ),
+            }));
 
             return finalizeReadToolResult({
                 ok: true,
                 bookCount: summaries.length,
+                catalogOnly: !effectiveIncludeContent,
+                ...(autoDegraded
+                    ? {
+                        degradedToCatalog: true,
+                        reason: !hasFilter ? 'unfiltered_request' : 'content_exceeded_24kb',
+                        totalContentBytes,
+                        hint: 'Returned World Info catalog summary (omitting full content). Specify bookName and/or query to read full content for specific entries, or use read_file("/lorebooks/<bookName>/...") for targeted reads.',
+                    }
+                    : {}),
                 books: summaries,
             });
         },

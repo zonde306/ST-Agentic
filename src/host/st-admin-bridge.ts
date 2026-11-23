@@ -26,7 +26,12 @@ import {
     world_names,
 } from '@st/scripts/world-info.js';
 
-import type { HostAdminBridge } from '@/core/bridge';
+import type {
+    HostAdminBridge,
+    ListPresetsOptions,
+    ReadHostSettingsOptions,
+} from '@/core/bridge';
+import { utf8ByteLength } from '@/core/context';
 import type {
     HostCharacterCreatePayload,
     HostCharacterFull,
@@ -64,6 +69,190 @@ interface PresetManagerLike {
     savePreset?: (name: string, settings: Record<string, unknown>, opts?: { skipUpdate?: boolean }) => Promise<void> | void;
     getCompletionPresetByName?: (name: string) => Record<string, unknown> | undefined;
     getPresetSettings?: (name: string) => Record<string, unknown> | undefined;
+}
+
+const HOST_SETTINGS_SUMMARY_THRESHOLD_BYTES = 16 * 1024;
+const CHARACTER_DESCRIPTION_PREVIEW_MAX_CHARS = 120;
+const SETTINGS_MANIFEST_PREVIEW_MAX_CHARS = 100;
+const SETTINGS_MANIFEST_MAX_SUBKEYS = 50;
+
+interface SettingsManifestEntry {
+    key: string;
+    type: 'null' | 'array' | 'object' | 'string' | 'number' | 'boolean';
+    bytes: number;
+    itemCount?: number;
+    preview: string;
+}
+
+function truncatePreviewText(raw: string, maxChars: number): string {
+    const clean = raw.replace(/\s+/g, ' ').trim();
+    if (clean.length <= maxChars) {
+        return clean;
+    }
+    return `${clean.slice(0, Math.max(1, maxChars - 3)).trimEnd()}...`;
+}
+
+function classifySettingsType(value: unknown): SettingsManifestEntry['type'] {
+    if (value === null || value === undefined) {
+        return 'null';
+    }
+    if (Array.isArray(value)) {
+        return 'array';
+    }
+    switch (typeof value) {
+        case 'object':
+            return 'object';
+        case 'string':
+            return 'string';
+        case 'number':
+            return 'number';
+        case 'boolean':
+            return 'boolean';
+        default:
+            return 'string';
+    }
+}
+
+function safeSerializeSettingsValue(value: unknown): string {
+    const seen = new WeakSet<object>();
+    try {
+        const encoded = JSON.stringify(value, (_key, val: unknown) => {
+            if (typeof val === 'bigint') {
+                return val.toString();
+            }
+            if (val && typeof val === 'object') {
+                if (seen.has(val)) {
+                    return '[Circular]';
+                }
+                seen.add(val);
+            }
+            return val;
+        });
+        return encoded === undefined ? 'null' : encoded;
+    } catch {
+        return String(value);
+    }
+}
+
+function compareManifestKeys(a: string, b: string): number {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
+
+function buildRecordManifestItems(
+    record: Record<string, unknown>,
+    maxItems?: number,
+): SettingsManifestEntry[] {
+    const items: SettingsManifestEntry[] = Object.entries(record).map(([key, value]) => {
+        const type = classifySettingsType(value);
+        const serialized = safeSerializeSettingsValue(value);
+        const bytes = utf8ByteLength(serialized);
+        const itemCount =
+            type === 'array'
+                ? (value as unknown[]).length
+                : type === 'object'
+                    ? Object.keys(value as Record<string, unknown>).length
+                    : undefined;
+        const previewSource = typeof value === 'string' ? value : serialized;
+        return {
+            key,
+            type,
+            bytes,
+            ...(itemCount !== undefined ? { itemCount } : {}),
+            preview: truncatePreviewText(previewSource, SETTINGS_MANIFEST_PREVIEW_MAX_CHARS),
+        };
+    });
+    items.sort((a, b) => b.bytes - a.bytes || compareManifestKeys(a.key, b.key));
+    return maxItems !== undefined && items.length > maxItems ? items.slice(0, maxItems) : items;
+}
+
+function buildHostSettingsSummaryManifest(
+    record: Record<string, unknown>,
+    scope: string,
+    totalBytes: number,
+    keyPath?: string,
+): Record<string, unknown> {
+    const manifest = buildRecordManifestItems(record);
+    const subManifests: Record<string, SettingsManifestEntry[]> = {};
+    if (scope === 'all' && !keyPath) {
+        if (isPlainRecord(record.extension_settings)) {
+            subManifests.extension_settings = buildRecordManifestItems(
+                record.extension_settings,
+                SETTINGS_MANIFEST_MAX_SUBKEYS,
+            );
+        }
+        if (isPlainRecord(record.power_user)) {
+            subManifests.power_user = buildRecordManifestItems(
+                record.power_user,
+                SETTINGS_MANIFEST_MAX_SUBKEYS,
+            );
+        }
+    }
+
+    return {
+        scope,
+        ...(keyPath ? { keyPath } : {}),
+        summaryOnly: true,
+        totalBytes,
+        manifest,
+        ...(Object.keys(subManifests).length > 0 ? { subManifests } : {}),
+        hint: 'Returned a hierarchical size manifest instead of dumping full host settings. Drill down with a specific extension scope (e.g. scope: "ST-Agentic") or keyPath (e.g. keyPath: "power_user.theme" or "TavernHelper.scripts").',
+    };
+}
+
+function parseKeyPathSegments(rawKeyPath: string): string[] {
+    return rawKeyPath
+        .trim()
+        .replace(/\\/g, '/')
+        .split(/[./]+/)
+        .map((seg) => seg.trim())
+        .filter((seg) => seg.length > 0);
+}
+
+function walkSettingsPath(
+    root: unknown,
+    segments: readonly string[],
+): { found: boolean; value: unknown } {
+    let cursor: unknown = root;
+    for (const seg of segments) {
+        if (seg === '__proto__' || seg === 'constructor' || seg === 'prototype') {
+            return { found: false, value: undefined };
+        }
+        if (Array.isArray(cursor)) {
+            const idx = Number.parseInt(seg, 10);
+            if (!Number.isInteger(idx) || idx < 0 || idx >= cursor.length || String(idx) !== seg) {
+                return { found: false, value: undefined };
+            }
+            cursor = cursor[idx];
+            continue;
+        }
+        if (isPlainRecord(cursor) && Object.hasOwn(cursor, seg)) {
+            cursor = cursor[seg];
+            continue;
+        }
+        return { found: false, value: undefined };
+    }
+    return { found: true, value: cursor };
+}
+
+function resolveSettingsKeyPath(
+    root: unknown,
+    scope: string,
+    rawKeyPath: string,
+): { found: boolean; value: unknown } {
+    const segments = parseKeyPathSegments(rawKeyPath);
+    if (segments.length === 0) {
+        return { found: true, value: root };
+    }
+    const direct = walkSettingsPath(root, segments);
+    if (direct.found) {
+        return direct;
+    }
+    if (segments[0] === scope && segments.length > 1) {
+        return walkSettingsPath(root, segments.slice(1));
+    }
+    return { found: false, value: undefined };
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -278,7 +467,14 @@ export class STAdminBridge implements HostAdminBridge {
                 chid: full.chid,
                 name: full.name,
                 avatar: full.avatar,
-                ...(full.description !== undefined ? { description: full.description } : {}),
+                ...(full.description !== undefined
+                    ? {
+                        description: truncatePreviewText(
+                            full.description,
+                            CHARACTER_DESCRIPTION_PREVIEW_MAX_CHARS,
+                        ),
+                    }
+                    : {}),
                 ...(full.tags !== undefined ? { tags: [...full.tags] } : {}),
                 ...(full.primaryWorld !== undefined ? { primaryWorld: full.primaryWorld } : {}),
             });
@@ -585,28 +781,40 @@ export class STAdminBridge implements HostAdminBridge {
         saveSettingsDebounced();
     }
 
-    async listPresets(apiType?: string): Promise<HostPresetInfo[]> {
+    async listPresets(apiTypeOrOptions?: string | ListPresetsOptions): Promise<HostPresetInfo[]> {
         if (typeof getPresetManager !== 'function') {
             return [];
         }
+        const options: ListPresetsOptions =
+            typeof apiTypeOrOptions === 'string'
+                ? { apiType: apiTypeOrOptions }
+                : (apiTypeOrOptions ?? {});
+        const apiType = options.apiType;
+        const includeData = options.includeData === true;
+        const nameFilter = typeof options.name === 'string' ? options.name.trim() : '';
+
         const pm = getPresetManager(apiType ?? '') as PresetManagerLike | null | undefined;
         if (!pm) {
             return [];
         }
 
-        const names = typeof pm.getAllPresets === 'function' ? pm.getAllPresets() : [];
+        const allNames = typeof pm.getAllPresets === 'function' ? pm.getAllPresets() : [];
+        const names = nameFilter ? allNames.filter((n) => n === nameFilter) : allNames;
         const selected = typeof pm.getSelectedPresetName === 'function' ? pm.getSelectedPresetName() : '';
         const resolvedApiType = apiType || pm.apiId || '';
 
         return names.map((name) => {
             let data: Record<string, unknown> | undefined;
-            try {
-                const raw = pm.getCompletionPresetByName?.(name);
-                if (isPlainRecord(raw)) {
-                    data = cloneValue(raw);
+            if (includeData) {
+                try {
+                    const raw =
+                        pm.getCompletionPresetByName?.(name) ?? pm.getPresetSettings?.(name);
+                    if (isPlainRecord(raw)) {
+                        data = cloneValue(raw);
+                    }
+                } catch {
+                    // Omit preset body when unavailable for this API type.
                 }
-            } catch {
-                // Omit preset body when unavailable for this API type.
             }
             return {
                 name,
@@ -670,28 +878,118 @@ export class STAdminBridge implements HostAdminBridge {
     // 4. Global Settings, Global Regex, Slash Exec & URL Import
     // ------------------------------------------------------------------------
 
-    async readHostSettings(scope: HostSettingsScope): Promise<Record<string, unknown>> {
+    async readHostSettings(
+        scope: HostSettingsScope,
+        options?: ReadHostSettingsOptions,
+    ): Promise<Record<string, unknown>> {
         const pu = isPlainRecord(power_user) ? power_user : {};
         const ext = isPlainRecord(extension_settings) ? extension_settings : {};
 
+        let baseObj: Record<string, unknown>;
         if (scope === 'all') {
-            return {
-                power_user: cloneValue(pu),
-                extension_settings: cloneValue(ext),
+            baseObj = {
+                power_user: pu,
+                extension_settings: ext,
             };
-        }
-        if (scope === 'power_user') {
-            return cloneValue(pu);
-        }
-        if (scope === 'extension_settings') {
-            return cloneValue(ext);
+        } else if (scope === 'power_user') {
+            baseObj = pu;
+        } else if (scope === 'extension_settings') {
+            baseObj = ext;
+        } else {
+            const bucket = (ext as Record<string, unknown>)[scope];
+            if (bucket === undefined) {
+                baseObj = {};
+            } else {
+                baseObj = isPlainRecord(bucket) ? bucket : { value: bucket };
+            }
         }
 
-        const bucket = (ext as Record<string, unknown>)[scope];
-        if (bucket === undefined) {
-            return {};
+        const keyPath = typeof options?.keyPath === 'string' ? options.keyPath.trim() : '';
+        if (keyPath) {
+            const resolved = resolveSettingsKeyPath(baseObj, scope, keyPath);
+            if (!resolved.found) {
+                return {
+                    scope,
+                    keyPath,
+                    found: false,
+                    value: null,
+                };
+            }
+            const resolvedSerialized = safeSerializeSettingsValue(resolved.value);
+            const resolvedBytes = utf8ByteLength(resolvedSerialized);
+            if (isPlainRecord(resolved.value)) {
+                if (
+                    options?.summaryOnly === true
+                    || (options?.summaryOnly !== false
+                        && resolvedBytes > HOST_SETTINGS_SUMMARY_THRESHOLD_BYTES)
+                ) {
+                    return buildHostSettingsSummaryManifest(
+                        resolved.value,
+                        scope,
+                        resolvedBytes,
+                        keyPath,
+                    );
+                }
+                return cloneValue(resolved.value);
+            }
+            if (
+                Array.isArray(resolved.value)
+                && (options?.summaryOnly === true
+                    || (options?.summaryOnly !== false
+                        && resolvedBytes > HOST_SETTINGS_SUMMARY_THRESHOLD_BYTES))
+            ) {
+                const sampleEntries: SettingsManifestEntry[] = resolved.value
+                    .slice(0, SETTINGS_MANIFEST_MAX_SUBKEYS)
+                    .map((item, idx) => {
+                        const type = classifySettingsType(item);
+                        const ser = safeSerializeSettingsValue(item);
+                        const itemCount =
+                            type === 'array'
+                                ? (item as unknown[]).length
+                                : type === 'object'
+                                    ? Object.keys(item as Record<string, unknown>).length
+                                    : undefined;
+                        return {
+                            key: String(idx),
+                            type,
+                            bytes: utf8ByteLength(ser),
+                            ...(itemCount !== undefined ? { itemCount } : {}),
+                            preview: truncatePreviewText(
+                                typeof item === 'string' ? item : ser,
+                                SETTINGS_MANIFEST_PREVIEW_MAX_CHARS,
+                            ),
+                        };
+                    });
+                return {
+                    scope,
+                    keyPath,
+                    summaryOnly: true,
+                    totalBytes: resolvedBytes,
+                    type: 'array',
+                    itemCount: resolved.value.length,
+                    manifest: sampleEntries,
+                    hint: `Array at "${keyPath}" has ${resolved.value.length} items (${resolvedBytes} bytes). Drill down by index (e.g. "${keyPath}.0") to inspect a specific item.`,
+                };
+            }
+            return {
+                scope,
+                keyPath,
+                found: true,
+                value: cloneValue(resolved.value),
+            };
         }
-        return isPlainRecord(bucket) ? cloneValue(bucket) : { value: cloneValue(bucket) };
+
+        const totalBytes = utf8ByteLength(safeSerializeSettingsValue(baseObj));
+        const shouldSummarize =
+            options?.summaryOnly === true
+            || (options?.summaryOnly !== false
+                && totalBytes > HOST_SETTINGS_SUMMARY_THRESHOLD_BYTES);
+
+        if (shouldSummarize) {
+            return buildHostSettingsSummaryManifest(baseObj, scope, totalBytes);
+        }
+
+        return cloneValue(baseObj);
     }
 
     async patchHostSettings(
