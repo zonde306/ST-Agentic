@@ -12,7 +12,8 @@ import { MacroCategory, macros, MacroValueType } from '@st/scripts/macros/macro-
 import { worldInfoCache } from '@st/scripts/world-info.js';
 
 import { resolveActivePreset } from '@/core/config';
-import { DecoratorParser } from '@/core/lore';
+import { formatSideBriefXml, selectUnconsumedSideBriefClues } from '@/core/context';
+import { DecoratorParser, TailRadar } from '@/core/lore';
 import {
     ChatDataStore,
     DATA_NAMESPACES,
@@ -42,6 +43,7 @@ import type { AppStore } from '@/ui/store';
 import type { STHostBridge } from './st-bridge';
 
 const COMPANION_PROMPT_KEY = 'agentic_companion_before';
+export const COMPANION_SIDE_BRIDGE_PROMPT_KEY = 'agentic_side_bridge';
 
 const CONTROL_DECORATOR_NAMES = new Set([
     'trigger',
@@ -73,16 +75,20 @@ export interface CompanionHooksOptions {
     getSettings: () => Settings | undefined;
     getAppStore?: () => AppStore | undefined;
     isTakeoverActive?: () => boolean;
+    tailRadar?: TailRadar;
 }
 
 export interface CompanionHooksHandle {
     dispose(): void;
     resolveVfsFileSync(rawPath: string, target?: MessageTarget): string;
+    clearSideBridgePrompt(): void;
+    syncSideBridgePrompt(target?: MessageTarget): Promise<string>;
 }
 
 interface PendingCompanionTurn {
     target: MessageTarget;
     controller: AbortController;
+    pendingSideBriefPaths?: string[];
 }
 
 function getLatestMessageTarget(): MessageTarget {
@@ -296,6 +302,19 @@ function buildSyncVfsReader(
             }
         }
 
+        if (rel.startsWith('side/')) {
+            const key = rel.slice('side/'.length);
+            if (!key) {
+                return '';
+            }
+            const entry =
+                store.getPending(DATA_NAMESPACES.SIDE_FILES, key, { target })
+                ?? store.get(DATA_NAMESPACES.SIDE_FILES, key, { target })
+                ?? store.getPending(DATA_NAMESPACES.SIDE_FILES, `/${rel}`, { target })
+                ?? store.get(DATA_NAMESPACES.SIDE_FILES, `/${rel}`, { target });
+            return typeof entry?.content === 'string' ? entry.content : '';
+        }
+
         if (rel.startsWith('chat/')) {
             const key = rel.slice('chat/'.length);
             return readNamespaceEntrySync(store, DATA_NAMESPACES.FILES, key, target) ?? '';
@@ -499,6 +518,52 @@ function mountCompanionCapsule(
     return capsule;
 }
 
+function collectRecentChatTexts(limit = 8): { input: string; recentMessages: string[] } {
+    if (!Array.isArray(chat) || chat.length === 0) {
+        return { input: '', recentMessages: [] };
+    }
+    const texts = chat
+        .slice(-Math.max(1, limit))
+        .map((msg) => {
+            const m = msg as { mes?: unknown };
+            return typeof m?.mes === 'string' ? m.mes.trim() : '';
+        })
+        .filter(Boolean);
+    if (texts.length === 0) {
+        return { input: '', recentMessages: [] };
+    }
+    return {
+        input: texts[texts.length - 1] ?? '',
+        recentMessages: texts.slice(0, -1),
+    };
+}
+
+async function buildCompanionSideBridgeContent(
+    orchestrator: PipelineOrchestrator,
+    radar: TailRadar,
+    target: MessageTarget,
+): Promise<{ content: string; briefPaths: string[] }> {
+    const clues = await orchestrator.vfs.listSideClues({ target });
+    if (clues.length === 0) {
+        return { content: '', briefPaths: [] };
+    }
+
+    const briefClues = selectUnconsumedSideBriefClues(clues);
+    const briefXml = formatSideBriefXml(briefClues);
+
+    const { input, recentMessages } = collectRecentChatTexts(8);
+    const scanResult = input || recentMessages.length > 0
+        ? radar.scanSideClues(clues, { input, recentMessages })
+        : undefined;
+    const hintXml = scanResult?.hintXml?.trim() ?? '';
+
+    const parts = [briefXml.trim(), hintXml].filter(Boolean);
+    return {
+        content: parts.join('\n\n'),
+        briefPaths: briefClues.map((clue) => clue.path),
+    };
+}
+
 function unregisterFileMacro(): void {
     const macroHolder = macros as {
         registry?: { unregister?: (name: string) => void };
@@ -546,6 +611,7 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
 
     let activeGenType: string | null = null;
     let pendingCompanionTurn: PendingCompanionTurn | null = null;
+    const sideTailRadar = options.tailRadar ?? TailRadar.fromBridge(bridge);
 
     const clearCompanionPrompt = () => {
         if (typeof setExtensionPrompt === 'function') {
@@ -558,6 +624,41 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
                 extension_prompt_roles?.SYSTEM ?? 0,
             );
         }
+    };
+
+    const clearSideBridgePrompt = () => {
+        if (typeof setExtensionPrompt === 'function') {
+            setExtensionPrompt(
+                COMPANION_SIDE_BRIDGE_PROMPT_KEY,
+                '',
+                extension_prompt_types?.IN_CHAT ?? 1,
+                0,
+                false,
+                extension_prompt_roles?.SYSTEM ?? 0,
+            );
+        }
+    };
+
+    const syncSideBridgePrompt = async (targetOverride?: MessageTarget): Promise<string> => {
+        const settings = getSettings();
+        if (!settings || settings.runMode !== 'companion') {
+            clearSideBridgePrompt();
+            return '';
+        }
+
+        const target = targetOverride ?? getLatestMessageTarget();
+        const sideBridge = await buildCompanionSideBridgeContent(orchestrator, sideTailRadar, target);
+        if (typeof setExtensionPrompt === 'function') {
+            setExtensionPrompt(
+                COMPANION_SIDE_BRIDGE_PROMPT_KEY,
+                sideBridge.content,
+                extension_prompt_types?.IN_CHAT ?? 1,
+                0,
+                false,
+                extension_prompt_roles?.SYSTEM ?? 0,
+            );
+        }
+        return sideBridge.content;
     };
 
     const onGenerationAfterCommands = async (
@@ -575,6 +676,7 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         const settings = getSettings();
         if (!settings || settings.runMode !== 'companion') {
             clearCompanionPrompt();
+            clearSideBridgePrompt();
             return;
         }
 
@@ -595,15 +697,22 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
                 return;
             }
 
-            const briefText = await runCompanionBeforeTurnUnits(
-                orchestrator,
-                bridge,
-                settings,
-                target,
-                controller.signal,
-            );
+            const [briefText, sideBridge] = await Promise.all([
+                runCompanionBeforeTurnUnits(
+                    orchestrator,
+                    bridge,
+                    settings,
+                    target,
+                    controller.signal,
+                ),
+                buildCompanionSideBridgeContent(orchestrator, sideTailRadar, target),
+            ]);
             if (controller.signal.aborted) {
                 return;
+            }
+
+            if (pendingCompanionTurn?.controller === controller) {
+                pendingCompanionTurn.pendingSideBriefPaths = sideBridge.briefPaths;
             }
 
             syncVariablesToChatMetadata(orchestrator.store, target);
@@ -617,6 +726,14 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
                     Boolean(briefText),
                     extension_prompt_roles?.SYSTEM ?? 0,
                 );
+                setExtensionPrompt(
+                    COMPANION_SIDE_BRIDGE_PROMPT_KEY,
+                    sideBridge.content,
+                    extension_prompt_types?.IN_CHAT ?? 1,
+                    0,
+                    false,
+                    extension_prompt_roles?.SYSTEM ?? 0,
+                );
             }
         } catch (error) {
             if (!controller.signal.aborted) {
@@ -628,6 +745,7 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
     const onWorldInfoEntriesLoaded = (data: unknown) => {
         const settings = getSettings();
         if (!settings || settings.runMode === 'off') {
+            clearSideBridgePrompt();
             return;
         }
 
@@ -684,6 +802,7 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
 
     const onCharacterMessageRendered = async (messageId: unknown) => {
         clearCompanionPrompt();
+        clearSideBridgePrompt();
 
         const settings = getSettings();
         if (!settings || settings.runMode !== 'companion') {
@@ -705,8 +824,16 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         const swipeId = typeof msg?.swipe_id === 'number' ? msg.swipe_id : 0;
         const target: MessageTarget = { messageId, swipeId };
 
+        let briefPathsToConsume: string[] = [];
         if (pendingCompanionTurn?.target.messageId === messageId) {
+            briefPathsToConsume = pendingCompanionTurn.pendingSideBriefPaths ?? [];
             pendingCompanionTurn = null;
+        }
+
+        if (briefPathsToConsume.length > 0) {
+            await orchestrator.vfs.markSideCluesConsumed(briefPathsToConsume, messageId + 1, {
+                target,
+            });
         }
 
         await orchestrator.store.commitStagedData(target);
@@ -777,6 +904,7 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
     const onGenerationStopped = () => {
         activeGenType = null;
         clearCompanionPrompt();
+        clearSideBridgePrompt();
         if (pendingCompanionTurn) {
             pendingCompanionTurn.controller.abort('Generation stopped');
             orchestrator.store.rollbackStagedData(pendingCompanionTurn.target);
@@ -860,10 +988,34 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         }
     }
 
+    // Proactively clear companion & `/side/*` prompts whenever runMode flips to `off` (or leaves `companion`).
+    let lastObservedRunMode = getSettings()?.runMode;
+    if (!lastObservedRunMode || lastObservedRunMode === 'off') {
+        clearSideBridgePrompt();
+    }
+    const appStore = getAppStore?.();
+    const unsubscribeAppStore =
+        appStore && typeof appStore.subscribe === 'function'
+            ? appStore.subscribe(() => {
+                  const nextRunMode = getSettings()?.runMode ?? appStore.getSnapshot()?.settings?.runMode;
+                  if (nextRunMode !== lastObservedRunMode) {
+                      lastObservedRunMode = nextRunMode;
+                      if (nextRunMode !== 'companion') {
+                          clearCompanionPrompt();
+                          clearSideBridgePrompt();
+                      }
+                  }
+              })
+            : undefined;
+
     return {
         resolveVfsFileSync,
+        clearSideBridgePrompt,
+        syncSideBridgePrompt,
         dispose() {
             clearCompanionPrompt();
+            clearSideBridgePrompt();
+            unsubscribeAppStore?.();
             for (const [eventName, handler] of registrations) {
                 if (eventName && typeof eventSource.removeListener === 'function') {
                     eventSource.removeListener(eventName, handler);

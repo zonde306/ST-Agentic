@@ -29,7 +29,13 @@ import {
     world_info,
 } from '@st/scripts/world-info.js';
 
-import type { HostBridge, HostIdentity, WriteChatMessageOptions } from '@/core/bridge';
+import type {
+    HostAdminBridge,
+    HostAuthorBridge,
+    HostBridge,
+    HostIdentity,
+    WriteChatMessageOptions,
+} from '@/core/bridge';
 import { resolveActivePreset } from '@/core/config';
 import { applyRegexRules } from '@/core/regex';
 import type { ChatDataStore } from '@/core/store';
@@ -44,6 +50,9 @@ import type {
 } from '@/core/types';
 import { hashText } from '@/core/utils';
 import { detectHostLuminanceFromCssVars } from '@/ui/store';
+
+import { STAdminBridge } from './st-admin-bridge';
+import { STAuthorBridge } from './st-author-bridge';
 
 export const DEFAULT_EXTENSION_SETTINGS_KEY = 'Agentic';
 
@@ -231,6 +240,8 @@ export class STHostBridge implements HostBridge {
 
     evaluateOptionalEjs?: EvaluateOptionalEjsHook;
     executeSlashCommand?: ExecuteSlashCommandHook;
+    readonly author: HostAuthorBridge;
+    readonly admin: HostAdminBridge;
 
     constructor(options: STHostBridgeOptions = {}) {
         this.extensionKey = options.extensionKey ?? DEFAULT_EXTENSION_SETTINGS_KEY;
@@ -243,6 +254,13 @@ export class STHostBridge implements HostBridge {
         if (options.executeSlashCommand) {
             this.executeSlashCommand = options.executeSlashCommand;
         }
+        this.author = new STAuthorBridge({
+            getSettings: () => this.getSettingsFn?.(),
+            getStore: () => this.getStoreFn?.(),
+        });
+        this.admin = new STAdminBridge({
+            getExecuteSlashCommand: () => this.executeSlashCommand,
+        });
     }
 
     /** Attach `ChatDataStore` after bridge construction. */
