@@ -13,6 +13,7 @@ import {
     selectPresetBlocksForContext,
 } from '@/core/config';
 import {
+    buildSideGenMacroOverrides,
     type Layer1TurnGroup,
     TrajectoryStore,
     estimateRequestTokens,
@@ -566,7 +567,13 @@ export class SideGenService implements ToolSideGenApi {
         try {
             throwIfAborted(signal, 'SideGen runOnce aborted before request');
 
-            const presetPrompts = await this.resolvePresetPromptMessages('once', startAnchor);
+            const { connectionId, connection } = this.resolveRequestConnection(opts.connectionId);
+            const presetPrompts = await this.resolvePresetPromptMessages('once', startAnchor, {
+                historyMessages: [],
+                currentPrompt: opts.prompt,
+                generationType: 'quiet',
+                connection,
+            });
             const baseMessages: CanonicalMessage[] = [];
             if (opts.systemPrompt && opts.systemPrompt.trim()) {
                 baseMessages.push({
@@ -589,7 +596,6 @@ export class SideGenService implements ToolSideGenApi {
                 content: userContent,
             });
 
-            const { connectionId, connection } = this.resolveRequestConnection(opts.connectionId);
             const turnResult = await this.executeSideGenTurn({
                 connectionId,
                 connection,
@@ -666,11 +672,14 @@ export class SideGenService implements ToolSideGenApi {
         const systemPrompt = opts.systemPrompt ?? '';
         const threadId = toSideThreadId(id);
 
+        const { connection } = this.resolveRequestConnection(opts.connectionId);
         const presetPrompts = await this.resolvePresetPromptMessages('session', anchor, {
             skipTail: true,
+            historyMessages: [],
+            generationType: 'normal',
+            connection,
         });
         const layer0Messages = this.buildLayer0Messages(systemPrompt, presetPrompts.prefixMessages);
-        const { connection } = this.resolveRequestConnection(opts.connectionId);
         const initialTools = connection?.strictToolLoop
             ? [canonicalClone(FINISH_TURN_TOOL_SCHEMA)]
             : [];
@@ -731,19 +740,27 @@ export class SideGenService implements ToolSideGenApi {
         try {
             throwIfAborted(signal, `SideGen send(${sessionId}) aborted before request`);
 
+            const { connectionId, connection } = this.resolveRequestConnection(
+                opts.connectionId ?? session.connectionId,
+            );
             const hasFrozenPrefix = Boolean(this.trajectoryStore.getFrozenPrefix(threadId));
+            const layer1Messages = this.trajectoryStore
+                .getMessages(threadId)
+                .map((m) => canonicalClone(m));
             const presetPrompts = await this.resolvePresetPromptMessages('session', startAnchor, {
                 skipPrefix: hasFrozenPrefix,
+                historyMessages: layer1Messages,
+                currentPrompt: prompt,
+                generationType: 'normal',
+                connection,
             });
             const layer0Messages = await this.ensureFrozenLayer0(
                 threadId,
                 session.systemPrompt,
                 presetPrompts.prefixMessages,
                 startAnchor,
+                connection,
             );
-            const layer1Messages = this.trajectoryStore
-                .getMessages(threadId)
-                .map((m) => canonicalClone(m));
 
             const userContent = this.composeUserContent(
                 prompt,
@@ -767,10 +784,6 @@ export class SideGenService implements ToolSideGenApi {
                 layer0Messages.length - 1,
                 layer1Messages.length,
                 this.trajectoryStore.getTurnEndCounts(threadId),
-            );
-
-            const { connectionId, connection } = this.resolveRequestConnection(
-                opts.connectionId ?? session.connectionId,
             );
 
             const turnResult = await this.executeSideGenTurn({
@@ -1494,7 +1507,14 @@ export class SideGenService implements ToolSideGenApi {
     private async resolvePresetPromptMessages(
         mode: 'once' | 'session',
         anchor: MessageTarget,
-        options?: { skipPrefix?: boolean; skipTail?: boolean },
+        options?: {
+            skipPrefix?: boolean;
+            skipTail?: boolean;
+            historyMessages?: readonly CanonicalMessage[];
+            currentPrompt?: string;
+            generationType?: 'normal' | 'quiet';
+            connection?: ApiConnection;
+        },
     ): Promise<{
         prefixMessages: CanonicalMessage[];
         tailMessages: CanonicalMessage[];
@@ -1517,15 +1537,26 @@ export class SideGenService implements ToolSideGenApi {
         }
 
         const vars = this.readVarsObject(anchor);
+        const macroOverrides = buildSideGenMacroOverrides({
+            mode,
+            historyMessages: options?.historyMessages,
+            currentPrompt: options?.currentPrompt,
+            bridge: this.bridge,
+            generationType: options?.generationType,
+            connection: options?.connection,
+            vars,
+        });
         const prefixMessages = needPrefix
             ? await renderPromptBlocks(selected.prefix, {
                   hostBridge: this.bridge,
+                  macroOverrides,
                   vars,
               })
             : [];
         const tailMessages = needTail
             ? await renderPromptBlocks(selected.tail, {
                   hostBridge: this.bridge,
+                  macroOverrides,
                   vars,
               })
             : [];
@@ -1538,6 +1569,7 @@ export class SideGenService implements ToolSideGenApi {
         systemPrompt: string,
         extraPrefixMessages?: readonly CanonicalMessage[],
         anchor?: MessageTarget,
+        connection?: ApiConnection,
     ): Promise<readonly CanonicalMessage[]> {
         const existing = this.trajectoryStore.getFrozenPrefix(threadId);
         if (existing) {
@@ -1549,7 +1581,7 @@ export class SideGenService implements ToolSideGenApi {
                 await this.resolvePresetPromptMessages(
                     'session',
                     anchor ?? this.resolveCurrentAnchor(),
-                    { skipTail: true },
+                    { skipTail: true, historyMessages: [], generationType: 'normal', connection },
                 )
             ).prefixMessages;
         const layer0Messages = this.buildLayer0Messages(systemPrompt, resolvedExtra);

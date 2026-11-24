@@ -67,6 +67,8 @@ export const DEFAULT_EXTENSION_SETTINGS_KEY = 'Agentic';
 const VALID_MACRO_IDENTIFIER = /^[a-zA-Z][\w-_]*$/;
 const GETVAR_MACRO_PATTERN = /\{\{getvar::([^}]+)\}\}/gi;
 const FILE_MACRO_PATTERN = /\{\{file::([^}]+)\}\}/gi;
+const SINGLE_MACRO_TOKEN_PATTERN = /\{\{([^{}]+)\}\}/g;
+const PRE_SUBSTITUTE_OVERRIDE_KEYS = new Set(['lastgenerationtype']);
 
 const CHARACTER_NON_SETTING_KEYS = new Set(['name', 'avatar']);
 
@@ -111,10 +113,6 @@ interface RawStLoreEntry {
     scanDepth?: number;
     caseSensitive?: boolean | null;
     matchWholeWords?: boolean | number | null;
-}
-
-function escapeRegExp(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function normalizeStringArray(value: unknown): string[] {
@@ -828,18 +826,31 @@ export class STHostBridge implements HostBridge {
 
         let working = text;
         const dynamicMacros: Record<string, string> = {};
-        const fallbackOverrides: Array<[string, string]> = [];
+        const fallbackMap = new Map<string, string>();
+        const preSubstituteMap = new Map<string, string>();
 
         if (overrides) {
+            const presentTemplateMacros = new Set<string>();
+            for (const match of working.matchAll(SINGLE_MACRO_TOKEN_PATTERN)) {
+                presentTemplateMacros.add(match[1].trim().toLowerCase());
+            }
+
             const varOverrides = new Map<string, string>();
             for (const [key, value] of Object.entries(overrides)) {
                 if (key.startsWith('var:')) {
                     varOverrides.set(key.slice(4), value);
-                } else if (VALID_MACRO_IDENTIFIER.test(key)) {
+                    continue;
+                }
+                const lowerKey = key.toLowerCase();
+                if (PRE_SUBSTITUTE_OVERRIDE_KEYS.has(lowerKey)) {
+                    preSubstituteMap.set(lowerKey, value);
+                    continue;
+                }
+                if (VALID_MACRO_IDENTIFIER.test(key)) {
                     dynamicMacros[key] = value;
-                    fallbackOverrides.push([key, value]);
-                } else {
-                    fallbackOverrides.push([key, value]);
+                }
+                if (presentTemplateMacros.has(lowerKey)) {
+                    fallbackMap.set(lowerKey, value);
                 }
             }
 
@@ -849,17 +860,31 @@ export class STHostBridge implements HostBridge {
                     return varOverrides.has(name) ? (varOverrides.get(name) ?? '') : full;
                 });
             }
+
+            if (preSubstituteMap.size > 0 && working.includes('{{')) {
+                working = working.replace(SINGLE_MACRO_TOKEN_PATTERN, (match, rawKey: string) => {
+                    const lower = rawKey.trim().toLowerCase();
+                    return preSubstituteMap.has(lower) ? (preSubstituteMap.get(lower) ?? '') : match;
+                });
+            }
         }
 
-        working = substituteParams(
-            working,
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            Object.keys(dynamicMacros).length > 0 ? dynamicMacros : undefined,
-        );
+        const hasDynamicMacros = Object.keys(dynamicMacros).length > 0;
+        if (!hasDynamicMacros) {
+            working = substituteParams(working);
+        } else if (substituteParams.length >= 2) {
+            working = (substituteParams as (...args: unknown[]) => string)(
+                working,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                dynamicMacros,
+            );
+        } else {
+            working = substituteParams(working, { dynamicMacros });
+        }
 
         if (this.resolveFileMacroSyncFn && FILE_MACRO_PATTERN.test(working)) {
             FILE_MACRO_PATTERN.lastIndex = 0;
@@ -869,9 +894,11 @@ export class STHostBridge implements HostBridge {
             );
         }
 
-        for (const [key, value] of fallbackOverrides) {
-            const pattern = new RegExp(`\\{\\{${escapeRegExp(key)}\\}\\}`, 'g');
-            working = working.replace(pattern, () => value);
+        if (fallbackMap.size > 0 && working.includes('{{')) {
+            working = working.replace(SINGLE_MACRO_TOKEN_PATTERN, (match, rawKey: string) => {
+                const lower = rawKey.trim().toLowerCase();
+                return fallbackMap.has(lower) ? (fallbackMap.get(lower) ?? '') : match;
+            });
         }
 
         return working;

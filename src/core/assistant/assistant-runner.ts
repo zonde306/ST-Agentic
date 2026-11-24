@@ -13,6 +13,7 @@ import {
     selectPresetBlocksForContext,
 } from '@/core/config';
 import {
+    buildAssistantMacroOverrides,
     estimateMessageTokens,
     isSpillPath,
     renderPromptBlocks,
@@ -21,6 +22,7 @@ import {
     TrajectoryStore,
     TransientToolSpillStore,
     type EffectiveContextBudget,
+    type SurfaceGenerationType,
 } from '@/core/context';
 import {
     computeRoundRetryDelayMs,
@@ -1291,6 +1293,7 @@ export class AssistantRunner {
     ): Promise<AssistantMessage> {
         return await this.executeAssistantTurn(sessionId, prompt, options, {
             appendUserMessage: true,
+            generationType: 'normal',
         });
     }
 
@@ -1402,6 +1405,7 @@ export class AssistantRunner {
             },
             {
                 appendUserMessage: false,
+                generationType: 'normal',
             },
         );
     }
@@ -1475,6 +1479,7 @@ export class AssistantRunner {
             },
             {
                 appendUserMessage: false,
+                generationType: 'regenerate',
             },
         );
     }
@@ -1511,6 +1516,7 @@ export class AssistantRunner {
                 },
                 {
                     appendUserMessage: false,
+                    generationType: 'continue',
                 },
             );
         }
@@ -1547,6 +1553,7 @@ export class AssistantRunner {
 
             return await this.executeAssistantTurn(sessionId, '', options, {
                 appendUserMessage: false,
+                generationType: 'continue',
                 resumeState: {
                     existingAssistantMessage: lastMsg,
                     inFlightMessages: resumedInFlight,
@@ -1611,6 +1618,7 @@ export class AssistantRunner {
 
         return await this.executeAssistantTurn(sessionId, targetUserMsg.content, options, {
             appendUserMessage: false,
+            generationType: 'continue',
             resumeState: {
                 existingAssistantMessage: lastMsg,
                 inFlightMessages: resumedInFlight,
@@ -1629,6 +1637,7 @@ export class AssistantRunner {
         options: AssistantSendOptions,
         config: {
             appendUserMessage: boolean;
+            generationType?: SurfaceGenerationType;
             resumeState?: {
                 existingAssistantMessage: AssistantMessage;
                 inFlightMessages: CanonicalMessage[];
@@ -1832,6 +1841,11 @@ export class AssistantRunner {
                 );
             const presetPrompts = await this.resolvePresetPromptMessages(currentSession, target, {
                 skipPrefix: canReuseFrozenPrefix,
+                excludeMessageId: assistantMessageId,
+                currentUserInput: prompt || undefined,
+                generationType: config.generationType ?? (resume ? 'continue' : 'normal'),
+                connection,
+                budget,
             });
             const effectivePrefixMessages: CanonicalMessage[] = canReuseFrozenPrefix
                 ? canonicalClone(existingFrozenPrefix!.messages.slice(1))
@@ -2963,6 +2977,10 @@ export class AssistantRunner {
             );
             const presetPrompts = await this.resolvePresetPromptMessages(session, target, {
                 skipPrefix: canReuseFrozenPrefix,
+                excludeMessageId: existing.messageId,
+                generationType: 'normal',
+                connection,
+                budget: this.resolveSessionContextBudget(session),
             });
             const effectivePrefixMessages: CanonicalMessage[] = canReuseFrozenPrefix
                 ? canonicalClone(existingFrozenPrefix!.messages.slice(1))
@@ -3197,7 +3215,14 @@ export class AssistantRunner {
     private async resolvePresetPromptMessages(
         session: AssistantSession,
         target?: MessageTarget,
-        options?: { skipPrefix?: boolean },
+        options?: {
+            skipPrefix?: boolean;
+            excludeMessageId?: string;
+            currentUserInput?: string;
+            generationType?: SurfaceGenerationType;
+            connection?: ApiConnection;
+            budget?: EffectiveContextBudget;
+        },
     ): Promise<{
         prefixMessages: CanonicalMessage[];
         tailMessages: CanonicalMessage[];
@@ -3220,15 +3245,27 @@ export class AssistantRunner {
         }
 
         const vars = await this.readPromptRenderVars(target);
+        const macroOverrides = buildAssistantMacroOverrides({
+            session,
+            bridge: this.bridge,
+            excludeMessageId: options?.excludeMessageId,
+            currentUserInput: options?.currentUserInput,
+            generationType: options?.generationType,
+            connection: options?.connection,
+            budget: options?.budget,
+            vars,
+        });
         const prefixMessages = needPrefix
             ? await renderPromptBlocks(selected.prefix, {
                   hostBridge: this.bridge,
+                  macroOverrides,
                   vars,
               })
             : [];
         const tailMessages = needTail
             ? await renderPromptBlocks(selected.tail, {
                   hostBridge: this.bridge,
+                  macroOverrides,
                   vars,
               })
             : [];
@@ -3236,7 +3273,13 @@ export class AssistantRunner {
         return { prefixMessages, tailMessages };
     }
 
-    private resolvePresetPromptMessagesSync(session: AssistantSession): {
+    private resolvePresetPromptMessagesSync(
+        session: AssistantSession,
+        options?: {
+            connection?: ApiConnection;
+            budget?: EffectiveContextBudget;
+        },
+    ): {
         prefixMessages: CanonicalMessage[];
         tailMessages: CanonicalMessage[];
     } {
@@ -3251,6 +3294,13 @@ export class AssistantRunner {
             { requireExplicit: true },
         );
 
+        const macroOverrides = buildAssistantMacroOverrides({
+            session,
+            bridge: this.bridge,
+            connection: options?.connection,
+            budget: options?.budget,
+        });
+
         const toMessages = (
             blocks: readonly (typeof selected.prefix)[number][],
         ): CanonicalMessage[] => {
@@ -3258,6 +3308,7 @@ export class AssistantRunner {
             for (const block of blocks) {
                 const rendered = renderPromptBlockSync(block, {
                     hostBridge: this.bridge,
+                    macroOverrides,
                     precedingMessages: messages,
                 });
                 messages.push(...rendered);
@@ -3363,7 +3414,10 @@ export class AssistantRunner {
                 tools: canonicalClone([...frozen!.tools]),
             };
         }
-        const presetPrompts = this.resolvePresetPromptMessagesSync(session);
+        const presetPrompts = this.resolvePresetPromptMessagesSync(session, {
+            connection,
+            budget: this.resolveSessionContextBudget(session),
+        });
         const layer0: CanonicalMessage[] = [
             { role: 'system', content: systemPrompt },
             ...presetPrompts.prefixMessages,

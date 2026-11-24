@@ -535,39 +535,93 @@ export class MemoryHostBridge implements HostBridge {
         if (!text) {
             return '';
         }
+        if (!text.includes('{{')) {
+            return text;
+        }
 
         const variables = this.getMetadataVariables();
         const globalVariables = this.getMetadataGlobalVariables();
-
-        let rendered = text.replace(/\{\{user\}\}/gi, overrides?.user ?? this.identity.userName);
-        rendered = rendered.replace(/\{\{char\}\}/gi, overrides?.char ?? this.identity.charName);
-
-        rendered = rendered.replace(/\{\{getvar::([^}]+)\}\}/gi, (_match, rawName: string) => {
-            const key = rawName.trim();
-            if (overrides && Object.hasOwn(overrides, key)) {
-                return overrides[key];
-            }
-            if (overrides && Object.hasOwn(overrides, `var:${key}`)) {
-                return overrides[`var:${key}`];
-            }
-            return stringifyVariable(variables[key]);
-        });
-
-        rendered = rendered.replace(/\{\{getglobalvar::([^}]+)\}\}/gi, (_match, rawName: string) => {
-            const key = rawName.trim();
-            return stringifyVariable(globalVariables[key]);
-        });
-
+        const overrideMap = new Map<string, string>();
         if (overrides) {
-            rendered = rendered.replace(/\{\{([a-zA-Z0-9_.:-]+)\}\}/g, (match, key: string) => {
-                if (Object.hasOwn(overrides, key)) {
-                    return overrides[key];
+            for (const [key, value] of Object.entries(overrides)) {
+                if (!key.startsWith('var:')) {
+                    overrideMap.set(key.toLowerCase(), value);
                 }
-                return match;
-            });
+            }
         }
 
-        return rendered;
+        const chatDefaults = new Map<string, string>();
+        if (this.chat.length > 0) {
+            const lastEntry = this.chat[this.chat.length - 1];
+            const lastMsgId =
+                typeof lastEntry?.id === 'number' && Number.isFinite(lastEntry.id)
+                    ? String(lastEntry.id)
+                    : String(this.chat.length - 1);
+            chatDefaults.set('lastmessage', typeof lastEntry?.mes === 'string' ? lastEntry.mes : '');
+            chatDefaults.set('lastmessageid', lastMsgId);
+            chatDefaults.set('allchatrange', `0-${this.chat.length - 1}`);
+
+            let lastUserMes = '';
+            for (let i = this.chat.length - 1; i >= 0; i -= 1) {
+                const msg = this.chat[i];
+                if (msg?.isUser && !msg.isSystem) {
+                    lastUserMes = typeof msg.mes === 'string' ? msg.mes : '';
+                    break;
+                }
+            }
+            chatDefaults.set('lastusermessage', lastUserMes);
+
+            let lastCharMes = '';
+            for (let i = this.chat.length - 1; i >= 0; i -= 1) {
+                const msg = this.chat[i];
+                if (msg && !msg.isUser && !msg.isSystem) {
+                    lastCharMes = typeof msg.mes === 'string' ? msg.mes : '';
+                    break;
+                }
+            }
+            chatDefaults.set('lastcharmessage', lastCharMes);
+        } else {
+            chatDefaults.set('lastmessage', '');
+            chatDefaults.set('lastmessageid', '');
+            chatDefaults.set('allchatrange', '');
+            chatDefaults.set('lastusermessage', '');
+            chatDefaults.set('lastcharmessage', '');
+        }
+
+        return text.replace(/\{\{([^{}]+)\}\}/g, (match, rawInner: string) => {
+            const trimmed = rawInner.trim();
+            const lower = trimmed.toLowerCase();
+
+            if (lower.startsWith('getvar::')) {
+                const varName = trimmed.slice('getvar::'.length).trim();
+                if (overrides && Object.hasOwn(overrides, varName)) {
+                    return overrides[varName];
+                }
+                if (overrides && Object.hasOwn(overrides, `var:${varName}`)) {
+                    return overrides[`var:${varName}`];
+                }
+                return stringifyVariable(variables[varName]);
+            }
+
+            if (lower.startsWith('getglobalvar::')) {
+                const varName = trimmed.slice('getglobalvar::'.length).trim();
+                return stringifyVariable(globalVariables[varName]);
+            }
+
+            if (overrideMap.has(lower)) {
+                return overrideMap.get(lower) ?? '';
+            }
+            if (lower === 'user') {
+                return this.identity.userName;
+            }
+            if (lower === 'char') {
+                return this.identity.charName;
+            }
+            if (chatDefaults.has(lower)) {
+                return chatDefaults.get(lower) ?? '';
+            }
+            return match;
+        });
     }
 
     async attachMediaToMessage(target: MessageTarget, media: MediaAttachment): Promise<void> {

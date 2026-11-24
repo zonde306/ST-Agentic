@@ -17,6 +17,7 @@ import {
 } from '@/core/config';
 import {
     buildLayer2MacroOverrides,
+    buildMainSurfaceMacroOverrides,
     buildWorkspaceNotices,
     ContextAssembler,
     DEFAULT_FOLD_THRESHOLD_CHARS,
@@ -1413,6 +1414,22 @@ export class AgentRunner {
         try {
             let activeRecentChatMessages = recentChatMessages ? [...recentChatMessages] : undefined;
 
+            const contextBudget = resolveEffectiveContextBudget(
+                connection,
+                agent.watermark ? { configuredWatermark: agent.watermark } : undefined,
+            );
+            const effectiveMacroOverrides = buildMainSurfaceMacroOverrides({
+                bridge: this.bridge,
+                userInput: input.userInput,
+                connection,
+                budget: contextBudget,
+                callerOverrides: input.macroOverrides,
+            });
+            const preRenderMacroOverrides = buildLayer2MacroOverrides(
+                workingVars,
+                effectiveMacroOverrides,
+            );
+
             // Pre-render matching Layer 0 `prefix` blocks (EJS + Track A/B custom JSON) once per run
             // whenever Layer 0 will not reuse a frozen prefix, so Round 2+ synchronous `reassembleInFlight()`
             // preserves exact byte-for-byte Layer 0 KV-cache invariance for ephemeral & trigger runs.
@@ -1458,6 +1475,7 @@ export class AgentRunner {
                 if (prefixBlocksToRender.length > 0) {
                     preRenderedBlocks = await prerenderPromptBlocks(prefixBlocksToRender, {
                         hostBridge: this.bridge,
+                        macroOverrides: preRenderMacroOverrides,
                         vars: workingVars,
                     });
                     throwIfAborted(signal);
@@ -1472,13 +1490,9 @@ export class AgentRunner {
                     && matchesPromptTriggers(block.triggers, promptTriggerContext),
             );
             if (floatingTailBlocksToRender.length > 0) {
-                const floatingMacroOverrides = buildLayer2MacroOverrides(
-                    workingVars,
-                    input.macroOverrides,
-                );
                 const renderedFloating = await prerenderPromptBlocks(floatingTailBlocksToRender, {
                     hostBridge: this.bridge,
-                    macroOverrides: floatingMacroOverrides,
+                    macroOverrides: preRenderMacroOverrides,
                     vars: workingVars,
                 });
                 throwIfAborted(signal);
@@ -1508,7 +1522,7 @@ export class AgentRunner {
                 hostBridge: this.bridge,
                 regex,
                 vars: workingVars,
-                macroOverrides: input.macroOverrides,
+                macroOverrides: effectiveMacroOverrides,
                 signal,
             };
 
@@ -1567,11 +1581,6 @@ export class AgentRunner {
                 turnMessages.push(...initialLayer2);
                 completedTurnMessages.push(...canonicalClone(initialLayer2));
             }
-
-            const contextBudget = resolveEffectiveContextBudget(
-                connection,
-                agent.watermark ? { configuredWatermark: agent.watermark } : undefined,
-            );
 
             const reassembleInFlight = () =>
                 this.contextAssembler.assemble({

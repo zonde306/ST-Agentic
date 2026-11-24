@@ -795,6 +795,43 @@ describe('STAuthorBridge', () => {
         expect(afterDelete?.entries.find((e) => e.uid === saved.uid)).toBeUndefined();
     });
 
+    it('hardens STHostBridge.substituteMacros with pre-substituted lastGenerationType, options dynamicMacros, and single-pass fallback', () => {
+        const bridge = new STHostBridge();
+        let capturedText = '';
+        let capturedOptions: unknown;
+
+        stMocks.fns.substituteParams.mockImplementationOnce((...args: unknown[]) => {
+            capturedText = String(args[0] ?? '');
+            capturedOptions = args[1];
+            // Simulate a host environment that overwrites {{lastGenerationType}} if still present
+            // and leaves unknown/mock tokens intact.
+            return capturedText.replace(/\{\{lastGenerationType\}\}/gi, 'host-clobbered');
+        });
+
+        const output = bridge.substituteMacros(
+            'gen={{LASTGENERATIONTYPE}}|u={{LASTUSERMESSAGE}}|st={{stLastUserMessage}}|v={{getvar::coin}}',
+            {
+                lastGenerationType: 'regenerate',
+                lastUserMessage: 'Literal {{model}} inside user input',
+                model: 'gpt-4.1',
+                stLastUserMessage: 'Main Chat User',
+                'var:coin': '55',
+            },
+        );
+
+        expect(capturedText).toContain('gen=regenerate|');
+        expect(capturedOptions).toEqual({
+            dynamicMacros: {
+                lastUserMessage: 'Literal {{model}} inside user input',
+                model: 'gpt-4.1',
+                stLastUserMessage: 'Main Chat User',
+            },
+        });
+        expect(output).toBe(
+            'gen=regenerate|u=Literal {{model}} inside user input|st=Main Chat User|v=55',
+        );
+    });
+
     it('lists and saves scoped regex via SCRIPT_TYPES.SCOPED and embeds agentic payload', async () => {
         const settings = createDefaultSettings();
         const bridge = new STHostBridge({ getSettings: () => settings });
