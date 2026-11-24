@@ -347,7 +347,7 @@ export function normalizeAgentProfile(
         promptBlocks,
         enabledTools: normalizeStringArray(raw.enabledTools),
         permissions: normalizePermissions(raw.permissions),
-        maxToolRounds: parseBoundedNumber(raw.maxToolRounds, 8, 1, 100, true),
+        maxToolRounds: parseBoundedNumber(raw.maxToolRounds, 0, 0, 1000, true),
         strictToolLoop: VALID_STRICT_TOOL_LOOP_OVERRIDES.has(
             raw.strictToolLoop as StrictToolLoopOverride,
         )

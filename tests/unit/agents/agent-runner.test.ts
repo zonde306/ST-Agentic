@@ -496,6 +496,57 @@ describe('AgentRunner & TraceLogger', () => {
         expect(latest.toolSteps).toHaveLength(2);
     });
 
+    it('treats maxToolRounds=0 as unlimited and executes >8 consecutive tool rounds cleanly', async () => {
+        const { bridge, runner, transport, traceLogger } = makeTestSetup({ maxToolRounds: 0 });
+
+        for (let i = 0; i < 11; i += 1) {
+            transport.enqueue({
+                content: '',
+                toolCalls: [
+                    {
+                        id: `unlim_list_${i}`,
+                        name: 'list_dir',
+                        arguments: JSON.stringify({ path: '/' }),
+                    },
+                ],
+            });
+        }
+        transport.enqueue(
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'unlim_write_out',
+                        name: 'write_file',
+                        arguments: JSON.stringify({
+                            path: '/output.md',
+                            content: '经过 12 轮工具调用后输出的最终正文。',
+                        }),
+                    },
+                ],
+            },
+            {
+                content: '已完成全部检索与输出写入。',
+            },
+        );
+
+        const res = await runner.run({
+            agent: 'main',
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'main_turn',
+            userInput: '执行超长多轮检索与汇总。',
+        });
+
+        expect(transport.requests).toHaveLength(13);
+        expect(res.toolSteps).toHaveLength(12);
+        expect(res.content).toBe('经过 12 轮工具调用后输出的最终正文。');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe(
+            '经过 12 轮工具调用后输出的最终正文。',
+        );
+        const [latest] = traceLogger.listTraces({ limit: 1 });
+        expect(latest.status).toBe('completed');
+    });
+
     it('supports AbortSignal during streaming/tool execution without mutating TrajectoryStore', async () => {
         const { runner, transport, traceLogger } = makeTestSetup();
         const abortController = new AbortController();

@@ -313,7 +313,7 @@ export function migrateLegacyTemplate(
                 'read_history',
             ],
             permissions: { read: ['/**'], write: [] },
-            maxToolRounds: 6,
+            maxToolRounds: 0,
         };
         return { agent };
     }
@@ -336,7 +336,7 @@ export function migrateLegacyTemplate(
         promptBlocks,
         enabledTools: capabilities.tools,
         permissions: capabilities.permissions,
-        maxToolRounds: 6,
+        maxToolRounds: 0,
     };
 
     const legacyOutputRegex = typeof rawTemplate.regex === 'string' ? rawTemplate.regex.trim() : '';

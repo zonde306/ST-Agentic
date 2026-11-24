@@ -610,9 +610,9 @@ export function AgentsView(props: Partial<ConsoleViewProps> = {}) {
     );
     const maxRoundsDraft = useDraftNumber(
         agentResetKey,
-        activeAgent?.maxToolRounds ?? 8,
+        activeAgent?.maxToolRounds ?? 0,
         (next) => mutateActiveAgent((ag) => ({ ...ag, maxToolRounds: next })),
-        { min: 1, max: 100, integer: true },
+        { min: 0, max: 1000, integer: true },
     );
     const ephWindowDraft = useDraftNumber(
         agentResetKey,
@@ -987,11 +987,14 @@ export function AgentsView(props: Partial<ConsoleViewProps> = {}) {
                                 />
                             </FormField>
 
-                            <FormField label="单轮最大工具调用步数 (maxToolRounds)">
+                            <FormField
+                                label="单轮最大工具调用步数 (maxToolRounds)"
+                                hint="0 表示不限制（默认），设为正整数可限制单轮最大工具轮次"
+                            >
                                 <TextInput
                                     type="number"
-                                    min={1}
-                                    max={100}
+                                    min={0}
+                                    max={1000}
                                     step={1}
                                     value={maxRoundsDraft.value}
                                     onInput={maxRoundsDraft.onInput}

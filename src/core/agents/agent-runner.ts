@@ -1668,7 +1668,13 @@ export class AgentRunner {
                 currentAssembled = reassembleInFlight();
             };
 
-            const maxToolRounds = Math.max(0, agent.maxToolRounds);
+            const hasToolRoundLimit =
+                typeof agent.maxToolRounds === 'number'
+                && Number.isFinite(agent.maxToolRounds)
+                && agent.maxToolRounds > 0;
+            const maxToolRounds = hasToolRoundLimit
+                ? Math.floor(agent.maxToolRounds)
+                : Number.POSITIVE_INFINITY;
             const maxRoundRetries = Math.max(0, Math.floor(connection.roundMaxRetries ?? 2));
             let toolRoundsExecuted = 0;
             let emptyOutputRetried = false;
@@ -1698,7 +1704,7 @@ export class AgentRunner {
                 }
 
                 let currentAllowed: string[];
-                if (toolRoundsExecuted >= maxToolRounds && canFinish) {
+                if (hasToolRoundLimit && toolRoundsExecuted >= maxToolRounds && canFinish) {
                     currentAllowed = allCanonicalToolNames.includes(FINISH_TURN_TOOL_NAME)
                         ? [FINISH_TURN_TOOL_NAME]
                         : [...allCanonicalToolNames];
@@ -1744,7 +1750,9 @@ export class AgentRunner {
                             ? hasWriteToolExecuted
                             : true;
                 return {
-                    round: `${toolRoundsExecuted}/${maxToolRounds}`,
+                    round: hasToolRoundLimit
+                        ? `${toolRoundsExecuted}/${maxToolRounds}`
+                        : `${toolRoundsExecuted}`,
                     output_ready: outputReady,
                 };
             };
@@ -2085,7 +2093,10 @@ export class AgentRunner {
                         const currentOutput = await readCurrentOutputSafe();
 
                         if (currentOutput.trim().length === 0) {
-                            if (!emptyOutputRetried && toolRoundsExecuted < maxToolRounds) {
+                            if (
+                                !emptyOutputRetried
+                                && (!hasToolRoundLimit || toolRoundsExecuted < maxToolRounds)
+                            ) {
                                 emptyOutputRetried = true;
                                 toolRoundsExecuted += 1;
 
@@ -2177,7 +2188,7 @@ export class AgentRunner {
                 }
 
                 // Enforce maxToolRounds guardrail before executing another round of tool calls.
-                if (toolRoundsExecuted >= maxToolRounds) {
+                if (hasToolRoundLimit && toolRoundsExecuted >= maxToolRounds) {
                     throwMaxToolRounds();
                 }
 
@@ -2994,7 +3005,7 @@ export class AgentRunner {
                 ],
                 enabledTools: [...DEFAULT_SUBAGENT_TOOLS],
                 permissions: { read: ['/**'], write: [] },
-                maxToolRounds: 6,
+                maxToolRounds: 0,
                 description: desc.description,
             };
 

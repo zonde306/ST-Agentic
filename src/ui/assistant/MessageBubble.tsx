@@ -14,7 +14,16 @@ import type {
     UndoRecord,
 } from '@/core/types';
 import { MarkdownContent } from '@/ui/components';
-import { IconAlertTriangle, IconInfo, IconPlay, IconRefresh } from '@/ui/components/Icons';
+import {
+    IconAlertTriangle,
+    IconChevronDown,
+    IconChevronRight,
+    IconFileText,
+    IconFiles,
+    IconInfo,
+    IconPlay,
+    IconRefresh,
+} from '@/ui/components/Icons';
 import { AttachedApprovalCard } from './AttachedApprovalCard';
 import {
     formatAssistantTime,
@@ -114,6 +123,147 @@ function getInterruptedStatusLabel(errorCode?: AssistantMessage['errorCode']): s
         default:
             return '已手动中止';
     }
+}
+
+function splitFilePath(filePath: string): { dir: string; name: string } {
+    const idx = filePath.lastIndexOf('/');
+    if (idx < 0) {
+        return { dir: '', name: filePath };
+    }
+    return { dir: filePath.slice(0, idx + 1), name: filePath.slice(idx + 1) || filePath };
+}
+
+/** Files referenced up to this count render inline; beyond it they collapse into one summary row. */
+const FILE_REFS_INLINE_LIMIT = 2;
+
+function FileRefChip({
+    filePath,
+    showDir,
+    onPreviewFile,
+}: {
+    filePath: string;
+    showDir: boolean;
+    onPreviewFile: (path: string) => void;
+}) {
+    const { dir, name } = splitFilePath(filePath);
+    return (
+        <button
+            type="button"
+            class="ag-ast-file-chip"
+            data-file-path={filePath}
+            title={`预览只读文件：${filePath}`}
+            onClick={() => onPreviewFile(filePath)}
+        >
+            <span class="ag-ast-file-chip-icon" aria-hidden="true">
+                <IconFileText size={13} />
+            </span>
+            {showDir && dir ? <span class="ag-ast-file-chip-dir">{dir}</span> : null}
+            <span class="ag-ast-file-chip-name">{name}</span>
+        </button>
+    );
+}
+
+/**
+ * Compact file-reference strip under an assistant reply (design spec §3.15):
+ * <= 2 files render inline; more collapse into a single summary row that expands
+ * into a scroll-capped, directory-grouped grid.
+ */
+function FileRefsStrip({
+    messageId,
+    fileRefs,
+    onPreviewFile,
+}: {
+    messageId: string;
+    fileRefs: readonly string[];
+    onPreviewFile: (path: string) => void;
+}) {
+    const [expanded, setExpanded] = useState(false);
+
+    if (fileRefs.length <= FILE_REFS_INLINE_LIMIT) {
+        return (
+            <div class="ag-ast-file-refs" data-assistant-file-refs={messageId}>
+                {fileRefs.map((filePath) => (
+                    <FileRefChip
+                        key={filePath}
+                        filePath={filePath}
+                        showDir
+                        onPreviewFile={onPreviewFile}
+                    />
+                ))}
+            </div>
+        );
+    }
+
+    const groups = new Map<string, string[]>();
+    for (const filePath of fileRefs) {
+        const { dir } = splitFilePath(filePath);
+        const list = groups.get(dir);
+        if (list) {
+            list.push(filePath);
+        } else {
+            groups.set(dir, [filePath]);
+        }
+    }
+    const previewNames = fileRefs
+        .slice(0, 2)
+        .map((p) => splitFilePath(p).name)
+        .join('、');
+
+    return (
+        <div
+            class="ag-ast-file-refs ag-ast-file-refs-collapsible"
+            data-assistant-file-refs={messageId}
+            data-expanded={expanded ? 'true' : 'false'}
+        >
+            <button
+                type="button"
+                class="ag-ast-file-refs-toggle"
+                aria-expanded={expanded}
+                data-assistant-file-refs-toggle={messageId}
+                onClick={() => setExpanded((prev) => !prev)}
+            >
+                <span class="ag-ast-file-refs-toggle-icon" aria-hidden="true">
+                    <IconFiles size={14} />
+                </span>
+                <span class="ag-ast-file-refs-count">引用 {fileRefs.length} 个文件</span>
+                {!expanded ? (
+                    <span class="ag-ast-file-refs-preview">
+                        {previewNames}
+                        {fileRefs.length > 2 ? ` 等` : ''}
+                    </span>
+                ) : (
+                    <span class="ag-ast-file-refs-preview" />
+                )}
+                <span class="ag-ast-file-refs-chevron" aria-hidden="true">
+                    {expanded ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />}
+                </span>
+            </button>
+            {expanded ? (
+                <div class="ag-ast-file-refs-panel ag-thin-scroll">
+                    {Array.from(groups.entries()).map(([dir, paths]) => (
+                        <div key={dir || '/'} class="ag-ast-file-group">
+                            {groups.size > 1 || dir ? (
+                                <div class="ag-ast-file-group-label" title={dir}>
+                                    {dir || '/'}
+                                    <span class="ag-ast-file-group-count">{paths.length}</span>
+                                </div>
+                            ) : null}
+                            <div class="ag-ast-file-group-grid">
+                                {paths.map((filePath) => (
+                                    <FileRefChip
+                                        key={filePath}
+                                        filePath={filePath}
+                                        showDir={false}
+                                        onPreviewFile={onPreviewFile}
+                                    />
+                                ))}
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            ) : null}
+        </div>
+    );
 }
 
 function formatTokenCountShort(tokens: number): string {
@@ -874,19 +1024,11 @@ export function MessageBubble({
                     )}
 
                     {fileRefs.length > 0 ? (
-                        <div class="ag-ast-file-refs">
-                            {fileRefs.map((filePath) => (
-                                <button
-                                    key={filePath}
-                                    type="button"
-                                    class="ag-ast-file-chip"
-                                    title={`预览只读文件：${filePath}`}
-                                    onClick={() => onPreviewFile(filePath)}
-                                >
-                                    📄 {filePath}
-                                </button>
-                            ))}
-                        </div>
+                        <FileRefsStrip
+                            messageId={message.id}
+                            fileRefs={fileRefs}
+                            onPreviewFile={onPreviewFile}
+                        />
                     ) : null}
 
                     {approvals.length > 0 ? (

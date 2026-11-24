@@ -192,14 +192,14 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     const refreshTokenStatus = useCallback(
         async (targetSessionId?: string | null) => {
             const sid = targetSessionId ?? activeSession?.id ?? null;
-            const getter = store.assistantRuntime?.getSessionTokenStatus;
-            if (!sid || !getter) {
+            const runtime = store.assistantRuntime;
+            if (!sid || !runtime?.getSessionTokenStatus) {
                 setTokenStatus(null);
                 return;
             }
             const seq = ++tokenFetchSeqRef.current;
             try {
-                const nextStatus = await getter(sid);
+                const nextStatus = await runtime.getSessionTokenStatus(sid);
                 if (tokenFetchSeqRef.current === seq) {
                     setTokenStatus(nextStatus ?? null);
                 }
@@ -1344,8 +1344,8 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     const handlePreviewFile = useCallback(
         async (filePath: string) => {
             setPreviewFile({ path: filePath, content: '', loading: true });
-            const reader = store.assistantRuntime?.readPreviewFile;
-            if (!reader) {
+            const runtime = store.assistantRuntime;
+            if (!runtime?.readPreviewFile) {
                 setPreviewFile({
                     path: filePath,
                     content: '（当前运行时未提供只读文件预览器）',
@@ -1354,7 +1354,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 return;
             }
             try {
-                const content = await reader(filePath);
+                const content = await runtime.readPreviewFile(filePath);
                 setPreviewFile({
                     path: filePath,
                     content: content ?? '（文件不存在或内容为空）',

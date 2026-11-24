@@ -1080,4 +1080,84 @@ describe('AgentRunner strictToolLoop, Prefill folding & round auto-retry', () =>
         // Prefix EJS blocks evaluated once at run start (no redundant re-evaluation in assembleWithHost/Round 2)
         expect(ejsCallCount).toBe(2);
     });
+
+    it('emits _turn_state.round without /Infinity and avoids forced finish_turn narrowing when maxToolRounds=0', async () => {
+        const { transport, runner } = makeStrictSetup({ maxToolRounds: 0 });
+
+        transport.enqueue(
+            // Round 1: list_dir
+            (req) => {
+                expect(req.toolChoice?.mode).toBe('required');
+                expect(req.toolChoice?.allowedToolNames).toContain('list_dir');
+                expect(req.toolChoice?.allowedToolNames).not.toContain(FINISH_TURN_TOOL_NAME);
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'u_list_1',
+                            name: 'list_dir',
+                            arguments: JSON.stringify({ path: '/' }),
+                        },
+                    ],
+                };
+            },
+            // Round 2: receives round='1' (no '/Infinity'), writes /output.md
+            (req) => {
+                const lastToolMsg = req.messages[req.messages.length - 1];
+                const parsed = JSON.parse(String(lastToolMsg.content)) as {
+                    _turn_state: { round: string; output_ready: boolean };
+                };
+                expect(parsed._turn_state).toEqual({ round: '1', output_ready: false });
+                expect(parsed._turn_state.round).not.toContain('Infinity');
+
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'u_write_2',
+                            name: 'write_file',
+                            arguments: JSON.stringify({
+                                path: '/output.md',
+                                content: '无限轮次严格闭环测试正文。',
+                            }),
+                        },
+                    ],
+                };
+            },
+            // Round 3: receives round='2', /output.md is ready, toolChoice still keeps write/edit tools alongside finish_turn
+            (req) => {
+                const lastToolMsg = req.messages[req.messages.length - 1];
+                const parsed = JSON.parse(String(lastToolMsg.content)) as {
+                    _turn_state: { round: string; output_ready: boolean };
+                };
+                expect(parsed._turn_state).toEqual({ round: '2', output_ready: true });
+                expect(parsed._turn_state.round).not.toContain('Infinity');
+                expect(req.toolChoice?.mode).toBe('required');
+                expect(req.toolChoice?.allowedToolNames).toContain(FINISH_TURN_TOOL_NAME);
+                expect(req.toolChoice?.allowedToolNames).toContain('write_file');
+                expect(req.toolChoice?.allowedToolNames).toContain('edit_file');
+
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'u_finish_3',
+                            name: FINISH_TURN_TOOL_NAME,
+                            arguments: JSON.stringify({ step_brief: '无限轮次模式下顺利交卷。' }),
+                        },
+                    ],
+                };
+            },
+        );
+
+        const res = await runner.run({
+            agent: 'main',
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'main_turn',
+            userInput: '验证无限轮次严格工具闭环状态回执。',
+        });
+
+        expect(res.content).toBe('无限轮次严格闭环测试正文。');
+        expect(transport.requests).toHaveLength(3);
+    });
 });

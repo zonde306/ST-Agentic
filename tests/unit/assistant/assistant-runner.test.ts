@@ -1050,6 +1050,38 @@ describe('AssistantRunner & AssistantSessionStore (TS2.1)', () => {
         expect(trajectoryStore.getMessageCount(toAssistantThreadId(session.id))).toBeGreaterThanOrEqual(4);
     });
 
+    it('allows unlimited tool rounds by default (>20 rounds) without max_tool_rounds interruption', async () => {
+        const turns: ScriptedTurnInput[] = [];
+        for (let i = 0; i < 25; i += 1) {
+            turns.push({
+                toolCalls: [
+                    {
+                        id: `call_unlim_${i}`,
+                        name: 'list_dir',
+                        arguments: JSON.stringify({ path: '/character' }),
+                    },
+                ],
+            });
+        }
+        turns.push({
+            content: '25 轮工具调用全部完成后已正常汇总。',
+        });
+
+        const { transport, runner } = createRunnerHarness(turns, {
+            stream: false,
+            autoRetry: false,
+        });
+
+        const session = await runner.createSession({ title: '默认无限轮次', mode: 'chat' });
+        const finished = await runner.sendPrompt(session.id, '执行多轮复杂检索');
+
+        expect(transport.requests).toHaveLength(26);
+        expect(finished.interrupted).toBeUndefined();
+        expect(finished.errorCode).toBeUndefined();
+        expect(finished.toolCalls).toHaveLength(25);
+        expect(finished.content).toBe('25 轮工具调用全部完成后已正常汇总。');
+    });
+
     it('handles finishReason=length truncation across consecutive continuations and protects truncated tool JSON', async () => {
         // 1. Consecutive text length truncations without duplicating already-output segments
         const { transport: textTransport, trajectoryStore: textTrajectory, runner: textRunner } =
@@ -1167,5 +1199,139 @@ describe('AssistantRunner & AssistantSessionStore (TS2.1)', () => {
             .join('\n');
         expect(sentText).toContain('read_file');
         expect(trajectoryStore.getMessageCount(toAssistantThreadId(session.id))).toBeGreaterThanOrEqual(2);
+    });
+
+    it('readPreviewFile() reads lorebook/workspace VFS files and /tmp/tool-spill/* entries with secret redaction', async () => {
+        const { bridge, runner } = createRunnerHarness();
+        bridge.setLorebook('雾港侦探录', [
+            SAMPLE_RAW_AUTHOR_WI_ENTRY,
+            {
+                world: '雾港侦探录',
+                uid: 111,
+                comment: '插画插入',
+                content: '## 插画插入规则\n在章节高潮处输出插画标记。',
+                keys: ['插画'],
+                keysecondary: [],
+                constant: false,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 4,
+                order: 100,
+                role: 0,
+            },
+        ]);
+
+        // 1. Read mounted /lorebooks/<book>/<entry>.md
+        const loreEntries = await runner.vfs.listDir('/lorebooks/雾港侦探录');
+        expect(loreEntries.length).toBeGreaterThan(0);
+        const lorePath = loreEntries[0].path;
+        const lorePreview = await runner.readPreviewFile(lorePath);
+        expect(lorePreview).not.toBeNull();
+        expect(lorePreview).toContain('在章节高潮处输出插画标记。');
+
+        // 2. Read committed VFS workspace file with automatic secret redaction
+        await runner.vfs.writeFile(
+            '/memory/preview-secret.md',
+            'endpoint: https://example.test\napiKey: sk-proj-secret-1234567890abcdef',
+            { staged: false },
+        );
+        const secretPreview = await runner.readPreviewFile('/memory/preview-secret.md');
+        expect(secretPreview).not.toBeNull();
+        expect(secretPreview).toContain('endpoint: https://example.test');
+        expect(secretPreview).toContain(REDACTED_PLACEHOLDER);
+        expect(secretPreview).not.toContain('sk-proj-secret-1234567890abcdef');
+
+        // 3. Read transient /tmp/tool-spill/* output with automatic secret redaction
+        const spill = runner.spillStore.put({
+            toolCallId: 'call_preview_spill_1',
+            toolName: 'read_file',
+            content: 'spilled line 1\nAuthorization: Bearer raw-spill-token-xyz\nspilled line 3',
+        });
+        const spillPreview = await runner.readPreviewFile(spill.path);
+        expect(spillPreview).not.toBeNull();
+        expect(spillPreview).toContain('spilled line 1');
+        expect(spillPreview).toContain(REDACTED_PLACEHOLDER);
+        expect(spillPreview).not.toContain('raw-spill-token-xyz');
+
+        // 4. Missing VFS or spill path returns null
+        expect(await runner.readPreviewFile('/lorebooks/不存在/missing-999.md')).toBeNull();
+        expect(await runner.readPreviewFile('/tmp/tool-spill/nonexistent.txt')).toBeNull();
+    });
+
+    it('records AssistantMessage.fileRefs only for successful write tools (excluding read-only and failed writes)', async () => {
+        const { runner } = createRunnerHarness(
+            [
+                // Turn 1 (read-only tools only): read_file + read_variables -> final text
+                {
+                    toolCalls: [
+                        {
+                            id: 'call_ro_1',
+                            name: 'read_file',
+                            arguments: JSON.stringify({ path: '/character/description.md' }),
+                        },
+                        {
+                            id: 'call_ro_2',
+                            name: 'read_variables',
+                            arguments: JSON.stringify({}),
+                        },
+                    ],
+                },
+                {
+                    content: '已只读核对角色描述与变量。',
+                },
+                // Turn 2 (adjust mode): read_file + failing edit_file + write_file + patch_variables -> final text
+                {
+                    toolCalls: [
+                        {
+                            id: 'call_mix_read',
+                            name: 'read_file',
+                            arguments: JSON.stringify({ path: '/character/description.md' }),
+                        },
+                        {
+                            id: 'call_mix_fail_edit',
+                            name: 'edit_file',
+                            arguments: JSON.stringify({
+                                path: '/workspace/missing.md',
+                                search: '不存在的片段',
+                                replace: '新内容',
+                            }),
+                        },
+                        {
+                            id: 'call_mix_write',
+                            name: 'write_file',
+                            arguments: JSON.stringify({
+                                path: '/workspace/written-note.md',
+                                content: '# 写入笔记\n已持久化到工作区。',
+                            }),
+                        },
+                        {
+                            id: 'call_mix_patch_vars',
+                            name: 'patch_variables',
+                            arguments: JSON.stringify({
+                                json_merge: { heat: 3 },
+                            }),
+                        },
+                    ],
+                },
+                {
+                    content: '已写入工作区笔记并更新分支变量。',
+                },
+            ],
+            { stream: false },
+        );
+
+        const chatSession = await runner.createSession({ title: '只读不展示fileRefs', mode: 'chat' });
+        const readOnlyReply = await runner.sendPrompt(chatSession.id, '帮我看看角色描述和变量');
+        expect(readOnlyReply.content).toBe('已只读核对角色描述与变量。');
+        expect(readOnlyReply.fileRefs).toBeUndefined();
+
+        const adjustSession = await runner.createSession({ title: '仅写入展示fileRefs', mode: 'adjust' });
+        const mixedReply = await runner.sendPrompt(adjustSession.id, '核对描述后写入笔记并更新变量');
+        expect(mixedReply.content).toBe('已写入工作区笔记并更新分支变量。');
+        expect(mixedReply.fileRefs).toEqual([
+            '/workspace/written-note.md',
+            '/state/variables.json',
+        ]);
     });
 });

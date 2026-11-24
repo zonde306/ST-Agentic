@@ -6,6 +6,7 @@ import type {
     AssistantMessage,
     AssistantRetryStatus,
     AssistantSession,
+    AssistantSessionTokenStatus,
     PendingApproval,
     UndoRecord,
 } from '@/core/types';
@@ -2275,5 +2276,231 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
         expect(shadowRoot.querySelector('[data-assistant-retry-banner="a_net"]')).toBeNull();
         expect(shadowRoot.querySelector('[data-assistant-continue-bar="a_net"]')).toBeNull();
         expect(shadowRoot.textContent).toContain('继续完成后的最终答复。');
+    });
+
+    it('preserves `this` binding on class-backed AssistantRuntimeBridge for readPreviewFile and getSessionTokenStatus', async () => {
+        const lorePath = '/lorebooks/创世回廊6.1/插画插入-111.md';
+        const loreContent = '## 插画插入规则\n在章节高潮处输出插画标记。';
+
+        const sessionWithRefs: AssistantSession = {
+            id: 'ast_class_runtime',
+            title: '类实例运行时绑定测试',
+            mode: 'chat',
+            stAdminEnabled: false,
+            autoApproveAuthor: false,
+            connectionId: 'inherit',
+            updatedAt: 1732329000000,
+            messages: [
+                {
+                    id: 'u_cls_1',
+                    role: 'user',
+                    content: '查看世界书插画条目',
+                    timestamp: 1732328990000,
+                },
+                {
+                    id: 'a_cls_1',
+                    role: 'assistant',
+                    content: '已读取目标条目。',
+                    fileRefs: [lorePath],
+                    timestamp: 1732329000000,
+                },
+            ],
+        };
+
+        const delegate = createMockAssistantRuntime({ sessions: [sessionWithRefs] });
+        const tokenStatusCalls: Array<{ bound: boolean; sessionId: string }> = [];
+        const previewCalls: Array<{ bound: boolean; path: string }> = [];
+
+        class ClassBackedRuntime implements AssistantRuntimeBridge {
+            private readonly files = new Map<string, string>([[lorePath, loreContent]]);
+            private readonly tokenStatus: AssistantSessionTokenStatus = {
+                sessionId: sessionWithRefs.id,
+                currentTokens: 5610,
+                contextLimit: 128000,
+                highWatermark: 96000,
+                lowWatermark: 32000,
+                usagePercent: 4,
+                level: 'normal',
+                activeTurnCount: 1,
+                activeMessageCount: 2,
+                foldableToolResultCount: 0,
+                compactedCount: 0,
+                isCompacting: false,
+            };
+
+            public listSessions(): AssistantSession[] {
+                return delegate.bridge.listSessions() as AssistantSession[];
+            }
+
+            public createSession(options?: Parameters<AssistantRuntimeBridge['createSession']>[0]) {
+                return delegate.bridge.createSession(options);
+            }
+
+            public sendPrompt(
+                sessionId: string,
+                prompt: string,
+                options?: Parameters<AssistantRuntimeBridge['sendPrompt']>[2],
+            ) {
+                return delegate.bridge.sendPrompt(sessionId, prompt, options);
+            }
+
+            public decideApproval(
+                approvalId: string,
+                decision: 'approve' | 'reject',
+                feedback?: string,
+            ) {
+                return delegate.bridge.decideApproval(approvalId, decision, feedback);
+            }
+
+            public retryApproval(approvalId: string, feedback?: string) {
+                return delegate.bridge.retryApproval(approvalId, feedback);
+            }
+
+            public applyUndo(undoId: string) {
+                return delegate.bridge.applyUndo(undoId);
+            }
+
+            public getSessionTokenStatus(sessionId: string): AssistantSessionTokenStatus | null {
+                // Accessing `this.tokenStatus` throws TypeError if invoked detached (`this === undefined`).
+                const isBound = this instanceof ClassBackedRuntime;
+                tokenStatusCalls.push({ bound: isBound, sessionId });
+                return sessionId === this.tokenStatus.sessionId
+                    ? structuredClone(this.tokenStatus)
+                    : null;
+            }
+
+            public async readPreviewFile(path: string): Promise<string | null> {
+                // Accessing `this.files` throws TypeError if invoked detached (`this === undefined`).
+                const isBound = this instanceof ClassBackedRuntime;
+                previewCalls.push({ bound: isBound, path });
+                return this.files.get(path) ?? null;
+            }
+        }
+
+        const classRuntime = new ClassBackedRuntime();
+        delegate.bridge = classRuntime;
+
+        activeHarness = mountAssistantHarness({
+            runtime: delegate,
+            initialSessionId: sessionWithRefs.id,
+        });
+        await settleLayout(6);
+
+        const { shadowRoot } = getShellElements();
+
+        // 1. getSessionTokenStatus ran with bound `this` and populated the topbar token pill
+        expect(tokenStatusCalls.length).toBeGreaterThan(0);
+        expect(tokenStatusCalls.every((c) => c.bound && c.sessionId === sessionWithRefs.id)).toBe(true);
+        expect(shadowRoot.textContent).toContain('5.6k');
+
+        // 2. Click the file reference chip -> readPreviewFile runs with bound `this` and renders real content
+        const fileChip = shadowRoot.querySelector('.ag-ast-file-chip') as HTMLButtonElement;
+        expect(fileChip).toBeTruthy();
+        expect(fileChip.textContent).toContain(lorePath);
+
+        fileChip.click();
+        await settleLayout(5);
+
+        expect(previewCalls).toEqual([{ bound: true, path: lorePath }]);
+        expect(shadowRoot.textContent).toContain(`只读文件预览 · ${lorePath}`);
+        expect(shadowRoot.textContent).toContain('在章节高潮处输出插画标记。');
+        expect(shadowRoot.textContent).not.toContain('（文件不存在或内容为空）');
+    });
+    it('collapses many referenced files into a single expandable summary row and keeps <= 2 refs inline', async () => {
+        await page.viewport(1280, 800);
+
+        const manyRefs = [
+            ...Array.from({ length: 15 }, (_, i) => `/lorebooks/创世回响6.1/mod-角色${i + 1}-正文-1-${100000 + i}.md`),
+            '/state/variables.json',
+            '/character/card.md',
+        ];
+        const manyRefsSession: AssistantSession = {
+            id: 'ast_file_refs_many',
+            title: '大量引用文件会话',
+            mode: 'chat',
+            stAdminEnabled: false,
+            autoApproveAuthor: false,
+            connectionId: 'inherit',
+            updatedAt: 1732330000000,
+            messages: [
+                { id: 'u_refs', role: 'user', content: '统一插画格式', timestamp: 1732329990000 },
+                {
+                    id: 'a_refs_many',
+                    role: 'assistant',
+                    content: '已逐个核对并统一插画插入格式。',
+                    fileRefs: manyRefs,
+                    timestamp: 1732330000000,
+                },
+                {
+                    id: 'a_refs_two',
+                    role: 'assistant',
+                    content: '变量与角色卡已同步。',
+                    fileRefs: ['/state/variables.json', '/character/card.md'],
+                    timestamp: 1732330001000,
+                },
+            ],
+        };
+
+        const runtime = createMockAssistantRuntime({ sessions: [manyRefsSession] });
+        activeHarness = mountAssistantHarness({ runtime, initialSessionId: manyRefsSession.id });
+        await settleLayout(5);
+
+        const shell = getShellElements();
+        const { shadowRoot } = shell;
+
+        // 1. 17 refs -> one collapsed summary row, no chips rendered yet
+        const manyStrip = shadowRoot.querySelector('[data-assistant-file-refs="a_refs_many"]') as HTMLDivElement;
+        expect(manyStrip).toBeTruthy();
+        expect(manyStrip.getAttribute('data-expanded')).toBe('false');
+        expect(manyStrip.querySelectorAll('.ag-ast-file-chip').length).toBe(0);
+        const toggle = manyStrip.querySelector('[data-assistant-file-refs-toggle="a_refs_many"]') as HTMLButtonElement;
+        expect(toggle.textContent).toContain('引用 17 个文件');
+        expect(toggle.getBoundingClientRect().height).toBeLessThanOrEqual(48);
+
+        // 2. <= 2 refs render inline with full path text
+        const twoStrip = shadowRoot.querySelector('[data-assistant-file-refs="a_refs_two"]') as HTMLDivElement;
+        const twoChips = twoStrip.querySelectorAll('.ag-ast-file-chip');
+        expect(twoChips.length).toBe(2);
+        expect(twoChips[0].textContent).toContain('/state/variables.json');
+
+        // 3. Expand -> grouped by directory, scroll-capped panel, chips open the preview
+        toggle.click();
+        await settleLayout(3);
+        expect(manyStrip.getAttribute('data-expanded')).toBe('true');
+        expect(manyStrip.querySelectorAll('.ag-ast-file-chip').length).toBe(17);
+        const groupLabels = Array.from(manyStrip.querySelectorAll('.ag-ast-file-group-label')).map((el) => el.textContent);
+        expect(groupLabels.some((t) => t?.includes('/lorebooks/创世回响6.1/'))).toBe(true);
+        const panel = manyStrip.querySelector('.ag-ast-file-refs-panel') as HTMLDivElement;
+        expect(panel.getBoundingClientRect().height).toBeLessThanOrEqual(240);
+        // Scope the >= 40px target check to the strip itself (the topbar rename button is
+        // hover-revealed at 28px on desktop and depends on the real pointer position).
+        for (const btn of Array.from(manyStrip.querySelectorAll('button'))) {
+            const rect = btn.getBoundingClientRect();
+            if (rect.width === 0) {
+                continue;
+            }
+            expect(rect.width, 'file-refs control width').toBeGreaterThanOrEqual(40);
+            expect(rect.height, 'file-refs control height').toBeGreaterThanOrEqual(40);
+        }
+
+        const firstChip = manyStrip.querySelector('.ag-ast-file-chip') as HTMLButtonElement;
+        expect(firstChip.getAttribute('data-file-path')).toBe(manyRefs[0]);
+        firstChip.click();
+        await settleLayout(4);
+        expect(shadowRoot.textContent).toContain(`只读文件预览 · ${manyRefs[0]}`);
+
+        // 4. Mobile (390x844): collapsed row stays single-line without horizontal overflow
+        await page.viewport(390, 844);
+        activeHarness.cleanup();
+        activeHarness = mountAssistantHarness({ runtime, initialSessionId: manyRefsSession.id });
+        await settleLayout(6);
+        activeHarness.store.openAssistantSession(manyRefsSession.id);
+        await settleLayout(4);
+        const mobile = getShellElements();
+        expect(
+            mobile.shadowRoot.querySelector('[data-assistant-file-refs-toggle="a_refs_many"]'),
+        ).toBeTruthy();
+        assertNoHorizontalOverflow(mobile.dialog, mobile.shadowRoot, 'mobile:file-refs');
+        assertTouchTargetsAndTypography(mobile.shadowRoot, 'mobile:file-refs');
     });
 });

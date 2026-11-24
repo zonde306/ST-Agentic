@@ -129,7 +129,7 @@ export function createDefaultMainAgent(overrides: Partial<AgentProfile> = {}): A
                 read: [...DEFAULT_MAIN_AGENT_PERMISSIONS.read],
                 write: [...DEFAULT_MAIN_AGENT_PERMISSIONS.write],
             },
-        maxToolRounds: overrides.maxToolRounds ?? 8,
+        maxToolRounds: overrides.maxToolRounds ?? 0,
         watermark: overrides.watermark
             ? { ...overrides.watermark }
             : { ...DEFAULT_WATERMARK },

@@ -3564,35 +3564,181 @@ textarea:focus-visible {
     word-break: break-all;
 }
 
+/* Referenced-file strip (design spec §3.15): inline <= 2, else one collapsible summary row */
 .ag-ast-file-refs {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 6px;
+    gap: 4px;
+    min-width: 0;
 }
 
 .ag-ast-file-chip {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: 6px;
     min-width: 40px;
     min-height: 40px;
     max-width: 100%;
     padding: 0 10px;
     border-radius: var(--radius-md);
-    border: 1px solid var(--border);
-    background: var(--content);
+    border: 1px solid var(--card-border);
+    background: transparent;
+    color: var(--foreground);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+    overflow: hidden;
+    white-space: nowrap;
+    transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+
+.ag-ast-file-chip:hover {
+    background: var(--hover);
+    border-color: var(--border);
+}
+
+.ag-ast-file-chip-icon {
+    display: inline-flex;
+    flex-shrink: 0;
+    color: var(--subtle-foreground);
+}
+
+.ag-ast-file-chip:hover .ag-ast-file-chip-icon {
     color: var(--primary);
+}
+
+.ag-ast-file-chip-dir {
+    flex: 0 100 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--subtle-foreground);
+}
+
+.ag-ast-file-chip-name {
+    flex: 0 1 auto;
+    min-width: 3em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.ag-ast-file-refs-collapsible {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0;
+    border: 1px solid var(--card-border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+}
+
+.ag-ast-file-refs-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0 10px 0 12px;
+    border: none;
+    background: transparent;
+    color: var(--muted-foreground);
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.ag-ast-file-refs-toggle:hover {
+    background: var(--hover);
+    color: var(--foreground);
+}
+
+.ag-ast-file-refs-toggle-icon,
+.ag-ast-file-refs-chevron {
+    display: inline-flex;
+    flex-shrink: 0;
+}
+
+.ag-ast-file-refs-toggle-icon {
+    color: var(--primary);
+}
+
+.ag-ast-file-refs-count {
+    flex-shrink: 0;
+    font-weight: 500;
+    color: var(--foreground);
+}
+
+.ag-ast-file-refs-preview {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-family: var(--font-mono);
     font-size: 11px;
-    cursor: pointer;
+    color: var(--subtle-foreground);
+}
+
+.ag-ast-file-refs-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 232px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 6px;
+    border-top: 1px solid var(--card-border);
+    background: var(--content);
+}
+
+.ag-ast-file-group {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.ag-ast-file-group-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--subtle-foreground);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-.ag-ast-file-chip:hover {
+.ag-ast-file-group-count {
+    flex-shrink: 0;
+    padding: 0 6px;
+    border-radius: 9999px;
     background: var(--secondary);
+    color: var(--muted-foreground);
+    font-family: var(--font-sans);
+    font-variant-numeric: tabular-nums;
+}
+
+.ag-ast-file-group-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 2px;
+    min-width: 0;
+}
+
+.ag-ast-file-group-grid .ag-ast-file-chip {
+    width: 100%;
+    border-color: transparent;
+}
+
+.ag-ast-file-group-grid .ag-ast-file-chip:hover {
+    border-color: transparent;
 }
 
 /* Inline Bubble Approval Card & Collapsed Single-Line Approval Badge */

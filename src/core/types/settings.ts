@@ -105,6 +105,7 @@ export interface AgentProfile {
     promptBlocks: PromptBlock[];
     enabledTools: string[];
     permissions: ScopedPermissions;
+    /** Maximum tool-calling rounds per turn (`0` = unlimited). */
     maxToolRounds: number;
     watermark?: { high: number; low: number };
     ephemeralWindowSize?: number;

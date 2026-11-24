@@ -271,7 +271,7 @@ function buildDerivedTriggerAgent(params: {
             read: [...params.permissions.read],
             write: [...params.permissions.write],
         },
-        maxToolRounds: 6,
+        maxToolRounds: 0,
     };
 }
 

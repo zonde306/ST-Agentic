@@ -14,6 +14,7 @@ import {
 } from '@/core/config';
 import {
     estimateMessageTokens,
+    isSpillPath,
     renderPromptBlocks,
     renderPromptBlockSync,
     resolveEffectiveContextBudget,
@@ -136,6 +137,7 @@ export interface AssistantRunnerOptions {
     getVariableSchema?: () => DynamicVariableSchema | undefined;
     getStatusSnapshot?: () => Record<string, unknown>;
     extraTools?: readonly AssistantToolDefinition[];
+    /** Optional positive cap on tool-calling rounds per turn; omitted or `<= 0` means unlimited. */
     maxToolRounds?: number;
     autoRetry?: AssistantRetryOptions | false;
     stream?: boolean;
@@ -172,7 +174,6 @@ interface TurnLLMOutput {
     finishReason?: string;
 }
 
-const DEFAULT_MAX_TOOL_ROUNDS = 20;
 const DEFAULT_COMPACTION_SUMMARY_TIMEOUT_MS = 25_000;
 const DEFAULT_AUTO_RETRY_OPTIONS: Required<AssistantRetryOptions> = {
     maxRetries: 2,
@@ -987,7 +988,12 @@ export class AssistantRunner {
         this.activeTargetProvider = options.getActiveTarget;
         this.variableSchemaProvider = options.getVariableSchema;
         this.statusSnapshotProvider = options.getStatusSnapshot;
-        this.maxToolRounds = Math.max(1, options.maxToolRounds ?? DEFAULT_MAX_TOOL_ROUNDS);
+        this.maxToolRounds =
+            typeof options.maxToolRounds === 'number'
+            && Number.isFinite(options.maxToolRounds)
+            && options.maxToolRounds > 0
+                ? Math.max(1, Math.floor(options.maxToolRounds))
+                : Number.POSITIVE_INFINITY;
         if (options.autoRetry === false) {
             this.autoRetryConfig = false;
         } else {
@@ -1212,11 +1218,15 @@ export class AssistantRunner {
     }
 
     /**
-     * Read a VFS file for UI preview with automatic secret redaction.
+     * Read a VFS or `/tmp/tool-spill/*` file for UI preview with automatic secret redaction.
      */
     public async readPreviewFile(path: string): Promise<string | null> {
         try {
             const normalized = normalizeVfsPath(path);
+            if (isSpillPath(normalized)) {
+                const slice = this.spillStore.readSlice(normalized);
+                return slice === null ? null : redactString(slice).value;
+            }
             const raw = await this.vfs.readFile(normalized, {
                 target: this.resolveActiveTarget(),
                 staged: false,
@@ -2608,7 +2618,7 @@ export class AssistantRunner {
 
                     // 3. Direct execution (read-only, adjust, or non-mandatory autoApproveAuthor)
                     const execResult = await executeAssistantTool(toolDef, parsedArgs, toolCtx);
-                    if (execResult.fileRefs?.length) {
+                    if (!toolDef.readOnly && execResult.ok && execResult.fileRefs?.length) {
                         for (const ref of execResult.fileRefs) {
                             fileRefs.add(ref);
                         }
@@ -2810,10 +2820,15 @@ export class AssistantRunner {
             } else {
                 nextCalls.push(toolRecord);
             }
+            const nextFileRefs =
+                !toolDef.readOnly && execResult.fileRefs?.length
+                    ? Array.from(new Set([...(msg.fileRefs ?? []), ...execResult.fileRefs]))
+                    : msg.fileRefs;
             return {
                 ...msg,
                 content: msg.content.trim() ? msg.content : `已执行：${approved.title}`,
                 toolCalls: nextCalls,
+                ...(nextFileRefs?.length ? { fileRefs: nextFileRefs } : {}),
             };
         });
 

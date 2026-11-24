@@ -10,6 +10,7 @@ import {
     importConnections,
     importPreset,
     importSettings,
+    normalizeAgentProfile,
     normalizeConnection,
     normalizePreset,
     normalizeSettings,
@@ -37,6 +38,7 @@ describe('src/core/config defaults, normalization, and secret-free exports', () 
         expect(mainAgent.permissions.read).toContain('/**');
         expect(mainAgent.permissions.write).toContain('/memory/**');
         expect(mainAgent.watermark).toEqual({ high: 36000, low: 18000 });
+        expect(mainAgent.maxToolRounds).toBe(0);
         expect(mainAgent.promptBlocks.some((b) => b.placement === 'prefix' && b.enabled)).toBe(true);
         expect(conn.id).toBe('default');
         expect(conn.cachePolicy).toBe('auto_prefix');
@@ -86,9 +88,16 @@ describe('src/core/config defaults, normalization, and secret-free exports', () 
             },
         });
         expect(preset.mainAgentId).toBe('narrator');
+        expect(preset.agents.narrator.maxToolRounds).toBe(0);
         expect(preset.agents.narrator.watermark).toEqual({ high: 12000, low: 12000 });
         expect(preset.agents.narrator.enabledTools).toEqual(['read_file']);
         expect(preset.files).toEqual({ 'valid.md': 'ok' });
+
+        expect(normalizeAgentProfile({ id: 'a_default' }).maxToolRounds).toBe(0);
+        expect(normalizeAgentProfile({ id: 'a_zero', maxToolRounds: 0 }).maxToolRounds).toBe(0);
+        expect(normalizeAgentProfile({ id: 'a_neg', maxToolRounds: -5 }).maxToolRounds).toBe(0);
+        expect(normalizeAgentProfile({ id: 'a_pos', maxToolRounds: 12 }).maxToolRounds).toBe(12);
+        expect(normalizeAgentProfile({ id: 'a_max', maxToolRounds: 5000 }).maxToolRounds).toBe(1000);
 
         const repaired = normalizeSettings({
             runMode: 'invalid_mode',
