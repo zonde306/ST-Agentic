@@ -142,4 +142,54 @@ describe('DataCompactor', () => {
         expect(store.get(DATA_NAMESPACES.WORLDINFO, 'LegacyBook/9')).toBeNull();
         expect(JSON.parse(store.get(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY)!.content)).toEqual({ hp: 88 });
     });
+
+    it('auto-prunes cold /scratch/** drafts while preserving hot /scratch/**, /workspace/shared/**, /workspace/docs/**, and /workspace/AGENTS.md', () => {
+        const bridge = buildMultiTurnChat(16);
+        const store = new ChatDataStore(bridge);
+
+        // Cold scratch files (messages 1 & 2, coldEnd = 12 when keepDepth = 4)
+        store.set(DATA_NAMESPACES.FILES, 'scratch/old-draft.md', 'agent:main', 'old scratch 1', {
+            messageId: 1,
+            swipeId: 0,
+        });
+        store.set(DATA_NAMESPACES.FILES, 'scratch/reused.md', 'agent:main', 'old version', {
+            messageId: 2,
+            swipeId: 0,
+        });
+        // Hot scratch file (touched at message 14 >= 12)
+        store.set(DATA_NAMESPACES.FILES, 'scratch/reused.md', 'agent:main', 'hot version', {
+            messageId: 14,
+            swipeId: 0,
+        });
+        store.set(DATA_NAMESPACES.FILES, 'scratch/hot-only.md', 'agent:main', 'active draft', {
+            messageId: 15,
+            swipeId: 0,
+        });
+
+        // Non-scratch workspace files & base specs must survive compaction
+        store.setBase(DATA_NAMESPACES.FILES, 'workspace/AGENTS.md', 'ui-edit', '# Core Index');
+        store.setBase(DATA_NAMESPACES.FILES, 'workspace/docs/style.md', 'assistant', '# Style Guide');
+        store.set(DATA_NAMESPACES.FILES, 'workspace/shared/handoff.md', 'agent:main', 'shared cold note', {
+            messageId: 3,
+            swipeId: 0,
+        });
+        store.set(DATA_NAMESPACES.FILES, 'memory/outline.md', 'agent:main', 'chapter outline', {
+            messageId: 4,
+            swipeId: 0,
+        });
+
+        const report = compactColdLayers(bridge, { keepDepth: 4 });
+        expect(report.prunedScratchFiles).toBe(1);
+
+        // Cold scratch draft was removed completely
+        expect(store.get(DATA_NAMESPACES.FILES, 'scratch/old-draft.md', { includeDeleted: true })).toBeNull();
+        // Hot scratch drafts stay intact
+        expect(store.get(DATA_NAMESPACES.FILES, 'scratch/reused.md')?.content).toBe('hot version');
+        expect(store.get(DATA_NAMESPACES.FILES, 'scratch/hot-only.md')?.content).toBe('active draft');
+        // Specs, shared workspace, and memory survive cold compaction
+        expect(store.get(DATA_NAMESPACES.FILES, 'workspace/AGENTS.md')?.content).toBe('# Core Index');
+        expect(store.get(DATA_NAMESPACES.FILES, 'workspace/docs/style.md')?.content).toBe('# Style Guide');
+        expect(store.get(DATA_NAMESPACES.FILES, 'workspace/shared/handoff.md')?.content).toBe('shared cold note');
+        expect(store.get(DATA_NAMESPACES.FILES, 'memory/outline.md')?.content).toBe('chapter outline');
+    });
 });

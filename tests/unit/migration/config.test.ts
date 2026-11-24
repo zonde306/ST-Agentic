@@ -84,14 +84,18 @@ describe('src/core/config defaults, normalization, and secret-free exports', () 
                 'valid.md': 'ok',
                 '../escape.md': 'bad',
                 '.hidden': 'bad',
-                'nested/path.md': 'bad',
+                'docs/.hidden': 'bad',
+                '/leading.md': 'bad',
+                'a//b.md': 'bad',
+                'back\\slash.md': 'bad',
+                'nested/path.md': 'ok',
             },
         });
         expect(preset.mainAgentId).toBe('narrator');
         expect(preset.agents.narrator.maxToolRounds).toBe(0);
         expect(preset.agents.narrator.watermark).toEqual({ high: 12000, low: 12000 });
         expect(preset.agents.narrator.enabledTools).toEqual(['read_file']);
-        expect(preset.files).toEqual({ 'valid.md': 'ok' });
+        expect(preset.files).toEqual({ 'valid.md': 'ok', 'nested/path.md': 'ok' });
 
         expect(normalizeAgentProfile({ id: 'a_default' }).maxToolRounds).toBe(0);
         expect(normalizeAgentProfile({ id: 'a_zero', maxToolRounds: 0 }).maxToolRounds).toBe(0);

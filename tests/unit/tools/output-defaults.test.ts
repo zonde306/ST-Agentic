@@ -26,6 +26,7 @@ describe('Main Agent /output.md Defaults & Legacy Preset Upgrade', () => {
             '/output.md',
             '/memory/**',
             '/scratch/**',
+            '/workspace/shared/**',
         ]);
 
         const main = createDefaultMainAgent();
@@ -63,8 +64,26 @@ describe('Main Agent /output.md Defaults & Legacy Preset Upgrade', () => {
             expect.arrayContaining([...LEGACY_8_TOOLS, 'write_file', 'append_file', 'edit_file']),
         );
         expect(upgradedLegacy.agents.main.permissions.write).toEqual(
-            expect.arrayContaining(['/output.md', '/memory/**', '/scratch/**']),
+            expect.arrayContaining(['/output.md', '/memory/**', '/scratch/**', '/workspace/shared/**']),
         );
+        // V2 mainAgent write permissions also upgrade cleanly to include /workspace/shared/**
+        const upgradedV2 = normalizePreset({
+            id: 'v2_preset',
+            name: 'V2',
+            mainAgentId: 'main',
+            agents: {
+                main: {
+                    id: 'main',
+                    permissions: { read: ['/**'], write: ['/output.md', '/memory/**', '/scratch/**'] },
+                },
+            },
+        });
+        expect(upgradedV2.agents.main.permissions.write).toEqual([
+            '/output.md',
+            '/memory/**',
+            '/scratch/**',
+            '/workspace/shared/**',
+        ]);
         // Non-main agent must NOT be mutated even if it happens to have legacy 8 tools
         expect(upgradedLegacy.agents.chronicler.enabledTools).toEqual(LEGACY_8_TOOLS);
         expect(upgradedLegacy.agents.chronicler.permissions.write).toEqual(['/memory/**', '/scratch/**']);

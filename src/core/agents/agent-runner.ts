@@ -17,6 +17,7 @@ import {
 } from '@/core/config';
 import {
     buildLayer2MacroOverrides,
+    buildWorkspaceNotices,
     ContextAssembler,
     DEFAULT_FOLD_THRESHOLD_CHARS,
     estimateMessageTokens,
@@ -1512,6 +1513,24 @@ export class AgentRunner {
             };
 
             const isMainTurnRoot = input.phase === 'main_turn' && delegationDepth === 0;
+            const workspaceNotices = input.resumeMessages === undefined
+                ? await buildWorkspaceNotices({
+                    vfs: this.vfs,
+                    permissions,
+                    readSet: effectiveReadSet,
+                    target,
+                    staged,
+                    hashText: (text) => this.bridge.hashText(text),
+                }).catch(() => ({
+                    noticeXml: '',
+                    unreadIndexPaths: [] as string[],
+                    updatedIndexPaths: [] as string[],
+                    staleDocPaths: [] as string[],
+                    sharedUpdatePaths: [] as string[],
+                }))
+                : { noticeXml: '' };
+            throwIfAborted(signal);
+
             let currentAssembled = input.resumeMessages !== undefined
                 ? this.contextAssembler.assemble({
                     ...baseAssembleInput,
@@ -1531,6 +1550,7 @@ export class AgentRunner {
                     runTailRadar: input.runTailRadar ?? (input.phase === 'main_turn'),
                     target,
                     tailRadar: this.tailRadar,
+                    ...(workspaceNotices.noticeXml ? { workspaceNotice: workspaceNotices.noticeXml } : {}),
                     ...(isMainTurnRoot ? { vfs: this.vfs } : {}),
                 });
 

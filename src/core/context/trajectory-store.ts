@@ -15,6 +15,8 @@ import { canonicalClone, canonicalStringify } from '@/core/utils';
 /** Metadata key where `TrajectoryStore` persists causal agent trajectories. */
 export const AGENTIC_TRAJECTORIES_KEY = 'agentic_trajectories';
 
+const trajectoryTextEncoder = new TextEncoder();
+
 /** Frozen Layer 0 static prefix cached once per persistent agent session. */
 export interface FrozenStaticPrefix {
     tools: readonly CanonicalToolSchema[];
@@ -566,6 +568,97 @@ export class TrajectoryStore {
         }
 
         return removedCount;
+    }
+
+    /** Count stored causal branch checkpoints across `agentId` (or all threads if omitted). */
+    countCheckpoints(agentId?: string): number {
+        const targetIds = agentId !== undefined ? [agentId] : Array.from(this.threads.keys());
+        let total = 0;
+        for (const id of targetIds) {
+            const state = this.threads.get(id);
+            if (state) {
+                total += state.checkpoints.size;
+            }
+        }
+        return total;
+    }
+
+    /** Estimate serialized UTF-8 byte size of the trajectory store. */
+    estimateBytes(): number {
+        if (this.threads.size === 0 && this.interrupted.size === 0) {
+            return 0;
+        }
+        return trajectoryTextEncoder.encode(canonicalStringify(this.serialize())).length;
+    }
+
+    /**
+     * Prune cold branch checkpoints with `messageId < coldEnd` so obsolete message
+     * snapshots no longer pin evicted turns in `messagePool`.
+     * Preserves all hot checkpoints (`>= coldEnd`), or the single latest anchor if all are cold.
+     */
+    pruneColdCheckpoints(
+        coldEnd: number,
+        agentId?: string,
+    ): { removedCheckpoints: number; remainingCheckpoints: number } {
+        const cutoff = Math.max(0, Math.floor(coldEnd));
+        const targetIds = agentId !== undefined ? [agentId] : Array.from(this.threads.keys());
+        let removedCheckpoints = 0;
+        let remainingCheckpoints = 0;
+
+        for (const id of targetIds) {
+            const state = this.threads.get(id);
+            if (!state) {
+                continue;
+            }
+
+            const hotKeys: BranchKey[] = [];
+            const coldEntries: Array<{ key: BranchKey; target: MessageTarget }> = [];
+            for (const key of state.checkpoints.keys()) {
+                const parsed = parseBranchKey(key);
+                if (!parsed) {
+                    continue;
+                }
+                if (parsed.messageId >= cutoff) {
+                    hotKeys.push(key);
+                } else {
+                    coldEntries.push({ key, target: parsed });
+                }
+            }
+
+            if (hotKeys.length > 0) {
+                for (const item of coldEntries) {
+                    if (state.checkpoints.delete(item.key)) {
+                        removedCheckpoints += 1;
+                    }
+                }
+            } else if (coldEntries.length > 1) {
+                coldEntries.sort(
+                    (a, b) =>
+                        b.target.messageId - a.target.messageId
+                        || b.target.swipeId - a.target.swipeId,
+                );
+                for (let i = 1; i < coldEntries.length; ++i) {
+                    if (state.checkpoints.delete(coldEntries[i].key)) {
+                        removedCheckpoints += 1;
+                    }
+                }
+            }
+
+            remainingCheckpoints += state.checkpoints.size;
+        }
+
+        for (const [key, cp] of Array.from(this.interrupted.entries())) {
+            const parsed = parseBranchKey(key);
+            if (
+                parsed
+                && parsed.messageId < cutoff
+                && (agentId === undefined || cp.agentId === agentId)
+            ) {
+                this.interrupted.delete(key);
+            }
+        }
+
+        return { removedCheckpoints, remainingCheckpoints };
     }
 
     /** Clear a persistent thread completely (including frozen Layer 0 prefix). */

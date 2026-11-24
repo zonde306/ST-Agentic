@@ -28,6 +28,7 @@ import {
     utf8ByteLength,
 } from './fs-base';
 import { parseInitVarEntries } from './fs-worldinfo';
+import { isChatBaseWorkspacePath } from './workspace-policy';
 
 export const GLOBAL_MOUNT = 'global';
 export const PERSONA_MOUNT = 'persona';
@@ -256,6 +257,16 @@ export class WorkspaceMount implements VfsMount {
         if (!clean) {
             throw new VfsError('Cannot overwrite root directory "/"', 'EISDIR', '/');
         }
+        const useBase = this.shouldUseBaseLayer(clean, opts);
+        if (useBase) {
+            this.store.setBase(
+                DATA_NAMESPACES.FILES,
+                clean,
+                opts.source ?? 'vfs',
+                content,
+            );
+            return;
+        }
         const existing = this.readStored(clean, opts);
         if (existing && existing.content === content) {
             return;
@@ -297,13 +308,22 @@ export class WorkspaceMount implements VfsMount {
 
         const updated = existing.content.replace(oldText, newText);
         if (updated !== existing.content) {
-            this.store.set(
-                DATA_NAMESPACES.FILES,
-                clean,
-                opts.source ?? 'vfs',
-                updated,
-                { target: opts.target, staged: opts.staged },
-            );
+            if (this.shouldUseBaseLayer(clean, opts)) {
+                this.store.setBase(
+                    DATA_NAMESPACES.FILES,
+                    clean,
+                    opts.source ?? 'vfs',
+                    updated,
+                );
+            } else {
+                this.store.set(
+                    DATA_NAMESPACES.FILES,
+                    clean,
+                    opts.source ?? 'vfs',
+                    updated,
+                    { target: opts.target, staged: opts.staged },
+                );
+            }
         }
         return { ok: true, path: fullPath, message: `Edited ${fullPath}` };
     }
@@ -313,12 +333,25 @@ export class WorkspaceMount implements VfsMount {
         if (!clean) {
             return false;
         }
+        if (this.shouldUseBaseLayer(clean, opts)) {
+            return this.store.removeBase(DATA_NAMESPACES.FILES, clean);
+        }
         return this.store.erase(
             DATA_NAMESPACES.FILES,
             clean,
             opts.source ?? 'vfs-delete',
             { target: opts.target, staged: opts.staged },
         );
+    }
+
+    private shouldUseBaseLayer(cleanKey: string, opts?: VfsWriteOptions): boolean {
+        if (opts?.layerMode === 'base') {
+            return true;
+        }
+        if (opts?.layerMode === 'branch') {
+            return false;
+        }
+        return isChatBaseWorkspacePath(`/${cleanKey}`);
     }
 
     async listFiles(opts?: VfsTargetOptions): Promise<VfsEntryStat[]> {

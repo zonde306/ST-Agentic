@@ -23,11 +23,17 @@ export interface CompactColdLayersOptions {
     keepDepth?: number;
     /** Include legacy `cg_data` / `wi_overrides` / `message.variables` inside cold range (default true). */
     includeLegacy?: boolean;
+    /** Prune cold `/scratch/**` temporary drafts no longer touched in the hot window (default true). */
+    pruneColdScratch?: boolean;
 }
 
 export const DEFAULT_KEEP_DEPTH = 32;
 
 const textEncoder = new TextEncoder();
+
+function isScratchFileKey(key: string): boolean {
+    return key.replace(/^\/+/, '').toLowerCase().startsWith('scratch/');
+}
 
 function measureUtf8Bytes(value: unknown): number {
     if (value == null) {
@@ -163,6 +169,7 @@ export class DataCompactor {
         const dryRun = options.dryRun === true;
         const keepDepth = Math.max(0, options.keepDepth ?? DEFAULT_KEEP_DEPTH);
         const includeLegacy = options.includeLegacy !== false;
+        const pruneColdScratch = options.pruneColdScratch !== false;
 
         const chat = this.bridge.getChat();
         const metadata = this.bridge.getMetadata();
@@ -170,6 +177,25 @@ export class DataCompactor {
         const previousWatermark = current?.watermark ?? 0;
         const coldEnd = Math.max(0, chat.length - keepDepth);
         const estimatedBytesBefore = measureUtf8Bytes(current);
+
+        const hotScratchKeys = new Set<string>();
+        if (pruneColdScratch && coldEnd > 0 && current) {
+            for (const branchKey of Object.keys(current.layers)) {
+                const parsed = parseBranchKey(branchKey);
+                if (!parsed || parsed.messageId < coldEnd) {
+                    continue;
+                }
+                const fileEntries = current.layers[branchKey]?.files;
+                if (!fileEntries) {
+                    continue;
+                }
+                for (const key of Object.keys(fileEntries)) {
+                    if (isScratchFileKey(key)) {
+                        hotScratchKeys.add(key);
+                    }
+                }
+            }
+        }
 
         const hasLingeringColdLayer = current
             ? Object.keys(current.layers).some((branchKey) => {
@@ -181,7 +207,14 @@ export class DataCompactor {
             })
             : false;
 
-        if (coldEnd <= previousWatermark && !hasLingeringColdLayer) {
+        const hasColdScratchInBase =
+            pruneColdScratch && coldEnd > 0 && current?.base?.files
+                ? Object.keys(current.base.files).some(
+                    (key) => isScratchFileKey(key) && !hotScratchKeys.has(key),
+                )
+                : false;
+
+        if (coldEnd <= previousWatermark && !hasLingeringColdLayer && !hasColdScratchInBase) {
             return {
                 dryRun,
                 compactedMessages: 0,
@@ -192,6 +225,7 @@ export class DataCompactor {
                 freedBytes: 0,
                 previousWatermark,
                 newWatermark: previousWatermark,
+                prunedScratchFiles: 0,
             };
         }
 
@@ -237,13 +271,34 @@ export class DataCompactor {
         }
 
         let flattenedEntries = 0;
+        const prunedScratchKeys = new Set<string>();
         for (const [ns, entries] of Object.entries(collected)) {
             if (!workingBase[ns]) {
                 workingBase[ns] = {};
             }
             for (const [key, entry] of Object.entries(entries)) {
+                if (
+                    pruneColdScratch
+                    && coldEnd > 0
+                    && ns === 'files'
+                    && isScratchFileKey(key)
+                    && !hotScratchKeys.has(key)
+                ) {
+                    prunedScratchKeys.add(key);
+                    delete workingBase[ns][key];
+                    continue;
+                }
                 workingBase[ns][key] = entry;
                 flattenedEntries += 1;
+            }
+        }
+
+        if (pruneColdScratch && coldEnd > 0 && workingBase.files) {
+            for (const key of Object.keys(workingBase.files)) {
+                if (isScratchFileKey(key) && !hotScratchKeys.has(key)) {
+                    delete workingBase.files[key];
+                    prunedScratchKeys.add(key);
+                }
             }
         }
 
@@ -277,6 +332,7 @@ export class DataCompactor {
         const estimatedBytesAfter = measureUtf8Bytes(nextPersisted);
         const freedBytes = Math.max(0, estimatedBytesBefore - estimatedBytesAfter);
         const compactedMessages = Math.max(0, coldEnd - previousWatermark);
+        const prunedScratchFiles = prunedScratchKeys.size;
 
         if (!dryRun) {
             const target = readPersistedAgenticData(metadata, true);
@@ -302,6 +358,7 @@ export class DataCompactor {
             freedBytes,
             previousWatermark,
             newWatermark,
+            prunedScratchFiles,
         };
     }
 

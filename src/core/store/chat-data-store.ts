@@ -252,6 +252,135 @@ export class ChatDataStore {
         return this.get(ns, key, { ...opts, includeStaged: true });
     }
 
+    /** Whether `(ns, key)` currently has a non-deleted entry in `metadata.agentic_data.base`. */
+    hasBase(ns: string, key: string): boolean {
+        const persisted = readPersistedAgenticData(this.bridge.getMetadata(), false);
+        const entry = persisted?.base?.[ns]?.[key];
+        return Boolean(entry && !entry.deleted);
+    }
+
+    /**
+     * Write `(ns, key)` directly into the chat-wide `base` layer and sweep any stale
+     * per-branch overrides/tombstones from `layers` and pending staging buckets so
+     * the base value is immediately authoritative across all swipes.
+     */
+    setBase(ns: string, key: string, source: string, content: string): void {
+        const metadata = this.bridge.getMetadata();
+        const persisted = readPersistedAgenticData(metadata, true);
+        if (!persisted) {
+            throw new Error('HostBridge.getMetadata() did not return a writable metadata object');
+        }
+
+        const existingBase = persisted.base?.[ns]?.[key];
+        let swept = false;
+
+        for (const [branchKey, layer] of Object.entries(persisted.layers)) {
+            const entries = layer?.[ns];
+            if (entries && Object.hasOwn(entries, key)) {
+                delete entries[key];
+                swept = true;
+                if (Object.keys(entries).length === 0) {
+                    delete layer[ns];
+                }
+                if (Object.keys(layer).length === 0) {
+                    delete persisted.layers[branchKey];
+                }
+            }
+        }
+
+        const buckets = this.getStagingBuckets(metadata, false);
+        if (buckets) {
+            for (const [bucketKey, bucket] of Array.from(buckets.entries())) {
+                const entries = bucket[ns];
+                if (entries && Object.hasOwn(entries, key)) {
+                    delete entries[key];
+                    swept = true;
+                    if (Object.keys(entries).length === 0) {
+                        delete bucket[ns];
+                    }
+                    if (Object.keys(bucket).length === 0) {
+                        buckets.delete(bucketKey);
+                    }
+                }
+            }
+        }
+
+        const unchanged =
+            Boolean(existingBase)
+            && !existingBase?.deleted
+            && existingBase?.content === content
+            && existingBase?.source === source
+            && !swept;
+        if (unchanged) {
+            return;
+        }
+
+        if (!persisted.base[ns]) {
+            persisted.base[ns] = {};
+        }
+        persisted.base[ns][key] = { source, content };
+
+        invalidateHeadIndex();
+        this.bridge.saveChatDebounced();
+    }
+
+    /**
+     * Physically delete `(ns, key)` from `base`, `layers`, and pending staging buckets.
+     * Returns `true` if any entry was removed.
+     */
+    removeBase(ns: string, key: string): boolean {
+        const metadata = this.bridge.getMetadata();
+        const persisted = readPersistedAgenticData(metadata, false);
+        let removed = false;
+
+        if (persisted?.base?.[ns] && Object.hasOwn(persisted.base[ns], key)) {
+            delete persisted.base[ns][key];
+            if (Object.keys(persisted.base[ns]).length === 0) {
+                delete persisted.base[ns];
+            }
+            removed = true;
+        }
+
+        if (persisted) {
+            for (const [branchKey, layer] of Object.entries(persisted.layers)) {
+                const entries = layer?.[ns];
+                if (entries && Object.hasOwn(entries, key)) {
+                    delete entries[key];
+                    removed = true;
+                    if (Object.keys(entries).length === 0) {
+                        delete layer[ns];
+                    }
+                    if (Object.keys(layer).length === 0) {
+                        delete persisted.layers[branchKey];
+                    }
+                }
+            }
+        }
+
+        const buckets = this.getStagingBuckets(metadata, false);
+        if (buckets) {
+            for (const [bucketKey, bucket] of Array.from(buckets.entries())) {
+                const entries = bucket[ns];
+                if (entries && Object.hasOwn(entries, key)) {
+                    delete entries[key];
+                    removed = true;
+                    if (Object.keys(entries).length === 0) {
+                        delete bucket[ns];
+                    }
+                    if (Object.keys(bucket).length === 0) {
+                        buckets.delete(bucketKey);
+                    }
+                }
+            }
+        }
+
+        if (removed) {
+            invalidateHeadIndex();
+            this.bridge.saveChatDebounced();
+        }
+        return removed;
+    }
+
     /** Write a value to a committed `(messageId, swipeId)` layer, or stage when `staged: true`. */
     set(
         ns: string,

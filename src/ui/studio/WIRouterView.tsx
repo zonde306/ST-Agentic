@@ -23,6 +23,7 @@ import {
 } from '@/ui/components';
 import {
     IconBookOpen,
+    IconDownload,
     IconFolder,
     IconPlus,
     IconRefresh,
@@ -34,7 +35,7 @@ import {
     useAppStore,
     useAppStoreInstance,
 } from '@/ui/store';
-import { useDraftString } from './studio-helpers';
+import { downloadTextFile, useDraftString } from './studio-helpers';
 
 type WIRouterSubTab = 'router' | 'preset_files';
 type OverrideChoice = 'auto' | WICategory;
@@ -304,7 +305,14 @@ export function WIRouterView(props: Partial<ConsoleViewProps> = {}) {
         if (!file) {
             return;
         }
-        const safeName = file.name.trim().replace(/[/\\%#?]/g, '_');
+        const rawRel =
+            (file as File & { webkitRelativePath?: string }).webkitRelativePath
+            || file.name;
+        const safeName = rawRel
+            .trim()
+            .replace(/\\/g, '/')
+            .replace(/^[./]+/, '')
+            .replace(/[%#?\0]/g, '_');
         const err = validatePresetFileName(safeName);
         if (err) {
             store.pushToast(`文件名不合法：${err}`, 'error');
@@ -670,14 +678,33 @@ export function WIRouterView(props: Partial<ConsoleViewProps> = {}) {
                         title={<span class="ag-mono">/preset/{selectedFile}</span>}
                         subtitle="随预设导出并只读挂载到 VFS /preset/*，不占用 Layer 0 静态前缀"
                         actions={
-                            <Button
-                                size="sm"
-                                variant="danger"
-                                icon={<IconTrash size={14} />}
-                                onClick={() => handleDeleteFile(selectedFile)}
-                            >
-                                删除文件
-                            </Button>
+                            <div class="ag-row-wrap" style={{ gap: '6px' }}>
+                                <Button
+                                    size="sm"
+                                    variant="secondary"
+                                    icon={<IconDownload size={14} />}
+                                    onClick={() => {
+                                        const basename = selectedFile.split('/').pop() || selectedFile;
+                                        const mime = selectedFile.toLowerCase().endsWith('.json')
+                                            ? 'application/json;charset=utf-8'
+                                            : selectedFile.toLowerCase().endsWith('.md')
+                                                ? 'text/markdown;charset=utf-8'
+                                                : 'text/plain;charset=utf-8';
+                                        downloadTextFile(basename, fileDraft.value, mime);
+                                        store.pushToast(`已下载 ${basename}`, 'success');
+                                    }}
+                                >
+                                    下载文件
+                                </Button>
+                                <Button
+                                    size="sm"
+                                    variant="danger"
+                                    icon={<IconTrash size={14} />}
+                                    onClick={() => handleDeleteFile(selectedFile)}
+                                >
+                                    删除文件
+                                </Button>
+                            </div>
                         }
                     >
                         <CodeEditor
@@ -767,15 +794,15 @@ export function WIRouterView(props: Partial<ConsoleViewProps> = {}) {
                 }
             >
                 <FormField
-                    label="文件名（单层文件名，不可含路径斜杠）"
+                    label="相对路径（支持子目录，不可含 .. 或以 . 开头）"
                     required
                     error={newFileError ?? undefined}
-                    hint="例如：style_guide.md、world_rules.txt、init_vars.json"
+                    hint="例如：AGENTS.md、docs/style_guide.md、init_vars.json"
                 >
                     <TextInput
                         className="ag-mono"
                         value={newFileName}
-                        placeholder="style_guide.md"
+                        placeholder="docs/style_guide.md"
                         onInput={(val) => {
                             setNewFileName(val);
                             setNewFileError(null);

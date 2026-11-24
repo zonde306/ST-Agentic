@@ -1,11 +1,16 @@
 import { z } from 'zod';
 import type { ToolExecutionContext } from '@/core/bridge';
-import type { VfsSearchHit } from '@/core/types';
+import type { VfsEntryStat, VfsSearchHit } from '@/core/types';
 import { hashText, normalizeVfsPath } from '@/core/utils';
 import {
+    AGENT_WORKSPACE_MAX_FILES,
+    AGENT_WORKSPACE_MAX_FILE_BYTES,
+    AGENT_WORKSPACE_MAX_TOTAL_BYTES,
     OUTPUT_FILE_PATH,
     ScopedToolGuard,
     VfsError,
+    VfsNotFoundError,
+    isAgentQuotaScopedPath,
     sliceLines,
     utf8ByteLength,
 } from '@/core/vfs';
@@ -47,6 +52,159 @@ function extractHashableBody(normalizedPath: string, content: string): string {
         }
     }
     return content;
+}
+
+async function recordReadSetDigest(
+    ctx: ToolExecutionContext,
+    normalizedPath: string,
+    content: string,
+): Promise<void> {
+    if (!ctx.readSet || normalizedPath === OUTPUT_FILE_PATH) {
+        return;
+    }
+    const hashable = extractHashableBody(normalizedPath, content);
+    const digest = await hashText(hashable);
+    ctx.readSet.set(normalizedPath, digest);
+}
+
+const KNOWN_MOUNT_PREFIXES = [
+    '/workspace/',
+    '/preset/',
+    '/global/',
+    '/character/',
+    '/persona/',
+    '/lorebooks/',
+    '/skills/',
+    '/history/',
+    '/state/',
+    '/side/',
+] as const;
+
+type StatCapableFs = ToolExecutionContext['fs'] & {
+    stat?: (path: string) => Promise<VfsEntryStat | null>;
+};
+
+function getStatFn(
+    fs: ToolExecutionContext['fs'],
+): ((path: string) => Promise<VfsEntryStat | null>) | undefined {
+    const candidate = (fs as StatCapableFs).stat;
+    return typeof candidate === 'function' ? candidate.bind(fs) : undefined;
+}
+
+async function findMissingPathHints(
+    ctx: ToolExecutionContext,
+    normalizedPath: string,
+): Promise<string[]> {
+    const statFn = getStatFn(ctx.fs);
+    if (!statFn || normalizedPath === '/') {
+        return [];
+    }
+    const lower = normalizedPath.toLowerCase();
+    if (KNOWN_MOUNT_PREFIXES.some((prefix) => lower.startsWith(prefix))) {
+        return [];
+    }
+    const candidates = [
+        `/workspace${normalizedPath}`,
+        `/preset${normalizedPath}`,
+        `/global${normalizedPath}`,
+    ];
+    const hits: string[] = [];
+    for (const candidate of candidates) {
+        try {
+            const st = await statFn(candidate);
+            if (st && st.kind === 'file') {
+                hits.push(candidate);
+            }
+        } catch {
+            // Skip unreadable or missing candidate without leaking unauthorized paths.
+        }
+    }
+    return hits;
+}
+
+async function checkAgentWorkspaceQuota(
+    ctx: ToolExecutionContext,
+    normalizedPath: string,
+    nextContent: string,
+): Promise<string | null> {
+    if (!isAgentQuotaScopedPath(normalizedPath)) {
+        return null;
+    }
+
+    const nextBytes = utf8ByteLength(nextContent);
+    if (nextBytes > AGENT_WORKSPACE_MAX_FILE_BYTES) {
+        return JSON.stringify({
+            ok: false,
+            code: 'EINVAL',
+            path: normalizedPath,
+            error: `Agent workspace file "${normalizedPath}" exceeds single-file quota (${nextBytes} > ${AGENT_WORKSPACE_MAX_FILE_BYTES} bytes). Trim or summarize content.`,
+        });
+    }
+
+    const seenPaths = new Set<string>();
+    if (typeof ctx.fs.glob === 'function') {
+        for (const pattern of ['/workspace/shared/**/*', '/scratch/**/*']) {
+            try {
+                const matched = await ctx.fs.glob(pattern);
+                for (const p of matched) {
+                    seenPaths.add(p);
+                }
+            } catch {
+                // Ignore quota partition not readable by this agent.
+            }
+        }
+    }
+
+    const statFn = getStatFn(ctx.fs);
+    let exists = seenPaths.has(normalizedPath);
+    if (!exists && statFn) {
+        try {
+            const st = await statFn(normalizedPath);
+            if (st && st.kind === 'file') {
+                exists = true;
+            }
+        } catch {
+            // File does not exist yet.
+        }
+    }
+
+    if (!exists && seenPaths.size >= AGENT_WORKSPACE_MAX_FILES) {
+        return JSON.stringify({
+            ok: false,
+            code: 'EINVAL',
+            path: normalizedPath,
+            error: `Agent workspace quota exceeded: maximum ${AGENT_WORKSPACE_MAX_FILES} files across /workspace/shared/** and /scratch/**. Reuse or consolidate existing files.`,
+        });
+    }
+
+    let otherBytes = 0;
+    if (statFn) {
+        for (const filePath of seenPaths) {
+            if (filePath === normalizedPath) {
+                continue;
+            }
+            try {
+                const st = await statFn(filePath);
+                if (st && st.kind === 'file') {
+                    otherBytes += st.size;
+                }
+            } catch {
+                // Ignore transient stat failure.
+            }
+        }
+    }
+
+    const projectedTotal = otherBytes + nextBytes;
+    if (projectedTotal > AGENT_WORKSPACE_MAX_TOTAL_BYTES) {
+        return JSON.stringify({
+            ok: false,
+            code: 'EINVAL',
+            path: normalizedPath,
+            error: `Agent workspace total quota exceeded (${projectedTotal} > ${AGENT_WORKSPACE_MAX_TOTAL_BYTES} bytes across /workspace/shared/** and /scratch/**). Trim or reuse existing files.`,
+        });
+    }
+
+    return null;
 }
 
 function supportsReadRangeOptions(fs: ToolExecutionContext['fs']): boolean {
@@ -380,14 +538,32 @@ export function createFsTools(): ToolDefinition[] {
                         : raw;
                 }
 
-                if (ctx.readSet && !hasRange && normalizedPath !== OUTPUT_FILE_PATH) {
-                    const hashable = extractHashableBody(normalizedPath, content);
-                    const digest = await hashText(hashable);
-                    ctx.readSet.set(normalizedPath, digest);
+                if (!hasRange) {
+                    await recordReadSetDigest(ctx, normalizedPath, content);
                 }
 
                 return content;
             } catch (error) {
+                const isNotFoundOrDenied =
+                    error instanceof VfsNotFoundError
+                    || (error instanceof VfsError && (error.code === 'ENOENT' || error.code === 'EACCES'));
+                if (isNotFoundOrDenied) {
+                    try {
+                        const normalizedPath = normalizeVfsPath(args.path);
+                        const hints = await findMissingPathHints(ctx, normalizedPath);
+                        if (hints.length > 0) {
+                            return JSON.stringify({
+                                ok: false,
+                                code: error.code,
+                                path: error.path,
+                                error: error.message,
+                                hint: `Did you mean ${hints.map((h) => `"${h}"`).join(' or ')}?`,
+                            });
+                        }
+                    } catch {
+                        // Fall through to standard error formatting.
+                    }
+                }
                 return formatFsError(error, ctx.signal);
             }
         },
@@ -403,7 +579,12 @@ export function createFsTools(): ToolDefinition[] {
             throwIfAborted(ctx.signal);
             try {
                 const normalizedPath = normalizeVfsPath(args.path);
+                const quotaError = await checkAgentWorkspaceQuota(ctx, normalizedPath, args.content);
+                if (quotaError) {
+                    return quotaError;
+                }
                 await ctx.fs.write(normalizedPath, args.content);
+                await recordReadSetDigest(ctx, normalizedPath, args.content);
                 return JSON.stringify({
                     ok: true,
                     path: normalizedPath,
@@ -419,29 +600,53 @@ export function createFsTools(): ToolDefinition[] {
     const appendFileTool: ToolDefinition<typeof APPEND_FILE_SCHEMA> = {
         name: 'append_file',
         description:
-            'Append content verbatim to the end of a writable VFS file bound to the current causal branch target (e.g. "/output.md" or "/memory/notes.md").',
+            'Append content verbatim to the end of a writable VFS file bound to the current causal branch target (e.g. "/output.md", "/memory/notes.md", or "/workspace/shared/handoff.md").',
         parameters: APPEND_FILE_SCHEMA,
         source: 'builtin',
         async execute(args, ctx) {
             throwIfAborted(ctx.signal);
             try {
                 const normalizedPath = normalizeVfsPath(args.path);
-                if (typeof ctx.fs.append === 'function') {
-                    await ctx.fs.append(normalizedPath, args.content);
-                } else {
-                    let existing = '';
+                let existing = '';
+                let hasExisting = false;
+                if (isAgentQuotaScopedPath(normalizedPath) || typeof ctx.fs.append !== 'function') {
                     try {
                         existing = await ctx.fs.read(normalizedPath);
+                        hasExisting = true;
                     } catch (error) {
-                        if (
-                            !(error instanceof VfsError && error.code === 'ENOENT')
-                            && !/not found|missing|enoent/i.test((error as Error)?.message ?? '')
-                        ) {
+                        const isNotFound =
+                            (error instanceof VfsError && error.code === 'ENOENT')
+                            || /not found|missing|enoent/i.test((error as Error)?.message ?? '');
+                        const isWriteOnlySkip =
+                            typeof ctx.fs.append === 'function'
+                            && error instanceof VfsError
+                            && error.code === 'EACCES';
+                        if (!isNotFound && !isWriteOnlySkip) {
                             throw error;
                         }
                     }
+                    const nextContent = `${hasExisting ? existing : ''}${args.content}`;
+                    const quotaError = await checkAgentWorkspaceQuota(ctx, normalizedPath, nextContent);
+                    if (quotaError) {
+                        return quotaError;
+                    }
+                }
+
+                if (typeof ctx.fs.append === 'function') {
+                    await ctx.fs.append(normalizedPath, args.content);
+                } else {
                     await ctx.fs.write(normalizedPath, `${existing}${args.content}`);
                 }
+
+                if (ctx.readSet && normalizedPath !== OUTPUT_FILE_PATH) {
+                    try {
+                        const finalContent = await ctx.fs.read(normalizedPath);
+                        await recordReadSetDigest(ctx, normalizedPath, finalContent);
+                    } catch {
+                        // Skip Read-Set self-dedup if read permission is absent.
+                    }
+                }
+
                 return JSON.stringify({
                     ok: true,
                     path: normalizedPath,
@@ -464,6 +669,21 @@ export function createFsTools(): ToolDefinition[] {
             throwIfAborted(ctx.signal);
             try {
                 const normalizedPath = normalizeVfsPath(args.path);
+                if (isAgentQuotaScopedPath(normalizedPath) && args.search) {
+                    try {
+                        const existing = await ctx.fs.read(normalizedPath);
+                        if (existing.includes(args.search)) {
+                            const updated = existing.replace(args.search, args.replace);
+                            const quotaError = await checkAgentWorkspaceQuota(ctx, normalizedPath, updated);
+                            if (quotaError) {
+                                return quotaError;
+                            }
+                        }
+                    } catch {
+                        // Let ctx.fs.edit handle missing or unreadable files cleanly.
+                    }
+                }
+
                 const result = await ctx.fs.edit(normalizedPath, args.search, args.replace);
                 if (!result.ok) {
                     return JSON.stringify({
@@ -472,6 +692,16 @@ export function createFsTools(): ToolDefinition[] {
                         error: `${result.message}. Re-read "${result.path}" and copy the exact anchor text.`,
                     });
                 }
+
+                if (ctx.readSet && normalizedPath !== OUTPUT_FILE_PATH) {
+                    try {
+                        const finalContent = await ctx.fs.read(normalizedPath);
+                        await recordReadSetDigest(ctx, normalizedPath, finalContent);
+                    } catch {
+                        // Skip Read-Set self-dedup if read permission is absent.
+                    }
+                }
+
                 return JSON.stringify({
                     ok: true,
                     path: result.path,

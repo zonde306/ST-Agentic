@@ -71,6 +71,35 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
     }
 }
 
+export function downloadTextFile(
+    filename: string,
+    content: string,
+    mimeType = 'text/plain;charset=utf-8',
+): boolean {
+    if (
+        typeof document === 'undefined'
+        || typeof URL === 'undefined'
+        || typeof URL.createObjectURL !== 'function'
+    ) {
+        return false;
+    }
+    try {
+        const blob = new Blob([content], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = filename;
+        anchor.style.display = 'none';
+        document.body?.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 export function formatBytes(bytes: number): string {
     if (!Number.isFinite(bytes) || bytes <= 0) {
         return '0 B';
@@ -141,6 +170,8 @@ export function formatTimestamp(ts: number): string {
 
 export function getCategoryLabel(category: FileOverrideCategory): string {
     switch (category) {
+        case 'instructions':
+            return '规范与文档';
         case 'workspace':
             return '工作区';
         case 'variables':
@@ -154,6 +185,8 @@ export function getCategoryLabel(category: FileOverrideCategory): string {
 
 export function getCategoryTone(category: FileOverrideCategory): BadgeTone {
     switch (category) {
+        case 'instructions':
+            return 'primary';
         case 'workspace':
             return 'primary';
         case 'variables':

@@ -1,29 +1,40 @@
 import { diffLines } from 'diff';
+import type { TargetedEvent } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { MessageTarget } from '@/core/types';
+import { isInstructionIndexPath } from '@/core/vfs';
 import {
     Badge,
     Button,
     CodeEditor,
     EmptyState,
+    FormField,
     MasterDetailLayout,
     SegmentedControl,
+    SelectInput,
+    ShadowModal,
     TextInput,
+    ToggleSwitch,
 } from '@/ui/components';
 import {
     IconCheck,
     IconCopy,
+    IconDownload,
     IconFolder,
+    IconPlus,
     IconRefresh,
     IconTrash,
+    IconUpload,
 } from '@/ui/components/Icons';
 import type {
     ConsoleViewProps,
     FileOverrideCategory,
     FileOverrideItem,
+    FileStorageScope,
 } from '@/ui/store';
 import {
     copyTextToClipboard,
+    downloadTextFile,
     getCategoryLabel,
     getCategoryTone,
     useStoreSlice,
@@ -31,6 +42,7 @@ import {
 
 type CategoryFilter = 'all' | FileOverrideCategory;
 type EditorViewMode = 'edit' | 'diff';
+type CreateUploadScope = 'workspace_docs' | 'workspace_shared' | 'preset' | 'global';
 
 interface DiffLineRow {
     kind: 'add' | 'del' | 'context';
@@ -40,11 +52,130 @@ interface DiffLineRow {
 
 const CATEGORY_FILTERS: readonly { id: CategoryFilter; label: string }[] = [
     { id: 'all', label: '全部' },
+    { id: 'instructions', label: '规范与文档' },
     { id: 'workspace', label: '工作区' },
     { id: 'variables', label: '变量' },
     { id: 'worldinfo', label: 'WI覆写' },
     { id: 'message', label: '输出 (/output.md)' },
 ];
+
+const SCOPE_OPTIONS: readonly { value: CreateUploadScope; label: string }[] = [
+    { value: 'workspace_docs', label: '会话规范 (/workspace/docs/ · 全分支)' },
+    { value: 'workspace_shared', label: '共享协作区 (/workspace/shared/ · 跟随分支)' },
+    { value: 'preset', label: '预设参考 (/preset/ · 随预设导出)' },
+    { value: 'global', label: '全局规范 (/global/ · 跨聊天生效)' },
+];
+
+const DEFAULT_AGENTS_MD_TEMPLATE = [
+    '# Agent 工作规范索引 (AGENTS.md)',
+    '',
+    '## 核心硬性规范（始终生效）',
+    '- 严格遵守世界观与角色设定，禁止抢写 {{user}} 的发言与内心想法。',
+    '- 输出前必须核对 `/state/variables.json` 中的最新状态并在 `/output.md` 保持格式一致。',
+    '',
+    '## 按需参考文档（仅在涉及对应场景时调用 read_file 读取）',
+    '- 文风与禁用词规范：`docs/writing-style.md`（若在本目录则对应 `/workspace/docs/writing-style.md`）',
+    '- 特殊战斗或数值判定：`docs/combat-rules.md`',
+    '',
+].join('\n');
+
+function resolveBasename(filePath: string): string {
+    const clean = filePath.replace(/^\/+/, '');
+    const idx = clean.lastIndexOf('/');
+    return idx >= 0 ? clean.slice(idx + 1) || 'file.txt' : clean || 'file.txt';
+}
+
+function resolveMimeType(filePath: string): string {
+    const lower = filePath.toLowerCase();
+    if (lower.endsWith('.json')) {
+        return 'application/json;charset=utf-8';
+    }
+    if (lower.endsWith('.md')) {
+        return 'text/markdown;charset=utf-8';
+    }
+    return 'text/plain;charset=utf-8';
+}
+
+function sanitizeRelativeInputPath(rawPath: string): string | null {
+    const posix = rawPath.trim().replace(/\\/g, '/').replace(/[\0%#?]/g, '_');
+    const rawSegs = posix.split('/');
+    const safeSegs: string[] = [];
+    for (const seg of rawSegs) {
+        const cleaned = seg.trim();
+        if (!cleaned || cleaned === '.' || cleaned === '..') {
+            continue;
+        }
+        const noLeadingDots = cleaned.replace(/^\.+/, '');
+        if (noLeadingDots) {
+            safeSegs.push(noLeadingDots);
+        }
+    }
+    return safeSegs.length > 0 ? safeSegs.join('/') : null;
+}
+
+function resolveTargetPathAndScope(
+    scope: CreateUploadScope,
+    rawRelPath: string,
+    branchWideOverride: boolean,
+): { fullPath: string; key: string; storageScope: FileStorageScope } | null {
+    const safeRel = sanitizeRelativeInputPath(rawRelPath);
+    if (!safeRel) {
+        return null;
+    }
+
+    const lowerRel = safeRel.toLowerCase();
+    if (scope === 'preset') {
+        const rel = lowerRel.startsWith('preset/') ? safeRel.slice('preset/'.length) : safeRel;
+        if (!rel) {
+            return null;
+        }
+        return { fullPath: `/preset/${rel}`, key: rel, storageScope: 'preset' };
+    }
+
+    if (scope === 'global') {
+        const rel = lowerRel.startsWith('global/') ? safeRel.slice('global/'.length) : safeRel;
+        if (!rel) {
+            return null;
+        }
+        return { fullPath: `/global/${rel}`, key: rel, storageScope: 'global' };
+    }
+
+    if (scope === 'workspace_shared') {
+        const rel = lowerRel.startsWith('workspace/shared/')
+            ? safeRel.slice('workspace/shared/'.length)
+            : lowerRel.startsWith('shared/')
+                ? safeRel.slice('shared/'.length)
+                : safeRel;
+        if (!rel) {
+            return null;
+        }
+        const key = `workspace/shared/${rel}`;
+        return {
+            fullPath: `/${key}`,
+            key,
+            storageScope: branchWideOverride ? 'chat_base' : 'chat_branch',
+        };
+    }
+
+    // workspace_docs: route AGENTS.md directly to /workspace/AGENTS.md, otherwise /workspace/docs/*
+    const stripped = lowerRel.startsWith('workspace/') ? safeRel.slice('workspace/'.length) : safeRel;
+    const strippedLower = stripped.toLowerCase();
+    if (strippedLower === 'agents.md') {
+        return {
+            fullPath: '/workspace/AGENTS.md',
+            key: 'workspace/AGENTS.md',
+            storageScope: 'chat_base',
+        };
+    }
+    const key = strippedLower.startsWith('docs/') || strippedLower.startsWith('shared/')
+        ? `workspace/${stripped}`
+        : `workspace/docs/${stripped}`;
+    return {
+        fullPath: `/${key}`,
+        key,
+        storageScope: key.startsWith('workspace/docs/') || branchWideOverride ? 'chat_base' : 'chat_branch',
+    };
+}
 
 function inferLanguageHint(
     item: FileOverrideItem,
@@ -137,6 +268,15 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
     );
     const [draftContent, setDraftContent] = useState('');
 
+    const [createModalOpen, setCreateModalOpen] = useState(false);
+    const [createScope, setCreateScope] = useState<CreateUploadScope>('workspace_docs');
+    const [newRelPath, setNewRelPath] = useState('');
+    const [newBranchWide, setNewBranchWide] = useState(true);
+    const [createError, setCreateError] = useState<string | null>(null);
+    const [dragActive, setDragActive] = useState(false);
+
+    const fileInputRef = useRef<HTMLInputElement | null>(null);
+    const uploadScopeOverrideRef = useRef<CreateUploadScope | null>(null);
     const lastDeepLinkSigRef = useRef<string>('');
     const consumedDeepLinkFileRef = useRef<string | null>(null);
     const selectedIdRef = useRef<string | null>(selectedId);
@@ -307,12 +447,13 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                 key: selectedItem.key,
                 content: draftContent,
                 target: selectedItem.target,
+                storageScope: selectedItem.storageScope,
             });
             setItems((prev) =>
                 prev.map((item) => (item.id === selectedItem.id ? { ...item, ...saved } : item)),
             );
             setDraftContent(saved.content);
-            store.pushToast(`已保存至分支 ${saved.layerLabel}：${saved.path}`, 'success');
+            store.pushToast(`已保存至 ${saved.layerLabel}：${saved.path}`, 'success');
         } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
             store.pushToast(`保存失败：${msg}`, 'error');
@@ -332,17 +473,254 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
         );
     };
 
-    const handleRequestRestoreOrDelete = () => {
+    const handleDownloadSelected = () => {
         if (!selectedItem) {
             return;
         }
+        const filename = resolveBasename(selectedItem.path);
+        const ok = downloadTextFile(filename, draftContent, resolveMimeType(selectedItem.path));
+        store.pushToast(
+            ok ? `已下载 ${filename}` : '当前环境不支持文件下载',
+            ok ? 'success' : 'warning',
+        );
+    };
+
+    const handleExportBundle = () => {
+        if (filteredItems.length === 0) {
+            store.pushToast('当前筛选结果为空，暂无可导出文件', 'warning');
+            return;
+        }
+        const bundle = {
+            version: 1,
+            exportedAt: new Date().toISOString(),
+            files: filteredItems.map((item) => ({
+                path: item.path,
+                category: item.category,
+                storageScope: item.storageScope,
+                source: item.source,
+                content: item.id === selectedItem?.id ? draftContent : item.content,
+            })),
+        };
+        const ok = downloadTextFile(
+            'agentic-files-bundle.json',
+            JSON.stringify(bundle, null, 2),
+            'application/json;charset=utf-8',
+        );
+        store.pushToast(
+            ok ? `已导出 ${filteredItems.length} 个文件打包 JSON` : '当前环境不支持文件下载',
+            ok ? 'success' : 'warning',
+        );
+    };
+
+    const upsertWorkspaceOrSpecFile = useCallback(
+        async (
+            scope: CreateUploadScope,
+            relPath: string,
+            content: string,
+            branchWide: boolean,
+        ): Promise<FileOverrideItem | null> => {
+            const resolved = resolveTargetPathAndScope(scope, relPath, branchWide);
+            if (!resolved) {
+                return null;
+            }
+            const saved = await store.services.saveFileOrOverride({
+                path: resolved.fullPath,
+                namespace: 'files',
+                key: resolved.key,
+                content,
+                target: effectiveTarget,
+                storageScope: resolved.storageScope,
+            });
+            return saved;
+        },
+        [effectiveTarget, store],
+    );
+
+    const resolveDefaultScopeFromFilter = useCallback((): CreateUploadScope => {
+        if (categoryFilter === 'workspace') {
+            return 'workspace_shared';
+        }
+        return 'workspace_docs';
+    }, [categoryFilter]);
+
+    const handleOpenCreateModal = () => {
+        const defaultScope = resolveDefaultScopeFromFilter();
+        setCreateScope(defaultScope);
+        setNewRelPath('');
+        setNewBranchWide(defaultScope === 'workspace_docs');
+        setCreateError(null);
+        setCreateModalOpen(true);
+    };
+
+    const handleCreateFile = async () => {
+        const resolved = resolveTargetPathAndScope(createScope, newRelPath, newBranchWide);
+        if (!resolved) {
+            setCreateError('请输入合法的文件相对路径（不可为空或包含 ..）');
+            return;
+        }
+        try {
+            setSaving(true);
+            setCreateError(null);
+            const initialContent = isInstructionIndexPath(resolved.fullPath)
+                ? DEFAULT_AGENTS_MD_TEMPLATE
+                : '';
+            const saved = await store.services.saveFileOrOverride({
+                path: resolved.fullPath,
+                namespace: 'files',
+                key: resolved.key,
+                content: initialContent,
+                target: effectiveTarget,
+                storageScope: resolved.storageScope,
+            });
+            await loadFiles(scopeByTarget ? effectiveTarget : undefined);
+            setSelectedId(saved.id);
+            setDetailOpen(true);
+            setViewMode('edit');
+            setCreateModalOpen(false);
+            store.pushToast(`已创建 ${saved.path}`, 'success');
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            setCreateError(msg);
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const handleQuickCreateAgentsMd = async () => {
+        try {
+            setSaving(true);
+            setCreateError(null);
+            const existing = items.find((item) => item.path.toLowerCase() === '/workspace/agents.md');
+            if (existing) {
+                setSelectedId(existing.id);
+                setDetailOpen(true);
+                setCreateModalOpen(false);
+                store.pushToast('已定位到现有的 /workspace/AGENTS.md', 'primary');
+                return;
+            }
+            const saved = await store.services.saveFileOrOverride({
+                path: '/workspace/AGENTS.md',
+                namespace: 'files',
+                key: 'workspace/AGENTS.md',
+                content: DEFAULT_AGENTS_MD_TEMPLATE,
+                target: effectiveTarget,
+                storageScope: 'chat_base',
+            });
+            await loadFiles(scopeByTarget ? effectiveTarget : undefined);
+            setCategoryFilter('all');
+            setSelectedId(saved.id);
+            setDetailOpen(true);
+            setViewMode('edit');
+            setCreateModalOpen(false);
+            store.pushToast('已创建规范索引模板 /workspace/AGENTS.md', 'success');
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            setCreateError(msg);
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const processUploadedFiles = useCallback(
+        async (fileList: FileList | File[], explicitScope?: CreateUploadScope) => {
+            const files = Array.from(fileList);
+            if (files.length === 0) {
+                return;
+            }
+            const scope = explicitScope ?? resolveDefaultScopeFromFilter();
+            const branchWide = scope === 'workspace_docs';
+            let lastSaved: FileOverrideItem | null = null;
+            let successCount = 0;
+            const failures: string[] = [];
+
+            setSaving(true);
+            try {
+                for (const file of files) {
+                    try {
+                        const relRaw =
+                            (file as File & { webkitRelativePath?: string }).webkitRelativePath
+                            || file.name;
+                        const content = await file.text();
+                        const saved = await upsertWorkspaceOrSpecFile(scope, relRaw, content, branchWide);
+                        if (saved) {
+                            lastSaved = saved;
+                            successCount += 1;
+                        } else {
+                            failures.push(`${file.name}: 文件路径不合法`);
+                        }
+                    } catch (error) {
+                        const msg = error instanceof Error ? error.message : String(error);
+                        failures.push(`${file.name}: ${msg}`);
+                    }
+                }
+                await loadFiles(scopeByTarget ? effectiveTarget : undefined);
+                if (lastSaved) {
+                    setSelectedId(lastSaved.id);
+                    setDetailOpen(true);
+                    setViewMode('edit');
+                }
+                if (successCount > 0) {
+                    store.pushToast(
+                        successCount === 1 && lastSaved
+                            ? `已上传 ${lastSaved.path}`
+                            : `已成功上传 ${successCount} 个文件`,
+                        'success',
+                    );
+                }
+                if (failures.length > 0) {
+                    store.pushToast(`部分文件上传失败：${failures[0]}`, 'error');
+                }
+            } finally {
+                setSaving(false);
+            }
+        },
+        [effectiveTarget, loadFiles, resolveDefaultScopeFromFilter, scopeByTarget, store, upsertWorkspaceOrSpecFile],
+    );
+
+    const handleTriggerUpload = (scopeOverride?: CreateUploadScope) => {
+        uploadScopeOverrideRef.current = scopeOverride ?? null;
+        fileInputRef.current?.click();
+    };
+
+    const handleFileInputChange = (event: TargetedEvent<HTMLInputElement, Event>) => {
+        const list = event.currentTarget.files;
+        const explicitScope = uploadScopeOverrideRef.current ?? undefined;
+        uploadScopeOverrideRef.current = null;
+        if (list && list.length > 0) {
+            void processUploadedFiles(list, explicitScope);
+        }
+        event.currentTarget.value = '';
+    };
+
+    const canDeleteSelected = Boolean(
+        selectedItem
+        && selectedItem.writable
+        && (selectedItem.overridden
+            || selectedItem.storageScope === 'chat_base'
+            || selectedItem.storageScope === 'preset'
+            || selectedItem.storageScope === 'global'
+            || selectedItem.category === 'workspace'
+            || selectedItem.category === 'instructions'),
+    );
+
+    const handleRequestRestoreOrDelete = () => {
+        if (!selectedItem || !canDeleteSelected) {
+            return;
+        }
         const isWorldInfo = selectedItem.category === 'worldinfo';
+        const isVariables = selectedItem.category === 'variables';
         store.openModal({
             kind: 'confirm',
-            title: isWorldInfo ? '确认恢复世界书原文' : '确认删除当前分支覆写',
+            title: isWorldInfo
+                ? '确认恢复世界书原文'
+                : isVariables
+                    ? '确认移除当前分支变量覆写'
+                    : '确认删除文件',
             message: isWorldInfo
                 ? `确定清除 ${selectedItem.path} 在 ${selectedItem.layerLabel} 的覆写并恢复原书内容吗？`
-                : `确定清除 ${selectedItem.path} 在 ${selectedItem.layerLabel} 的当前覆写/文件吗？`,
+                : isVariables
+                    ? `确定清除 ${selectedItem.path} 在 ${selectedItem.layerLabel} 的变量覆写吗？`
+                    : `确定永久删除 ${selectedItem.path}（${selectedItem.layerLabel}）吗？`,
             confirmLabel: isWorldInfo ? '恢复原书' : '确认删除',
             cancelLabel: '取消',
             tone: 'danger',
@@ -352,20 +730,61 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                     namespace: selectedItem.namespace,
                     key: selectedItem.key,
                     target: selectedItem.target,
+                    storageScope: selectedItem.storageScope,
                 });
                 await loadFiles(scopeByTarget ? effectiveTarget : undefined);
+                setDetailOpen(false);
                 store.pushToast(
                     isWorldInfo
                         ? `已清除覆写并恢复原书：${selectedItem.path}`
-                        : `已移除当前层覆写：${selectedItem.path}`,
+                        : `已移除：${selectedItem.path}`,
                     'warning',
                 );
             },
         });
     };
 
+    const previewResolvedCreate = useMemo(
+        () => resolveTargetPathAndScope(createScope, newRelPath, newBranchWide),
+        [createScope, newBranchWide, newRelPath],
+    );
+
     const masterPane = (
-        <div class="ag-stack-v" style={{ padding: '10px', gap: '10px' }}>
+        <div
+            class="ag-stack-v"
+            style={{
+                padding: '10px',
+                gap: '10px',
+                outline: dragActive ? '2px dashed var(--primary)' : undefined,
+                outlineOffset: '-4px',
+                borderRadius: '8px',
+            }}
+            onDragOver={(e) => {
+                e.preventDefault();
+                if (!dragActive) {
+                    setDragActive(true);
+                }
+            }}
+            onDragLeave={() => {
+                setDragActive(false);
+            }}
+            onDrop={(e) => {
+                e.preventDefault();
+                setDragActive(false);
+                if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+                    void processUploadedFiles(e.dataTransfer.files);
+                }
+            }}
+        >
+            <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept=".md,.txt,.json,.yaml,.yml,.csv,.xml,text/*"
+                style={{ display: 'none' }}
+                onChange={handleFileInputChange}
+            />
+
             <div class="ag-row-wrap" style={{ justifyContent: 'space-between' }}>
                 <div class="ag-row-wrap" style={{ gap: '6px' }}>
                     {CATEGORY_FILTERS.map((cat) => (
@@ -413,6 +832,43 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                         : '全部层'}
                 </Button>
             </div>
+
+            <div class="ag-row-wrap" style={{ gap: '6px' }}>
+                <Button
+                    size="sm"
+                    variant="primary"
+                    icon={<IconPlus size={14} />}
+                    onClick={handleOpenCreateModal}
+                >
+                    新建
+                </Button>
+                <Button
+                    size="sm"
+                    variant="secondary"
+                    icon={<IconUpload size={14} />}
+                    loading={saving}
+                    title="上传本地 .md / .txt / .json 文件（或直接拖拽到列表）"
+                    onClick={() => handleTriggerUpload()}
+                >
+                    上传
+                </Button>
+                <Button
+                    size="sm"
+                    variant="secondary"
+                    icon={<IconDownload size={14} />}
+                    disabled={filteredItems.length === 0}
+                    title="将当前筛选结果导出为 JSON 打包文件"
+                    onClick={handleExportBundle}
+                >
+                    导出包
+                </Button>
+            </div>
+
+            {dragActive ? (
+                <div class="ag-banner ag-banner-primary">
+                    松开鼠标即可上传文件到 {resolveDefaultScopeFromFilter() === 'workspace_shared' ? '/workspace/shared/' : '/workspace/docs/ (AGENTS.md 自动入根规范)'}
+                </div>
+            ) : null}
 
             {errorText ? <div class="ag-banner ag-banner-error">{errorText}</div> : null}
 
@@ -472,6 +928,9 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                                         {item.source}
                                     </span>
                                     <span class="ag-row" style={{ gap: '4px', flexShrink: 0 }}>
+                                        {isInstructionIndexPath(item.path) ? (
+                                            <Badge tone="primary">索引</Badge>
+                                        ) : null}
                                         {isTargetMatch ? (
                                             <Badge tone="primary">定位</Badge>
                                         ) : null}
@@ -564,13 +1023,25 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                             复制
                         </Button>
                         <Button
+                            variant="secondary"
+                            size="sm"
+                            icon={<IconDownload size={14} />}
+                            onClick={handleDownloadSelected}
+                        >
+                            下载
+                        </Button>
+                        <Button
                             variant="danger"
                             size="sm"
                             icon={<IconTrash size={14} />}
-                            disabled={!selectedItem.writable || !selectedItem.overridden}
+                            disabled={!canDeleteSelected}
                             onClick={handleRequestRestoreOrDelete}
                         >
-                            恢复原书/删除
+                            {selectedItem.category === 'worldinfo'
+                                ? '恢复原书'
+                                : selectedItem.category === 'variables'
+                                    ? '清除覆写'
+                                    : '删除'}
                         </Button>
                     </div>
                     {!selectedItem.writable ? (
@@ -675,15 +1146,115 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
     ) : null;
 
     return (
-        <MasterDetailLayout
-            isMobile={isMobile}
-            detailOpen={detailOpen}
-            onDetailOpenChange={setDetailOpen}
-            detailTitle={selectedItem?.path ?? '文件详情'}
-            emptyDetailTitle="选择左侧文件或覆写条目"
-            emptyDetailDescription="支持工作区文件、/state/variables.json、世界书覆写及 /output.md 消息输出的编辑与 Diff 对比。"
-            master={masterPane}
-            detail={detailPane}
-        />
+        <>
+            <MasterDetailLayout
+                isMobile={isMobile}
+                detailOpen={detailOpen}
+                onDetailOpenChange={setDetailOpen}
+                detailTitle={selectedItem?.path ?? '文件详情'}
+                emptyDetailTitle="选择左侧文件或覆写条目"
+                emptyDetailDescription="支持工作区与协作文件、AGENTS.md 规范树、/state/variables.json、世界书覆写及 /output.md 消息输出的上传、下载、编辑与 Diff 对比。"
+                master={masterPane}
+                detail={detailPane}
+            />
+
+            <ShadowModal
+                open={createModalOpen}
+                title="新建或上传规范与工作区文件"
+                maxWidth="480px"
+                onClose={() => setCreateModalOpen(false)}
+                footer={
+                    <>
+                        <Button variant="secondary" onClick={() => setCreateModalOpen(false)}>
+                            取消
+                        </Button>
+                        <Button
+                            variant="secondary"
+                            icon={<IconUpload size={14} />}
+                            loading={saving}
+                            onClick={() => {
+                                setCreateModalOpen(false);
+                                handleTriggerUpload(createScope);
+                            }}
+                        >
+                            上传本地文件至此域
+                        </Button>
+                        <Button
+                            variant="primary"
+                            icon={<IconPlus size={14} />}
+                            loading={saving}
+                            onClick={() => void handleCreateFile()}
+                        >
+                            创建文件
+                        </Button>
+                    </>
+                }
+            >
+                <div class="ag-stack-v">
+                    <div class="ag-banner ag-banner-neutral">
+                        <div class="ag-row-wrap" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+                            <span style={{ fontSize: '12px' }}>
+                                推荐结构：薄索引 <span class="ag-mono">/workspace/AGENTS.md</span> + 按需子文档 <span class="ag-mono">/workspace/docs/*.md</span>
+                            </span>
+                            <Button
+                                size="sm"
+                                variant="secondary"
+                                loading={saving}
+                                onClick={() => void handleQuickCreateAgentsMd()}
+                            >
+                                一键创建 AGENTS.md 模板
+                            </Button>
+                        </div>
+                    </div>
+
+                    <FormField label="目标作用域">
+                        <SelectInput<CreateUploadScope>
+                            value={createScope}
+                            options={SCOPE_OPTIONS}
+                            ariaLabel="文件目标作用域"
+                            onChange={(val) => {
+                                setCreateScope(val);
+                                setNewBranchWide(val !== 'workspace_shared');
+                                setCreateError(null);
+                            }}
+                        />
+                    </FormField>
+
+                    <FormField
+                        label="相对路径"
+                        required
+                        error={createError ?? undefined}
+                        hint={
+                            previewResolvedCreate
+                                ? `最终 VFS 路径：${previewResolvedCreate.fullPath}`
+                                : '例如：AGENTS.md、writing-style.md、combat/rules.md'
+                        }
+                    >
+                        <TextInput
+                            className="ag-mono"
+                            value={newRelPath}
+                            placeholder={
+                                createScope === 'workspace_shared'
+                                    ? 'handoff.md'
+                                    : 'AGENTS.md 或 writing-style.md'
+                            }
+                            onInput={(val) => {
+                                setNewRelPath(val);
+                                setCreateError(null);
+                            }}
+                        />
+                    </FormField>
+
+                    {createScope === 'workspace_shared' ? (
+                        <ToggleSwitch
+                            checked={newBranchWide}
+                            label="全分支生效（切换 Swipe / 重生成保留）"
+                            description="关闭时跟随当前消息分支回滚；规范索引与 docs/** 始终跨分支保留。"
+                            onChange={setNewBranchWide}
+                        />
+                    ) : null}
+                </div>
+            </ShadowModal>
+        </>
     );
 }

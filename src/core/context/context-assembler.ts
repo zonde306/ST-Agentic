@@ -115,6 +115,8 @@ export interface ContextAssembleInput {
     sideHint?: string | SideClueRadarScanResult;
     /** Explicit `<side-brief>` override for Layer 2 dynamic tail. */
     sideBrief?: string;
+    /** Progressive-disclosure workspace/instruction notices appended in Layer 2 tail. */
+    workspaceNotice?: string;
     /** Optional `TailRadar` for synchronous `scanSideClues` when `sideClues` is passed and `sideHint` is omitted. */
     tailRadar?: TailRadar;
     /** Active turn messages during multi-step tool loop (bypasses regenerating Layer 2). */
@@ -988,6 +990,7 @@ export class ContextAssembler {
 
         const turnBriefXml = input.turnBrief ? wrapXmlIfNeeded('turn-brief', input.turnBrief) : '';
         const sideBriefXml = sideBlocks.sideBriefXml?.trim() ?? '';
+        const workspaceNoticeXml = input.workspaceNotice?.trim() ?? '';
         const remindersXml = reminderLines.length > 0
             ? `<dynamic-reminders>\n${reminderLines.join('\n')}\n</dynamic-reminders>`
             : '';
@@ -999,6 +1002,7 @@ export class ContextAssembler {
         const tailBlocks = [
             turnBriefXml,
             sideBriefXml,
+            workspaceNoticeXml,
             remindersXml,
             loreHintXml,
             sideHintXml,

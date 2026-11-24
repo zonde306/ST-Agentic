@@ -98,17 +98,29 @@ function normalizeStringArray(raw: unknown): string[] {
     return result;
 }
 
-/** Validate a single-segment preset file name safe for mounting under `/preset/<name>`. */
+/** Validate a preset file relative path safe for mounting under `/preset/<name>`. */
 export function validatePresetFileName(name: string): string | null {
     const trimmed = name.trim();
     if (!trimmed) {
         return 'File name is required';
     }
-    if (trimmed.includes('\0') || /[/\\%#?]/.test(trimmed)) {
-        return 'File name cannot contain / \\ % # ? or null bytes';
+    if (trimmed.includes('\0') || /[%#?\\]/.test(trimmed)) {
+        return 'File name cannot contain \\ % # ? or null bytes';
     }
-    if (trimmed.startsWith('.')) {
-        return 'File name cannot start with "."';
+    if (trimmed.startsWith('/') || trimmed.endsWith('/')) {
+        return 'File path cannot start or end with "/"';
+    }
+    const segments = trimmed.split('/');
+    for (const seg of segments) {
+        if (!seg) {
+            return 'File path cannot contain empty "/" segments';
+        }
+        if (seg === '.' || seg === '..') {
+            return 'File path cannot contain "." or ".." traversal segments';
+        }
+        if (seg.startsWith('.')) {
+            return 'File or folder name cannot start with "."';
+        }
     }
     if (trimmed.length > 120) {
         return 'File name exceeds 120 characters';
@@ -633,7 +645,13 @@ const OUTPUT_WRITE_TOOLS: readonly string[] = [
     'edit_file',
 ];
 
-const LEGACY_DEFAULT_MAIN_WRITE_PERMISSIONS: readonly string[] = [
+const LEGACY_DEFAULT_MAIN_WRITE_PERMISSIONS_V1: readonly string[] = [
+    '/memory/**',
+    '/scratch/**',
+];
+
+const LEGACY_DEFAULT_MAIN_WRITE_PERMISSIONS_V2: readonly string[] = [
+    '/output.md',
     '/memory/**',
     '/scratch/**',
 ];
@@ -716,14 +734,20 @@ export function normalizePreset(input: unknown, fallbackId: string = DEFAULT_PRE
             || rawMainAgent.permissions.write === undefined;
         if (
             omittedPermissions
-            || hasExactStringSet(mainAgent.permissions.write, LEGACY_DEFAULT_MAIN_WRITE_PERMISSIONS)
+            || hasExactStringSet(mainAgent.permissions.write, LEGACY_DEFAULT_MAIN_WRITE_PERMISSIONS_V1)
+            || hasExactStringSet(mainAgent.permissions.write, LEGACY_DEFAULT_MAIN_WRITE_PERMISSIONS_V2)
         ) {
-            if (!mainAgent.permissions.write.includes('/output.md')) {
-                mainAgent.permissions = {
-                    read: mainAgent.permissions.read,
-                    write: ['/output.md', ...mainAgent.permissions.write],
-                };
+            const nextWrite = [...mainAgent.permissions.write];
+            if (!nextWrite.includes('/output.md')) {
+                nextWrite.unshift('/output.md');
             }
+            if (!nextWrite.includes('/workspace/shared/**')) {
+                nextWrite.push('/workspace/shared/**');
+            }
+            mainAgent.permissions = {
+                read: mainAgent.permissions.read,
+                write: nextWrite,
+            };
         }
     }
 

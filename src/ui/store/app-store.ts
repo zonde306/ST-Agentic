@@ -209,11 +209,19 @@ export type ActiveModalState =
         payload?: unknown;
     };
 
-export type FileOverrideCategory = 'workspace' | 'variables' | 'worldinfo' | 'message';
+export type FileOverrideCategory =
+    | 'instructions'
+    | 'workspace'
+    | 'variables'
+    | 'worldinfo'
+    | 'message';
+
+export type FileStorageScope = 'chat_base' | 'chat_branch' | 'preset' | 'global';
 
 export interface FileOverrideItem {
     id: string;
     category: FileOverrideCategory;
+    storageScope?: FileStorageScope;
     namespace: DataNamespace;
     path: string;
     key: string;
@@ -243,6 +251,8 @@ export interface StorageOverview {
     keepDepth: number;
     autoCompact: boolean;
     sizeThreshold: number;
+    trajectoryBytes?: number;
+    trajectoryCheckpoints?: number;
 }
 
 export type { RemoteModelInfo };
@@ -299,12 +309,14 @@ export interface AgenticUIServices {
         key: string;
         content: string;
         target?: MessageTarget;
+        storageScope?: FileStorageScope;
     }): Promise<FileOverrideItem>;
     deleteFileOrOverride(input: {
         path: string;
         namespace: DataNamespace;
         key: string;
         target?: MessageTarget;
+        storageScope?: FileStorageScope;
     }): Promise<void>;
 
     // Watermark & Cold-layer Compaction (View 3)

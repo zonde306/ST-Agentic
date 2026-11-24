@@ -553,6 +553,11 @@ function buildAssistantSystemPrompt(mode: AssistantMode, stAdminEnabled: boolean
                 : 'Mode rule: Full control over all enabled World Info books (raw @@ and EJS preserved). Permanent writes require user approval.',
         );
     }
+    if (mode !== 'chat') {
+        lines.push(
+            'Workspace Progressive-Disclosure Convention: Keep persistent user rules/directives under /workspace/AGENTS.md (thin index + core rules, saved chat-wide across swipes; modifying AGENTS.md ALWAYS requires explicit user confirmation). Put lengthy or topic-specific guidelines under /workspace/docs/<topic>.md (saved chat-wide across swipes, directly editable with UndoRecord) and link them from /workspace/AGENTS.md with a brief "when to read" trigger. Use /workspace/shared/<name>.md for cross-agent collaboration/handoff notes.',
+        );
+    }
     return lines.join('\n');
 }
 

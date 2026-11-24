@@ -57,6 +57,7 @@ export interface VfsReadOptions extends VfsTargetOptions {
 
 export interface VfsWriteOptions extends VfsTargetOptions {
     source?: string;
+    layerMode?: 'auto' | 'base' | 'branch';
 }
 
 export interface VfsSearchDocument {

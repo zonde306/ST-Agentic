@@ -8,6 +8,7 @@ import {
 import type { ToolSideGenApi } from '@/core/bridge';
 import {
     createDefaultSettings,
+    DEFAULT_FILE_MAP_SIZE_LIMIT,
     exportPreset,
     importConnections,
     importPreset,
@@ -15,6 +16,7 @@ import {
     normalizeSettings,
     resolveActivePreset,
     validateConnectionsImport,
+    validatePresetFileName,
     validatePresetImport,
     validateSettingsImport,
 } from '@/core/config';
@@ -78,8 +80,15 @@ import type {
     Settings,
     WICategory,
 } from '@/core/types';
-import { canonicalClone, canonicalStringify, initXxHash } from '@/core/utils';
-import { OUTPUT_FILE_PATH, VirtualFileSystem } from '@/core/vfs';
+import { canonicalClone, canonicalStringify, initXxHash, normalizeVfsPath } from '@/core/utils';
+import {
+    GLOBAL_VFS_EXTENSION_KEY,
+    OUTPUT_FILE_PATH,
+    VirtualFileSystem,
+    isChatBaseWorkspacePath,
+    isInstructionDocPath,
+    isInstructionIndexPath,
+} from '@/core/vfs';
 import type { AgenticAssistantPublicApi, AgenticPublicApi } from '@/globals';
 import { type CompanionHooksHandle, setupCompanionHooks } from '@/host/companion-hooks';
 import { evaluateOptionalEjs } from '@/host/ejs-adapter';
@@ -517,61 +526,92 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             writable: true,
         });
 
-        // 2. Workspace files (chat DataStore `files` + active preset embedded files)
-        const presetFileMap = new Map<string, string>();
-        for (const [rawKey, content] of Object.entries(activePreset.files)) {
-            presetFileMap.set(rawKey.replace(/^\/+/, ''), content);
-        }
-
+        // 2. Workspace files (chat DataStore `files`), Preset files (`/preset/*`), and Global files (`/global/*`)
         const fileRows = store.lookup(DATA_NAMESPACES.FILES, {
             target,
             includeStaged: true,
         });
-        const seenFileKeys = new Set<string>();
         for (const row of fileRows) {
             const cleanKey = row.key.replace(/^\/+/, '');
             if (cleanKey === 'output.md') {
                 continue;
             }
-            seenFileKeys.add(cleanKey);
-            const presetBase = presetFileMap.get(cleanKey);
+            const fullPath = `/${cleanKey}`;
+            const isSpec = isInstructionIndexPath(fullPath) || isInstructionDocPath(fullPath);
+            const inBase = store.hasBase(DATA_NAMESPACES.FILES, cleanKey) || row.messageId < 0;
             items.push({
                 id: `files:${cleanKey}`,
-                category: 'workspace',
+                category: isSpec ? 'instructions' : 'workspace',
+                storageScope: inBase ? 'chat_base' : 'chat_branch',
                 namespace: DATA_NAMESPACES.FILES,
-                path: `/${cleanKey}`,
+                path: fullPath,
                 key: cleanKey,
                 target:
                     row.messageId >= 0
                         ? { messageId: row.messageId, swipeId: row.swipeId }
                         : target,
-                layerLabel: formatLayerLabel(row.messageId, row.swipeId, row.messageId < 0),
+                layerLabel: inBase
+                    ? (isSpec ? '聊天规范层 (全分支)' : '聊天基底层 (全分支)')
+                    : formatLayerLabel(row.messageId, row.swipeId, false),
                 source: row.entry.source,
                 content: row.entry.content,
-                baseContent: presetBase,
                 overridden: row.messageId >= 0,
                 writable: true,
             });
         }
 
-        for (const [cleanKey, content] of presetFileMap.entries()) {
-            if (seenFileKeys.has(cleanKey)) {
+        const presetKeys = Object.keys(activePreset.files).sort((a, b) => a.localeCompare(b));
+        for (const rawKey of presetKeys) {
+            const content = activePreset.files[rawKey];
+            const cleanKey = rawKey.replace(/^\/+/, '');
+            if (!cleanKey || typeof content !== 'string') {
                 continue;
             }
             items.push({
-                id: `files:preset:${cleanKey}`,
-                category: 'workspace',
+                id: `preset:${cleanKey}`,
+                category: 'instructions',
+                storageScope: 'preset',
                 namespace: DATA_NAMESPACES.FILES,
-                path: `/${cleanKey}`,
+                path: `/preset/${cleanKey}`,
                 key: cleanKey,
                 target,
-                layerLabel: 'Preset 预设默认层',
+                layerLabel: '预设参考 (/preset/*)',
                 source: 'preset',
                 content,
                 baseContent: content,
                 overridden: false,
                 writable: true,
             });
+        }
+
+        const globalFiles = await bridge.loadExtensionData<Record<string, string>>(
+            GLOBAL_VFS_EXTENSION_KEY,
+            {},
+        );
+        if (globalFiles && typeof globalFiles === 'object') {
+            const globalKeys = Object.keys(globalFiles).sort((a, b) => a.localeCompare(b));
+            for (const rawKey of globalKeys) {
+                const content = globalFiles[rawKey];
+                const cleanKey = rawKey.replace(/^\/+/, '');
+                if (!cleanKey || typeof content !== 'string') {
+                    continue;
+                }
+                items.push({
+                    id: `global:${cleanKey}`,
+                    category: 'instructions',
+                    storageScope: 'global',
+                    namespace: DATA_NAMESPACES.FILES,
+                    path: `/global/${cleanKey}`,
+                    key: cleanKey,
+                    target,
+                    layerLabel: '全局规范 (/global/*)',
+                    source: 'global',
+                    content,
+                    baseContent: content,
+                    overridden: false,
+                    writable: true,
+                });
+            }
         }
 
         // 3. World Info entries & branch overrides
@@ -741,9 +781,122 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                 };
             }
 
-            const cleanKey = normalizeKeyForNamespace(input.namespace, input.key, input.path);
+            const normalizedPath = normalizeVfsPath(input.path || `/${input.key || ''}`);
+            const isPresetScope = input.storageScope === 'preset' || normalizedPath.startsWith('/preset/');
+            if (isPresetScope) {
+                const relName = (
+                    normalizedPath.startsWith('/preset/')
+                        ? normalizedPath.slice('/preset/'.length)
+                        : (input.key || normalizedPath)
+                ).replace(/^\/+/, '');
+                const validationErr = validatePresetFileName(relName);
+                if (validationErr) {
+                    throw new Error(validationErr);
+                }
 
-            store.set(input.namespace, cleanKey, 'ui-edit', input.content, { target });
+                const prevSettings = getSettings();
+                const activePreset = resolveActivePreset(prevSettings);
+                const currentTotal = Object.entries(activePreset.files).reduce(
+                    (sum, [name, content]) =>
+                        name === relName ? sum : sum + name.length + content.length,
+                    0,
+                );
+                if (currentTotal + relName.length + input.content.length > DEFAULT_FILE_MAP_SIZE_LIMIT) {
+                    throw new Error(
+                        `预设文件总大小超出 ${Math.floor(DEFAULT_FILE_MAP_SIZE_LIMIT / 1024)} KB 上限`,
+                    );
+                }
+
+                const nextSettings: Settings = {
+                    ...prevSettings,
+                    presets: {
+                        ...prevSettings.presets,
+                        [activePreset.id]: {
+                            ...activePreset,
+                            files: {
+                                ...activePreset.files,
+                                [relName]: input.content,
+                            },
+                        },
+                    },
+                };
+                const storeUi = getAppStore();
+                if (storeUi) {
+                    await storeUi.updateSettings(() => nextSettings);
+                } else {
+                    setSettings(nextSettings, !isSuppressingSave());
+                    await syncTools();
+                }
+
+                const refreshed = await listFilesAndOverrides(target);
+                const matched = refreshed.find(
+                    (item) => item.storageScope === 'preset' && item.key === relName,
+                );
+                if (matched) {
+                    return matched;
+                }
+                return {
+                    id: `preset:${relName}`,
+                    category: 'instructions',
+                    storageScope: 'preset',
+                    namespace: DATA_NAMESPACES.FILES,
+                    path: `/preset/${relName}`,
+                    key: relName,
+                    target,
+                    layerLabel: '预设参考 (/preset/*)',
+                    source: 'preset',
+                    content: input.content,
+                    baseContent: input.content,
+                    overridden: false,
+                    writable: true,
+                };
+            }
+
+            const isGlobalScope = input.storageScope === 'global' || normalizedPath.startsWith('/global/');
+            if (isGlobalScope) {
+                const relKey = (
+                    normalizedPath.startsWith('/global/')
+                        ? normalizedPath.slice('/global/'.length)
+                        : (input.key || normalizedPath)
+                ).replace(/^\/+/, '');
+                if (!relKey) {
+                    throw new Error('全局文件路径不能为空');
+                }
+                await vfs.writeFile(`/global/${relKey}`, input.content, { source: 'ui-edit' });
+                const refreshed = await listFilesAndOverrides(target);
+                const matched = refreshed.find(
+                    (item) => item.storageScope === 'global' && item.key === relKey,
+                );
+                if (matched) {
+                    return matched;
+                }
+                return {
+                    id: `global:${relKey}`,
+                    category: 'instructions',
+                    storageScope: 'global',
+                    namespace: DATA_NAMESPACES.FILES,
+                    path: `/global/${relKey}`,
+                    key: relKey,
+                    target,
+                    layerLabel: '全局规范 (/global/*)',
+                    source: 'global',
+                    content: input.content,
+                    baseContent: input.content,
+                    overridden: false,
+                    writable: true,
+                };
+            }
+
+            const cleanKey = normalizeKeyForNamespace(input.namespace, input.key, normalizedPath);
+            const isBaseScope =
+                input.namespace === DATA_NAMESPACES.FILES
+                && (input.storageScope === 'chat_base' || isChatBaseWorkspacePath(normalizedPath));
+
+            if (isBaseScope) {
+                store.setBase(DATA_NAMESPACES.FILES, cleanKey, 'ui-edit', input.content);
+            } else {
+                store.set(input.namespace, cleanKey, 'ui-edit', input.content, { target });
+            }
             await saveMetadata();
 
             const refreshed = await listFilesAndOverrides(target);
@@ -751,12 +904,16 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                 (item) =>
                     item.namespace === input.namespace
                     && item.key === cleanKey
-                    && item.target.messageId === target.messageId
-                    && item.target.swipeId === target.swipeId,
+                    && item.storageScope !== 'preset'
+                    && item.storageScope !== 'global'
+                    && (isBaseScope
+                        || (item.target.messageId === target.messageId
+                            && item.target.swipeId === target.swipeId)),
             );
             if (matched) {
                 return matched;
             }
+            const isSpec = isInstructionIndexPath(`/${cleanKey}`) || isInstructionDocPath(`/${cleanKey}`);
             return {
                 id: `${input.namespace}:${cleanKey}`,
                 category:
@@ -764,15 +921,20 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                         ? 'variables'
                         : input.namespace === DATA_NAMESPACES.WORLDINFO
                             ? 'worldinfo'
-                            : 'workspace',
+                            : isSpec
+                                ? 'instructions'
+                                : 'workspace',
+                storageScope: isBaseScope ? 'chat_base' : 'chat_branch',
                 namespace: input.namespace,
-                path: input.path,
+                path: normalizedPath,
                 key: cleanKey,
                 target,
-                layerLabel: formatLayerLabel(target.messageId, target.swipeId),
+                layerLabel: isBaseScope
+                    ? (isSpec ? '聊天规范层 (全分支)' : '聊天基底层 (全分支)')
+                    : formatLayerLabel(target.messageId, target.swipeId),
                 source: 'ui-edit',
                 content: input.content,
-                overridden: true,
+                overridden: !isBaseScope,
                 writable: true,
             };
         },
@@ -790,7 +952,61 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                 return;
             }
 
-            const cleanKey = normalizeKeyForNamespace(input.namespace, input.key, input.path);
+            const normalizedPath = normalizeVfsPath(input.path || `/${input.key || ''}`);
+            if (input.storageScope === 'preset' || normalizedPath.startsWith('/preset/')) {
+                const relName = (
+                    normalizedPath.startsWith('/preset/')
+                        ? normalizedPath.slice('/preset/'.length)
+                        : (input.key || normalizedPath)
+                ).replace(/^\/+/, '');
+                const prevSettings = getSettings();
+                const activePreset = resolveActivePreset(prevSettings);
+                if (!Object.hasOwn(activePreset.files, relName)) {
+                    return;
+                }
+                const nextFiles = { ...activePreset.files };
+                delete nextFiles[relName];
+                const nextSettings: Settings = {
+                    ...prevSettings,
+                    presets: {
+                        ...prevSettings.presets,
+                        [activePreset.id]: {
+                            ...activePreset,
+                            files: nextFiles,
+                        },
+                    },
+                };
+                const storeUi = getAppStore();
+                if (storeUi) {
+                    await storeUi.updateSettings(() => nextSettings);
+                } else {
+                    setSettings(nextSettings, !isSuppressingSave());
+                    await syncTools();
+                }
+                return;
+            }
+
+            if (input.storageScope === 'global' || normalizedPath.startsWith('/global/')) {
+                const relKey = (
+                    normalizedPath.startsWith('/global/')
+                        ? normalizedPath.slice('/global/'.length)
+                        : (input.key || normalizedPath)
+                ).replace(/^\/+/, '');
+                if (relKey) {
+                    await vfs.deleteFile(`/global/${relKey}`, { source: 'ui-delete' });
+                }
+                return;
+            }
+
+            const cleanKey = normalizeKeyForNamespace(input.namespace, input.key, normalizedPath);
+            if (
+                input.namespace === DATA_NAMESPACES.FILES
+                && (input.storageScope === 'chat_base' || isChatBaseWorkspacePath(normalizedPath))
+            ) {
+                store.removeBase(DATA_NAMESPACES.FILES, cleanKey);
+                await saveMetadata();
+                return;
+            }
 
             const removed = store.remove(input.namespace, cleanKey, target);
             if (
@@ -911,29 +1127,64 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                 keepDepth: settings.storage.keepDepth,
                 autoCompact: settings.storage.autoCompact,
                 sizeThreshold: settings.storage.sizeThreshold,
+                trajectoryBytes: trajectoryStore.estimateBytes(),
+                trajectoryCheckpoints: trajectoryStore.countCheckpoints(),
             };
         },
 
         async previewColdCompaction(keepDepth?: number): Promise<CompactionReport> {
             const settings = getSettings();
-            return dataCompactor.compactColdLayers({
+            const resolvedKeepDepth = keepDepth ?? settings.storage.keepDepth;
+            const report = dataCompactor.compactColdLayers({
                 dryRun: true,
-                keepDepth: keepDepth ?? settings.storage.keepDepth,
+                keepDepth: resolvedKeepDepth,
                 includeLegacy: settings.storage.pruneLegacy,
+                pruneColdScratch: true,
             });
+            const coldEnd = Math.max(0, bridge.getChat().length - resolvedKeepDepth);
+            const sim = new TrajectoryStore();
+            sim.replaceFrom(trajectoryStore);
+            const trajectoryBytesBefore = sim.estimateBytes();
+            const cpResult = sim.pruneColdCheckpoints(coldEnd);
+            const trajectoryBytesAfter = sim.estimateBytes();
+            return {
+                ...report,
+                prunedCheckpoints: cpResult.removedCheckpoints,
+                trajectoryBytesBefore,
+                trajectoryBytesAfter,
+            };
         },
 
         async runColdCompaction(keepDepth?: number): Promise<CompactionReport> {
             const settings = getSettings();
+            const resolvedKeepDepth = keepDepth ?? settings.storage.keepDepth;
             const report = dataCompactor.compactColdLayers({
                 dryRun: false,
-                keepDepth: keepDepth ?? settings.storage.keepDepth,
+                keepDepth: resolvedKeepDepth,
                 includeLegacy: settings.storage.pruneLegacy,
+                pruneColdScratch: true,
             });
-            if (report.removedLayers > 0 || report.compactedMessages > 0) {
+            const coldEnd = Math.max(0, bridge.getChat().length - resolvedKeepDepth);
+            const trajectoryBytesBefore = trajectoryStore.estimateBytes();
+            const cpResult = trajectoryStore.pruneColdCheckpoints(coldEnd);
+            const trajectoryBytesAfter = trajectoryStore.estimateBytes();
+            if (cpResult.removedCheckpoints > 0) {
+                trajectoryStore.saveToHost(bridge);
+            }
+            if (
+                report.removedLayers > 0
+                || report.compactedMessages > 0
+                || (report.prunedScratchFiles ?? 0) > 0
+                || cpResult.removedCheckpoints > 0
+            ) {
                 await saveMetadata();
             }
-            return report;
+            return {
+                ...report,
+                prunedCheckpoints: cpResult.removedCheckpoints,
+                trajectoryBytesBefore,
+                trajectoryBytesAfter,
+            };
         },
 
         async listTraces(filter?: { messageId?: number; swipeId?: number }): Promise<AgentRunTrace[]> {
@@ -1882,6 +2133,46 @@ jQuery(async () => {
             }
         });
 
+        let autoCompactInFlight = false;
+        const runAutoStorageCompactionIfNeeded = async (): Promise<void> => {
+            if (autoCompactInFlight || !currentSettings.storage.autoCompact) {
+                return;
+            }
+            const keepDepth = currentSettings.storage.keepDepth;
+            const threshold = currentSettings.storage.sizeThreshold;
+            const overDataThreshold = dataCompactor.estimateBytes() > threshold;
+            const overTrajectoryThreshold =
+                trajectoryStore.estimateBytes() > threshold
+                || trajectoryStore.countCheckpoints() > keepDepth + 16;
+            if (!overDataThreshold && !overTrajectoryThreshold) {
+                return;
+            }
+            autoCompactInFlight = true;
+            try {
+                const report = dataCompactor.compactColdLayers({
+                    dryRun: false,
+                    keepDepth,
+                    includeLegacy: currentSettings.storage.pruneLegacy,
+                    pruneColdScratch: true,
+                });
+                const coldEnd = Math.max(0, bridge.getChat().length - keepDepth);
+                const cpResult = trajectoryStore.pruneColdCheckpoints(coldEnd);
+                if (cpResult.removedCheckpoints > 0) {
+                    trajectoryStore.saveToHost(bridge);
+                }
+                if (
+                    report.removedLayers > 0
+                    || report.compactedMessages > 0
+                    || (report.prunedScratchFiles ?? 0) > 0
+                    || cpResult.removedCheckpoints > 0
+                ) {
+                    await saveMetadata();
+                }
+            } finally {
+                autoCompactInFlight = false;
+            }
+        };
+
         // Persist persistent agent trajectories and interrupted checkpoints whenever turn/trace events fire.
         traceLogger.subscribe((event) => {
             if (
@@ -1895,25 +2186,11 @@ jQuery(async () => {
             }
             if (event.kind === 'turn_completed') {
                 scheduleSideGenUiRefresh(event.target);
+                void runAutoStorageCompactionIfNeeded().catch(() => {
+                    // Best-effort post-turn background compaction.
+                });
             }
         });
-
-        const runAutoStorageCompactionIfNeeded = async (): Promise<void> => {
-            if (!currentSettings.storage.autoCompact) {
-                return;
-            }
-            if (dataCompactor.estimateBytes() <= currentSettings.storage.sizeThreshold) {
-                return;
-            }
-            const report = dataCompactor.compactColdLayers({
-                dryRun: false,
-                keepDepth: currentSettings.storage.keepDepth,
-                includeLegacy: currentSettings.storage.pruneLegacy,
-            });
-            if (report.removedLayers > 0 || report.compactedMessages > 0) {
-                await saveMetadata();
-            }
-        };
 
         const syncActiveTargetFromChat = (explicitMessageId?: number): void => {
             if (
@@ -2138,6 +2415,9 @@ jQuery(async () => {
         eventSource.on(event_types.MESSAGE_RECEIVED, (messageId: unknown) => {
             syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
             scheduleSideGenUiRefresh();
+            void runAutoStorageCompactionIfNeeded().catch(() => {
+                // Best-effort message-received background compaction.
+            });
         });
         if (event_types.MESSAGE_SENT) {
             eventSource.on(event_types.MESSAGE_SENT, (messageId: unknown) => {

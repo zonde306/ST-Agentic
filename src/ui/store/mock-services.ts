@@ -535,6 +535,85 @@ export function createMockBackgroundTasks(): BackgroundTaskStatus[] {
 function createInitialMockFiles(): FileOverrideItem[] {
     return [
         {
+            id: 'f_agents_ws',
+            category: 'instructions',
+            storageScope: 'chat_base',
+            namespace: 'files',
+            path: '/workspace/AGENTS.md',
+            key: 'workspace/AGENTS.md',
+            target: { messageId: 12, swipeId: 0 },
+            layerLabel: '聊天规范层 (全分支)',
+            source: 'user-edit',
+            content:
+                '# 本局叙事规范索引\n\n## 核心要求\n- 保持第三人称克制白描，禁止抢写 {{user}} 台词与心理。\n- 出场前先核对 `/state/variables.json` 中的灵力与位置。\n\n## 按需参考文档（遇到对应场景再 read_file）\n- 文风细节与禁用词表：`docs/writing-style.md`（实际路径 `/workspace/docs/writing-style.md`）\n',
+            overridden: false,
+            writable: true,
+        },
+        {
+            id: 'f_docs_style',
+            category: 'instructions',
+            storageScope: 'chat_base',
+            namespace: 'files',
+            path: '/workspace/docs/writing-style.md',
+            key: 'workspace/docs/writing-style.md',
+            target: { messageId: 12, swipeId: 0 },
+            layerLabel: '聊天规范层 (全分支)',
+            source: 'assistant:write_file',
+            content:
+                '---\ndescription: 古风白描文风细则与动作描写规范\n---\n\n# 文风细则\n1. 环境描写控制在两句以内，优先推进人物对话与互动。\n2. 避免使用现代网络用语与过度感叹号。\n',
+            overridden: false,
+            writable: true,
+        },
+        {
+            id: 'f_preset_agents',
+            category: 'instructions',
+            storageScope: 'preset',
+            namespace: 'files',
+            path: '/preset/AGENTS.md',
+            key: 'AGENTS.md',
+            target: { messageId: 12, swipeId: 0 },
+            layerLabel: '预设参考 (/preset/*)',
+            source: 'preset',
+            content:
+                '# 预设通用规范\n\n- 每次主线生成结束前必须自检 `/output.md` 的标签闭合与人称一致。\n',
+            baseContent:
+                '# 预设通用规范\n\n- 每次主线生成结束前必须自检 `/output.md` 的标签闭合与人称一致。\n',
+            overridden: false,
+            writable: true,
+        },
+        {
+            id: 'f_global_agents',
+            category: 'instructions',
+            storageScope: 'global',
+            namespace: 'files',
+            path: '/global/AGENTS.md',
+            key: 'AGENTS.md',
+            target: { messageId: 12, swipeId: 0 },
+            layerLabel: '全局规范 (/global/*)',
+            source: 'global',
+            content:
+                '# 全局偏好\n\n- 默认保留叙事张力，不要在结尾强行升华总结。\n',
+            baseContent:
+                '# 全局偏好\n\n- 默认保留叙事张力，不要在结尾强行升华总结。\n',
+            overridden: false,
+            writable: true,
+        },
+        {
+            id: 'f_shared_handoff',
+            category: 'workspace',
+            storageScope: 'chat_branch',
+            namespace: 'files',
+            path: '/workspace/shared/handoff.md',
+            key: 'workspace/shared/handoff.md',
+            target: { messageId: 12, swipeId: 0 },
+            layerLabel: '#12#0',
+            source: 'assistant:write_file',
+            content:
+                '# 跨 Agent 交接笔记\n\n- 用户希望接下来两轮把重心放在听竹小筑密道潜入，暂时不要直接揭晓黑衣人身份。\n',
+            overridden: true,
+            writable: true,
+        },
+        {
             id: 'f_vars',
             category: 'variables',
             namespace: 'variables',
@@ -1301,6 +1380,8 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
         keepDepth: 12,
         autoCompact: true,
         sizeThreshold: 256 * 1024,
+        trajectoryBytes: 840 * 1024,
+        trajectoryCheckpoints: 18,
     };
     const loreEntries = createInitialMockLore();
     let embeddedCardState: EmbeddedCardStatus = {
@@ -1324,26 +1405,44 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
 
         async saveFileOrOverride(input) {
             const target = input.target ?? { messageId: 12, swipeId: 0 };
+            const normalizedPath = input.path.startsWith('/') ? input.path : `/${input.path}`;
+            const scope =
+                input.storageScope
+                ?? (normalizedPath.startsWith('/preset/')
+                    ? 'preset'
+                    : normalizedPath.startsWith('/global/')
+                        ? 'global'
+                        : normalizedPath === '/workspace/AGENTS.md'
+                            || normalizedPath === '/AGENTS.md'
+                            || normalizedPath.startsWith('/workspace/docs/')
+                            ? 'chat_base'
+                            : 'chat_branch');
             const existingIdx = files.findIndex(
                 (f) =>
-                    f.namespace === input.namespace
-                    && f.key === input.key
+                    f.path === normalizedPath
                     && (f.path !== '/output.md'
                         || (f.target.messageId === target.messageId && f.target.swipeId === target.swipeId)),
             );
             if (existingIdx >= 0) {
                 const updated: FileOverrideItem = {
                     ...files[existingIdx],
+                    storageScope: scope,
                     content: input.content,
                     target,
                     source: 'user-edit',
-                    overridden: true,
+                    overridden: scope === 'chat_branch' || files[existingIdx].overridden,
                 };
                 files[existingIdx] = updated;
                 return { ...updated };
             }
+            const isSpec =
+                scope === 'preset'
+                || scope === 'global'
+                || normalizedPath === '/workspace/AGENTS.md'
+                || normalizedPath === '/AGENTS.md'
+                || normalizedPath.startsWith('/workspace/docs/');
             const category =
-                input.path === '/output.md'
+                normalizedPath === '/output.md'
                     ? 'message'
                     : input.namespace === 'variables'
                         ? 'variables'
@@ -1351,19 +1450,33 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
                             ? 'worldinfo'
                             : input.namespace === 'message'
                                 ? 'message'
-                                : 'workspace';
+                                : isSpec
+                                    ? 'instructions'
+                                    : 'workspace';
+            const layerLabel =
+                scope === 'preset'
+                    ? '预设参考 (/preset/*)'
+                    : scope === 'global'
+                        ? '全局规范 (/global/*)'
+                        : scope === 'chat_base'
+                            ? '聊天规范层 (全分支)'
+                            : `L${target.messageId}#${target.swipeId}`;
             const created: FileOverrideItem = {
-                id: input.path === '/output.md' ? `output:${target.messageId}#${target.swipeId}` : `f_${Date.now()}`,
+                id:
+                    normalizedPath === '/output.md'
+                        ? `output:${target.messageId}#${target.swipeId}`
+                        : `f_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
                 category,
+                storageScope: scope,
                 namespace: input.namespace,
-                path: input.path,
+                path: normalizedPath,
                 key: input.key,
                 target,
-                layerLabel: `L${target.messageId}#${target.swipeId}`,
-                source: 'user-edit',
+                layerLabel,
+                source: scope === 'preset' ? 'preset' : scope === 'global' ? 'global' : 'user-edit',
                 content: input.content,
-                baseContent: '',
-                overridden: true,
+                baseContent: scope === 'preset' || scope === 'global' ? input.content : '',
+                overridden: scope === 'chat_branch',
                 writable: true,
             };
             files = [created, ...files];
@@ -1372,6 +1485,12 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
 
         async deleteFileOrOverride(input) {
             const target = input.target;
+            const normalizedPath = input.path.startsWith('/') ? input.path : `/${input.path}`;
+            const isWorldInfo = input.namespace === 'worldinfo';
+            if (!isWorldInfo && normalizedPath !== '/output.md' && input.namespace !== 'variables') {
+                files = files.filter((f) => f.path !== normalizedPath);
+                return;
+            }
             files = files.map((f) => {
                 if (
                     f.namespace === input.namespace
@@ -1418,6 +1537,8 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
         async previewColdCompaction(keepDepth?: number): Promise<CompactionReport> {
             const bytesBefore = storageOverview.estimatedBytes;
             const bytesAfter = Math.max(256 * 1024, Math.floor(bytesBefore * 0.52));
+            const trajBefore = storageOverview.trajectoryBytes ?? 840 * 1024;
+            const trajAfter = Math.max(128 * 1024, Math.floor(trajBefore * 0.35));
             return {
                 dryRun: true,
                 compactedMessages: Math.max(0, 12 - (keepDepth ?? storageOverview.keepDepth)),
@@ -1428,6 +1549,10 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
                 freedBytes: bytesBefore - bytesAfter,
                 previousWatermark: storageOverview.compactedWatermark,
                 newWatermark: 9,
+                prunedScratchFiles: 3,
+                prunedCheckpoints: 11,
+                trajectoryBytesBefore: trajBefore,
+                trajectoryBytesAfter: trajAfter,
             };
         },
 
@@ -1438,6 +1563,11 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
                 estimatedBytes: report.estimatedBytesAfter,
                 activeLayers: Math.max(4, storageOverview.activeLayers - report.removedLayers),
                 compactedWatermark: report.newWatermark,
+                trajectoryBytes: report.trajectoryBytesAfter,
+                trajectoryCheckpoints: Math.max(
+                    1,
+                    (storageOverview.trajectoryCheckpoints ?? 18) - (report.prunedCheckpoints ?? 0),
+                ),
             };
             return {
                 ...report,

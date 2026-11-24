@@ -11,6 +11,10 @@ import {
     VfsPermissionError,
     type VfsReadOptions,
 } from './fs-base';
+import {
+    isLiteralNonWildcardAllowMatch,
+    isProtectedSpecWritePath,
+} from './workspace-policy';
 import type { VirtualFileSystem, VfsGrepOptions, VfsSearchOptions } from './filesystem';
 
 export interface ScopedToolGuardOptions {
@@ -47,7 +51,23 @@ export class ScopedToolGuard implements ToolFsApi {
 
     /** Check whether `targetPath` is permitted for writing (never throws). */
     canWrite(targetPath: string): boolean {
-        return isPathAllowed(this.permissions.write, targetPath);
+        let normalized: string;
+        try {
+            normalized = safeNormalizePath(targetPath);
+        } catch {
+            return false;
+        }
+        if (!isPathAllowed(this.permissions.write, normalized)) {
+            return false;
+        }
+        if (isProtectedSpecWritePath(normalized)) {
+            const lower = normalized.toLowerCase();
+            if (lower === '/preset' || lower.startsWith('/preset/')) {
+                return false;
+            }
+            return isLiteralNonWildcardAllowMatch(this.permissions.write, normalized);
+        }
+        return true;
     }
 
     /** Validate path syntax (no `..`) and enforce `permissions.read`. */
@@ -70,6 +90,16 @@ export class ScopedToolGuard implements ToolFsApi {
                 normalized,
                 `Unauthorized VFS write access to "${normalized}". Allowed write patterns: ${JSON.stringify(this.permissions.write)}.`,
             );
+        }
+        if (isProtectedSpecWritePath(normalized)) {
+            const lower = normalized.toLowerCase();
+            const isPresetPath = lower === '/preset' || lower.startsWith('/preset/');
+            if (isPresetPath || !isLiteralNonWildcardAllowMatch(this.permissions.write, normalized)) {
+                throw new VfsPermissionError(
+                    normalized,
+                    `Protected instruction/spec path "${normalized}" cannot be written via wildcard permissions.`,
+                );
+            }
         }
         return normalized;
     }

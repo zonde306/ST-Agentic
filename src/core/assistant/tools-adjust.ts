@@ -317,7 +317,7 @@ export function createAdjustTools(): AssistantToolDefinition[] {
     const writeFileTool: AssistantToolDefinition<typeof WRITE_FILE_SCHEMA> = {
         name: 'write_file',
         description:
-            'Create or overwrite a VFS file under /workspace/**, /state/**, /lorebooks/** (preserves escapeAt), or /side/**. Captures pre-write UndoRecord.',
+            'Create or overwrite a VFS file under /workspace/** (/workspace/AGENTS.md asks mandatory user confirmation; /workspace/docs/** and /workspace/shared/** apply directly), /state/**, /lorebooks/** (preserves escapeAt), or /side/**. Captures pre-write UndoRecord.',
         parameters: WRITE_FILE_SCHEMA,
         tier: 'adjust',
         readOnly: false,
@@ -361,7 +361,7 @@ export function createAdjustTools(): AssistantToolDefinition[] {
     const appendFileTool: AssistantToolDefinition<typeof APPEND_FILE_SCHEMA> = {
         name: 'append_file',
         description:
-            'Append content verbatim to a VFS file under /workspace/**, /state/**, /lorebooks/**, or /side/**. Captures pre-write UndoRecord.',
+            'Append content verbatim to a VFS file under /workspace/** (/workspace/AGENTS.md requires confirmation; /workspace/docs/** and /workspace/shared/** apply directly), /state/**, /lorebooks/**, or /side/**. Captures pre-write UndoRecord.',
         parameters: APPEND_FILE_SCHEMA,
         tier: 'adjust',
         readOnly: false,
@@ -407,7 +407,7 @@ export function createAdjustTools(): AssistantToolDefinition[] {
     const editFileTool: AssistantToolDefinition<typeof EDIT_FILE_SCHEMA> = {
         name: 'edit_file',
         description:
-            'Replace the first exact match of `search` with `replace` in a VFS file under /workspace/**, /state/**, /lorebooks/**, or /side/**. Captures pre-write UndoRecord.',
+            'Replace the first exact match of `search` with `replace` in a VFS file under /workspace/** (/workspace/AGENTS.md requires confirmation; /workspace/docs/** and /workspace/shared/** apply directly), /state/**, /lorebooks/**, or /side/**. Captures pre-write UndoRecord.',
         parameters: EDIT_FILE_SCHEMA,
         tier: 'adjust',
         readOnly: false,

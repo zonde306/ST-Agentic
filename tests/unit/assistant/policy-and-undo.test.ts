@@ -27,10 +27,18 @@ import {
     MemoryUndoPersistence,
     UNDO_KINDS,
     UndoStore,
+    createAssistantUndoExecutor,
     createChatMetadataUndoAdapter,
     createExtensionDataUndoAdapter,
     createUndoKindDispatcher,
-} from '@/core/assistant/undo-store';
+} from '@/core/assistant';
+import { createAdjustTools } from '@/core/assistant/tools-adjust';
+import { executeAssistantTool } from '@/core/assistant/tools-chat';
+import { TrajectoryStore } from '@/core/context';
+import { TraceLogger } from '@/core/logger';
+import { ChatDataStore } from '@/core/store';
+import { createDefaultSettings } from '@/core/config';
+import { VirtualFileSystem } from '@/core/vfs';
 import type { UndoKind, UndoRecord } from '@/core/types';
 import {
     SAMPLE_RAW_AUTHOR_WI_ENTRY,
@@ -881,5 +889,93 @@ describe('undo-store.ts — 7-Kind Pre-Write Snapshot & Idempotent Rollback', ()
 
         expect(bounded.list().map((r) => r.id)).toEqual([u3.id, u1.id]);
         expect(bounded.get(u2.id)).toBeUndefined();
+    });
+
+    it('enforces mandatoryConfirm for AGENTS.md while keeping docs/** and shared/** direct with Undo', async () => {
+        for (const vfsTool of ['write_file', 'append_file', 'edit_file']) {
+            for (const specPath of ['/workspace/AGENTS.md', '/workspace/agents.md']) {
+                const res = evaluateToolPolicy(
+                    vfsTool,
+                    { path: specPath, content: 'rule' },
+                    { mode: 'full', stAdminEnabled: true, autoApproveAuthor: true, autoApproveChatDelete: true },
+                );
+                expect(res.allowed).toBe(true);
+                expect(res.mandatoryConfirm, `${vfsTool}(${specPath}) must require mandatoryConfirm`).toBe(true);
+                expect(res.requiresApproval).toBe(true);
+                expect(res.riskLevel).toBe('high');
+                expect(shouldRequireApproval(res, true)).toBe(true);
+                expect(isMandatoryConfirmTool(vfsTool, { path: specPath })).toBe(true);
+            }
+
+            // /workspace/docs/** and /workspace/shared/** stay direct (no confirm needed)
+            for (const directPath of ['/workspace/docs/style.md', '/workspace/shared/handoff.md']) {
+                const res = evaluateToolPolicy(
+                    vfsTool,
+                    { path: directPath, content: 'ok' },
+                    { mode: 'adjust' },
+                );
+                expect(res.allowed).toBe(true);
+                expect(res.mandatoryConfirm).toBe(false);
+                expect(res.requiresApproval).toBe(false);
+                expect(res.riskLevel).toBe('low');
+            }
+
+            // /global/AGENTS.md remains denied by Assistant VFS write scope
+            const globalDenied = evaluateToolPolicy(
+                vfsTool,
+                { path: '/global/AGENTS.md', content: 'no' },
+                { mode: 'full', stAdminEnabled: true },
+            );
+            expect(globalDenied.allowed).toBe(false);
+        }
+
+        // Undo cleanly reverts/deletes chat base layer specs (/workspace/AGENTS.md and /workspace/docs/**)
+        const bridge = createOffMainlineTestBridge();
+        const store = new ChatDataStore(bridge);
+        const vfs = new VirtualFileSystem({ bridge, store });
+        const undoStore = new UndoStore();
+        const executor = createAssistantUndoExecutor({ bridge, store, vfs });
+        const adjustTools = new Map(createAdjustTools().map((t) => [t.name, t]));
+        const ctx = {
+            sessionId: 'ast_spec_undo',
+            toolCallId: 'tc_spec_1',
+            mode: 'adjust' as const,
+            stAdminEnabled: false,
+            bridge,
+            store,
+            vfs,
+            undoStore,
+            trajectoryStore: new TrajectoryStore(),
+            traceLogger: new TraceLogger(),
+            settings: createDefaultSettings(),
+            target: { messageId: 1, swipeId: 0 },
+            signal: new AbortController().signal,
+        };
+
+        await executeAssistantTool(adjustTools.get('write_file')!, {
+            path: '/workspace/AGENTS.md',
+            content: 'Index v1',
+        }, ctx);
+        await executeAssistantTool(adjustTools.get('write_file')!, {
+            path: '/workspace/docs/style.md',
+            content: 'Doc v1',
+        }, { ...ctx, toolCallId: 'tc_spec_2' });
+        await executeAssistantTool(adjustTools.get('write_file')!, {
+            path: '/workspace/AGENTS.md',
+            content: 'Index v2',
+        }, { ...ctx, toolCallId: 'tc_spec_3' });
+
+        expect(await vfs.readFile('/workspace/AGENTS.md')).toBe('Index v2');
+        expect(await vfs.readFile('/workspace/docs/style.md')).toBe('Doc v1');
+
+        // Undo latest edit to AGENTS.md -> restores Index v1 in base
+        const latestRec = undoStore.list()[0];
+        await undoStore.revert(latestRec.id, executor);
+        expect(await vfs.readFile('/workspace/AGENTS.md')).toBe('Index v1');
+
+        // Undo initial creation of docs/style.md -> deletes from base cleanly
+        const docRec = undoStore.list().find((r) => r.scope === 'vfs:/workspace/docs/style.md')!;
+        await undoStore.revert(docRec.id, executor);
+        await expect(vfs.readFile('/workspace/docs/style.md')).rejects.toThrow();
     });
 });

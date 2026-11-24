@@ -344,6 +344,11 @@ export function CacheStorageView({ store }: ConsoleViewProps) {
                                     >
                                         {overview ? formatBytes(overview.estimatedBytes) : '-'}
                                     </div>
+                                    {overview && overview.trajectoryBytes !== undefined ? (
+                                        <div class="ag-field-hint">
+                                            轨迹检查点体积：{formatBytes(overview.trajectoryBytes)}
+                                        </div>
+                                    ) : null}
                                 </div>
                             </div>
 
@@ -356,6 +361,11 @@ export function CacheStorageView({ store }: ConsoleViewProps) {
                                     >
                                         {overview ? `${overview.activeLayers} 层` : '-'}
                                     </div>
+                                    {overview && overview.trajectoryCheckpoints !== undefined ? (
+                                        <div class="ag-field-hint">
+                                            轨迹检查点：{overview.trajectoryCheckpoints} 个
+                                        </div>
+                                    ) : null}
                                 </div>
                             </div>
 
@@ -455,10 +465,23 @@ export function CacheStorageView({ store }: ConsoleViewProps) {
                                     <span>压缩楼层：{lastReport.compactedMessages} 条</span>
                                     <span>移除冷层：{lastReport.removedLayers} 个</span>
                                     <span>压平条目：{lastReport.flattenedEntries} 条</span>
+                                    {lastReport.prunedScratchFiles !== undefined ? (
+                                        <span>清理冷草稿：{lastReport.prunedScratchFiles} 个</span>
+                                    ) : null}
+                                    {lastReport.prunedCheckpoints !== undefined ? (
+                                        <span>裁剪检查点：{lastReport.prunedCheckpoints} 个</span>
+                                    ) : null}
                                     <span>
                                         体积：{formatBytes(lastReport.estimatedBytesBefore)} →{' '}
                                         {formatBytes(lastReport.estimatedBytesAfter)}
                                     </span>
+                                    {lastReport.trajectoryBytesBefore !== undefined
+                                        && lastReport.trajectoryBytesAfter !== undefined ? (
+                                            <span>
+                                                轨迹：{formatBytes(lastReport.trajectoryBytesBefore)} →{' '}
+                                                {formatBytes(lastReport.trajectoryBytesAfter)}
+                                            </span>
+                                        ) : null}
                                     <span>
                                         水位：#{lastReport.previousWatermark} → #
                                         {lastReport.newWatermark}

@@ -1,5 +1,6 @@
 import type { AssistantMode } from '../types';
 import { isPathAllowed, normalizeVfsPath } from '../utils/glob';
+import { isAgentsMdApprovalRequiredPath } from '../vfs/workspace-policy';
 
 export type PolicyRiskLevel = 'low' | 'medium' | 'high';
 
@@ -741,6 +742,13 @@ export function isMandatoryConfirmTool(
         return true;
     }
     if (toolName === 'st_slash_exec' || toolName === 'st_import_url') {
+        return true;
+    }
+    if (
+        (VFS_SCOPED_WRITE_TOOLS as readonly string[]).includes(toolName)
+        && typeof args?.path === 'string'
+        && isAgentsMdApprovalRequiredPath(args.path)
+    ) {
         return true;
     }
     if (isCrossCardBatchOperation(toolName, args)) {

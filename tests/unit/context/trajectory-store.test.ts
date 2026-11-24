@@ -359,4 +359,60 @@ describe('TrajectoryStore', () => {
         store.pruneFromMessage(4);
         expect(store.getInterruptedCheckpoint({ messageId: 4, swipeId: 0 })).toBeUndefined();
     });
+
+    it('prunes cold checkpoints (< coldEnd) and releases obsolete message snapshots from serialized pool', () => {
+        const store = new TrajectoryStore();
+        const totalTurns = 100;
+        const keepDepth = 12;
+
+        // Simulate 100 turns where compaction periodically replaced active Layer 1 messages
+        for (let i = 0; i < totalTurns; ++i) {
+            store.appendTurn(
+                [
+                    { role: 'user', content: `Turn ${i} user input ` + 'u'.repeat(200) },
+                    { role: 'assistant', content: `Turn ${i} reply ` + 'a'.repeat(200) },
+                ],
+                'main',
+            );
+            store.recordCheckpoint({ messageId: i, swipeId: 0 }, 'main');
+
+            // At turn 80, simulate watermark compaction flattening turns [0..80)
+            if (i === 80) {
+                store.applyCompaction(
+                    {
+                        compactedMessages: [
+                            { role: 'system', content: 'Compacted summary up to turn 80' },
+                        ],
+                        archivedUpToChunk: 1,
+                        compactionHeaderCount: 1,
+                        turnEndCounts: [1],
+                    },
+                    'main',
+                );
+            }
+        }
+
+        expect(store.countCheckpoints('main')).toBe(100);
+        const bytesBefore = store.estimateBytes();
+
+        const coldEnd = totalTurns - keepDepth; // 88
+        const result = store.pruneColdCheckpoints(coldEnd, 'main');
+        expect(result.removedCheckpoints).toBe(88);
+        expect(result.remainingCheckpoints).toBe(12);
+        expect(store.countCheckpoints('main')).toBe(12);
+
+        const bytesAfter = store.estimateBytes();
+        // Releasing 88 obsolete checkpoints dramatically shrinks messagePool
+        expect(bytesAfter).toBeLessThan(bytesBefore * 0.5);
+
+        // Hot checkpoints [88..99] remain restorable
+        expect(store.restoreBranch({ messageId: 90, swipeId: 0 }, 'main')).toBe(true);
+        expect(store.restoreBranch({ messageId: 99, swipeId: 0 }, 'main')).toBe(true);
+
+        // When ALL checkpoints are cold (coldEnd > max messageId), keep single newest anchor
+        const anchorOnly = store.pruneColdCheckpoints(500, 'main');
+        expect(anchorOnly.removedCheckpoints).toBe(11);
+        expect(anchorOnly.remainingCheckpoints).toBe(1);
+        expect(store.restoreBranch({ messageId: 99, swipeId: 0 }, 'main')).toBe(true);
+    });
 });

@@ -19,6 +19,10 @@ export interface CompactionReport {
     freedBytes: number;
     previousWatermark: number;
     newWatermark: number;
+    prunedScratchFiles?: number;
+    prunedCheckpoints?: number;
+    trajectoryBytesBefore?: number;
+    trajectoryBytesAfter?: number;
 }
 
 export type VfsEntryKind = 'file' | 'directory';
