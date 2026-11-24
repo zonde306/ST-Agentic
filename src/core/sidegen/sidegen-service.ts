@@ -1,6 +1,8 @@
+import { FinishTurnStreamExtractor } from '@/core/agents';
 import type {
     HostBridge,
     LLMRequest,
+    LLMToolChoice,
     LLMTransport,
     ToolSideCluesApi,
     ToolSideGenApi,
@@ -15,7 +17,18 @@ import {
     TrajectoryStore,
     estimateRequestTokens,
     groupLayer1Turns,
+    renderPromptBlocks,
 } from '@/core/context';
+import {
+    LLMTransportError,
+    ROUND_RETRY_ERROR_CODES,
+    computeRoundRetryDelayMs,
+    delayWithAbort,
+    isAbortError,
+    isLengthFinishReason,
+    isRetryableRoundError,
+    isValidJsonObjectString,
+} from '@/core/llm';
 import {
     ChatDataStore,
     DATA_NAMESPACES,
@@ -26,6 +39,8 @@ import {
     type ApiConnection,
     type CanonicalContentPart,
     type CanonicalMessage,
+    type CanonicalToolCall,
+    type CanonicalToolSchema,
     type CreateSideSessionOptions,
     type MessageTarget,
     type Settings,
@@ -38,6 +53,7 @@ import {
     type SideSessionFilter,
     type SideSessionInfo,
     type SideSessionTranscriptEntry,
+    type TokenUsage,
     toBranchKey,
 } from '@/core/types';
 import { canonicalClone, canonicalStringify } from '@/core/utils';
@@ -60,6 +76,12 @@ export type SideCompactionSummarizer = (
     signal?: AbortSignal,
 ) => Promise<string> | string;
 
+export interface SideGenRoundRetryOptions {
+    initialDelayMs?: number;
+    maxDelayMs?: number;
+    backoffFactor?: number;
+}
+
 export interface SideGenServiceOptions {
     bridge: HostBridge;
     transport: LLMTransport;
@@ -75,15 +97,142 @@ export interface SideGenServiceOptions {
     defaultDelivery?: SideClueDelivery;
     defaultWatermark?: { high: number; low: number };
     summarizeCompaction?: SideCompactionSummarizer;
+    roundRetry?: SideGenRoundRetryOptions;
     onTrace?: (trace: AgentRunTrace) => void;
     now?: () => number;
     generateId?: () => string;
+}
+
+interface SideGenRoundOutput {
+    content: string;
+    reasoningContent: string;
+    toolCalls: CanonicalToolCall[];
+    usage: TokenUsage;
+    finishReason?: string;
 }
 
 const MAX_CACHE_BREAKPOINTS = 4;
 const SIDE_SUMMARY_TAG = '<side-session-summary';
 const MAX_SUMMARY_SNIPPET_CHARS = 160;
 const MAX_DETERMINISTIC_SUMMARY_CHARS = 1200;
+const DEFAULT_SIDEGEN_ROUND_MAX_RETRIES = 2;
+const MAX_SIDEGEN_STRICT_ROUNDS = 4;
+
+const FINISH_TURN_TOOL_NAME = 'finish_turn';
+
+const FINISH_TURN_TOOL_SCHEMA: CanonicalToolSchema = canonicalClone({
+    name: FINISH_TURN_TOOL_NAME,
+    description: 'Complete the current turn and submit the final result.',
+    parameters: {
+        type: 'object',
+        properties: {
+            step_brief: {
+                type: 'string',
+                description: 'Concise 1-line summary of the reasoning or completed step.',
+            },
+            response: {
+                type: 'string',
+                description: 'Final Markdown response to return.',
+            },
+        },
+        required: ['step_brief', 'response'],
+        propertyOrdering: ['step_brief', 'response'],
+        additionalProperties: false,
+    },
+});
+
+const DEFERRED_FINISH_TURN_PAYLOAD = JSON.stringify({
+    ok: false,
+    deferred: true,
+    message:
+        'Other tools ran in this round. Review their outputs (or approval result) first, then call finish_turn in the next round.',
+});
+
+function normalizeUsage(partial?: Partial<TokenUsage>): TokenUsage {
+    const inputTokens = partial?.inputTokens ?? 0;
+    const cachedTokens = partial?.cachedTokens ?? 0;
+    const outputTokens = partial?.outputTokens ?? 0;
+    const totalTokens = partial?.totalTokens ?? inputTokens + outputTokens;
+    const cacheHitRate =
+        partial?.cacheHitRate ?? (inputTokens > 0 ? cachedTokens / inputTokens : 0);
+    return {
+        inputTokens,
+        cachedTokens,
+        outputTokens,
+        totalTokens,
+        cacheHitRate,
+    };
+}
+
+function addTokenUsage(acc: TokenUsage, next: TokenUsage): TokenUsage {
+    const inputTokens = acc.inputTokens + next.inputTokens;
+    const cachedTokens = acc.cachedTokens + next.cachedTokens;
+    const outputTokens = acc.outputTokens + next.outputTokens;
+    return {
+        inputTokens,
+        cachedTokens,
+        outputTokens,
+        totalTokens: inputTokens + outputTokens,
+        cacheHitRate: inputTokens > 0 ? cachedTokens / inputTokens : 0,
+    };
+}
+
+function safeParseJsonObject(raw: string): Record<string, unknown> {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+        return {};
+    }
+    try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return parsed as Record<string, unknown>;
+        }
+    } catch {
+        // Return empty object when malformed.
+    }
+    return {};
+}
+
+function isTrailingPrefillAssistantMessage(msg: CanonicalMessage | undefined): boolean {
+    if (!msg || msg.role !== 'assistant') {
+        return false;
+    }
+    if (msg.toolCalls && msg.toolCalls.length > 0) {
+        return false;
+    }
+    return msg.extraFields?.partial === true || msg.extraFields?.prefix === true;
+}
+
+function consumeTrailingPrefill(
+    activeTailMessages: CanonicalMessage[],
+    inFlightMessages: CanonicalMessage[],
+    baseMessages: CanonicalMessage[],
+): string {
+    if (activeTailMessages.length > 0) {
+        const lastTail = activeTailMessages[activeTailMessages.length - 1];
+        if (isTrailingPrefillAssistantMessage(lastTail)) {
+            const popped = activeTailMessages.pop()!;
+            return contentToText(popped.content);
+        }
+        return '';
+    }
+    if (inFlightMessages.length > 0) {
+        const lastInFlight = inFlightMessages[inFlightMessages.length - 1];
+        if (isTrailingPrefillAssistantMessage(lastInFlight)) {
+            const popped = inFlightMessages.pop()!;
+            return contentToText(popped.content);
+        }
+        return '';
+    }
+    if (baseMessages.length > 0) {
+        const lastBase = baseMessages[baseMessages.length - 1];
+        if (isTrailingPrefillAssistantMessage(lastBase)) {
+            const popped = baseMessages.pop()!;
+            return contentToText(popped.content);
+        }
+    }
+    return '';
+}
 
 function createAbortError(message: string = 'SideGen operation aborted'): Error {
     const err = new Error(message);
@@ -305,6 +454,7 @@ export class SideGenService implements ToolSideGenApi {
     private readonly resolveConnectionFn?: (connectionId: string) => ApiConnection | undefined;
     private readonly defaultWatermark: { high: number; low: number };
     private readonly summarizeCompactionFn?: SideCompactionSummarizer;
+    private readonly roundRetryOptions?: SideGenRoundRetryOptions;
     private readonly onTraceFn?: (trace: AgentRunTrace) => void;
     private readonly nowFn: () => number;
     private readonly generateIdFn: () => string;
@@ -347,6 +497,7 @@ export class SideGenService implements ToolSideGenApi {
             { ...DEFAULT_SIDE_SESSION_WATERMARK },
         );
         this.summarizeCompactionFn = options.summarizeCompaction;
+        this.roundRetryOptions = options.roundRetry;
         this.onTraceFn = options.onTrace;
         this.nowFn = options.now ?? (() => Date.now());
         this.generateIdFn =
@@ -415,16 +566,16 @@ export class SideGenService implements ToolSideGenApi {
         try {
             throwIfAborted(signal, 'SideGen runOnce aborted before request');
 
-            const presetPrompts = this.resolvePresetPromptMessages('once');
-            const messages: CanonicalMessage[] = [];
+            const presetPrompts = await this.resolvePresetPromptMessages('once', startAnchor);
+            const baseMessages: CanonicalMessage[] = [];
             if (opts.systemPrompt && opts.systemPrompt.trim()) {
-                messages.push({
+                baseMessages.push({
                     role: 'system',
                     content: opts.systemPrompt.trim(),
                 });
             }
             for (const msg of presetPrompts.prefixMessages) {
-                messages.push(canonicalClone(msg));
+                baseMessages.push(canonicalClone(msg));
             }
 
             const userContent = this.composeUserContent(
@@ -433,25 +584,19 @@ export class SideGenService implements ToolSideGenApi {
                 opts.includeVars,
                 startAnchor,
             );
-            messages.push({
+            baseMessages.push({
                 role: 'user',
                 content: userContent,
             });
-            for (const msg of presetPrompts.tailMessages) {
-                messages.push(canonicalClone(msg));
-            }
 
             const { connectionId, connection } = this.resolveRequestConnection(opts.connectionId);
-            const request: LLMRequest = {
+            const turnResult = await this.executeSideGenTurn({
                 connectionId,
-                ...(connection ? { connection } : {}),
-                messages: canonicalClone(messages),
-                tools: [],
-                stream: false,
+                connection,
+                baseMessages,
+                tailMessages: presetPrompts.tailMessages,
                 signal,
-            };
-
-            const response = await this.transport.complete(request);
+            });
 
             // Re-check abort, chat switch, and branch anchor (when bridging) before committing.
             throwIfAborted(signal, 'SideGen runOnce aborted before commit');
@@ -464,11 +609,11 @@ export class SideGenService implements ToolSideGenApi {
                 this.assertAnchorUnchanged(startAnchor, 'runOnce bridge commit');
                 const written = await this.clues.write({
                     path: opts.bridge.path,
-                    body: response.content,
+                    body: turnResult.text,
                     delivery: opts.bridge.delivery,
                     title: opts.bridge.title,
                     keywords: opts.bridge.keywords,
-                    summary: opts.bridge.summary ?? deriveCompactSummary(response.content),
+                    summary: opts.bridge.summary ?? deriveCompactSummary(turnResult.text),
                     anchor: toBranchKey(startAnchor),
                     target: startAnchor,
                 });
@@ -483,18 +628,18 @@ export class SideGenService implements ToolSideGenApi {
                 model: connection?.model ?? '',
                 startedAt,
                 durationMs,
-                usage: response.usage,
-                outputPreview: response.content.slice(0, 200),
-                request,
+                usage: turnResult.usage,
+                outputPreview: turnResult.text.slice(0, 200),
+                request: turnResult.request,
             });
 
             return {
-                text: response.content,
+                text: turnResult.text,
                 ...(bridgedPath ? { bridgedPath } : {}),
                 usage: {
-                    inputTokens: response.usage.inputTokens,
-                    cachedTokens: response.usage.cachedTokens,
-                    outputTokens: response.usage.outputTokens,
+                    inputTokens: turnResult.usage.inputTokens,
+                    cachedTokens: turnResult.usage.cachedTokens,
+                    outputTokens: turnResult.usage.outputTokens,
                 },
                 durationMs,
             };
@@ -521,19 +666,25 @@ export class SideGenService implements ToolSideGenApi {
         const systemPrompt = opts.systemPrompt ?? '';
         const threadId = toSideThreadId(id);
 
-        const presetPrompts = this.resolvePresetPromptMessages('session');
+        const presetPrompts = await this.resolvePresetPromptMessages('session', anchor, {
+            skipTail: true,
+        });
         const layer0Messages = this.buildLayer0Messages(systemPrompt, presetPrompts.prefixMessages);
+        const { connection } = this.resolveRequestConnection(opts.connectionId);
+        const initialTools = connection?.strictToolLoop
+            ? [canonicalClone(FINISH_TURN_TOOL_SCHEMA)]
+            : [];
         this.trajectoryStore.ensureThread(threadId);
         this.trajectoryStore.setFrozenPrefix(
             {
-                tools: [],
+                tools: initialTools,
                 messages: layer0Messages,
                 layer0EndIndex: layer0Messages.length - 1,
             },
             threadId,
         );
 
-        const estimatedTokens = estimateRequestTokens(layer0Messages, []);
+        const estimatedTokens = estimateRequestTokens(layer0Messages, initialTools);
         const config: SideSessionConfig = {
             id,
             title: opts.title.trim() || id,
@@ -580,11 +731,15 @@ export class SideGenService implements ToolSideGenApi {
         try {
             throwIfAborted(signal, `SideGen send(${sessionId}) aborted before request`);
 
-            const presetPrompts = this.resolvePresetPromptMessages('session');
-            const layer0Messages = this.ensureFrozenLayer0(
+            const hasFrozenPrefix = Boolean(this.trajectoryStore.getFrozenPrefix(threadId));
+            const presetPrompts = await this.resolvePresetPromptMessages('session', startAnchor, {
+                skipPrefix: hasFrozenPrefix,
+            });
+            const layer0Messages = await this.ensureFrozenLayer0(
                 threadId,
                 session.systemPrompt,
                 presetPrompts.prefixMessages,
+                startAnchor,
             );
             const layer1Messages = this.trajectoryStore
                 .getMessages(threadId)
@@ -601,11 +756,10 @@ export class SideGenService implements ToolSideGenApi {
                 content: userContent,
             };
 
-            const allMessages: CanonicalMessage[] = [
+            const baseMessages: CanonicalMessage[] = [
                 ...layer0Messages.map((m) => canonicalClone(m)),
                 ...layer1Messages,
                 canonicalClone(userMessage),
-                ...presetPrompts.tailMessages.map((m) => canonicalClone(m)),
             ];
 
             const cacheBreakpoints = computeSideCacheBreakpoints(
@@ -619,17 +773,14 @@ export class SideGenService implements ToolSideGenApi {
                 opts.connectionId ?? session.connectionId,
             );
 
-            const request: LLMRequest = {
+            const turnResult = await this.executeSideGenTurn({
                 connectionId,
-                ...(connection ? { connection } : {}),
-                messages: allMessages,
-                tools: [],
-                ...(cacheBreakpoints.length > 0 ? { cacheBreakpoints } : {}),
-                stream: false,
+                connection,
+                baseMessages,
+                tailMessages: presetPrompts.tailMessages,
+                cacheBreakpoints: cacheBreakpoints.length > 0 ? cacheBreakpoints : undefined,
                 signal,
-            };
-
-            const response = await this.transport.complete(request);
+            });
 
             // Guard against abort, chat switch, or branch divergence before committing ANY state.
             throwIfAborted(signal, `SideGen send(${sessionId}) aborted before commit`);
@@ -643,9 +794,13 @@ export class SideGenService implements ToolSideGenApi {
                 throw createAbortError(`SideGen send(${sessionId}) aborted: session was deleted`);
             }
 
+            // Persist clean unwrapped assistant message (zero `finish_turn` pseudo tool-calls/results).
             const assistantMessage: CanonicalMessage = {
                 role: 'assistant',
-                content: response.content,
+                content: turnResult.text,
+                ...(turnResult.reasoningContent
+                    ? { reasoningContent: turnResult.reasoningContent }
+                    : {}),
             };
 
             // Append finalized turn to TrajectoryStore (immutable Layer 1 append).
@@ -653,7 +808,7 @@ export class SideGenService implements ToolSideGenApi {
 
             let estimatedTokens = estimateRequestTokens(
                 [...layer0Messages, ...this.trajectoryStore.getMessages(threadId)],
-                [],
+                turnResult.request.tools,
             );
 
             // Automatic independent off-mainline compaction when reaching watermark.high.
@@ -681,8 +836,8 @@ export class SideGenService implements ToolSideGenApi {
                 turns: session.turns + 1,
                 estimatedTokens,
                 lastCacheHitRate: formatCacheHitRate(
-                    response.usage.inputTokens,
-                    response.usage.cachedTokens,
+                    turnResult.usage.inputTokens,
+                    turnResult.usage.cachedTokens,
                 ),
                 updatedAt: Math.floor(this.nowFn()),
             };
@@ -697,7 +852,7 @@ export class SideGenService implements ToolSideGenApi {
                 bridgedPath = await this.applyAutoBridge(
                     updatedConfig,
                     prompt,
-                    response.content,
+                    turnResult.text,
                     startAnchor,
                 );
             }
@@ -711,19 +866,19 @@ export class SideGenService implements ToolSideGenApi {
                 model: connection?.model ?? '',
                 startedAt,
                 durationMs,
-                usage: response.usage,
-                outputPreview: response.content.slice(0, 200),
-                request,
+                usage: turnResult.usage,
+                outputPreview: turnResult.text.slice(0, 200),
+                request: turnResult.request,
             });
 
             return {
-                text: response.content,
+                text: turnResult.text,
                 sessionId: updatedConfig.id,
                 ...(bridgedPath ? { bridgedPath } : {}),
                 usage: {
-                    inputTokens: response.usage.inputTokens,
-                    cachedTokens: response.usage.cachedTokens,
-                    outputTokens: response.usage.outputTokens,
+                    inputTokens: turnResult.usage.inputTokens,
+                    cachedTokens: turnResult.usage.cachedTokens,
+                    outputTokens: turnResult.usage.outputTokens,
                 },
                 durationMs,
             };
@@ -778,7 +933,12 @@ export class SideGenService implements ToolSideGenApi {
         const { signal, cleanup } = this.createLinkedSignal(undefined);
 
         try {
-            const layer0 = this.ensureFrozenLayer0(threadId, session.systemPrompt);
+            const layer0 = await this.ensureFrozenLayer0(
+                threadId,
+                session.systemPrompt,
+                undefined,
+                startAnchor,
+            );
             const result = await this.compactThreadInternal(session, layer0, {
                 force: true,
                 signal,
@@ -959,10 +1119,386 @@ export class SideGenService implements ToolSideGenApi {
         return doc.path;
     }
 
-    private resolvePresetPromptMessages(mode: 'once' | 'session'): {
+    private async executeSideGenTurn(params: {
+        connectionId: string;
+        connection?: ApiConnection;
+        baseMessages: CanonicalMessage[];
+        tailMessages: readonly CanonicalMessage[];
+        cacheBreakpoints?: number[];
+        signal: AbortSignal;
+    }): Promise<{
+        text: string;
+        reasoningContent?: string;
+        usage: TokenUsage;
+        request: LLMRequest;
+    }> {
+        const strictToolLoop = Boolean(params.connection?.strictToolLoop);
+        const tools: CanonicalToolSchema[] = strictToolLoop
+            ? [canonicalClone(FINISH_TURN_TOOL_SCHEMA)]
+            : [];
+        const toolChoice: LLMToolChoice | undefined = strictToolLoop
+            ? { mode: 'required', allowedToolNames: [FINISH_TURN_TOOL_NAME] }
+            : undefined;
+        const maxRoundRetries =
+            typeof params.connection?.roundMaxRetries === 'number'
+            && Number.isFinite(params.connection.roundMaxRetries)
+                ? Math.max(0, Math.min(10, Math.floor(params.connection.roundMaxRetries)))
+                : DEFAULT_SIDEGEN_ROUND_MAX_RETRIES;
+        const useStream = Boolean(params.connection?.stream);
+        const maxRounds = strictToolLoop ? MAX_SIDEGEN_STRICT_ROUNDS : 1;
+
+        const baseMessages = canonicalClone(params.baseMessages);
+        const inFlightMessages: CanonicalMessage[] = [];
+        const activeTailMessages: CanonicalMessage[] = canonicalClone([...params.tailMessages]);
+        let cumulativeUsage = normalizeUsage();
+        let lastRequest!: LLMRequest;
+
+        for (let round = 0; round < maxRounds; round += 1) {
+            throwIfAborted(params.signal, 'SideGen turn aborted before LLM call');
+
+            const messages: CanonicalMessage[] = [
+                ...canonicalClone(baseMessages),
+                ...canonicalClone(inFlightMessages),
+                ...canonicalClone(activeTailMessages),
+            ];
+
+            const request: LLMRequest = {
+                connectionId: params.connectionId,
+                ...(params.connection ? { connection: params.connection } : {}),
+                messages,
+                tools: canonicalClone(tools),
+                ...(toolChoice ? { toolChoice: { ...toolChoice } } : {}),
+                ...(params.cacheBreakpoints && params.cacheBreakpoints.length > 0
+                    ? { cacheBreakpoints: [...params.cacheBreakpoints] }
+                    : {}),
+                stream: useStream,
+                signal: params.signal,
+            };
+            lastRequest = request;
+
+            let roundOutput!: SideGenRoundOutput;
+            let roundRetriesUsed = 0;
+            let streamedFinishResponse = '';
+            let streamedFinishStepBrief = '';
+            const finishTurnExtractor = strictToolLoop
+                ? new FinishTurnStreamExtractor({
+                      onResponseDelta: (delta) => {
+                          streamedFinishResponse += delta;
+                      },
+                      onStepBriefDelta: (delta) => {
+                          streamedFinishStepBrief += delta;
+                      },
+                      onSuppressed: () => {
+                          streamedFinishResponse = '';
+                          streamedFinishStepBrief = '';
+                      },
+                  })
+                : undefined;
+
+            // eslint-disable-next-line no-constant-condition
+            while (true) {
+                throwIfAborted(params.signal, 'SideGen round aborted');
+                streamedFinishResponse = '';
+                streamedFinishStepBrief = '';
+                finishTurnExtractor?.resetRound();
+
+                try {
+                    roundOutput = await this.invokeLLM(request, useStream, {
+                        onToolCallDelta: finishTurnExtractor
+                            ? (index, delta) => {
+                                  finishTurnExtractor.feedToolCallDelta(index, delta);
+                              }
+                            : undefined,
+                    });
+
+                    if (!isLengthFinishReason(roundOutput.finishReason)) {
+                        if (
+                            roundOutput.toolCalls.length === 0
+                            && !roundOutput.content.trim()
+                        ) {
+                            throw new LLMTransportError(
+                                'SideGen 模型返回了空响应（EMPTY_RESPONSE）',
+                                {
+                                    retryable: true,
+                                    code: ROUND_RETRY_ERROR_CODES.EMPTY_RESPONSE,
+                                },
+                            );
+                        }
+                        if (
+                            request.toolChoice?.mode === 'required'
+                            && roundOutput.toolCalls.length === 0
+                        ) {
+                            throw new LLMTransportError(
+                                'SideGen 模型未按强约束要求调用工具（TOOL_CHOICE_VIOLATION）',
+                                {
+                                    retryable: true,
+                                    code: ROUND_RETRY_ERROR_CODES.TOOL_CHOICE_VIOLATION,
+                                },
+                            );
+                        }
+                        if (
+                            strictToolLoop
+                            && roundOutput.toolCalls.some(
+                                (tc) => !isValidJsonObjectString(tc.arguments),
+                            )
+                        ) {
+                            throw new LLMTransportError(
+                                'SideGen 模型返回了格式损坏的工具参数 JSON（MALFORMED_TOOL_CALL）',
+                                {
+                                    retryable: true,
+                                    code: ROUND_RETRY_ERROR_CODES.MALFORMED_TOOL_CALL,
+                                },
+                            );
+                        }
+                        if (
+                            strictToolLoop
+                            && roundOutput.toolCalls.length === 1
+                            && roundOutput.toolCalls[0].name === FINISH_TURN_TOOL_NAME
+                        ) {
+                            const parsedFinish = safeParseJsonObject(
+                                roundOutput.toolCalls[0].arguments,
+                            );
+                            const candidateResp =
+                                typeof parsedFinish.response === 'string'
+                                    ? parsedFinish.response
+                                    : '';
+                            if (!candidateResp.trim()) {
+                                throw new LLMTransportError(
+                                    'SideGen finish_turn 缺少非空 response 参数（MALFORMED_TOOL_CALL）',
+                                    {
+                                        retryable: true,
+                                        code: ROUND_RETRY_ERROR_CODES.MALFORMED_TOOL_CALL,
+                                    },
+                                );
+                            }
+                        }
+                    }
+
+                    break;
+                } catch (llmError) {
+                    if (isAbortError(llmError) || params.signal.aborted) {
+                        throw llmError;
+                    }
+                    if (
+                        roundRetriesUsed < maxRoundRetries
+                        && isRetryableRoundError(llmError)
+                    ) {
+                        roundRetriesUsed += 1;
+                        streamedFinishResponse = '';
+                        streamedFinishStepBrief = '';
+                        finishTurnExtractor?.resetRound();
+
+                        const delayMs = computeRoundRetryDelayMs({
+                            error: llmError,
+                            attempt: roundRetriesUsed,
+                            initialDelayMs: this.roundRetryOptions?.initialDelayMs,
+                            maxDelayMs: this.roundRetryOptions?.maxDelayMs,
+                            backoffFactor: this.roundRetryOptions?.backoffFactor,
+                            jitterRatio: 0.25,
+                        });
+                        if (delayMs > 0) {
+                            await delayWithAbort(delayMs, params.signal);
+                        }
+                        throwIfAborted(params.signal, 'SideGen retry aborted');
+                        continue;
+                    }
+                    throw llmError;
+                }
+            }
+
+            cumulativeUsage = addTokenUsage(cumulativeUsage, roundOutput.usage);
+
+            // Multi-round Prefill (`partial: true` / `prefix: true`) auto-consumption folding:
+            const consumedPrefill = consumeTrailingPrefill(
+                activeTailMessages,
+                inFlightMessages,
+                baseMessages,
+            );
+            if (consumedPrefill) {
+                roundOutput.content = `${consumedPrefill}${roundOutput.content}`;
+            }
+
+            if (!strictToolLoop) {
+                return {
+                    text: roundOutput.content,
+                    ...(roundOutput.reasoningContent
+                        ? { reasoningContent: roundOutput.reasoningContent }
+                        : {}),
+                    usage: cumulativeUsage,
+                    request: lastRequest,
+                };
+            }
+
+            const isSoloFinishTurn =
+                roundOutput.toolCalls.length === 1
+                && roundOutput.toolCalls[0].name === FINISH_TURN_TOOL_NAME;
+
+            if (isSoloFinishTurn) {
+                const parsedArgs = safeParseJsonObject(roundOutput.toolCalls[0].arguments);
+                const parsedResponse =
+                    typeof parsedArgs.response === 'string' ? parsedArgs.response : '';
+                const extractedResponse =
+                    finishTurnExtractor && !finishTurnExtractor.isSuppressed()
+                        ? finishTurnExtractor.getDecodedResponse() || streamedFinishResponse
+                        : '';
+                const finalResponse = parsedResponse || extractedResponse;
+                const parsedStepBrief =
+                    typeof parsedArgs.step_brief === 'string'
+                        ? parsedArgs.step_brief
+                        : finishTurnExtractor && !finishTurnExtractor.isSuppressed()
+                            ? finishTurnExtractor.getDecodedStepBrief() || streamedFinishStepBrief
+                            : '';
+                const effectiveReasoning = roundOutput.reasoningContent || parsedStepBrief;
+
+                return {
+                    text: finalResponse,
+                    ...(effectiveReasoning ? { reasoningContent: effectiveReasoning } : {}),
+                    usage: cumulativeUsage,
+                    request: lastRequest,
+                };
+            }
+
+            // Length truncation with no valid solo finish_turn
+            if (isLengthFinishReason(roundOutput.finishReason) && roundOutput.toolCalls.length === 0) {
+                return {
+                    text: roundOutput.content,
+                    ...(roundOutput.reasoningContent
+                        ? { reasoningContent: roundOutput.reasoningContent }
+                        : {}),
+                    usage: cumulativeUsage,
+                    request: lastRequest,
+                };
+            }
+
+            // Mixed-call / unexpected tool deferral: push assistantToolMessage (no prefill flags)
+            // + deferred/error tool responses and ask the model to call solo finish_turn next round.
+            const assistantToolMessage: CanonicalMessage = {
+                role: 'assistant',
+                content: roundOutput.content,
+                ...(roundOutput.reasoningContent
+                    ? { reasoningContent: roundOutput.reasoningContent }
+                    : {}),
+                toolCalls: canonicalClone(roundOutput.toolCalls),
+            };
+            const roundToolResults: CanonicalMessage[] = roundOutput.toolCalls.map((tc) => ({
+                role: 'tool',
+                toolCallId: tc.id,
+                toolName: tc.name,
+                content:
+                    tc.name === FINISH_TURN_TOOL_NAME
+                        ? DEFERRED_FINISH_TURN_PAYLOAD
+                        : JSON.stringify({
+                              ok: false,
+                              error: `Tool "${tc.name}" is unavailable in SideGen. Call finish_turn with your final response.`,
+                          }),
+            }));
+            inFlightMessages.push(assistantToolMessage, ...roundToolResults);
+        }
+
+        throw new LLMTransportError(
+            `SideGen strictToolLoop exceeded maximum ${maxRounds} rounds without a clean solo finish_turn.`,
+            { retryable: false, code: ROUND_RETRY_ERROR_CODES.TOOL_CHOICE_VIOLATION },
+        );
+    }
+
+    private async invokeLLM(
+        request: LLMRequest,
+        useStream: boolean,
+        callbacks: {
+            onToolCallDelta?: (
+                index: number,
+                delta: { name?: string; argumentsDelta?: string },
+            ) => void;
+        },
+    ): Promise<SideGenRoundOutput> {
+        throwIfAborted(request.signal, 'SideGen LLM call aborted');
+
+        if (!useStream) {
+            const resp = await this.transport.complete(request);
+            throwIfAborted(request.signal, 'SideGen LLM call aborted');
+            return {
+                content: resp.content ?? '',
+                reasoningContent: resp.reasoningContent ?? '',
+                toolCalls: resp.toolCalls ? canonicalClone(resp.toolCalls) : [],
+                usage: normalizeUsage(resp.usage),
+                finishReason: resp.finishReason,
+            };
+        }
+
+        let content = '';
+        let reasoningContent = '';
+        const toolMap = new Map<number, CanonicalToolCall>();
+        let usage = normalizeUsage();
+        let finishReason: string | undefined;
+
+        for await (const chunk of this.transport.stream(request)) {
+            throwIfAborted(request.signal, 'SideGen stream aborted');
+            if (chunk.type === 'text_delta' && chunk.textDelta) {
+                content += chunk.textDelta;
+            } else if (chunk.type === 'reasoning_delta' && chunk.reasoningDelta) {
+                reasoningContent += chunk.reasoningDelta;
+            } else if (chunk.type === 'tool_call_delta') {
+                const idx = chunk.toolCallIndex ?? 0;
+                const prev = toolMap.get(idx) ?? {
+                    id: `call_${Math.floor(this.nowFn())}_${idx}`,
+                    name: '',
+                    arguments: '',
+                };
+                if (chunk.toolCallId) {
+                    prev.id = chunk.toolCallId;
+                }
+                if (chunk.toolName) {
+                    if (!prev.name) {
+                        prev.name = chunk.toolName;
+                    } else if (
+                        chunk.toolName === prev.name
+                        || chunk.toolName.startsWith(prev.name)
+                    ) {
+                        prev.name = chunk.toolName;
+                    } else {
+                        prev.name += chunk.toolName;
+                    }
+                }
+                if (chunk.argumentsDelta) {
+                    prev.arguments += chunk.argumentsDelta;
+                }
+                if (chunk.thoughtSignature) {
+                    prev.thoughtSignature = chunk.thoughtSignature;
+                }
+                toolMap.set(idx, prev);
+                callbacks.onToolCallDelta?.(idx, {
+                    ...(chunk.toolName ? { name: chunk.toolName } : {}),
+                    ...(chunk.argumentsDelta ? { argumentsDelta: chunk.argumentsDelta } : {}),
+                });
+            } else if (chunk.type === 'usage' && chunk.usage) {
+                usage = normalizeUsage(chunk.usage);
+            } else if (chunk.type === 'done' && chunk.finishReason) {
+                finishReason = chunk.finishReason;
+            }
+        }
+
+        const toolCalls = Array.from(toolMap.entries())
+            .sort(([a], [b]) => a - b)
+            .map(([, tc]) => tc)
+            .filter((tc) => tc.name.trim().length > 0);
+
+        return {
+            content,
+            reasoningContent,
+            toolCalls,
+            usage,
+            finishReason,
+        };
+    }
+
+    private async resolvePresetPromptMessages(
+        mode: 'once' | 'session',
+        anchor: MessageTarget,
+        options?: { skipPrefix?: boolean; skipTail?: boolean },
+    ): Promise<{
         prefixMessages: CanonicalMessage[];
         tailMessages: CanonicalMessage[];
-    } {
+    }> {
         const settings = this.getSettingsFn?.();
         if (!settings) {
             return { prefixMessages: [], tailMessages: [] };
@@ -974,39 +1510,48 @@ export class SideGenService implements ToolSideGenApi {
             { requireExplicit: true },
         );
 
-        const toMessages = (
-            blocks: readonly { role: 'system' | 'user' | 'assistant'; content: string }[],
-        ): CanonicalMessage[] => {
-            const messages: CanonicalMessage[] = [];
-            for (const block of blocks) {
-                const rendered = this.bridge.substituteMacros(block.content).trim();
-                if (rendered) {
-                    messages.push({
-                        role: block.role,
-                        content: rendered,
-                    });
-                }
-            }
-            return messages;
-        };
+        const needPrefix = !options?.skipPrefix && selected.prefix.length > 0;
+        const needTail = !options?.skipTail && selected.tail.length > 0;
+        if (!needPrefix && !needTail) {
+            return { prefixMessages: [], tailMessages: [] };
+        }
 
-        return {
-            prefixMessages: toMessages(selected.prefix),
-            tailMessages: toMessages(selected.tail),
-        };
+        const vars = this.readVarsObject(anchor);
+        const prefixMessages = needPrefix
+            ? await renderPromptBlocks(selected.prefix, {
+                  hostBridge: this.bridge,
+                  vars,
+              })
+            : [];
+        const tailMessages = needTail
+            ? await renderPromptBlocks(selected.tail, {
+                  hostBridge: this.bridge,
+                  vars,
+              })
+            : [];
+
+        return { prefixMessages, tailMessages };
     }
 
-    private ensureFrozenLayer0(
+    private async ensureFrozenLayer0(
         threadId: string,
         systemPrompt: string,
         extraPrefixMessages?: readonly CanonicalMessage[],
-    ): readonly CanonicalMessage[] {
+        anchor?: MessageTarget,
+    ): Promise<readonly CanonicalMessage[]> {
         const existing = this.trajectoryStore.getFrozenPrefix(threadId);
         if (existing) {
             return existing.messages;
         }
         const resolvedExtra =
-            extraPrefixMessages ?? this.resolvePresetPromptMessages('session').prefixMessages;
+            extraPrefixMessages
+            ?? (
+                await this.resolvePresetPromptMessages(
+                    'session',
+                    anchor ?? this.resolveCurrentAnchor(),
+                    { skipTail: true },
+                )
+            ).prefixMessages;
         const layer0Messages = this.buildLayer0Messages(systemPrompt, resolvedExtra);
         this.trajectoryStore.ensureThread(threadId);
         this.trajectoryStore.setFrozenPrefix(
@@ -1103,32 +1648,34 @@ export class SideGenService implements ToolSideGenApi {
         return `<main-chat-context>\n${lines.join('\n')}\n</main-chat-context>`;
     }
 
-    private buildReadOnlyVarsSnapshot(anchor: MessageTarget): string {
+    private readVarsObject(anchor: MessageTarget): Record<string, unknown> {
         const stored = this.dataStore.get(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, {
             target: anchor,
             includeStaged: true,
         });
 
-        let varsObj: Record<string, unknown> | null = null;
         if (stored?.content) {
             try {
                 const parsed = JSON.parse(stored.content) as unknown;
                 if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-                    varsObj = parsed as Record<string, unknown>;
+                    return canonicalClone(parsed as Record<string, unknown>);
                 }
             } catch {
-                varsObj = null;
+                // Fall through to metadata variables.
             }
         }
 
-        if (!varsObj) {
-            const metaVars = this.bridge.getMetadata()?.variables;
-            if (metaVars && typeof metaVars === 'object' && !Array.isArray(metaVars)) {
-                varsObj = metaVars as Record<string, unknown>;
-            }
+        const metaVars = this.bridge.getMetadata()?.variables;
+        if (metaVars && typeof metaVars === 'object' && !Array.isArray(metaVars)) {
+            return canonicalClone(metaVars as Record<string, unknown>);
         }
 
-        if (!varsObj || Object.keys(varsObj).length === 0) {
+        return {};
+    }
+
+    private buildReadOnlyVarsSnapshot(anchor: MessageTarget): string {
+        const varsObj = this.readVarsObject(anchor);
+        if (Object.keys(varsObj).length === 0) {
             return '';
         }
 
@@ -1237,7 +1784,7 @@ export class SideGenService implements ToolSideGenApi {
             ...(params.sessionId ? { offMainlineSessionId: params.sessionId } : {}),
             requestSnapshot: {
                 messages: canonicalClone(params.request.messages),
-                tools: [],
+                tools: canonicalClone(params.request.tools),
                 ...(params.request.cacheBreakpoints
                     ? { cacheBreakpoints: [...params.request.cacheBreakpoints] }
                     : {}),

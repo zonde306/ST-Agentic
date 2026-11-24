@@ -3,6 +3,7 @@ import type {
     HostBridge,
     LLMRequest,
     LLMStreamChunk,
+    LLMToolChoice,
     LLMTransport,
     ToolExecutionContext,
     ToolSideGenApi,
@@ -19,6 +20,7 @@ import {
     DEFAULT_FOLD_THRESHOLD_CHARS,
     estimateMessageTokens,
     estimateRequestTokens,
+    prerenderPromptBlocks,
     resolveEffectiveContextBudget,
     TrajectoryStore,
     TransientToolSpillStore,
@@ -26,7 +28,17 @@ import {
     type InterruptedTurnCheckpoint,
     type RegexSource,
 } from '@/core/context';
-import { parseContextOverflowError, type ContextOverflowInfo } from '@/core/llm';
+import {
+    computeRoundRetryDelayMs,
+    delayWithAbort,
+    isLengthFinishReason,
+    isRetryableRoundError,
+    isValidJsonObjectString,
+    LLMTransportError,
+    parseContextOverflowError,
+    ROUND_RETRY_ERROR_CODES,
+    type ContextOverflowInfo,
+} from '@/core/llm';
 import { TraceLogger } from '@/core/logger';
 import {
     DecoratorParser,
@@ -73,12 +85,27 @@ import type {
     TokenUsage,
     ToolStepLog,
 } from '@/core/types';
-import { canonicalClone, normalizeVfsPath } from '@/core/utils';
+import { canonicalClone, canonicalStringify, normalizeVfsPath } from '@/core/utils';
 import { OUTPUT_FILE_PATH, VirtualFileSystem } from '@/core/vfs';
 import {
+    FinishTurnStreamExtractor,
     IncrementalOutputStreamExtractor,
     type ToolCallDeltaInput,
 } from './output-stream-extractor';
+
+export const FINISH_TURN_TOOL_NAME = 'finish_turn';
+const FINISH_TURN_DESCRIPTION = 'Complete the current turn and submit the final result.';
+
+export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
+    'list_dir',
+    'glob_files',
+    'grep_search',
+    'search_files',
+    'read_file',
+    'read_variables',
+    'search_history',
+    'read_history',
+]);
 
 export const DEFAULT_SUBAGENT_TOOLS: readonly string[] = [
     'list_dir',
@@ -101,8 +128,32 @@ export const REQUIRED_OUTPUT_MODE_TOOLS: readonly string[] = [
 const EMPTY_OUTPUT_CHECK_PROMPT =
     '[System Check] /output.md is still empty. Plain assistant text is NOT displayed to the user. Write the final response to /output.md via write_file and review it before finishing.';
 
+const EMPTY_OUTPUT_FINISH_ERROR =
+    '/output.md is still empty. Call write_file("/output.md", ...) first.';
+
 const PREFLIGHT_FOLDED_TOOL_PREFIX = '[已折叠本轮早期工具输出:';
 const OVERFLOW_CROPPED_TOOL_PREFIX = '[输出因触发模型上下文上限';
+
+const LIKELY_REFUSAL_RE =
+    /^(?:(?:i(?:'m|\s+am)\s+sorry|sorry|apologies)[,.\s!]*)?(?:i\s+(?:can(?:'t|not)|am\s+unable\s+to|won't|will\s+not|must\s+decline)|as\s+an\s+ai|抱歉|对不起|很抱歉|作为(?:一个)?(?:ai|人工智能)|我(?:无法|不能|不便)(?:满足|协助|完成|生成|继续|回答|提供|执行))/i;
+
+type FinishTurnMode = 'main_output' | 'side_effect' | 'return_value';
+
+/**
+ * Resolve effective strict tool loop enablement from agent override and connection default.
+ */
+export function resolveStrictToolLoop(
+    agent: Pick<AgentProfile, 'strictToolLoop'>,
+    connection: Pick<ApiConnection, 'strictToolLoop'>,
+): boolean {
+    if (agent.strictToolLoop === 'on') {
+        return true;
+    }
+    if (agent.strictToolLoop === 'off') {
+        return false;
+    }
+    return Boolean(connection.strictToolLoop);
+}
 
 export interface SubAgentDescriptor {
     name: string;
@@ -178,6 +229,8 @@ export interface AgentRunnerDependencies {
     sandbox?: ScriptSandbox;
     sideGen?: ToolSideGenApi;
     maxDelegationDepth?: number;
+    roundRetryInitialDelayMs?: number;
+    roundRetryMaxDelayMs?: number;
 }
 
 export interface AgentRunInput {
@@ -400,12 +453,188 @@ function assertValidTarget(target: MessageTarget): MessageTarget {
     return Object.freeze({ messageId: target.messageId, swipeId: target.swipeId });
 }
 
-function isLengthFinishReason(finishReason?: string): boolean {
-    return (
-        finishReason === 'length'
-        || finishReason === 'max_tokens'
-        || finishReason === 'MAX_TOKENS'
-    );
+function resolveFinishTurnMode(
+    isMainOutputMode: boolean,
+    promptTriggerContext: PromptTriggerContext,
+): FinishTurnMode {
+    if (isMainOutputMode) {
+        return 'main_output';
+    }
+    if (
+        promptTriggerContext.kind === 'trigger'
+        && (promptTriggerContext.targetPaths?.length ?? 0) > 0
+    ) {
+        return 'side_effect';
+    }
+    return 'return_value';
+}
+
+function createFinishTurnDefinition(mode: FinishTurnMode): {
+    definition: ToolDefinition;
+    propertyOrdering: string[];
+} {
+    if (mode === 'main_output') {
+        return {
+            definition: {
+                name: FINISH_TURN_TOOL_NAME,
+                description: FINISH_TURN_DESCRIPTION,
+                parameters: z.object({
+                    step_brief: z
+                        .string()
+                        .min(1)
+                        .describe('Concise summary of the completed work in /output.md.'),
+                }),
+                source: 'builtin',
+                execute: () => ({ ok: true }),
+            },
+            propertyOrdering: ['step_brief'],
+        };
+    }
+
+    if (mode === 'side_effect') {
+        return {
+            definition: {
+                name: FINISH_TURN_TOOL_NAME,
+                description: FINISH_TURN_DESCRIPTION,
+                parameters: z.object({
+                    step_brief: z
+                        .string()
+                        .min(1)
+                        .describe('Concise summary of the completed side-effect updates.'),
+                    status: z
+                        .string()
+                        .optional()
+                        .describe('Optional short completion status note.'),
+                }),
+                source: 'builtin',
+                execute: () => ({ ok: true }),
+            },
+            propertyOrdering: ['step_brief', 'status'],
+        };
+    }
+
+    return {
+        definition: {
+            name: FINISH_TURN_TOOL_NAME,
+            description: FINISH_TURN_DESCRIPTION,
+            parameters: z.object({
+                step_brief: z
+                    .string()
+                    .min(1)
+                    .describe('Concise internal plan or completion brief.'),
+                response: z
+                    .string()
+                    .min(1)
+                    .describe('Final response text to return to the caller.'),
+            }),
+            source: 'builtin',
+            execute: () => ({ ok: true }),
+        },
+        propertyOrdering: ['step_brief', 'response'],
+    };
+}
+
+function parseFinishTurnArgs(
+    rawArgs: string,
+    schema: z.ZodTypeAny,
+): { ok: true; data: Record<string, unknown> } | { ok: false } {
+    const trimmed = rawArgs.trim();
+    if (!trimmed) {
+        return { ok: false };
+    }
+    try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return { ok: false };
+        }
+        const validated = schema.safeParse(parsed);
+        if (!validated.success) {
+            return { ok: false };
+        }
+        return { ok: true, data: validated.data as Record<string, unknown> };
+    } catch {
+        return { ok: false };
+    }
+}
+
+function buildToolCallSignature(toolName: string, rawArgs: string): string {
+    const trimmed = rawArgs.trim();
+    if (!trimmed) {
+        return `${toolName}:{}`;
+    }
+    try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        return `${toolName}:${canonicalStringify(parsed)}`;
+    } catch {
+        return `${toolName}:${trimmed}`;
+    }
+}
+
+function decorateStrictToolResult(
+    rawOutput: string,
+    turnState: { round: string; output_ready: boolean },
+    warning?: string,
+): string {
+    const trimmed = rawOutput.trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+        try {
+            const parsed = JSON.parse(trimmed) as unknown;
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                return JSON.stringify({
+                    ...(parsed as Record<string, unknown>),
+                    ...(warning ? { _warning: warning } : {}),
+                    _turn_state: turnState,
+                });
+            }
+        } catch {
+            // Fall through to text suffix.
+        }
+    }
+
+    const parts: string[] = [rawOutput];
+    if (warning) {
+        parts.push(`[Warning] ${warning}`);
+    }
+    parts.push(`_turn_state: ${JSON.stringify(turnState)}`);
+    return parts.join('\n\n');
+}
+
+function isPrefillAssistantMessage(msg: CanonicalMessage | undefined): boolean {
+    if (!msg || msg.role !== 'assistant') {
+        return false;
+    }
+    if (msg.toolCalls && msg.toolCalls.length > 0) {
+        return false;
+    }
+    return msg.extraFields?.partial === true || msg.extraFields?.prefix === true;
+}
+
+function extractMessageText(content: CanonicalMessage['content']): string {
+    if (typeof content === 'string') {
+        return content;
+    }
+    return content
+        .filter((part): part is { type: 'text'; text: string } => part.type === 'text')
+        .map((part) => part.text)
+        .join('');
+}
+
+function isLikelyRefusalText(text: string): boolean {
+    const trimmed = text.trim();
+    if (!trimmed) {
+        return false;
+    }
+    return LIKELY_REFUSAL_RE.test(trimmed);
+}
+
+function formatRoundRetryReason(error: unknown): string {
+    if (error instanceof LLMTransportError && error.code) {
+        return error.code;
+    }
+    if (error instanceof Error && error.message.trim()) {
+        return error.message.trim();
+    }
+    return String(error);
 }
 
 function isOutputMutationToolCall(
@@ -666,6 +895,8 @@ export class AgentRunner {
     private readonly sandbox?: ScriptSandbox;
     private readonly sideGen?: ToolSideGenApi;
     private readonly maxDelegationDepth: number;
+    private readonly roundRetryInitialDelayMs: number;
+    private readonly roundRetryMaxDelayMs: number;
     private runSequence = 0;
 
     constructor(deps: AgentRunnerDependencies) {
@@ -681,6 +912,11 @@ export class AgentRunner {
         this.sandbox = deps.sandbox;
         this.sideGen = deps.sideGen;
         this.maxDelegationDepth = Math.max(0, deps.maxDelegationDepth ?? 1);
+        this.roundRetryInitialDelayMs = Math.max(0, deps.roundRetryInitialDelayMs ?? 1200);
+        this.roundRetryMaxDelayMs = Math.max(
+            this.roundRetryInitialDelayMs,
+            deps.roundRetryMaxDelayMs ?? 10_000,
+        );
 
         this.store = deps.store ?? deps.vfs?.store ?? new ChatDataStore(deps.bridge);
         this.traceLogger = deps.traceLogger ?? new TraceLogger();
@@ -865,16 +1101,51 @@ export class AgentRunner {
             signal,
         });
 
+        const strictToolLoop = resolveStrictToolLoop(effectiveAgent, connection);
+        const finishTurnMode: FinishTurnMode = resolveFinishTurnMode(
+            isMainOutputMode,
+            promptTriggerContext,
+        );
+        let finishTurnSpec: ReturnType<typeof createFinishTurnDefinition> | undefined;
+        if (strictToolLoop) {
+            finishTurnSpec = createFinishTurnDefinition(finishTurnMode);
+            registry.register(finishTurnSpec.definition, { replace: true });
+        }
+
         const requiredOutputTools = isMainOutputMode ? REQUIRED_OUTPUT_MODE_TOOLS : [];
         const enabledToolNames = this.resolveEnabledToolNames(
             input.enabledToolNames ?? agent.enabledTools,
             [...autoAttachedToolNames, ...requiredOutputTools],
             preset,
         );
-        const canonicalTools: CanonicalToolSchema[] = registry.toCanonicalSchemas(
-            enabledToolNames,
-            preset.builtinToolSettings,
-        );
+        if (strictToolLoop && !enabledToolNames.includes(FINISH_TURN_TOOL_NAME)) {
+            enabledToolNames.push(FINISH_TURN_TOOL_NAME);
+        }
+
+        const effectiveBuiltinToolSettings =
+            strictToolLoop && preset.builtinToolSettings && FINISH_TURN_TOOL_NAME in preset.builtinToolSettings
+                ? Object.fromEntries(
+                    Object.entries(preset.builtinToolSettings).filter(
+                        ([key]) => key !== FINISH_TURN_TOOL_NAME,
+                    ),
+                )
+                : preset.builtinToolSettings;
+
+        const canonicalTools: CanonicalToolSchema[] = registry
+            .toCanonicalSchemas(enabledToolNames, effectiveBuiltinToolSettings)
+            .map((schema) => {
+                if (finishTurnSpec && schema.name === FINISH_TURN_TOOL_NAME) {
+                    return canonicalClone({
+                        ...schema,
+                        parameters: {
+                            ...schema.parameters,
+                            propertyOrdering: [...finishTurnSpec.propertyOrdering],
+                        },
+                    });
+                }
+                return schema;
+            });
+        const allCanonicalToolNames = canonicalTools.map((t) => t.name);
 
         const recentChatMessages =
             input.recentChatMessages
@@ -960,12 +1231,22 @@ export class AgentRunner {
             })
             : undefined;
 
+        const finishExtractor =
+            strictToolLoop && finishTurnMode === 'return_value' && input.onTextDelta
+                ? new FinishTurnStreamExtractor({
+                    onResponseDelta: (delta) => {
+                        input.onTextDelta?.(delta);
+                    },
+                })
+                : undefined;
+
         const turnMessages: CanonicalMessage[] = input.resumeMessages
             ? canonicalClone([...input.resumeMessages])
             : [];
         const completedTurnMessages: CanonicalMessage[] = input.resumeMessages
             ? canonicalClone([...input.resumeMessages])
             : [];
+        let bestSalvageableOutput: string | null = null;
 
         const recordFailureAndThrow = (
             aborted: boolean,
@@ -1016,7 +1297,7 @@ export class AgentRunner {
             errorMessage?: string,
             originalError?: unknown,
         ): Promise<never> => {
-            const salvaged = extractor?.getSalvageableOutput() ?? null;
+            const salvaged = extractor?.getSalvageableOutput() ?? bestSalvageableOutput ?? null;
             if (salvaged !== null && salvaged.length > 0) {
                 await this.vfs.writeFile(OUTPUT_FILE_PATH, salvaged, {
                     target,
@@ -1129,6 +1410,58 @@ export class AgentRunner {
 
         try {
             let activeRecentChatMessages = recentChatMessages ? [...recentChatMessages] : undefined;
+
+            // Pre-render matching Layer 0 `prefix` blocks (EJS + Track A/B custom JSON) once per run
+            // whenever Layer 0 will not reuse a frozen prefix, so Round 2+ synchronous `reassembleInFlight()`
+            // preserves exact byte-for-byte Layer 0 KV-cache invariance for ephemeral & trigger runs.
+            const promptBlocks = effectiveAgent.promptBlocks ?? [];
+            const isPersistent = effectiveAgent.sessionMode === 'persistent';
+            const hasTriggerScopedBlocks = promptBlocks.some(
+                (b) => b.triggers && b.triggers.length > 0,
+            );
+            const isNonMainTriggerRun =
+                isPersistent
+                && promptTriggerContext.kind !== 'main'
+                && hasTriggerScopedBlocks;
+            const willUseFrozenPrefix =
+                isPersistent
+                && !input.forceRecompilePrefix
+                && !isNonMainTriggerRun
+                && Boolean(this.trajectoryStore.getFrozenPrefix(effectiveAgent.id));
+
+            let preRenderedBlocks: Map<string, CanonicalMessage[]> | undefined;
+            if (!willUseFrozenPrefix) {
+                const prefixBlocksToRender: PromptBlock[] = [];
+                const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
+                if (
+                    input.systemBasePrompt === undefined
+                    && systemBaseBlock
+                    && systemBaseBlock.enabled
+                    && systemBaseBlock.content.trim().length > 0
+                    && matchesPromptTriggers(systemBaseBlock.triggers, promptTriggerContext)
+                ) {
+                    prefixBlocksToRender.push(systemBaseBlock);
+                }
+                for (const block of promptBlocks) {
+                    if (
+                        block.enabled
+                        && block.placement === 'prefix'
+                        && block.id !== 'system_base'
+                        && block.content.trim().length > 0
+                        && matchesPromptTriggers(block.triggers, promptTriggerContext)
+                    ) {
+                        prefixBlocksToRender.push(block);
+                    }
+                }
+                if (prefixBlocksToRender.length > 0) {
+                    preRenderedBlocks = await prerenderPromptBlocks(prefixBlocksToRender, {
+                        hostBridge: this.bridge,
+                        vars: workingVars,
+                    });
+                    throwIfAborted(signal);
+                }
+            }
+
             const baseAssembleInput = {
                 agent: effectiveAgent,
                 connectionId: connection.id,
@@ -1140,6 +1473,7 @@ export class AgentRunner {
                 presetFiles: preset.files,
                 systemBasePrompt: input.systemBasePrompt,
                 promptTriggerContext,
+                ...(preRenderedBlocks ? { preRenderedBlocks } : {}),
                 trajectoryStore: agent.sessionMode === 'persistent' ? this.trajectoryStore : undefined,
                 recentChatMessages: activeRecentChatMessages,
                 hostBridge: this.bridge,
@@ -1335,9 +1669,199 @@ export class AgentRunner {
             };
 
             const maxToolRounds = Math.max(0, agent.maxToolRounds);
+            const maxRoundRetries = Math.max(0, Math.floor(connection.roundMaxRetries ?? 2));
             let toolRoundsExecuted = 0;
             let emptyOutputRetried = false;
             let overflowRecoveryAttempted = false;
+
+            // Per-turn strict tool loop state (causally bound to this target & AbortSignal)
+            const readSignatureCounts = new Map<string, number>();
+            const blockedReadTools = new Set<string>();
+            let consecutiveDuplicateReadOnlyRounds = 0;
+            let shrinkToWriteAndFinish = false;
+            let hasWriteToolExecuted = false;
+
+            const readCurrentOutputSafe = async (): Promise<string> =>
+                await this.vfs.readFile(OUTPUT_FILE_PATH, { target, staged }).catch(() => '');
+
+            const computeRoundToolChoice = async (): Promise<LLMToolChoice | undefined> => {
+                if (!strictToolLoop || allCanonicalToolNames.length === 0) {
+                    return undefined;
+                }
+
+                let canFinish = true;
+                if (finishTurnMode === 'main_output') {
+                    const currentOut = await readCurrentOutputSafe();
+                    canFinish = currentOut.trim().length > 0;
+                } else if (finishTurnMode === 'side_effect') {
+                    canFinish = hasWriteToolExecuted || toolRoundsExecuted > 0;
+                }
+
+                let currentAllowed: string[];
+                if (toolRoundsExecuted >= maxToolRounds && canFinish) {
+                    currentAllowed = allCanonicalToolNames.includes(FINISH_TURN_TOOL_NAME)
+                        ? [FINISH_TURN_TOOL_NAME]
+                        : [...allCanonicalToolNames];
+                } else {
+                    currentAllowed = allCanonicalToolNames.filter((name) => {
+                        if (name === FINISH_TURN_TOOL_NAME) {
+                            return canFinish;
+                        }
+                        if (shrinkToWriteAndFinish && READ_ONLY_TOOL_NAMES.has(name)) {
+                            return false;
+                        }
+                        if (blockedReadTools.has(name)) {
+                            return false;
+                        }
+                        return true;
+                    });
+
+                    if (currentAllowed.length === 0) {
+                        if (canFinish && allCanonicalToolNames.includes(FINISH_TURN_TOOL_NAME)) {
+                            currentAllowed = [FINISH_TURN_TOOL_NAME];
+                        } else {
+                            const nonFinish = allCanonicalToolNames.filter(
+                                (name) => name !== FINISH_TURN_TOOL_NAME,
+                            );
+                            currentAllowed = nonFinish.length > 0
+                                ? nonFinish
+                                : [...allCanonicalToolNames];
+                        }
+                    }
+                }
+
+                return {
+                    mode: 'required',
+                    allowedToolNames: currentAllowed,
+                };
+            };
+
+            const buildTurnState = async (): Promise<{ round: string; output_ready: boolean }> => {
+                const outputReady =
+                    finishTurnMode === 'main_output'
+                        ? (await readCurrentOutputSafe()).trim().length > 0
+                        : finishTurnMode === 'side_effect'
+                            ? hasWriteToolExecuted
+                            : true;
+                return {
+                    round: `${toolRoundsExecuted}/${maxToolRounds}`,
+                    output_ready: outputReady,
+                };
+            };
+
+            const finalizeSuccessfulTurn = async (params: {
+                finalContent: string;
+                persistedAssistantContent: string;
+                reasoningContent?: string;
+            }): Promise<AgentRunResult> => {
+                if (consumedSideBriefPaths.length > 0) {
+                    await this.vfs.markSideCluesConsumed(
+                        consumedSideBriefPaths,
+                        target.messageId + 1,
+                        {
+                            target,
+                            staged,
+                            source: `agent:${agent.id}`,
+                        },
+                    );
+                }
+
+                if (agent.sessionMode === 'persistent') {
+                    this.trajectoryStore.setReadSet(effectiveReadSet, agent.id);
+                    this.contextAssembler.finalizeTurn({
+                        trajectoryStore: this.trajectoryStore,
+                        agentId: agent.id,
+                        target,
+                        turnMessages,
+                        finalAssistantMessage: {
+                            role: 'assistant',
+                            content: params.persistedAssistantContent,
+                            ...(params.reasoningContent
+                                ? { reasoningContent: params.reasoningContent }
+                                : {}),
+                        },
+                        regex,
+                    });
+                }
+
+                const endedAt = Date.now();
+                const finalTrace = this.traceLogger.recordTrace(
+                    {
+                        runId,
+                        target: { ...target },
+                        phase: input.phase,
+                        agentProfileId: agent.id,
+                        agentName: agent.name,
+                        ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                        ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+                        connectionId: connection.id,
+                        model: connection.model,
+                        status: 'completed',
+                        startedAt,
+                        endedAt,
+                        durationMs: Math.max(0, endedAt - startedAt),
+                        usage: cumulativeUsage,
+                        toolSteps: canonicalClone(toolSteps),
+                        outputPreview: params.finalContent.slice(0, 240),
+                        requestSnapshot: lastRequestSnapshot,
+                    },
+                    true,
+                );
+
+                this.traceLogger.emit({
+                    kind: 'phase_completed',
+                    target: { ...target },
+                    timestamp: endedAt,
+                    phase: input.phase,
+                    runId,
+                    agentProfileId: agent.id,
+                });
+
+                return {
+                    runId,
+                    target,
+                    phase: input.phase,
+                    agentProfileId: agent.id,
+                    content: params.finalContent,
+                    ...(params.reasoningContent
+                        ? { reasoningContent: params.reasoningContent }
+                        : {}),
+                    toolSteps,
+                    usage: cumulativeUsage,
+                    trace: finalTrace,
+                    rounds: roundsCompleted,
+                    requestSnapshot: lastRequestSnapshot,
+                };
+            };
+
+            const throwMaxToolRounds = (): never => {
+                const endedAt = Date.now();
+                const errorMessage = `Agent "${agent.name}" exceeded maxToolRounds (${maxToolRounds}).`;
+                const errorTrace = this.traceLogger.recordTrace(
+                    {
+                        runId,
+                        target: { ...target },
+                        phase: input.phase,
+                        agentProfileId: agent.id,
+                        agentName: agent.name,
+                        ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                        ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+                        connectionId: connection.id,
+                        model: connection.model,
+                        status: 'error',
+                        startedAt,
+                        endedAt,
+                        durationMs: Math.max(0, endedAt - startedAt),
+                        usage: cumulativeUsage,
+                        toolSteps: canonicalClone(toolSteps),
+                        ...(lastContent ? { outputPreview: lastContent.slice(0, 240) } : {}),
+                        error: errorMessage,
+                        requestSnapshot: lastRequestSnapshot,
+                    },
+                    true,
+                );
+                throw new MaxToolRoundsError(maxToolRounds, errorTrace);
+            };
 
             // eslint-disable-next-line no-constant-condition
             while (true) {
@@ -1345,7 +1869,11 @@ export class AgentRunner {
 
                 await runPreflightBudgetGuard();
 
+                const roundToolChoice = await computeRoundToolChoice();
+                let roundRetriesUsed = 0;
+                let nonStrictRefusalRetried = false;
                 let turnOutput: Awaited<ReturnType<AgentRunner['invokeLLM']>>;
+
                 // eslint-disable-next-line no-constant-condition
                 while (true) {
                     throwIfAborted(signal);
@@ -1354,6 +1882,7 @@ export class AgentRunner {
                         ...currentAssembled.request,
                         connectionId: connection.id,
                         connection,
+                        ...(roundToolChoice ? { toolChoice: roundToolChoice } : {}),
                         stream: input.stream ?? connection.stream ?? true,
                         signal,
                     };
@@ -1366,6 +1895,14 @@ export class AgentRunner {
                             : {}),
                     };
 
+                    const onToolCallDelta =
+                        extractor || finishExtractor
+                            ? (idx: number, delta: ToolCallDeltaInput) => {
+                                extractor?.feedToolCallDelta(idx, delta);
+                                finishExtractor?.feedToolCallDelta(idx, delta);
+                            }
+                            : undefined;
+
                     try {
                         turnOutput = await this.invokeLLM({
                             request: llmRequest,
@@ -1375,23 +1912,137 @@ export class AgentRunner {
                             runId,
                             agentId: agent.id,
                             signal,
-                            onTextDelta: isMainOutputMode ? undefined : input.onTextDelta,
+                            onTextDelta:
+                                isMainOutputMode || strictToolLoop ? undefined : input.onTextDelta,
                             onReasoningDelta: input.onReasoningDelta,
-                            onToolCallDelta: extractor
-                                ? (idx, delta) => extractor.feedToolCallDelta(idx, delta)
-                                : undefined,
+                            onToolCallDelta,
                         });
+
+                        if (!isLengthFinishReason(turnOutput.finishReason)) {
+                            if (turnOutput.toolCalls.length === 0 && !turnOutput.content.trim()) {
+                                throw new LLMTransportError(
+                                    'Model returned an empty response with no tool calls.',
+                                    {
+                                        code: ROUND_RETRY_ERROR_CODES.EMPTY_RESPONSE,
+                                        retryable: true,
+                                    },
+                                );
+                            }
+                            if (
+                                llmRequest.toolChoice?.mode === 'required'
+                                && turnOutput.toolCalls.length === 0
+                            ) {
+                                throw new LLMTransportError(
+                                    'Model violated required toolChoice by returning plain text without tool calls.',
+                                    {
+                                        code: ROUND_RETRY_ERROR_CODES.TOOL_CHOICE_VIOLATION,
+                                        retryable: true,
+                                    },
+                                );
+                            }
+                            if (
+                                strictToolLoop
+                                && turnOutput.toolCalls.some(
+                                    (tc) => !isValidJsonObjectString(tc.arguments),
+                                )
+                            ) {
+                                throw new LLMTransportError(
+                                    'Model produced malformed non-JSON-object tool call arguments.',
+                                    {
+                                        code: ROUND_RETRY_ERROR_CODES.MALFORMED_TOOL_CALL,
+                                        retryable: true,
+                                    },
+                                );
+                            }
+                            if (
+                                !strictToolLoop
+                                && isMainOutputMode
+                                && turnOutput.toolCalls.length === 0
+                                && !nonStrictRefusalRetried
+                                && roundRetriesUsed < maxRoundRetries
+                                && isLikelyRefusalText(turnOutput.content)
+                            ) {
+                                const currentOut = await readCurrentOutputSafe();
+                                if (currentOut.trim().length === 0) {
+                                    nonStrictRefusalRetried = true;
+                                    throw new LLMTransportError(
+                                        'Model returned a refusal in plain text without writing /output.md.',
+                                        {
+                                            code: ROUND_RETRY_ERROR_CODES.EMPTY_RESPONSE,
+                                            retryable: true,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+
+                        bestSalvageableOutput = null;
                         break;
                     } catch (error) {
                         if (isAbortError(error) || signal.aborted) {
                             throw error;
                         }
                         const overflowInfo = parseContextOverflowError(error);
-                        if (!overflowInfo || overflowRecoveryAttempted) {
-                            throw error;
+                        if (overflowInfo && !overflowRecoveryAttempted) {
+                            overflowRecoveryAttempted = true;
+                            await runEmergencyOverflowRecovery(overflowInfo);
+                            continue;
                         }
-                        overflowRecoveryAttempted = true;
-                        await runEmergencyOverflowRecovery(overflowInfo);
+
+                        if (roundRetriesUsed < maxRoundRetries && isRetryableRoundError(error)) {
+                            const attemptSalvage = extractor?.getSalvageableOutput() ?? null;
+                            if (
+                                attemptSalvage
+                                && (!bestSalvageableOutput
+                                    || attemptSalvage.length > bestSalvageableOutput.length)
+                            ) {
+                                bestSalvageableOutput = attemptSalvage;
+                            }
+
+                            roundRetriesUsed += 1;
+                            const retryDelayMs = computeRoundRetryDelayMs({
+                                error,
+                                attempt: roundRetriesUsed,
+                                initialDelayMs: this.roundRetryInitialDelayMs,
+                                maxDelayMs: this.roundRetryMaxDelayMs,
+                                jitterRatio: 0.25,
+                            });
+                            const retryReason = formatRoundRetryReason(error);
+
+                            if (extractor) {
+                                const committedOutput = await readCurrentOutputSafe();
+                                extractor.resetRound(committedOutput);
+                                this.traceLogger.emit({
+                                    kind: 'output_preview',
+                                    target: { ...target },
+                                    timestamp: Date.now(),
+                                    phase: input.phase,
+                                    runId,
+                                    agentProfileId: agent.id,
+                                    outputPreview: committedOutput,
+                                });
+                                input.onOutputPreview?.(committedOutput);
+                            }
+                            finishExtractor?.resetRound();
+
+                            this.traceLogger.emit({
+                                kind: 'turn_retrying',
+                                target: { ...target },
+                                timestamp: Date.now(),
+                                phase: input.phase,
+                                runId,
+                                agentProfileId: agent.id,
+                                retryAttempt: roundRetriesUsed,
+                                retryMaxAttempts: maxRoundRetries,
+                                retryDelayMs,
+                                retryReason,
+                            });
+
+                            await delayWithAbort(retryDelayMs, signal);
+                            continue;
+                        }
+
+                        throw error;
                     }
                 }
 
@@ -1407,12 +2058,31 @@ export class AgentRunner {
                     return await salvageAndInterrupt('length');
                 }
 
+                // Multi-round Prefill (`partial: true` / `prefix: true`) auto-consumption folding:
+                // Pop the transient trailing prefill placeholder and prepend its prefix text into
+                // the clean assistant turn output before writing into history (prevents Round 2 HTTP 400).
+                const trailingTurnMsg = turnMessages[turnMessages.length - 1];
+                if (isPrefillAssistantMessage(trailingTurnMsg)) {
+                    const prefixText = extractMessageText(trailingTurnMsg.content);
+                    turnMessages.pop();
+                    if (
+                        isPrefillAssistantMessage(
+                            completedTurnMessages[completedTurnMessages.length - 1],
+                        )
+                    ) {
+                        completedTurnMessages.pop();
+                    }
+                    turnOutput = {
+                        ...turnOutput,
+                        content: `${prefixText}${turnOutput.content ?? ''}`,
+                    };
+                    lastContent = turnOutput.content;
+                }
+
                 if (turnOutput.toolCalls.length === 0) {
                     let finalContent = turnOutput.content;
                     if (isMainOutputMode) {
-                        const currentOutput = await this.vfs
-                            .readFile(OUTPUT_FILE_PATH, { target, staged })
-                            .catch(() => '');
+                        const currentOutput = await readCurrentOutputSafe();
 
                         if (currentOutput.trim().length === 0) {
                             if (!emptyOutputRetried && toolRoundsExecuted < maxToolRounds) {
@@ -1449,114 +2119,66 @@ export class AgentRunner {
                         finalContent = currentOutput;
                     }
 
-                    if (consumedSideBriefPaths.length > 0) {
-                        await this.vfs.markSideCluesConsumed(
-                            consumedSideBriefPaths,
-                            target.messageId + 1,
-                            {
-                                target,
-                                staged,
-                                source: `agent:${agent.id}`,
-                            },
-                        );
-                    }
+                    return await finalizeSuccessfulTurn({
+                        finalContent,
+                        persistedAssistantContent: turnOutput.content,
+                        reasoningContent: turnOutput.reasoningContent,
+                    });
+                }
 
-                    if (agent.sessionMode === 'persistent') {
-                        this.trajectoryStore.setReadSet(effectiveReadSet, agent.id);
-                        this.contextAssembler.finalizeTurn({
-                            trajectoryStore: this.trajectoryStore,
-                            agentId: agent.id,
-                            target,
-                            turnMessages,
-                            finalAssistantMessage: {
-                                role: 'assistant',
-                                content: turnOutput.content,
-                                ...(turnOutput.reasoningContent
-                                    ? { reasoningContent: turnOutput.reasoningContent }
-                                    : {}),
-                            },
-                            regex,
-                        });
-                    }
-
-                    const endedAt = Date.now();
-                    const finalTrace = this.traceLogger.recordTrace(
-                        {
-                            runId,
-                            target: { ...target },
-                            phase: input.phase,
-                            agentProfileId: agent.id,
-                            agentName: agent.name,
-                            ...(input.triggerId ? { triggerId: input.triggerId } : {}),
-                            ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
-                            connectionId: connection.id,
-                            model: connection.model,
-                            status: 'completed',
-                            startedAt,
-                            endedAt,
-                            durationMs: Math.max(0, endedAt - startedAt),
-                            usage: cumulativeUsage,
-                            toolSteps: canonicalClone(toolSteps),
-                            outputPreview: finalContent.slice(0, 240),
-                            requestSnapshot: lastRequestSnapshot,
-                        },
-                        true,
+                // Strict tool loop: check pure `finish_turn` completion BEFORE `maxToolRounds` guardrail.
+                if (
+                    strictToolLoop
+                    && finishTurnSpec
+                    && turnOutput.toolCalls.every((tc) => tc.name === FINISH_TURN_TOOL_NAME)
+                ) {
+                    const primaryFinish = turnOutput.toolCalls[0];
+                    const parsedFinish = parseFinishTurnArgs(
+                        primaryFinish.arguments,
+                        finishTurnSpec.definition.parameters,
                     );
 
-                    this.traceLogger.emit({
-                        kind: 'phase_completed',
-                        target: { ...target },
-                        timestamp: endedAt,
-                        phase: input.phase,
-                        runId,
-                        agentProfileId: agent.id,
-                    });
-
-                    return {
-                        runId,
-                        target,
-                        phase: input.phase,
-                        agentProfileId: agent.id,
-                        content: finalContent,
-                        ...(turnOutput.reasoningContent
-                            ? { reasoningContent: turnOutput.reasoningContent }
-                            : {}),
-                        toolSteps,
-                        usage: cumulativeUsage,
-                        trace: finalTrace,
-                        rounds: roundsCompleted,
-                        requestSnapshot: lastRequestSnapshot,
-                    };
+                    if (parsedFinish.ok) {
+                        if (finishTurnMode === 'main_output') {
+                            const currentOutput = await readCurrentOutputSafe();
+                            if (currentOutput.trim().length > 0) {
+                                const stepBrief = String(parsedFinish.data.step_brief ?? '').trim();
+                                return await finalizeSuccessfulTurn({
+                                    finalContent: currentOutput,
+                                    persistedAssistantContent:
+                                        turnOutput.content.trim() || stepBrief,
+                                    reasoningContent: turnOutput.reasoningContent,
+                                });
+                            }
+                            // Fall through below to reject empty `/output.md` `finish_turn` and continue loop.
+                        } else if (finishTurnMode === 'side_effect') {
+                            if (hasWriteToolExecuted || toolRoundsExecuted > 0) {
+                                const statusText =
+                                    typeof parsedFinish.data.status === 'string'
+                                    && parsedFinish.data.status.trim().length > 0
+                                        ? parsedFinish.data.status.trim()
+                                        : String(parsedFinish.data.step_brief ?? '').trim();
+                                return await finalizeSuccessfulTurn({
+                                    finalContent: statusText,
+                                    persistedAssistantContent: statusText,
+                                    reasoningContent: turnOutput.reasoningContent,
+                                });
+                            }
+                            // Fall through below to reject premature round-1 side-effect `finish_turn`.
+                        } else {
+                            const responseText = String(parsedFinish.data.response ?? '');
+                            return await finalizeSuccessfulTurn({
+                                finalContent: responseText,
+                                persistedAssistantContent: responseText,
+                                reasoningContent: turnOutput.reasoningContent,
+                            });
+                        }
+                    }
                 }
 
                 // Enforce maxToolRounds guardrail before executing another round of tool calls.
                 if (toolRoundsExecuted >= maxToolRounds) {
-                    const endedAt = Date.now();
-                    const errorMessage = `Agent "${agent.name}" exceeded maxToolRounds (${maxToolRounds}).`;
-                    const errorTrace = this.traceLogger.recordTrace(
-                        {
-                            runId,
-                            target: { ...target },
-                            phase: input.phase,
-                            agentProfileId: agent.id,
-                            agentName: agent.name,
-                            ...(input.triggerId ? { triggerId: input.triggerId } : {}),
-                            ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
-                            connectionId: connection.id,
-                            model: connection.model,
-                            status: 'error',
-                            startedAt,
-                            endedAt,
-                            durationMs: Math.max(0, endedAt - startedAt),
-                            usage: cumulativeUsage,
-                            toolSteps: canonicalClone(toolSteps),
-                            ...(lastContent ? { outputPreview: lastContent.slice(0, 240) } : {}),
-                            error: errorMessage,
-                            requestSnapshot: lastRequestSnapshot,
-                        },
-                        true,
-                    );
-                    throw new MaxToolRoundsError(maxToolRounds, errorTrace);
+                    throwMaxToolRounds();
                 }
 
                 toolRoundsExecuted += 1;
@@ -1571,6 +2193,13 @@ export class AgentRunner {
                 };
                 turnMessages.push(assistantToolMsg);
                 const roundToolResults: CanonicalMessage[] = [];
+                const hasOtherToolsInRound = turnOutput.toolCalls.some(
+                    (tc) => tc.name !== FINISH_TURN_TOOL_NAME,
+                );
+
+                let roundNonFinishCount = 0;
+                let roundAllDuplicateReadOnly = true;
+                let roundHadSuccessfulWrite = false;
 
                 for (const toolCall of turnOutput.toolCalls) {
                     throwIfAborted(signal);
@@ -1600,26 +2229,130 @@ export class AgentRunner {
                     });
                     input.onToolStart?.(startedStep);
 
-                    const execResult = await registry.executeToolCall(
-                        toolCall.name,
-                        toolCall.arguments,
-                        toolCtx,
-                        {
-                            toolCallId: toolCall.id,
-                            spillStore: registry.getSpillStore() ?? this.spillStore,
-                            scopeId: `${agent.id}:${target.messageId}#${target.swipeId}`,
-                        },
-                    );
+                    let execResult: Awaited<ReturnType<ToolRegistry['executeToolCall']>>;
+                    let duplicateReadWarning: string | undefined;
 
-                    if (
-                        extractor
-                        && execResult.ok
-                        && isOutputMutationToolCall(toolCall.name, parsedArgs)
-                    ) {
-                        const currentOut = await this.vfs
-                            .readFile(OUTPUT_FILE_PATH, { target, staged })
-                            .catch(() => '');
-                        extractor.markToolExecuted(currentOut);
+                    if (strictToolLoop && toolCall.name === FINISH_TURN_TOOL_NAME) {
+                        if (hasOtherToolsInRound) {
+                            let errorMsg =
+                                'Other tools ran in this round. Review their outputs first, then call finish_turn in the next round.';
+                            if (finishTurnMode === 'main_output') {
+                                const currentOut = await readCurrentOutputSafe();
+                                if (currentOut.trim().length === 0) {
+                                    errorMsg = EMPTY_OUTPUT_FINISH_ERROR;
+                                }
+                            }
+                            execResult = {
+                                ok: false,
+                                toolName: toolCall.name,
+                                output: JSON.stringify({
+                                    ok: false,
+                                    ...(errorMsg !== EMPTY_OUTPUT_FINISH_ERROR
+                                        ? { deferred: true }
+                                        : {}),
+                                    error: errorMsg,
+                                }),
+                                error: errorMsg,
+                                durationMs: Math.max(0, Date.now() - stepStartedAt),
+                            };
+                        } else if (finishTurnSpec) {
+                            const parsedFinish = parseFinishTurnArgs(
+                                toolCall.arguments,
+                                finishTurnSpec.definition.parameters,
+                            );
+                            if (!parsedFinish.ok) {
+                                execResult = await registry.executeToolCall(
+                                    toolCall.name,
+                                    toolCall.arguments,
+                                    toolCtx,
+                                    {
+                                        toolCallId: toolCall.id,
+                                        spillStore: registry.getSpillStore() ?? this.spillStore,
+                                        scopeId: `${agent.id}:${target.messageId}#${target.swipeId}`,
+                                    },
+                                );
+                            } else if (finishTurnMode === 'main_output') {
+                                execResult = {
+                                    ok: false,
+                                    toolName: toolCall.name,
+                                    output: JSON.stringify({
+                                        ok: false,
+                                        error: EMPTY_OUTPUT_FINISH_ERROR,
+                                    }),
+                                    error: EMPTY_OUTPUT_FINISH_ERROR,
+                                    durationMs: Math.max(0, Date.now() - stepStartedAt),
+                                };
+                            } else {
+                                const sideEffectErr =
+                                    'Target path(s) have not been inspected or updated yet. Call tools first before calling finish_turn.';
+                                execResult = {
+                                    ok: false,
+                                    toolName: toolCall.name,
+                                    output: JSON.stringify({
+                                        ok: false,
+                                        error: sideEffectErr,
+                                    }),
+                                    error: sideEffectErr,
+                                    durationMs: Math.max(0, Date.now() - stepStartedAt),
+                                };
+                            }
+                        } else {
+                            execResult = await registry.executeToolCall(
+                                toolCall.name,
+                                toolCall.arguments,
+                                toolCtx,
+                                {
+                                    toolCallId: toolCall.id,
+                                    spillStore: registry.getSpillStore() ?? this.spillStore,
+                                    scopeId: `${agent.id}:${target.messageId}#${target.swipeId}`,
+                                },
+                            );
+                        }
+                    } else {
+                        roundNonFinishCount += 1;
+                        execResult = await registry.executeToolCall(
+                            toolCall.name,
+                            toolCall.arguments,
+                            toolCtx,
+                            {
+                                toolCallId: toolCall.id,
+                                spillStore: registry.getSpillStore() ?? this.spillStore,
+                                scopeId: `${agent.id}:${target.messageId}#${target.swipeId}`,
+                            },
+                        );
+
+                        if (
+                            extractor
+                            && execResult.ok
+                            && isOutputMutationToolCall(toolCall.name, parsedArgs)
+                        ) {
+                            const currentOut = await readCurrentOutputSafe();
+                            extractor.markToolExecuted(currentOut);
+                        }
+
+                        if (strictToolLoop) {
+                            if (READ_ONLY_TOOL_NAMES.has(toolCall.name)) {
+                                const signature = buildToolCallSignature(
+                                    toolCall.name,
+                                    toolCall.arguments,
+                                );
+                                const seenCount = (readSignatureCounts.get(signature) ?? 0) + 1;
+                                readSignatureCounts.set(signature, seenCount);
+                                if (seenCount >= 2) {
+                                    blockedReadTools.add(toolCall.name);
+                                    duplicateReadWarning =
+                                        `Repeated identical read-only call "${toolCall.name}" (${seenCount}x). Do not re-read the same data; proceed with writing or calling finish_turn.`;
+                                } else {
+                                    roundAllDuplicateReadOnly = false;
+                                }
+                            } else {
+                                roundAllDuplicateReadOnly = false;
+                                if (execResult.ok) {
+                                    hasWriteToolExecuted = true;
+                                    roundHadSuccessfulWrite = true;
+                                }
+                            }
+                        }
                     }
 
                     throwIfAborted(signal);
@@ -1648,15 +2381,37 @@ export class AgentRunner {
                     });
                     input.onToolComplete?.(completedStep);
 
-                    // Append tool result (including structured self-healing errors) for the next round.
+                    // Append tool result (including structured self-healing errors & strict `_turn_state`)
+                    const toolResultContent = strictToolLoop
+                        ? decorateStrictToolResult(
+                            execResult.output,
+                            await buildTurnState(),
+                            duplicateReadWarning,
+                        )
+                        : execResult.output;
+
                     const toolResultMsg: CanonicalMessage = {
                         role: 'tool',
                         toolCallId: toolCall.id,
                         toolName: toolCall.name,
-                        content: execResult.output,
+                        content: toolResultContent,
                     };
                     turnMessages.push(toolResultMsg);
                     roundToolResults.push(toolResultMsg);
+                }
+
+                if (strictToolLoop) {
+                    if (roundNonFinishCount > 0 && roundAllDuplicateReadOnly) {
+                        consecutiveDuplicateReadOnlyRounds += 1;
+                        if (consecutiveDuplicateReadOnlyRounds >= 2) {
+                            shrinkToWriteAndFinish = true;
+                        }
+                    } else {
+                        consecutiveDuplicateReadOnlyRounds = 0;
+                        if (roundHadSuccessfulWrite) {
+                            shrinkToWriteAndFinish = false;
+                        }
+                    }
                 }
 
                 // Append closed assistant(tool_calls) -> tool_results round ONLY after all calls succeed.
@@ -1666,11 +2421,10 @@ export class AgentRunner {
                 );
 
                 if (extractor) {
-                    const currentOut = await this.vfs
-                        .readFile(OUTPUT_FILE_PATH, { target, staged })
-                        .catch(() => '');
+                    const currentOut = await readCurrentOutputSafe();
                     extractor.resetRound(currentOut);
                 }
+                finishExtractor?.resetRound();
 
                 // Re-assemble with frozen Layer 0 + frozen Layer 1 + appended inFlightMessages.
                 currentAssembled = reassembleInFlight();

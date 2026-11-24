@@ -6,6 +6,7 @@ import {
     normalizePromptBlock,
     resolveActivePreset,
 } from '@/core/config';
+import { validateCustomPromptBlock } from '@/core/context';
 import {
     importSillyTavernOpenAIPreset,
     isSillyTavernOpenAIPreset,
@@ -84,6 +85,74 @@ function IconEditPen({ size = 14 }: { size?: number }) {
             <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
         </svg>
     );
+}
+
+const CUSTOM_EJS_INFO_HINT =
+    '检测到外层 EJS 控制流，将在上下文组装时求值后解析为 JSON 消息';
+
+const CUSTOM_INIT_TOOL_CONTEXT_TEMPLATE = JSON.stringify(
+    [
+        {
+            role: 'user',
+            content: '请先读取当前场景设定与状态。',
+        },
+        {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+                {
+                    id: 'call_init_read_1',
+                    type: 'function',
+                    function: {
+                        name: 'read_file',
+                        arguments: '{"path":"/state/variables.json"}',
+                    },
+                },
+            ],
+        },
+        {
+            role: 'tool',
+            tool_call_id: 'call_init_read_1',
+            name: 'read_file',
+            content: '{"status":"ready"}',
+        },
+    ],
+    null,
+    2,
+);
+
+const CUSTOM_ASSISTANT_PREFILL_TEMPLATE = JSON.stringify(
+    {
+        role: 'assistant',
+        content: '好的，我将严格按照设定与工具规范执行。',
+        partial: true,
+    },
+    null,
+    2,
+);
+
+const PROMPT_ROLE_OPTIONS: ReadonlyArray<{ value: PromptBlock['role']; label: string }> = [
+    { value: 'system', label: 'system' },
+    { value: 'user', label: 'user' },
+    { value: 'assistant', label: 'assistant' },
+    { value: 'custom', label: 'custom (自定义 JSON 消息)' },
+];
+
+function hasTrailingSystemInPrefix(blocks: readonly PromptBlock[]): boolean {
+    let seenNonSystemPrefix = false;
+    for (const block of blocks) {
+        if (!block.enabled || block.placement !== 'prefix') {
+            continue;
+        }
+        if (block.role === 'system') {
+            if (seenNonSystemPrefix) {
+                return true;
+            }
+        } else {
+            seenNonSystemPrefix = true;
+        }
+    }
+    return false;
 }
 
 interface ParsedPromptImport {
@@ -217,6 +286,10 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
         () => promptBlocks.filter((b) => b.enabled).length,
         [promptBlocks],
     );
+    const prefixHasTrailingSystem = useMemo(
+        () => hasTrailingSystemInPrefix(promptBlocks),
+        [promptBlocks],
+    );
     const enabledRegexCount = useMemo(
         () => activePreset.regexRules.filter((r) => r.enabled).length,
         [activePreset.regexRules],
@@ -236,6 +309,40 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
     const [draftTriggers, setDraftTriggers] = useState<PromptTriggerType[]>([]);
     const [draftContent, setDraftContent] = useState('');
     const [editError, setEditError] = useState<string | null>(null);
+    const [customSaveErrors, setCustomSaveErrors] = useState<string[]>([]);
+
+    const customValidation = useMemo(
+        () => (draftRole === 'custom' ? validateCustomPromptBlock(draftContent) : null),
+        [draftContent, draftRole],
+    );
+
+    const modalHasTrailingSystem = useMemo(() => {
+        if (editorMode === null) {
+            return false;
+        }
+        const draftPreview: PromptBlock = {
+            id: editingBlockId ?? '__draft__',
+            name: draftName || 'draft',
+            role: draftRole,
+            placement: draftPlacement,
+            content: draftContent,
+            enabled: draftEnabled,
+        };
+        const previewList =
+            editorMode === 'create'
+                ? [...promptBlocks, draftPreview]
+                : promptBlocks.map((b) => (b.id === editingBlockId ? draftPreview : b));
+        return hasTrailingSystemInPrefix(previewList);
+    }, [
+        draftContent,
+        draftEnabled,
+        draftName,
+        draftPlacement,
+        draftRole,
+        editingBlockId,
+        editorMode,
+        promptBlocks,
+    ]);
 
     // Import modal state
     const [importOpen, setImportOpen] = useState(false);
@@ -294,6 +401,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
         setDraftTriggers([]);
         setDraftContent('');
         setEditError(null);
+        setCustomSaveErrors([]);
     };
 
     const openEditModal = (block: PromptBlock) => {
@@ -306,6 +414,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
         setDraftTriggers(block.triggers ? [...block.triggers] : []);
         setDraftContent(block.content);
         setEditError(null);
+        setCustomSaveErrors([]);
     };
 
     const handleSavePromptModal = () => {
@@ -313,6 +422,21 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
         if (!trimmedName) {
             setEditError('请输入提示词名称');
             return;
+        }
+
+        if (draftRole === 'custom') {
+            const validation = validateCustomPromptBlock(draftContent);
+            if (!validation.valid) {
+                setCustomSaveErrors(
+                    validation.errors.length > 0
+                        ? validation.errors
+                        : ['自定义 JSON 消息格式无效，请检查语法与字段结构。'],
+                );
+                return;
+            }
+            setCustomSaveErrors([]);
+        } else if (customSaveErrors.length > 0) {
+            setCustomSaveErrors([]);
         }
 
         const nextTriggers = draftTriggers.length > 0 ? [...draftTriggers] : undefined;
@@ -370,6 +494,18 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
     const handleDuplicateEditingBlock = () => {
         if (!editingBlockId) {
             return;
+        }
+        if (draftRole === 'custom') {
+            const validation = validateCustomPromptBlock(draftContent);
+            if (!validation.valid) {
+                setCustomSaveErrors(
+                    validation.errors.length > 0
+                        ? validation.errors
+                        : ['自定义 JSON 消息格式无效，请检查语法与字段结构。'],
+                );
+                return;
+            }
+            setCustomSaveErrors([]);
         }
         const trimmedName = draftName.trim() || '提示词';
         const copyName = `${trimmedName} (副本)`;
@@ -606,6 +742,15 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                             </div>
                         }
                     >
+                        {prefixHasTrailingSystem ? (
+                            <div
+                                class="ag-banner ag-banner-warning"
+                                role="status"
+                                style={{ marginBottom: '10px' }}
+                            >
+                                提示：当前 Prefix 区域存在位于 custom / user / assistant 积木之后的 system 积木。Gemini 与 Claude 仅会将前导连续 system 消息放入顶层系统指令，建议将 system 积木置于 Prefix 最前。
+                            </div>
+                        ) : null}
                         {promptBlocks.length === 0 ? (
                             <EmptyState
                                 title="暂无提示词条目"
@@ -793,7 +938,12 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                                                             ? 'Prefix'
                                                             : 'Tail'}
                                                     </Badge>
-                                                    <Badge tone="neutral">{block.role}</Badge>
+                                                    <Badge
+                                                        tone={block.role === 'custom' ? 'primary' : 'neutral'}
+                                                        className="ag-mono"
+                                                    >
+                                                        {block.role}
+                                                    </Badge>
                                                     {block.triggers && block.triggers.length > 0 ? (
                                                         <>
                                                             {block.triggers.slice(0, 3).map((tag) => {
@@ -989,12 +1139,11 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                             <SelectInput<PromptBlock['role']>
                                 ariaLabel="提示词消息角色"
                                 value={draftRole}
-                                options={[
-                                    { value: 'system', label: 'system' },
-                                    { value: 'user', label: 'user' },
-                                    { value: 'assistant', label: 'assistant' },
-                                ]}
-                                onChange={setDraftRole}
+                                options={PROMPT_ROLE_OPTIONS}
+                                onChange={(role) => {
+                                    setDraftRole(role);
+                                    setCustomSaveErrors([]);
+                                }}
                             />
                         </FormField>
                     </div>
@@ -1012,15 +1161,90 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                         />
                     </FormField>
 
+                    {draftRole === 'custom' ? (
+                        <div class="ag-row-wrap" role="toolbar" aria-label="自定义 JSON 快捷模板">
+                            <Button
+                                size="sm"
+                                variant="secondary"
+                                onClick={() => {
+                                    setDraftContent(CUSTOM_INIT_TOOL_CONTEXT_TEMPLATE);
+                                    setCustomSaveErrors([]);
+                                }}
+                            >
+                                插入初始工具上下文模板
+                            </Button>
+                            <Button
+                                size="sm"
+                                variant="secondary"
+                                onClick={() => {
+                                    setDraftContent(CUSTOM_ASSISTANT_PREFILL_TEMPLATE);
+                                    setCustomSaveErrors([]);
+                                }}
+                            >
+                                插入 Assistant Prefill 模板
+                            </Button>
+                        </div>
+                    ) : null}
+
                     <CodeEditor
                         label={`提示词正文 (${draftContent.length} 字符)`}
-                        languageHint="markdown"
+                        languageHint={draftRole === 'custom' ? 'json' : 'markdown'}
                         rows={10}
                         minHeight="220px"
                         value={draftContent}
-                        placeholder="输入提示词内容，支持 {{user}}、{{char}}、{{file::/path}} 等宏..."
-                        onChange={setDraftContent}
+                        placeholder={
+                            draftRole === 'custom'
+                                ? '输入合法 JSON 消息对象 {...}、消息数组 [{...}] 或外层 EJS 控制流模板...'
+                                : '输入提示词内容，支持 {{user}}、{{char}}、{{file::/path}} 等宏...'
+                        }
+                        onChange={(next) => {
+                            setDraftContent(next);
+                            if (customSaveErrors.length > 0) {
+                                setCustomSaveErrors([]);
+                            }
+                        }}
                     />
+
+                    {draftRole === 'custom' && customSaveErrors.length > 0 ? (
+                        <div class="ag-banner ag-banner-error" role="alert">
+                            {customSaveErrors.join('；')}
+                        </div>
+                    ) : null}
+
+                    {draftRole === 'custom' && customValidation?.mode === 'ejs_template' ? (
+                        <div class="ag-banner ag-banner-primary" role="status">
+                            {CUSTOM_EJS_INFO_HINT}
+                        </div>
+                    ) : null}
+
+                    {draftRole === 'custom' && customValidation && customValidation.valid ? (() => {
+                        const filteredWarnings = customValidation.warnings.filter(
+                            (w) =>
+                                customValidation.mode !== 'ejs_template'
+                                || !w.includes('检测到外层 EJS 控制流'),
+                        );
+                        if (filteredWarnings.length === 0) {
+                            return null;
+                        }
+                        if (customValidation.mode === 'empty') {
+                            return (
+                                <div class="ag-field-hint" role="status">
+                                    {filteredWarnings.join(' ')}
+                                </div>
+                            );
+                        }
+                        return (
+                            <div class="ag-banner ag-banner-warning" role="status">
+                                {filteredWarnings.join('；')}
+                            </div>
+                        );
+                    })() : null}
+
+                    {modalHasTrailingSystem ? (
+                        <div class="ag-banner ag-banner-warning" role="status">
+                            提示：当前 Prefix 区域存在位于 custom / user / assistant 积木之后的 system 积木。Gemini 与 Claude 仅会将前导连续 system 消息放入顶层系统指令，建议将 system 积木置于 Prefix 最前。
+                        </div>
+                    ) : null}
                 </div>
             </ShadowModal>
 

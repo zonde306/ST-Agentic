@@ -67,6 +67,8 @@ export function createMockSettings(): Settings {
         cachePolicy: 'anthropic_explicit',
         maxCacheBreakpoints: 4,
         stream: true,
+        strictToolLoop: false,
+        roundMaxRetries: 2,
         includeHeaders: { 'HTTP-Referer': 'https://sillytavern.local' },
     });
 
@@ -82,6 +84,8 @@ export function createMockSettings(): Settings {
         maxConcurrency: 6,
         cachePolicy: 'auto_prefix',
         stream: false,
+        strictToolLoop: false,
+        roundMaxRetries: 2,
     });
 
     const connLocal = createDefaultConnection({
@@ -96,6 +100,8 @@ export function createMockSettings(): Settings {
         maxConcurrency: 1,
         cachePolicy: 'auto_prefix',
         stream: true,
+        strictToolLoop: false,
+        roundMaxRetries: 2,
     });
 
     const mainAgent = createDefaultMainAgent({
@@ -103,6 +109,7 @@ export function createMockSettings(): Settings {
         name: '主叙事 Agent',
         connectionId: 'inherit',
         sessionMode: 'persistent',
+        strictToolLoop: 'inherit',
         watermark: { high: 36000, low: 18000 },
         enabledTools: [...DEFAULT_MAIN_AGENT_TOOLS],
         permissions: { read: ['/**'], write: ['/output.md', '/memory/**', '/scratch/**'] },
@@ -142,6 +149,7 @@ export function createMockSettings(): Settings {
         name: '变量管家',
         connectionId: 'conn_flash',
         sessionMode: 'persistent',
+        strictToolLoop: 'inherit',
         watermark: { high: 16000, low: 6000 },
         enabledTools: ['read_variables', 'patch_variables', 'read_file'],
         permissions: { read: ['/state/variables.json', '/lorebooks/**'], write: ['/state/variables.json'] },
@@ -164,6 +172,7 @@ export function createMockSettings(): Settings {
         connectionId: 'conn_flash',
         sessionMode: 'ephemeral',
         ephemeralWindowSize: 4,
+        strictToolLoop: 'inherit',
         enabledTools: ['read_file', 'comfy_illustrate'],
         permissions: { read: ['/character/**', '/lorebooks/**'], write: [] },
         promptBlocks: [

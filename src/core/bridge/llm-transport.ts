@@ -6,12 +6,24 @@ import type {
     TokenUsage,
 } from '../types';
 
+export type LLMToolChoiceMode = 'auto' | 'required' | 'none';
+
+export interface LLMToolChoice {
+    mode: LLMToolChoiceMode;
+    /**
+     * Optional whitelist of tool names allowed in this round (compiler intersects with `request.tools`).
+     * Never mutates top-level `request.tools`; maps only to backend decoding config.
+     */
+    allowedToolNames?: readonly string[];
+}
+
 export interface LLMRequest {
     connectionId: string;
     connection?: ApiConnection;
     messages: CanonicalMessage[];
     tools: CanonicalToolSchema[];
     cacheBreakpoints?: number[];
+    toolChoice?: LLMToolChoice;
     stream?: boolean;
     signal?: AbortSignal;
 }

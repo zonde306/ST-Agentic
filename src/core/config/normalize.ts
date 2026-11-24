@@ -19,6 +19,7 @@ import type {
     SlashToolParamDef,
     SlashToolParamType,
     StorageSettings,
+    StrictToolLoopOverride,
     ThemeMode,
     TriggerCondition,
     TriggerRule,
@@ -234,6 +235,17 @@ export function normalizeConnection(
         ),
         promptPostProcessing,
         linkedPreset: typeof raw.linkedPreset === 'string' ? raw.linkedPreset.trim() : '',
+        strictToolLoop:
+            raw.strictToolLoop === undefined
+                ? Boolean(defaults.strictToolLoop)
+                : Boolean(raw.strictToolLoop),
+        roundMaxRetries: parseBoundedNumber(
+            raw.roundMaxRetries,
+            defaults.roundMaxRetries ?? 2,
+            0,
+            10,
+            true,
+        ),
     };
 }
 
@@ -268,8 +280,9 @@ export function normalizeConnectionsMap(raw: unknown): Record<string, ApiConnect
     return result;
 }
 
-const VALID_BLOCK_ROLES = new Set<PromptBlock['role']>(['system', 'user', 'assistant']);
+const VALID_BLOCK_ROLES = new Set<PromptBlock['role']>(['system', 'user', 'assistant', 'custom']);
 const VALID_BLOCK_PLACEMENTS = new Set<PromptBlock['placement']>(['prefix', 'tail']);
+const VALID_STRICT_TOOL_LOOP_OVERRIDES = new Set<StrictToolLoopOverride>(['inherit', 'on', 'off']);
 
 /** Normalize a `PromptBlock` entry. */
 export function normalizePromptBlock(
@@ -335,6 +348,11 @@ export function normalizeAgentProfile(
         enabledTools: normalizeStringArray(raw.enabledTools),
         permissions: normalizePermissions(raw.permissions),
         maxToolRounds: parseBoundedNumber(raw.maxToolRounds, 8, 1, 100, true),
+        strictToolLoop: VALID_STRICT_TOOL_LOOP_OVERRIDES.has(
+            raw.strictToolLoop as StrictToolLoopOverride,
+        )
+            ? (raw.strictToolLoop as StrictToolLoopOverride)
+            : 'inherit',
     };
 
     if (isPlainRecord(raw.watermark)) {

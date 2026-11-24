@@ -31,6 +31,10 @@ export interface ApiConnection {
     maxCacheBreakpoints?: number;
     promptPostProcessing?: 'none' | 'merge' | 'semi' | 'strict' | 'single';
     linkedPreset?: string;
+    /** Enable strict tool loop (forced tool decoding + finish_turn gate + repeated read breaker; default false). */
+    strictToolLoop?: boolean;
+    /** Max automatic per-round retries on stream drop, empty response, constraint violation, or malformed tool JSON (default 2, 0 disables). */
+    roundMaxRetries?: number;
 }
 
 export type PipelinePhase = 'before_turn' | 'main_turn' | 'after_turn' | 'maintenance';
@@ -79,15 +83,19 @@ export type PromptTriggerContext =
     | { kind: 'subagent'; phase?: PipelinePhase }
     | { kind: 'sidegen'; mode?: 'once' | 'session' };
 
+export type PromptBlockRole = 'system' | 'user' | 'assistant' | 'custom';
+
 export interface PromptBlock {
     id: string;
     name: string;
-    role: 'system' | 'user' | 'assistant';
+    role: PromptBlockRole;
     placement: 'prefix' | 'tail';
     content: string;
     enabled: boolean;
     triggers?: PromptTriggerType[];
 }
+
+export type StrictToolLoopOverride = 'inherit' | 'on' | 'off';
 
 export interface AgentProfile {
     id: string;
@@ -101,6 +109,8 @@ export interface AgentProfile {
     watermark?: { high: number; low: number };
     ephemeralWindowSize?: number;
     description?: string;
+    /** Agent-level strict tool loop override: 'inherit' (default, follows connection) | 'on' | 'off'. */
+    strictToolLoop?: StrictToolLoopOverride;
 }
 
 export interface TriggerCondition {

@@ -1,11 +1,18 @@
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
     createDefaultMainAgent,
     DEFAULT_WATERMARK,
     resolveActivePreset,
 } from '@/core/config';
+import { validateCustomPromptBlock } from '@/core/context';
 import { BUILTIN_TOOL_NAMES } from '@/core/tools';
-import type { AgentProfile, PromptBlock, SessionMode, TriggerRule } from '@/core/types';
+import type {
+    AgentProfile,
+    PromptBlock,
+    SessionMode,
+    StrictToolLoopOverride,
+    TriggerRule,
+} from '@/core/types';
 import {
     Badge,
     Button,
@@ -41,6 +48,80 @@ import {
     useDraftString,
     withUpdatedAgent,
 } from './studio-helpers';
+
+const CUSTOM_EJS_INFO_HINT =
+    '检测到外层 EJS 控制流，将在上下文组装时求值后解析为 JSON 消息';
+
+const CUSTOM_INIT_TOOL_CONTEXT_TEMPLATE = JSON.stringify(
+    [
+        {
+            role: 'user',
+            content: '请先读取当前场景设定与状态。',
+        },
+        {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+                {
+                    id: 'call_init_read_1',
+                    type: 'function',
+                    function: {
+                        name: 'read_file',
+                        arguments: '{"path":"/state/variables.json"}',
+                    },
+                },
+            ],
+        },
+        {
+            role: 'tool',
+            tool_call_id: 'call_init_read_1',
+            name: 'read_file',
+            content: '{"status":"ready"}',
+        },
+    ],
+    null,
+    2,
+);
+
+const CUSTOM_ASSISTANT_PREFILL_TEMPLATE = JSON.stringify(
+    {
+        role: 'assistant',
+        content: '好的，我将严格按照设定与工具规范执行。',
+        partial: true,
+    },
+    null,
+    2,
+);
+
+const PROMPT_ROLE_OPTIONS: ReadonlyArray<{ value: PromptBlock['role']; label: string }> = [
+    { value: 'system', label: 'system' },
+    { value: 'user', label: 'user' },
+    { value: 'assistant', label: 'assistant' },
+    { value: 'custom', label: 'custom (自定义 JSON 消息)' },
+];
+
+const STRICT_TOOL_LOOP_OPTIONS: ReadonlyArray<{ value: StrictToolLoopOverride; label: string }> = [
+    { value: 'inherit', label: '跟随连接 (inherit)' },
+    { value: 'on', label: '强制开启 (on)' },
+    { value: 'off', label: '强制关闭 (off)' },
+];
+
+function hasTrailingSystemInPrefix(blocks: readonly PromptBlock[]): boolean {
+    let seenNonSystemPrefix = false;
+    for (const block of blocks) {
+        if (!block.enabled || block.placement !== 'prefix') {
+            continue;
+        }
+        if (block.role === 'system') {
+            if (seenNonSystemPrefix) {
+                return true;
+            }
+        } else {
+            seenNonSystemPrefix = true;
+        }
+    }
+    return false;
+}
 
 const BUILTIN_TOOL_DESCRIPTIONS: Record<string, string> = {
     list_dir: '列出 VFS 目录结构',
@@ -89,12 +170,40 @@ function PromptBlockCard({
         (next) => onUpdate({ name: next }),
         { allowEmpty: false },
     );
-    const contentDraft = useDraftString(
-        resetKey,
-        block.content,
-        (next) => onUpdate({ content: next }),
-        { allowEmpty: true },
+    const [contentText, setContentText] = useState(block.content);
+    const prevContentKeyRef = useRef(resetKey);
+    const lastCommittedContentRef = useRef(block.content);
+
+    useEffect(() => {
+        if (prevContentKeyRef.current !== resetKey) {
+            prevContentKeyRef.current = resetKey;
+            lastCommittedContentRef.current = block.content;
+            setContentText(block.content);
+            return;
+        }
+        if (block.content !== lastCommittedContentRef.current) {
+            lastCommittedContentRef.current = block.content;
+            setContentText(block.content);
+        }
+    }, [block.content, resetKey]);
+
+    const customValidation = useMemo(
+        () => (block.role === 'custom' ? validateCustomPromptBlock(contentText) : null),
+        [block.role, contentText],
     );
+
+    const handleContentChange = (next: string) => {
+        setContentText(next);
+        if (block.role === 'custom') {
+            const validation = validateCustomPromptBlock(next);
+            if (!validation.valid) {
+                return;
+            }
+        }
+        lastCommittedContentRef.current = next;
+        onUpdate({ content: next });
+    };
+
     const orderDraft = useDraftNumber(
         `${resetKey}:order:${index}`,
         index + 1,
@@ -125,6 +234,12 @@ function PromptBlockCard({
                 <div class="ag-row-wrap" style={{ flex: '1 1 200px', minWidth: 0 }}>
                     <Badge tone={block.placement === 'prefix' ? 'primary' : 'warning'}>
                         #{index + 1} · {block.placement === 'prefix' ? 'Prefix' : 'Tail'}
+                    </Badge>
+                    <Badge
+                        tone={block.role === 'custom' ? 'primary' : 'neutral'}
+                        className="ag-mono"
+                    >
+                        {block.role}
                     </Badge>
                     <div style={{ flex: '1 1 160px', minWidth: 0 }}>
                         <TextInput
@@ -197,15 +312,18 @@ function PromptBlockCard({
                 </FormField>
 
                 <FormField label="消息角色 (Role)">
-                    <SelectInput
+                    <SelectInput<PromptBlock['role']>
                         ariaLabel="积木角色"
                         value={block.role}
-                        options={[
-                            { value: 'system', label: 'system' },
-                            { value: 'user', label: 'user' },
-                            { value: 'assistant', label: 'assistant' },
-                        ]}
-                        onChange={(role) => onUpdate({ role })}
+                        options={PROMPT_ROLE_OPTIONS}
+                        onChange={(role) => {
+                            if (role !== 'custom' && contentText !== lastCommittedContentRef.current) {
+                                lastCommittedContentRef.current = contentText;
+                                onUpdate({ role, content: contentText });
+                            } else {
+                                onUpdate({ role });
+                            }
+                        }}
                     />
                 </FormField>
             </div>
@@ -222,14 +340,73 @@ function PromptBlockCard({
                 />
             </FormField>
 
+            {block.role === 'custom' ? (
+                <div class="ag-row-wrap" role="toolbar" aria-label="自定义 JSON 快捷模板">
+                    <Button
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => handleContentChange(CUSTOM_INIT_TOOL_CONTEXT_TEMPLATE)}
+                    >
+                        插入初始工具上下文模板
+                    </Button>
+                    <Button
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => handleContentChange(CUSTOM_ASSISTANT_PREFILL_TEMPLATE)}
+                    >
+                        插入 Assistant Prefill 模板
+                    </Button>
+                </div>
+            ) : null}
+
             <CodeEditor
                 label="积木指令正文"
-                languageHint="markdown"
+                languageHint={block.role === 'custom' ? 'json' : 'markdown'}
                 rows={4}
                 minHeight="110px"
-                value={contentDraft.value}
-                onChange={contentDraft.onInput}
+                placeholder={
+                    block.role === 'custom'
+                        ? '输入合法 JSON 消息对象 {...}、消息数组 [{...}] 或外层 EJS 控制流模板...'
+                        : undefined
+                }
+                value={contentText}
+                onChange={handleContentChange}
             />
+
+            {block.role === 'custom' && customValidation && !customValidation.valid ? (
+                <div class="ag-banner ag-banner-error" role="alert">
+                    {customValidation.errors.join('；')}
+                </div>
+            ) : null}
+
+            {block.role === 'custom' && customValidation?.mode === 'ejs_template' ? (
+                <div class="ag-banner ag-banner-primary" role="status">
+                    {CUSTOM_EJS_INFO_HINT}
+                </div>
+            ) : null}
+
+            {block.role === 'custom' && customValidation && customValidation.valid ? (() => {
+                const filteredWarnings = customValidation.warnings.filter(
+                    (w) =>
+                        customValidation.mode !== 'ejs_template'
+                        || !w.includes('检测到外层 EJS 控制流'),
+                );
+                if (filteredWarnings.length === 0) {
+                    return null;
+                }
+                if (customValidation.mode === 'empty') {
+                    return (
+                        <div class="ag-field-hint" role="status">
+                            {filteredWarnings.join(' ')}
+                        </div>
+                    );
+                }
+                return (
+                    <div class="ag-banner ag-banner-warning" role="status">
+                        {filteredWarnings.join('；')}
+                    </div>
+                );
+            })() : null}
         </div>
     );
 }
@@ -822,6 +999,20 @@ export function AgentsView(props: Partial<ConsoleViewProps> = {}) {
                                 />
                             </FormField>
 
+                            <FormField
+                                label="强约束工具闭环"
+                                hint="strictToolLoop · 覆盖当前连接的强约束工具闭环开关"
+                            >
+                                <SelectInput<StrictToolLoopOverride>
+                                    ariaLabel="强约束工具闭环"
+                                    value={activeAgent.strictToolLoop ?? 'inherit'}
+                                    options={STRICT_TOOL_LOOP_OPTIONS}
+                                    onChange={(strictToolLoop) =>
+                                        mutateActiveAgent((ag) => ({ ...ag, strictToolLoop }))
+                                    }
+                                />
+                            </FormField>
+
                             {activeAgent.sessionMode === 'ephemeral' ? (
                                 <FormField
                                     label="瞬态窗口轮数 (ephemeralWindowSize)"
@@ -897,6 +1088,15 @@ export function AgentsView(props: Partial<ConsoleViewProps> = {}) {
                         </Button>
                     }
                 >
+                    {hasTrailingSystemInPrefix(activeAgent.promptBlocks) ? (
+                        <div
+                            class="ag-banner ag-banner-warning"
+                            role="status"
+                            style={{ marginBottom: '10px' }}
+                        >
+                            提示：当前 Prefix 区域存在位于 custom / user / assistant 积木之后的 system 积木。Gemini 与 Claude 仅会将前导连续 system 消息放入顶层系统指令，建议将 system 积木置于 Prefix 最前。
+                        </div>
+                    ) : null}
                     {activeAgent.promptBlocks.length === 0 ? (
                         <EmptyState
                             title="暂无提示词积木"

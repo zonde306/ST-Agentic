@@ -89,6 +89,8 @@ export interface CanonicalToolCall {
     name: string;
     arguments: string;
     thoughtSignature?: string;
+    /** Unknown vendor extension fields preserved verbatim (prototype-pollution keys filtered). */
+    extraFields?: Record<string, unknown>;
 }
 
 export interface CanonicalMessage {
@@ -99,6 +101,8 @@ export interface CanonicalMessage {
     toolCalls?: CanonicalToolCall[];
     toolCallId?: string;
     toolName?: string;
+    /** Unknown top-level vendor extension fields preserved verbatim (e.g. Kimi partial: true, DeepSeek prefix: true). */
+    extraFields?: Record<string, unknown>;
 }
 
 export interface CanonicalToolSchema {

@@ -1,3 +1,18 @@
+export const ROUND_RETRY_ERROR_CODES = {
+    EMPTY_RESPONSE: 'EMPTY_RESPONSE',
+    TOOL_CHOICE_VIOLATION: 'TOOL_CHOICE_VIOLATION',
+    MALFORMED_TOOL_CALL: 'MALFORMED_TOOL_CALL',
+} as const;
+
+export type RoundRetryErrorCode =
+    (typeof ROUND_RETRY_ERROR_CODES)[keyof typeof ROUND_RETRY_ERROR_CODES];
+
+const ROUND_RETRY_ERROR_CODE_SET = new Set<string>(Object.values(ROUND_RETRY_ERROR_CODES));
+
+export function isRoundRetryErrorCode(code: unknown): code is RoundRetryErrorCode {
+    return typeof code === 'string' && ROUND_RETRY_ERROR_CODE_SET.has(code);
+}
+
 export interface LLMTransportErrorOptions {
     status?: number;
     code?: string;
@@ -23,7 +38,10 @@ export class LLMTransportError extends Error {
         this.status = options.status;
         this.code = options.code;
         this.retryable =
-            options.retryable ?? (options.status !== undefined ? isRetryableStatus(options.status) : false);
+            options.retryable
+            ?? (options.status !== undefined
+                ? isRetryableStatus(options.status)
+                : isRoundRetryErrorCode(options.code));
         this.retryAfterMs = options.retryAfterMs;
         this.responseBody = options.responseBody;
     }
@@ -393,4 +411,75 @@ export function parseContextOverflowError(error: unknown): ContextOverflowInfo |
 
 export function isContextOverflowError(error: unknown): boolean {
     return parseContextOverflowError(error) !== null;
+}
+
+export function isLengthFinishReason(finishReason?: string): boolean {
+    return (
+        finishReason === 'length'
+        || finishReason === 'max_tokens'
+        || finishReason === 'MAX_TOKENS'
+    );
+}
+
+/**
+ * Returns `true` when `raw` is a string that parses to a non-null plain JSON object (`{...}`).
+ * Used to detect truncated or malformed tool call argument payloads from degraded models.
+ */
+export function isValidJsonObjectString(raw: unknown): boolean {
+    if (typeof raw !== 'string') {
+        return false;
+    }
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+        return false;
+    }
+    try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        return Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed);
+    } catch {
+        return false;
+    }
+}
+
+const ROUND_RETRYABLE_MESSAGE_RE =
+    /failed to fetch|network\s*error|load failed|connection reset|socket hang up|econnreset|econnrefused|etimedout|incomplete_chunked_encoding|premature close|body stream|stream read failed|sse.*(?:dropped|closed|error)|temporarily unavailable|service unavailable|bad gateway|gateway timeout|overloaded|rate[\s_-]?limit|too many requests|empty_response|tool_choice_violation|malformed_tool_call/i;
+
+/**
+ * Unified per-round retryability classifier shared across `AgentRunner`, `AssistantRunner`,
+ * and `SideGenService`. Rejects aborts and context overflows, honors `LLMTransportError.retryable`,
+ * HTTP 408/429/5xx, `ROUND_RETRY_ERROR_CODES`, and transient stream/network drop patterns.
+ */
+export function isRetryableRoundError(error: unknown): boolean {
+    if (error === null || error === undefined) {
+        return false;
+    }
+    if (isAbortError(error)) {
+        return false;
+    }
+    if (typeof error === 'object') {
+        const name = (error as { name?: unknown }).name;
+        if (name === 'AssistantAbortError') {
+            return false;
+        }
+    }
+    if (isContextOverflowError(error)) {
+        return false;
+    }
+    if (error instanceof LLMTransportError) {
+        return error.retryable;
+    }
+    if (typeof error === 'object') {
+        const maybe = error as { retryable?: unknown; status?: unknown; code?: unknown };
+        if (typeof maybe.retryable === 'boolean') {
+            return maybe.retryable;
+        }
+        if (isRoundRetryErrorCode(maybe.code)) {
+            return true;
+        }
+        if (typeof maybe.status === 'number') {
+            return isRetryableStatus(maybe.status);
+        }
+    }
+    const msg = error instanceof Error ? error.message : String(error);
+    return ROUND_RETRYABLE_MESSAGE_RE.test(msg);
 }

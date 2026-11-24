@@ -3,6 +3,7 @@ import type {
     CapsulePersistMode,
     CapsulePosition,
     ConsoleTabId,
+    GenerationEventPayload,
     InterruptedReason,
     MessageTarget,
     ThemeMode,
@@ -19,6 +20,7 @@ export type CapsuleStatus =
     | 'idle'
     | 'retrieving'
     | 'streaming'
+    | 'retrying'
     | 'done'
     | 'background-running'
     | 'interrupted'
@@ -46,6 +48,9 @@ export interface AgenticCapsuleData {
     errorMessage?: string;
     interruptedReason?: InterruptedReason;
     canResume?: boolean;
+    retryAttempt?: number;
+    retryMaxAttempts?: number;
+    retryReason?: string;
     taskId?: string;
     taskLabel?: string;
     badges: CapsuleBadgeItem[];
@@ -72,6 +77,9 @@ const CAPSULE_OBSERVED_ATTRIBUTES = [
     'error-message',
     'interrupted-reason',
     'can-resume',
+    'retry-attempt',
+    'retry-max-attempts',
+    'retry-reason',
 ] as const;
 
 const CAPSULE_STYLES = `
@@ -154,7 +162,8 @@ const CAPSULE_STYLES = `
     border-color: color-mix(in srgb, var(--cap-error) 55%, var(--cap-border));
 }
 
-.cap-shell[data-status="interrupted"] {
+.cap-shell[data-status="interrupted"],
+.cap-shell[data-status="retrying"] {
     border-color: color-mix(in srgb, var(--cap-warning) 60%, var(--cap-border));
 }
 
@@ -210,7 +219,8 @@ const CAPSULE_STYLES = `
     color: var(--cap-success);
 }
 
-.cap-shell[data-status="interrupted"] .cap-indicator {
+.cap-shell[data-status="interrupted"] .cap-indicator,
+.cap-shell[data-status="retrying"] .cap-indicator {
     color: var(--cap-warning);
 }
 
@@ -494,6 +504,15 @@ function buildDefaultSummary(state: AgenticCapsuleData): string {
                 return `已检索 ${state.stepCount} 步 · 缓存命中 ${hitText} · 流式输出中`;
             }
             return hitText ? `缓存命中 ${hitText} · 流式输出中` : '主叙事流式生成中...';
+        case 'retrying': {
+            const attempt = state.retryAttempt ?? 1;
+            const maxAttempts = state.retryMaxAttempts;
+            const progress =
+                typeof maxAttempts === 'number' && maxAttempts > 0
+                    ? ` (${attempt}/${maxAttempts})`
+                    : ` (${attempt})`;
+            return `网络/模型异常，自动重试${progress}...`;
+        }
         case 'background-running':
             return state.stepCount > 0 && hitText
                 ? `${state.stepCount} 步 · 缓存 ${hitText} · 后台运行中`
@@ -557,6 +576,7 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
 
     private _store: AppStore | null = null;
     private _storeUnsubscribe: (() => void) | null = null;
+    private _eventsUnsubscribe: (() => void) | null = null;
     private _timerId: ReturnType<typeof setInterval> | null = null;
     private _resumePending = false;
     private _shadow: ShadowRoot | null = null;
@@ -626,6 +646,7 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
                     val === 'idle'
                     || val === 'retrieving'
                     || val === 'streaming'
+                    || val === 'retrying'
                     || val === 'done'
                     || val === 'background-running'
                     || val === 'interrupted'
@@ -682,6 +703,20 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
                     this._state.canResume = undefined;
                 }
                 break;
+            case 'retry-attempt': {
+                const num = Number(val);
+                this._state.retryAttempt = Number.isFinite(num) && num > 0 ? Math.floor(num) : undefined;
+                break;
+            }
+            case 'retry-max-attempts': {
+                const num = Number(val);
+                this._state.retryMaxAttempts =
+                    Number.isFinite(num) && num > 0 ? Math.floor(num) : undefined;
+                break;
+            }
+            case 'retry-reason':
+                this._state.retryReason = val || undefined;
+                break;
         }
         this.render();
         this.syncTicker();
@@ -704,7 +739,11 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
                 ? [...patch.backgroundTasks]
                 : this._state.backgroundTasks,
         };
-        if (patch.position && this.getAttribute('position') !== patch.position) {
+        if (
+            patch.position
+            && typeof this.getAttribute === 'function'
+            && this.getAttribute('position') !== patch.position
+        ) {
             this.setAttribute('position', patch.position);
         }
         this.render();
@@ -801,12 +840,59 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
      */
     connectStore(store: AppStore, target?: MessageTarget): () => void {
         this._storeUnsubscribe?.();
+        this._eventsUnsubscribe?.();
+        this._eventsUnsubscribe = null;
         this._store = store;
 
         if (target) {
             this._state.messageId = target.messageId;
             this._state.swipeId = target.swipeId;
         }
+
+        const handleGenerationEvent = (event: GenerationEventPayload) => {
+            if (
+                event.target.messageId !== this._state.messageId
+                || event.target.swipeId !== this._state.swipeId
+            ) {
+                return;
+            }
+
+            if (event.kind === 'turn_retrying') {
+                this.setState({
+                    status: 'retrying',
+                    retryAttempt: event.retryAttempt ?? 1,
+                    retryMaxAttempts: event.retryMaxAttempts,
+                    retryReason: event.retryReason,
+                    summary: '',
+                });
+                return;
+            }
+
+            if (this._state.status === 'retrying') {
+                if (
+                    event.kind === 'text_delta'
+                    || event.kind === 'reasoning_delta'
+                    || event.kind === 'output_preview'
+                ) {
+                    this.setState({
+                        status: 'streaming',
+                        retryAttempt: undefined,
+                        retryMaxAttempts: undefined,
+                        retryReason: undefined,
+                        summary: '',
+                    });
+                } else if (event.kind === 'tool_started') {
+                    this.setState({
+                        status: 'retrieving',
+                        currentStep: event.toolStep ? `Tool: ${event.toolStep.toolName}` : undefined,
+                        retryAttempt: undefined,
+                        retryMaxAttempts: undefined,
+                        retryReason: undefined,
+                        summary: '',
+                    });
+                }
+            }
+        };
 
         const syncFromStore = () => {
             const snap = store.getSnapshot();
@@ -846,12 +932,21 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
                 derivedStatus = 'background-running';
             }
 
+            const clearRetryState = derivedStatus !== 'retrying';
+
             this.setState({
                 theme: snap.themeMode === 'auto' ? snap.resolvedTheme : snap.themeMode,
                 position: snap.settings.capsulePosition,
                 persistMode: snap.settings.capsulePersistMode,
                 backgroundTasks: matchingTasks,
                 status: derivedStatus,
+                ...(clearRetryState
+                    ? {
+                        retryAttempt: undefined,
+                        retryMaxAttempts: undefined,
+                        retryReason: undefined,
+                    }
+                    : {}),
                 interruptedReason:
                     mainTrace?.status === 'interrupted'
                         ? (mainTrace.interruptedReason ?? this._state.interruptedReason)
@@ -876,6 +971,9 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
 
         syncFromStore();
         this._storeUnsubscribe = store.subscribe(syncFromStore);
+        if (store.services?.subscribeEvents) {
+            this._eventsUnsubscribe = store.services.subscribeEvents(handleGenerationEvent);
+        }
         return () => {
             this.disconnectStore();
         };
@@ -885,6 +983,8 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
     disconnectStore(): void {
         this._storeUnsubscribe?.();
         this._storeUnsubscribe = null;
+        this._eventsUnsubscribe?.();
+        this._eventsUnsubscribe = null;
     }
 
     private resolveStore(): AppStore | null {
@@ -1170,6 +1270,7 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
             activeTasks.length > 0
             || this._state.status === 'retrieving'
             || this._state.status === 'streaming'
+            || this._state.status === 'retrying'
             || this._state.status === 'background-running'
             || this._state.status === 'interrupted'
             || this._state.status === 'error';
@@ -1187,6 +1288,7 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
         if (
             this._state.status === 'retrieving'
             || this._state.status === 'streaming'
+            || this._state.status === 'retrying'
             || this._state.status === 'background-running'
         ) {
             const pulse = document.createElement('span');
@@ -1202,7 +1304,9 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
         const detailSuffix =
             this._state.status === 'interrupted' && this._state.errorMessage?.trim()
                 ? ` (${this._state.errorMessage.trim()})`
-                : '';
+                : this._state.status === 'retrying' && this._state.retryReason?.trim()
+                    ? ` (${this._state.retryReason.trim()})`
+                    : '';
         this._openBtnEl.title = `#${this._state.messageId}#${this._state.swipeId} · ${summaryText}${detailSuffix}`;
 
         // Dedicated resume action button when interrupted

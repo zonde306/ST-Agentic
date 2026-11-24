@@ -94,6 +94,8 @@ export function createDefaultConnection(overrides: Partial<ApiConnection> = {}):
         maxCacheBreakpoints: 4,
         promptPostProcessing: 'none',
         linkedPreset: '',
+        strictToolLoop: false,
+        roundMaxRetries: 2,
     };
 
     return {
@@ -137,6 +139,7 @@ export function createDefaultMainAgent(overrides: Partial<AgentProfile> = {}): A
         ...(overrides.description !== undefined
             ? { description: overrides.description }
             : {}),
+        strictToolLoop: overrides.strictToolLoop ?? 'inherit',
     };
 }
 

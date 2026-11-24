@@ -78,6 +78,35 @@ export function defaultShouldRetry(error: unknown): boolean {
     return true;
 }
 
+export interface RoundRetryDelayParams {
+    error?: unknown;
+    /** 1-based retry attempt number (1 for first retry). */
+    attempt: number;
+    /** Base delay in ms before the first retry (default: 1200). */
+    initialDelayMs?: number;
+    /** Maximum backoff delay in ms (default: 10_000). */
+    maxDelayMs?: number;
+    /** Exponential multiplier between retries (default: 2). */
+    backoffFactor?: number;
+    /** Proportional jitter in [0, 1] applied to computed delay (default: 0.25). */
+    jitterRatio?: number;
+}
+
+function extractRetryAfterMs(error: unknown): number | undefined {
+    if (error instanceof LLMTransportError) {
+        return typeof error.retryAfterMs === 'number' && Number.isFinite(error.retryAfterMs)
+            ? error.retryAfterMs
+            : undefined;
+    }
+    if (error && typeof error === 'object') {
+        const candidate = (error as { retryAfterMs?: unknown }).retryAfterMs;
+        if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+            return candidate;
+        }
+    }
+    return undefined;
+}
+
 function computeBackoffDelay(
     error: unknown,
     attempt: number,
@@ -89,8 +118,9 @@ function computeBackoffDelay(
     const expDelay = initialDelayMs * Math.pow(backoffFactor, Math.max(0, attempt - 1));
     let delay = Math.min(maxDelayMs, Math.max(0, expDelay));
 
-    if (error instanceof LLMTransportError && typeof error.retryAfterMs === 'number' && Number.isFinite(error.retryAfterMs)) {
-        delay = Math.min(maxDelayMs, Math.max(delay, error.retryAfterMs));
+    const retryAfterMs = extractRetryAfterMs(error);
+    if (retryAfterMs !== undefined) {
+        delay = Math.min(maxDelayMs, Math.max(delay, retryAfterMs));
     }
 
     if (jitterRatio > 0 && delay > 0) {
@@ -100,6 +130,26 @@ function computeBackoffDelay(
     }
 
     return delay;
+}
+
+/**
+ * Compute exponential backoff delay with default 25% jitter (`jitterRatio: 0.25`)
+ * for per-round automatic retries, honoring upstream `retryAfterMs` when present.
+ */
+export function computeRoundRetryDelayMs(params: RoundRetryDelayParams): number {
+    const initialDelayMs = Math.max(0, params.initialDelayMs ?? 1200);
+    const maxDelayMs = Math.max(initialDelayMs, params.maxDelayMs ?? 10_000);
+    const backoffFactor = Math.max(1, params.backoffFactor ?? 2);
+    const jitterRatio = params.jitterRatio ?? 0.25;
+    const attempt = Math.max(1, Math.floor(params.attempt));
+    return computeBackoffDelay(
+        params.error,
+        attempt,
+        initialDelayMs,
+        maxDelayMs,
+        backoffFactor,
+        jitterRatio,
+    );
 }
 
 /**

@@ -33,6 +33,7 @@ import type {
     WICategory,
 } from '@/core/types';
 import { canonicalClone, stripJsonSchemaMeta } from '@/core/utils';
+import { prerenderPromptBlocks, renderPromptBlockSync } from './prompt-block-renderer';
 import { TrajectoryStore } from './trajectory-store';
 import { estimateRequestTokens, groupLayer1Turns } from './watermark-compactor';
 
@@ -90,6 +91,8 @@ export interface ContextAssembleInput {
     systemBasePrompt?: string;
     promptTriggerContext?: PromptTriggerContext;
     forceRecompilePrefix?: boolean;
+    /** Optional pre-rendered prompt blocks (keyed by `PromptBlock.id`) from async EJS / custom JSON rendering. */
+    preRenderedBlocks?: ReadonlyMap<string, CanonicalMessage[]>;
 
     // Layer 1 inputs
     trajectoryStore?: TrajectoryStore;
@@ -399,6 +402,7 @@ export class ContextAssembler {
         hollowThreshold?: number;
         systemBasePrompt?: string;
         promptTriggerContext?: PromptTriggerContext;
+        preRenderedBlocks?: ReadonlyMap<string, CanonicalMessage[]>;
         hostBridge?: HostBridge;
     }): StaticPrefixResult {
         const canonicalTools = canonicalizeTools(input.tools);
@@ -407,24 +411,43 @@ export class ContextAssembler {
 
         // 1. Decoupled System Base (multi-character / world-simulator safe)
         const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
-        let rawBaseText = '';
         if (input.systemBasePrompt !== undefined) {
-            rawBaseText = input.systemBasePrompt;
+            const resolvedBase = substituteText(input.systemBasePrompt, input.hostBridge).trim();
+            if (resolvedBase) {
+                const baseRole =
+                    systemBaseBlock?.role && systemBaseBlock.role !== 'custom'
+                        ? systemBaseBlock.role
+                        : 'system';
+                layer0Messages.push({
+                    role: baseRole,
+                    content: resolvedBase,
+                });
+            }
         } else if (systemBaseBlock) {
-            rawBaseText =
+            if (
                 systemBaseBlock.enabled
                 && matchesPromptTriggers(systemBaseBlock.triggers, input.promptTriggerContext)
-                    ? systemBaseBlock.content
-                    : '';
+            ) {
+                if (input.preRenderedBlocks?.has(systemBaseBlock.id)) {
+                    for (const msg of input.preRenderedBlocks.get(systemBaseBlock.id) ?? []) {
+                        layer0Messages.push(canonicalClone(msg));
+                    }
+                } else {
+                    const rendered = renderPromptBlockSync(systemBaseBlock, {
+                        hostBridge: input.hostBridge,
+                        precedingMessages: layer0Messages,
+                    });
+                    layer0Messages.push(...rendered);
+                }
+            }
         } else {
-            rawBaseText = this.defaultSystemBase;
-        }
-        const resolvedBase = substituteText(rawBaseText, input.hostBridge).trim();
-        if (resolvedBase) {
-            layer0Messages.push({
-                role: systemBaseBlock?.role ?? 'system',
-                content: resolvedBase,
-            });
+            const resolvedBase = substituteText(this.defaultSystemBase, input.hostBridge).trim();
+            if (resolvedBase) {
+                layer0Messages.push({
+                    role: 'system',
+                    content: resolvedBase,
+                });
+            }
         }
 
         // 2. Category ① `system_rule` compiled block
@@ -485,7 +508,7 @@ export class ContextAssembler {
             content: manifestText,
         });
 
-        // 4. Additional `prefix` PromptBlocks (preserving explicit order and role)
+        // 4. Additional `prefix` PromptBlocks (preserving explicit order, role, and multi-message custom blocks)
         const prefixBlocks = promptBlocks.filter(
             (b: PromptBlock) =>
                 b.enabled
@@ -495,12 +518,16 @@ export class ContextAssembler {
                 && matchesPromptTriggers(b.triggers, input.promptTriggerContext),
         );
         for (const block of prefixBlocks) {
-            const rendered = substituteText(block.content, input.hostBridge).trim();
-            if (rendered) {
-                layer0Messages.push({
-                    role: block.role,
-                    content: rendered,
+            if (input.preRenderedBlocks?.has(block.id)) {
+                for (const msg of input.preRenderedBlocks.get(block.id) ?? []) {
+                    layer0Messages.push(canonicalClone(msg));
+                }
+            } else {
+                const rendered = renderPromptBlockSync(block, {
+                    hostBridge: input.hostBridge,
+                    precedingMessages: layer0Messages,
                 });
+                layer0Messages.push(...rendered);
             }
         }
 
@@ -569,6 +596,7 @@ export class ContextAssembler {
                 hollowThreshold: input.hollowThreshold,
                 systemBasePrompt: input.systemBasePrompt,
                 promptTriggerContext: input.promptTriggerContext,
+                preRenderedBlocks: input.preRenderedBlocks,
                 hostBridge,
             });
             tools = prefix.tools;
@@ -772,6 +800,86 @@ export class ContextAssembler {
             });
         }
 
+        // Pre-render PromptBlocks asynchronously (EJS + custom JSON):
+        // - `prefix` blocks ONLY when Layer 0 is not frozen (or forceRecompilePrefix) to preserve KV cache invariance
+        // - `tail` blocks on every new turn (Layer 2 dynamic tail)
+        const preRenderedBlocks = new Map<string, CanonicalMessage[]>(
+            rest.preRenderedBlocks ? Array.from(rest.preRenderedBlocks.entries()) : [],
+        );
+        const promptBlocks = rest.agent.promptBlocks ?? [];
+        const isPersistent = rest.agent.sessionMode === 'persistent';
+        const hasTriggerScopedBlocks = promptBlocks.some(
+            (b) => b.triggers && b.triggers.length > 0,
+        );
+        const isNonMainTriggerRun =
+            isPersistent
+            && rest.promptTriggerContext !== undefined
+            && rest.promptTriggerContext.kind !== 'main'
+            && hasTriggerScopedBlocks;
+        const willUseFrozenPrefix =
+            isPersistent
+            && !rest.forceRecompilePrefix
+            && !isNonMainTriggerRun
+            && Boolean(rest.trajectoryStore?.getFrozenPrefix(rest.agent.id));
+
+        if (!willUseFrozenPrefix) {
+            const prefixBlocksToRender: PromptBlock[] = [];
+            const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
+            if (
+                rest.systemBasePrompt === undefined
+                && systemBaseBlock
+                && systemBaseBlock.enabled
+                && systemBaseBlock.content.trim().length > 0
+                && matchesPromptTriggers(systemBaseBlock.triggers, rest.promptTriggerContext)
+                && !preRenderedBlocks.has(systemBaseBlock.id)
+            ) {
+                prefixBlocksToRender.push(systemBaseBlock);
+            }
+            for (const block of promptBlocks) {
+                if (
+                    block.enabled
+                    && block.placement === 'prefix'
+                    && block.id !== 'system_base'
+                    && block.content.trim().length > 0
+                    && matchesPromptTriggers(block.triggers, rest.promptTriggerContext)
+                    && !preRenderedBlocks.has(block.id)
+                ) {
+                    prefixBlocksToRender.push(block);
+                }
+            }
+            if (prefixBlocksToRender.length > 0) {
+                const renderedPrefix = await prerenderPromptBlocks(prefixBlocksToRender, {
+                    hostBridge,
+                    vars: rest.vars,
+                });
+                for (const [blockId, messages] of renderedPrefix.entries()) {
+                    preRenderedBlocks.set(blockId, messages);
+                }
+            }
+        }
+
+        if (rest.inFlightMessages === undefined) {
+            const tailBlocksToRender = promptBlocks.filter(
+                (b: PromptBlock) =>
+                    b.enabled
+                    && b.placement === 'tail'
+                    && b.content.trim().length > 0
+                    && matchesPromptTriggers(b.triggers, rest.promptTriggerContext)
+                    && !preRenderedBlocks.has(b.id),
+            );
+            if (tailBlocksToRender.length > 0) {
+                const tailMacroOverrides = buildLayer2MacroOverrides(rest.vars, rest.macroOverrides);
+                const renderedTail = await prerenderPromptBlocks(tailBlocksToRender, {
+                    hostBridge,
+                    macroOverrides: tailMacroOverrides,
+                    vars: rest.vars,
+                });
+                for (const [blockId, messages] of renderedTail.entries()) {
+                    preRenderedBlocks.set(blockId, messages);
+                }
+            }
+        }
+
         return this.assemble({
             ...rest,
             loreEntries,
@@ -779,6 +887,7 @@ export class ContextAssembler {
             sideClues,
             sideHint,
             tailRadar: runTailRadar ? tailRadar : undefined,
+            preRenderedBlocks,
             hostBridge,
         });
     }
@@ -897,7 +1006,7 @@ export class ContextAssembler {
             }
         }
 
-        // 3. Enabled `tail` PromptBlocks
+        // 3. Enabled `tail` PromptBlocks (supporting multi-message custom blocks & async pre-rendered EJS)
         const tailPromptBlocks = (input.agent.promptBlocks ?? []).filter(
             (b: PromptBlock) =>
                 b.enabled
@@ -906,12 +1015,17 @@ export class ContextAssembler {
                 && matchesPromptTriggers(b.triggers, input.promptTriggerContext),
         );
         for (const block of tailPromptBlocks) {
-            const rendered = substituteText(block.content, input.hostBridge, macroOverrides).trim();
-            if (rendered) {
-                layer2Messages.push({
-                    role: block.role,
-                    content: rendered,
+            if (input.preRenderedBlocks?.has(block.id)) {
+                for (const msg of input.preRenderedBlocks.get(block.id) ?? []) {
+                    layer2Messages.push(canonicalClone(msg));
+                }
+            } else {
+                const rendered = renderPromptBlockSync(block, {
+                    hostBridge: input.hostBridge,
+                    macroOverrides,
+                    precedingMessages: layer2Messages,
                 });
+                layer2Messages.push(...rendered);
             }
         }
 

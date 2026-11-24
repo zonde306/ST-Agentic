@@ -28,6 +28,7 @@ import type { ChatDataStore } from '@/core/store';
 import type { GenerationAction } from '@/core/triggers';
 import type {
     CapsulePosition,
+    GenerationEventPayload,
     InterruptedReason,
     MessageTarget,
     RegexRule,
@@ -69,6 +70,14 @@ export interface StreamSessionInterruptedOptions {
     stepCount?: number;
     cacheHitRate?: number;
     onResume?: () => void | Promise<void>;
+}
+
+export interface StreamSessionRetryingOptions {
+    attempt: number;
+    maxAttempts?: number;
+    delayMs?: number;
+    reason?: string;
+    rollbackPreviewText?: string;
 }
 
 interface ExtractedDisplayParts {
@@ -237,6 +246,7 @@ export class StreamRenderer {
 
     private capsuleEl: AgenticCapsuleElement | null = null;
     private capsuleDisconnect?: () => void;
+    private eventsUnsubscribe?: () => void;
 
     private constructor(
         deps: StreamRendererDependencies,
@@ -258,6 +268,7 @@ export class StreamRenderer {
         this.previousChatSwipeInfo = previousChatSwipeInfo;
 
         this.mountCapsule();
+        this.attachEventListener();
     }
 
     /**
@@ -479,7 +490,69 @@ export class StreamRenderer {
             status: 'retrieving',
             currentStep: stepLabel,
             stepCount: this.stepCount,
+            summary: '',
+            retryAttempt: undefined,
+            retryMaxAttempts: undefined,
+            retryReason: undefined,
         });
+    }
+
+    /**
+     * Handle live `GenerationEventPayload` notifications (e.g. `turn_retrying`) bound to
+     * this renderer's `(messageId, swipeId)` target.
+     */
+    handleGenerationEvent(event: GenerationEventPayload): void {
+        if (this.finalized) {
+            return;
+        }
+        if (
+            event.target.messageId !== this.target.messageId
+            || event.target.swipeId !== this.target.swipeId
+        ) {
+            return;
+        }
+        if (event.kind === 'turn_retrying') {
+            this.onTurnRetrying({
+                attempt: event.retryAttempt ?? 1,
+                maxAttempts: event.retryMaxAttempts,
+                delayMs: event.retryDelayMs,
+                reason: event.retryReason,
+            });
+        }
+    }
+
+    /**
+     * Surface transient single-round auto-retry status inside `<agentic-capsule>` and
+     * roll back any dirty streaming preview until the next retry chunk arrives.
+     */
+    onTurnRetrying(options: StreamSessionRetryingOptions): void {
+        if (this.finalized) {
+            return;
+        }
+        const attempt = Math.max(1, Math.floor(options.attempt));
+        const maxAttempts =
+            typeof options.maxAttempts === 'number' && options.maxAttempts > 0
+                ? Math.floor(options.maxAttempts)
+                : undefined;
+        const progress = maxAttempts !== undefined ? `(${attempt}/${maxAttempts})` : `(${attempt})`;
+
+        this.currentRoundText = '';
+        this.pendingToolReset = false;
+        if (options.rollbackPreviewText !== undefined) {
+            this.outputPreviewText = options.rollbackPreviewText;
+            this.hasOutputPreview = true;
+        }
+
+        this.capsuleEl?.setState({
+            status: 'retrying',
+            currentStep: `自动重试 ${progress}...`,
+            summary: '',
+            stepCount: this.stepCount,
+            retryAttempt: attempt,
+            retryMaxAttempts: maxAttempts,
+            retryReason: options.reason,
+        });
+        this.scheduleFlush();
     }
 
     /** Push an incremental full `/output.md` preview extracted from streaming tool arguments. */
@@ -493,6 +566,10 @@ export class StreamRenderer {
             status: 'streaming',
             currentStep: 'Writing /output.md',
             stepCount: this.stepCount,
+            summary: '',
+            retryAttempt: undefined,
+            retryMaxAttempts: undefined,
+            retryReason: undefined,
         });
         this.scheduleFlush();
     }
@@ -511,6 +588,10 @@ export class StreamRenderer {
             status: 'streaming',
             currentStep: 'Streaming response',
             stepCount: this.stepCount,
+            summary: '',
+            retryAttempt: undefined,
+            retryMaxAttempts: undefined,
+            retryReason: undefined,
         });
         this.scheduleFlush();
     }
@@ -529,6 +610,10 @@ export class StreamRenderer {
             status: 'streaming',
             currentStep: 'Reasoning',
             stepCount: this.stepCount,
+            summary: '',
+            retryAttempt: undefined,
+            retryMaxAttempts: undefined,
+            retryReason: undefined,
         });
         this.scheduleFlush();
     }
@@ -544,6 +629,10 @@ export class StreamRenderer {
             status: 'retrieving',
             currentStep: `Tool: ${toolName}`,
             stepCount: this.stepCount,
+            summary: '',
+            retryAttempt: undefined,
+            retryMaxAttempts: undefined,
+            retryReason: undefined,
         });
     }
 
@@ -576,6 +665,10 @@ export class StreamRenderer {
             status: 'retrieving',
             currentStep: `Finished: ${toolName}`,
             stepCount: this.stepCount,
+            summary: '',
+            retryAttempt: undefined,
+            retryMaxAttempts: undefined,
+            retryReason: undefined,
         });
     }
 
@@ -680,6 +773,10 @@ export class StreamRenderer {
             ...(options.cacheHitRate !== undefined ? { cacheHitRate: options.cacheHitRate } : {}),
             canResume: false,
             interruptedReason: undefined,
+            retryAttempt: undefined,
+            retryMaxAttempts: undefined,
+            retryReason: undefined,
+            summary: '',
             errorMessage: '',
             onResume: undefined,
         });
@@ -738,10 +835,15 @@ export class StreamRenderer {
             summary: formatInterruptedSummary(options.reason),
             currentStep: '',
             errorMessage: options.errorMessage ?? '',
+            retryAttempt: undefined,
+            retryMaxAttempts: undefined,
+            retryReason: undefined,
             stepCount: options.stepCount ?? this.stepCount,
             ...(options.cacheHitRate !== undefined ? { cacheHitRate: options.cacheHitRate } : {}),
             ...(options.onResume ? { onResume: options.onResume } : {}),
         });
+        this.eventsUnsubscribe?.();
+        this.eventsUnsubscribe = undefined;
     }
 
     /**
@@ -827,12 +929,20 @@ export class StreamRenderer {
                     status: 'error',
                     errorMessage: options.errorMessage,
                     currentStep: '',
+                    summary: '',
+                    retryAttempt: undefined,
+                    retryMaxAttempts: undefined,
+                    retryReason: undefined,
                     stepCount: this.stepCount,
                 });
             } else {
                 this.capsuleEl.setState({
                     status: 'done',
                     currentStep: options.wasUserStop ? 'Stopped' : '',
+                    summary: '',
+                    retryAttempt: undefined,
+                    retryMaxAttempts: undefined,
+                    retryReason: undefined,
                     stepCount: this.stepCount,
                 });
             }
@@ -874,6 +984,9 @@ export class StreamRenderer {
             stepCount: 0,
             canResume: false,
             interruptedReason: undefined,
+            retryAttempt: undefined,
+            retryMaxAttempts: undefined,
+            retryReason: undefined,
             summary: '',
             errorMessage: '',
             onResume: undefined,
@@ -881,9 +994,22 @@ export class StreamRenderer {
         this.capsuleEl = capsule;
     }
 
+    private attachEventListener(): void {
+        this.eventsUnsubscribe?.();
+        this.eventsUnsubscribe = undefined;
+        const appStore = this.deps.getAppStore?.();
+        if (appStore?.services?.subscribeEvents) {
+            this.eventsUnsubscribe = appStore.services.subscribeEvents((event) => {
+                this.handleGenerationEvent(event);
+            });
+        }
+    }
+
     private detachStoreListener(): void {
         this.capsuleDisconnect?.();
         this.capsuleDisconnect = undefined;
+        this.eventsUnsubscribe?.();
+        this.eventsUnsubscribe = undefined;
     }
 
     private scheduleFlush(): void {

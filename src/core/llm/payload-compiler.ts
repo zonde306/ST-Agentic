@@ -1,9 +1,10 @@
-import type { LLMRequest } from '../bridge';
+import type { LLMRequest, LLMToolChoice } from '../bridge';
 import type {
     ApiConnection,
     ApiProviderFormat,
     CanonicalContentPart,
     CanonicalMessage,
+    CanonicalToolCall,
     CanonicalToolSchema,
 } from '../types';
 import { canonicalClone, canonicalStringify } from '../utils';
@@ -78,6 +79,122 @@ function applyExcludeRecord(target: Record<string, unknown>, exclude: Record<str
     }
 }
 
+function compareCodeUnits(a: string, b: string): number {
+    if (a < b) {
+        return -1;
+    }
+    if (a > b) {
+        return 1;
+    }
+    return 0;
+}
+
+function sanitizeExtraValue(value: unknown, seen = new Set<object>()): unknown {
+    if (value === null || value === undefined) {
+        return value;
+    }
+    if (typeof value === 'boolean' || typeof value === 'string') {
+        return value;
+    }
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) {
+            return null;
+        }
+        return Object.is(value, -0) ? 0 : value;
+    }
+    if (typeof value !== 'object') {
+        return undefined;
+    }
+    if (seen.has(value)) {
+        return undefined;
+    }
+    seen.add(value);
+    try {
+        if (Array.isArray(value)) {
+            return value.map((item) => {
+                const sanitized = sanitizeExtraValue(item, seen);
+                return sanitized === undefined ? null : sanitized;
+            });
+        }
+        const record = value as Record<string, unknown>;
+        const sortedKeys = Object.keys(record).sort(compareCodeUnits);
+        const result: Record<string, unknown> = {};
+        for (const key of sortedKeys) {
+            if (FORBIDDEN_MERGE_KEYS.has(key)) {
+                continue;
+            }
+            const sanitized = sanitizeExtraValue(record[key], seen);
+            if (sanitized !== undefined) {
+                result[key] = sanitized;
+            }
+        }
+        return result;
+    } finally {
+        seen.delete(value);
+    }
+}
+
+function sanitizeExtraFields(
+    extra: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+    if (!extra || !isPlainObject(extra)) {
+        return undefined;
+    }
+    const sanitized = sanitizeExtraValue(extra) as Record<string, unknown>;
+    return Object.keys(sanitized).length > 0 ? sanitized : undefined;
+}
+
+function hasNonEmptyExtraFields(extra: Record<string, unknown> | undefined): boolean {
+    if (!extra || !isPlainObject(extra)) {
+        return false;
+    }
+    for (const key of Object.keys(extra)) {
+        if (FORBIDDEN_MERGE_KEYS.has(key)) {
+            continue;
+        }
+        const val = extra[key];
+        if (val !== undefined && typeof val !== 'function' && typeof val !== 'symbol') {
+            return true;
+        }
+    }
+    return false;
+}
+
+function applyExtraFields(
+    target: Record<string, unknown>,
+    extra: Record<string, unknown> | undefined,
+): void {
+    const sanitized = sanitizeExtraFields(extra);
+    if (!sanitized) {
+        return;
+    }
+    for (const [key, value] of Object.entries(sanitized)) {
+        if (FORBIDDEN_MERGE_KEYS.has(key)) {
+            continue;
+        }
+        target[key] = value;
+    }
+}
+
+function resolveValidAllowedToolNames(
+    toolChoice: LLMToolChoice,
+    tools: readonly CanonicalToolSchema[],
+): string[] {
+    if (!toolChoice.allowedToolNames?.length || tools.length === 0) {
+        return [];
+    }
+    const available = new Set(tools.map((tool) => tool.name));
+    const seen = new Set<string>();
+    const valid: string[] = [];
+    for (const name of toolChoice.allowedToolNames) {
+        if (typeof name === 'string' && available.has(name) && !seen.has(name)) {
+            seen.add(name);
+            valid.push(name);
+        }
+    }
+    return valid;
+}
+
 function cloneContent(content: string | CanonicalContentPart[]): string | CanonicalContentPart[] {
     if (typeof content === 'string') {
         return content;
@@ -85,17 +202,30 @@ function cloneContent(content: string | CanonicalContentPart[]): string | Canoni
     return content.map((part) => ({ ...part }));
 }
 
+function cloneToolCall(tc: CanonicalToolCall): CanonicalToolCall {
+    const sanitizedExtra = sanitizeExtraFields(tc.extraFields);
+    return {
+        id: tc.id,
+        name: tc.name,
+        arguments: tc.arguments,
+        ...(tc.thoughtSignature !== undefined ? { thoughtSignature: tc.thoughtSignature } : {}),
+        ...(sanitizedExtra !== undefined ? { extraFields: sanitizedExtra } : {}),
+    };
+}
+
 function cloneMessage(msg: CanonicalMessage): CanonicalMessage {
+    const sanitizedExtra = sanitizeExtraFields(msg.extraFields);
     return {
         role: msg.role,
         content: cloneContent(msg.content),
         ...(msg.name !== undefined ? { name: msg.name } : {}),
         ...(msg.reasoningContent !== undefined ? { reasoningContent: msg.reasoningContent } : {}),
         ...(msg.toolCalls !== undefined
-            ? { toolCalls: msg.toolCalls.map((tc) => ({ ...tc })) }
+            ? { toolCalls: msg.toolCalls.map(cloneToolCall) }
             : {}),
         ...(msg.toolCallId !== undefined ? { toolCallId: msg.toolCallId } : {}),
         ...(msg.toolName !== undefined ? { toolName: msg.toolName } : {}),
+        ...(sanitizedExtra !== undefined ? { extraFields: sanitizedExtra } : {}),
     };
 }
 
@@ -168,7 +298,9 @@ function squashConsecutiveRoles(
             && prev.role === curr.role
             && curr.role !== 'tool'
             && !prev.toolCalls?.length
-            && !curr.toolCalls?.length;
+            && !curr.toolCalls?.length
+            && !hasNonEmptyExtraFields(prev.extraFields)
+            && !hasNonEmptyExtraFields(curr.extraFields);
 
         if (canMergeWithPrev && prev) {
             if (curr.name && curr.role !== 'system') {
@@ -721,19 +853,24 @@ function compileOpenAIPayload(
             out.name = msg.name;
         }
         if (msg.role === 'assistant' && msg.toolCalls?.length) {
-            out.tool_calls = msg.toolCalls.map((tc) => ({
-                id: tc.id,
-                type: 'function',
-                function: {
-                    name: tc.name,
-                    arguments: tc.arguments,
-                },
-            }));
+            out.tool_calls = msg.toolCalls.map((tc) => {
+                const compiledToolCall: Record<string, unknown> = {
+                    id: tc.id,
+                    type: 'function',
+                    function: {
+                        name: tc.name,
+                        arguments: tc.arguments,
+                    },
+                };
+                applyExtraFields(compiledToolCall, tc.extraFields);
+                return compiledToolCall;
+            });
         }
         if (msg.role === 'tool' && msg.toolCallId !== undefined) {
             out.tool_call_id = msg.toolCallId;
         }
 
+        applyExtraFields(out, msg.extraFields);
         return out;
     });
 
@@ -779,6 +916,17 @@ function compileOpenAIPayload(
                 ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
             },
         }));
+        if (request.toolChoice) {
+            const validAllowed = resolveValidAllowedToolNames(request.toolChoice, request.tools);
+            if (request.toolChoice.mode === 'none' || request.toolChoice.mode === 'auto') {
+                body.tool_choice = request.toolChoice.mode;
+            } else {
+                body.tool_choice =
+                    validAllowed.length === 1
+                        ? { type: 'function', function: { name: validAllowed[0] } }
+                        : 'required';
+            }
+        }
     }
 
     if (Number.isFinite(connection.maxTokens) && connection.maxTokens > 0) {
@@ -818,13 +966,20 @@ function compileAnthropicPayload(
         const text = extractTextForSystem(msgs[idx].content);
         if (text.length > 0) {
             const block: Record<string, unknown> = { type: 'text', text };
+            applyExtraFields(block, msgs[idx].extraFields);
             systemBlocks.push(block);
             blockRefByProcessedIdx.set(idx, block);
         }
         idx += 1;
     }
 
-    const anthropicMessages: Array<{ role: 'user' | 'assistant'; content: Array<Record<string, unknown>> }> = [];
+    const anthropicMessages: Array<
+        Record<string, unknown> & {
+            role: 'user' | 'assistant';
+            content: Array<Record<string, unknown>>;
+        }
+    > = [];
+    const anthropicMessageHasExtra: boolean[] = [];
 
     for (; idx < msgs.length; idx += 1) {
         const msg = msgs[idx];
@@ -859,12 +1014,14 @@ function compileAnthropicPayload(
             }
             if (msg.toolCalls?.length) {
                 for (const tc of msg.toolCalls) {
-                    blocks.push({
+                    const toolUseBlock: Record<string, unknown> = {
                         type: 'tool_use',
                         id: tc.id,
                         name: tc.name,
                         input: safeParseToolInput(tc.arguments),
-                    });
+                    };
+                    applyExtraFields(toolUseBlock, tc.extraFields);
+                    blocks.push(toolUseBlock);
                 }
             }
             if (blocks.length === 0) {
@@ -888,11 +1045,24 @@ function compileAnthropicPayload(
 
         blockRefByProcessedIdx.set(idx, blocks[blocks.length - 1]);
 
-        const prev = anthropicMessages[anthropicMessages.length - 1];
-        if (prev && prev.role === targetRole) {
+        const currHasExtra = hasNonEmptyExtraFields(msg.extraFields);
+        const prevIdx = anthropicMessages.length - 1;
+        const prev = prevIdx >= 0 ? anthropicMessages[prevIdx] : undefined;
+        const prevHasExtra = prevIdx >= 0 ? anthropicMessageHasExtra[prevIdx] : false;
+
+        if (prev && prev.role === targetRole && !prevHasExtra && !currHasExtra) {
             prev.content.push(...blocks);
         } else {
-            anthropicMessages.push({ role: targetRole, content: blocks });
+            const compiledMsg: Record<string, unknown> & {
+                role: 'user' | 'assistant';
+                content: Array<Record<string, unknown>>;
+            } = {
+                role: targetRole,
+                content: blocks,
+            };
+            applyExtraFields(compiledMsg, msg.extraFields);
+            anthropicMessages.push(compiledMsg);
+            anthropicMessageHasExtra.push(currHasExtra);
         }
     }
 
@@ -974,6 +1144,19 @@ function compileAnthropicPayload(
     }
     if (anthropicTools.length > 0) {
         body.tools = anthropicTools;
+        if (request.toolChoice) {
+            const validAllowed = resolveValidAllowedToolNames(request.toolChoice, request.tools);
+            if (request.toolChoice.mode === 'none') {
+                body.tool_choice = { type: 'none' };
+            } else if (request.toolChoice.mode === 'auto') {
+                body.tool_choice = { type: 'auto' };
+            } else {
+                body.tool_choice =
+                    validAllowed.length === 1
+                        ? { type: 'tool', name: validAllowed[0] }
+                        : { type: 'any' };
+            }
+        }
     }
     if (Number.isFinite(connection.temperature)) {
         body.temperature = connection.temperature;
@@ -1322,21 +1505,31 @@ function compileGeminiPayload(
         const content = msgs[idx].content;
         if (typeof content === 'string') {
             if (content.length > 0) {
-                systemParts.push({ text: content });
+                const part: Record<string, unknown> = { text: content };
+                applyExtraFields(part, msgs[idx].extraFields);
+                systemParts.push(part);
             }
         } else {
             for (const part of content) {
                 if (part.type === 'text' && !part.text) {
                     continue;
                 }
-                systemParts.push(convertPartToGemini(part));
+                const compiledPart = convertPartToGemini(part);
+                applyExtraFields(compiledPart, msgs[idx].extraFields);
+                systemParts.push(compiledPart);
             }
         }
         idx += 1;
     }
 
     const toolCallIdToName = new Map<string, string>();
-    const contents: Array<{ role: 'user' | 'model'; parts: Array<Record<string, unknown>> }> = [];
+    const contents: Array<
+        Record<string, unknown> & {
+            role: 'user' | 'model';
+            parts: Array<Record<string, unknown>>;
+        }
+    > = [];
+    const contentHasExtra: boolean[] = [];
 
     for (; idx < msgs.length; idx += 1) {
         const msg = msgs[idx];
@@ -1391,11 +1584,13 @@ function compileGeminiPayload(
                     if (tc.id && tc.name) {
                         toolCallIdToName.set(tc.id, tc.name);
                     }
+                    const functionCall: Record<string, unknown> = {
+                        name: tc.name,
+                        args: safeParseToolInput(tc.arguments),
+                    };
+                    applyExtraFields(functionCall, tc.extraFields);
                     parts.push({
-                        functionCall: {
-                            name: tc.name,
-                            args: safeParseToolInput(tc.arguments),
-                        },
+                        functionCall,
                         ...(tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : {}),
                     });
                 }
@@ -1420,11 +1615,24 @@ function compileGeminiPayload(
             }
         }
 
-        const prev = contents[contents.length - 1];
-        if (prev && prev.role === targetRole) {
+        const currHasExtra = hasNonEmptyExtraFields(msg.extraFields);
+        const prevIdx = contents.length - 1;
+        const prev = prevIdx >= 0 ? contents[prevIdx] : undefined;
+        const prevHasExtra = prevIdx >= 0 ? contentHasExtra[prevIdx] : false;
+
+        if (prev && prev.role === targetRole && !prevHasExtra && !currHasExtra) {
             prev.parts.push(...parts);
         } else {
-            contents.push({ role: targetRole, parts });
+            const contentEntry: Record<string, unknown> & {
+                role: 'user' | 'model';
+                parts: Array<Record<string, unknown>>;
+            } = {
+                role: targetRole,
+                parts,
+            };
+            applyExtraFields(contentEntry, msg.extraFields);
+            contents.push(contentEntry);
+            contentHasExtra.push(currHasExtra);
         }
     }
 
@@ -1457,6 +1665,22 @@ function compileGeminiPayload(
             };
         });
         body.tools = [{ functionDeclarations }];
+
+        if (request.toolChoice) {
+            const validAllowed = resolveValidAllowedToolNames(request.toolChoice, request.tools);
+            let functionCallingConfig: Record<string, unknown>;
+            if (request.toolChoice.mode === 'none') {
+                functionCallingConfig = { mode: 'NONE' };
+            } else if (request.toolChoice.mode === 'auto') {
+                functionCallingConfig = { mode: 'AUTO' };
+            } else {
+                functionCallingConfig = {
+                    mode: 'ANY',
+                    ...(validAllowed.length > 0 ? { allowedFunctionNames: validAllowed } : {}),
+                };
+            }
+            body.toolConfig = { functionCallingConfig };
+        }
     }
 
     const generationConfig: Record<string, unknown> = {};
@@ -1520,6 +1744,33 @@ export class PayloadCompiler {
 
         if (connection.includeBody && isPlainObject(connection.includeBody)) {
             deepMergeRecord(body, connection.includeBody);
+            if (providerFormat === 'gemini') {
+                const includeToolConfig = connection.includeBody.toolConfig;
+                const includeFcc = isPlainObject(includeToolConfig)
+                    ? includeToolConfig.functionCallingConfig
+                    : undefined;
+                if (
+                    isPlainObject(includeFcc)
+                    && (includeFcc.mode === 'AUTO' || includeFcc.mode === 'NONE')
+                    && includeFcc.allowedFunctionNames === undefined
+                    && isPlainObject(body.toolConfig)
+                    && isPlainObject(body.toolConfig.functionCallingConfig)
+                ) {
+                    delete body.toolConfig.functionCallingConfig.allowedFunctionNames;
+                }
+            } else if (providerFormat === 'anthropic') {
+                const includeToolChoice = connection.includeBody.tool_choice;
+                if (
+                    isPlainObject(includeToolChoice)
+                    && (includeToolChoice.type === 'auto'
+                        || includeToolChoice.type === 'none'
+                        || includeToolChoice.type === 'any')
+                    && includeToolChoice.name === undefined
+                    && isPlainObject(body.tool_choice)
+                ) {
+                    delete body.tool_choice.name;
+                }
+            }
         }
         if (connection.excludeBody && isPlainObject(connection.excludeBody)) {
             applyExcludeRecord(body, connection.excludeBody);

@@ -83,6 +83,7 @@ export type GenerationEventKind =
     | 'text_delta'
     | 'reasoning_delta'
     | 'output_preview'
+    | 'turn_retrying'
     | 'turn_interrupted'
     | 'turn_resumed'
     | 'background_task_updated'
@@ -102,6 +103,10 @@ export interface GenerationEventPayload {
     reasoningDelta?: string;
     outputPreview?: string;
     interruptedReason?: InterruptedReason;
+    retryAttempt?: number;
+    retryMaxAttempts?: number;
+    retryDelayMs?: number;
+    retryReason?: string;
     toolStep?: ToolStepLog;
     task?: BackgroundTaskStatus;
     trace?: AgentRunTrace;

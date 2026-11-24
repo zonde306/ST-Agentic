@@ -301,6 +301,12 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
         (maxCacheBreakpoints) => mutateActiveConn((c) => ({ ...c, maxCacheBreakpoints })),
         { min: 0, max: 4, integer: true },
     );
+    const roundMaxRetriesDraft = useDraftNumber(
+        resetKey,
+        activeConn?.roundMaxRetries ?? 2,
+        (roundMaxRetries) => mutateActiveConn((c) => ({ ...c, roundMaxRetries })),
+        { min: 0, max: 10, integer: true },
+    );
 
     const linkedPresetOptions = useMemo(
         () => [
@@ -1025,81 +1031,108 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                     </div>
                 </Card>
 
-                {/* Caching, Concurrency & Preset Linking */}
+                {/* Caching, Concurrency, Request Strategy & Preset Linking */}
                 <Card title="缓存协议、并发与预设联动">
-                    <div class="ag-grid-2">
-                        <FormField
-                            label="前缀缓存协议策略 (cachePolicy)"
-                            hint="auto_prefix 保障键序与前缀稳定；anthropic_explicit 注入 cache_control 断点"
-                        >
-                            <SelectInput<CachePolicy>
-                                value={activeConn.cachePolicy}
-                                options={[
-                                    { value: 'auto_prefix', label: 'auto_prefix (自动前缀缓存: OpenAI/DeepSeek/Gemini)' },
-                                    { value: 'anthropic_explicit', label: 'anthropic_explicit (显式 cache_control 断点)' },
-                                    { value: 'none', label: 'none (禁用缓存断点标记)' },
-                                ]}
-                                onChange={(cachePolicy) =>
-                                    mutateActiveConn((c) => ({ ...c, cachePolicy }))
-                                }
-                            />
-                        </FormField>
+                    <div class="ag-stack-v">
+                        <div class="ag-grid-2">
+                            <FormField
+                                label="前缀缓存协议策略 (cachePolicy)"
+                                hint="auto_prefix 保障键序与前缀稳定；anthropic_explicit 注入 cache_control 断点"
+                            >
+                                <SelectInput<CachePolicy>
+                                    value={activeConn.cachePolicy}
+                                    options={[
+                                        { value: 'auto_prefix', label: 'auto_prefix (自动前缀缓存: OpenAI/DeepSeek/Gemini)' },
+                                        { value: 'anthropic_explicit', label: 'anthropic_explicit (显式 cache_control 断点)' },
+                                        { value: 'none', label: 'none (禁用缓存断点标记)' },
+                                    ]}
+                                    onChange={(cachePolicy) =>
+                                        mutateActiveConn((c) => ({ ...c, cachePolicy }))
+                                    }
+                                />
+                            </FormField>
 
-                        <FormField label="最大断点数量 (maxCacheBreakpoints, 0-4)">
-                            <TextInput
-                                type="number"
-                                min={0}
-                                max={4}
-                                step={1}
-                                value={maxBreakpointsDraft.value}
-                                onInput={maxBreakpointsDraft.onInput}
-                                onChange={maxBreakpointsDraft.onChange}
-                            />
-                        </FormField>
+                            <FormField label="最大断点数量 (maxCacheBreakpoints, 0-4)">
+                                <TextInput
+                                    type="number"
+                                    min={0}
+                                    max={4}
+                                    step={1}
+                                    value={maxBreakpointsDraft.value}
+                                    onInput={maxBreakpointsDraft.onInput}
+                                    onChange={maxBreakpointsDraft.onChange}
+                                />
+                            </FormField>
 
-                        <FormField
-                            label="最大并发数 (maxConcurrency)"
-                            hint="限制同时进行的后台触发/生成请求并发数 (1-100)"
-                        >
-                            <TextInput
-                                type="number"
-                                min={1}
-                                max={100}
-                                step={1}
-                                value={maxConcDraft.value}
-                                onInput={maxConcDraft.onInput}
-                                onChange={maxConcDraft.onChange}
-                            />
-                        </FormField>
+                            <FormField
+                                label="最大并发数 (maxConcurrency)"
+                                hint="限制同时进行的后台触发/生成请求并发数 (1-100)"
+                            >
+                                <TextInput
+                                    type="number"
+                                    min={1}
+                                    max={100}
+                                    step={1}
+                                    value={maxConcDraft.value}
+                                    onInput={maxConcDraft.onInput}
+                                    onChange={maxConcDraft.onChange}
+                                />
+                            </FormField>
 
-                        <FormField label="Prompt 后处理模式 (promptPostProcessing)">
-                            <SelectInput<NonNullable<ApiConnection['promptPostProcessing']>>
-                                value={activeConn.promptPostProcessing ?? 'none'}
-                                options={[
-                                    { value: 'none', label: 'none (保持原始三层结构)' },
-                                    { value: 'merge', label: 'merge (合并相邻同角色消息)' },
-                                    { value: 'semi', label: 'semi (半严格交替)' },
-                                    { value: 'strict', label: 'strict (严格 user/assistant 交替)' },
-                                    { value: 'single', label: 'single (合并为单条消息)' },
-                                ]}
-                                onChange={(promptPostProcessing) =>
-                                    mutateActiveConn((c) => ({ ...c, promptPostProcessing }))
-                                }
-                            />
-                        </FormField>
+                            <FormField
+                                label="单拍自动重试次数 (roundMaxRetries)"
+                                hint="0~10 整数；流断流/空响应/约束违例自动回滚重试，设为 0 关闭单拍自动重试"
+                            >
+                                <TextInput
+                                    type="number"
+                                    ariaLabel="单拍自动重试次数"
+                                    min={0}
+                                    max={10}
+                                    step={1}
+                                    value={roundMaxRetriesDraft.value}
+                                    onInput={roundMaxRetriesDraft.onInput}
+                                    onChange={roundMaxRetriesDraft.onChange}
+                                />
+                            </FormField>
 
-                        <FormField
-                            label="联动预设 (linkedPreset)"
-                            hint="可选记录与该模型连接配套使用的推荐预设"
-                        >
-                            <SelectInput
-                                value={activeConn.linkedPreset ?? ''}
-                                options={linkedPresetOptions}
-                                onChange={(linkedPreset) =>
-                                    mutateActiveConn((c) => ({ ...c, linkedPreset }))
-                                }
-                            />
-                        </FormField>
+                            <FormField label="Prompt 后处理模式 (promptPostProcessing)">
+                                <SelectInput<NonNullable<ApiConnection['promptPostProcessing']>>
+                                    value={activeConn.promptPostProcessing ?? 'none'}
+                                    options={[
+                                        { value: 'none', label: 'none (保持原始三层结构)' },
+                                        { value: 'merge', label: 'merge (合并相邻同角色消息)' },
+                                        { value: 'semi', label: 'semi (半严格交替)' },
+                                        { value: 'strict', label: 'strict (严格 user/assistant 交替)' },
+                                        { value: 'single', label: 'single (合并为单条消息)' },
+                                    ]}
+                                    onChange={(promptPostProcessing) =>
+                                        mutateActiveConn((c) => ({ ...c, promptPostProcessing }))
+                                    }
+                                />
+                            </FormField>
+
+                            <FormField
+                                label="联动预设 (linkedPreset)"
+                                hint="可选记录与该模型连接配套使用的推荐预设"
+                            >
+                                <SelectInput
+                                    value={activeConn.linkedPreset ?? ''}
+                                    options={linkedPresetOptions}
+                                    onChange={(linkedPreset) =>
+                                        mutateActiveConn((c) => ({ ...c, linkedPreset }))
+                                    }
+                                />
+                            </FormField>
+                        </div>
+
+                        <ToggleSwitch
+                            checked={Boolean(activeConn.strictToolLoop)}
+                            onChange={(strictToolLoop) =>
+                                mutateActiveConn((c) => ({ ...c, strictToolLoop }))
+                            }
+                            label="强约束工具闭环（防路由降智与半途罢工）"
+                            description="开启后全程强制工具解码，配合 finish_turn 门禁与重复只读熔断防止弱模型纯文本早停"
+                        />
                     </div>
                 </Card>
 
