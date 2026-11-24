@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { AssistantRunner, toAssistantThreadId } from '@/core/assistant';
 import {
     createDefaultConnection,
@@ -557,6 +557,243 @@ describe('PromptBlock trigger filtering (ST-native triggers compatibility)', () 
         expect(adminText).toContain('ASSISTANT_ADMIN_PREFIX');
         expect(adminText).not.toContain('ASSISTANT_AUTHOR_TAIL');
         expect(adminText).not.toContain('UNTRACKED_MAIN_ONLY');
+    });
+
+    it('recomputes Workbench Prefix blocks when preset/triggers/content change or legacy frozenPrefix lacks prefixFingerprint, across send/regenerate/continue/tokenStatus', async () => {
+        const bridge = createOffMainlineTestBridge();
+        const transport = new ScriptedLLMTransport([
+            { content: 'Turn 1 (before prefix configured)' },
+            { content: 'Turn 2 (after switching preset with Prefix)' },
+            { content: 'Turn 3 (after regenerate with updated Prefix)' },
+            { content: 'Turn 4 (continued after abort with updated Prefix)' },
+            { content: 'Turn 5 (after hydrating legacy frozenPrefix without fingerprint)' },
+        ]);
+        const trajectoryStore = new TrajectoryStore();
+
+        const settings = createDefaultSettings();
+        settings.presets.default.agents.main.promptBlocks = [
+            {
+                id: 'prefix_untriggered',
+                name: 'Initially Main-Only Prefix',
+                role: 'system',
+                placement: 'prefix',
+                content: 'MAIN_ONLY_PREFIX',
+                enabled: true,
+                triggers: ['main'],
+            },
+            {
+                id: 'tail_ast',
+                name: 'Tail Block',
+                role: 'system',
+                placement: 'tail',
+                content: 'TAIL_STILL_PRESENT',
+                enabled: true,
+                triggers: ['assistant'],
+            },
+        ];
+
+        const runner = new AssistantRunner({
+            bridge,
+            transport,
+            trajectoryStore,
+            settings: () => settings,
+            stream: false,
+        });
+
+        const session = await runner.createSession({ title: 'Prefix 失效重算测试', mode: 'chat' });
+
+        // 1. Turn 1: no assistant-triggered Prefix blocks yet -> freezes prefix with empty extraPrefixMessages
+        await runner.sendPrompt(session.id, '第一问');
+        const req1Texts = transport.requests[0].messages.map((m) => String(m.content));
+        expect(req1Texts.join('\n')).not.toContain('MAIN_ONLY_PREFIX');
+        expect(req1Texts[req1Texts.length - 1]).toBe('TAIL_STILL_PRESENT');
+
+        const tokensBeforePresetSwitch = runner.getSessionTokenStatus(session.id)!.currentTokens;
+
+        // 2. Switch to a new preset ("cat_preset") that has assistant-triggered Prefix + custom JSON Prefix + Tail
+        const catPreset = createDefaultPreset();
+        catPreset.id = 'cat_preset';
+        catPreset.name = '猫猫';
+        catPreset.agents.main.promptBlocks = [
+            {
+                id: 'cat_think_prefix',
+                name: '思考强度',
+                role: 'system',
+                placement: 'prefix',
+                content: 'CAT_THINK_PREFIX_V1 ' + '长前缀内容'.repeat(40),
+                enabled: true,
+                triggers: ['main', 'assistant'],
+            },
+            {
+                id: 'cat_custom_prefix',
+                name: '主体前缀',
+                role: 'custom',
+                placement: 'prefix',
+                content: JSON.stringify([
+                    { role: 'user', content: 'CAT_CUSTOM_USER_PREFIX' },
+                    { role: 'assistant', content: 'CAT_CUSTOM_MODEL_PREFIX' },
+                ]),
+                enabled: true,
+                triggers: ['main', 'assistant'],
+            },
+            {
+                id: 'cat_tail',
+                name: '末尾结束',
+                role: 'user',
+                placement: 'tail',
+                content: 'CAT_TAIL_END',
+                enabled: true,
+                triggers: ['main', 'assistant'],
+            },
+        ];
+        settings.presets.cat_preset = catPreset;
+        settings.currentPresetId = 'cat_preset';
+
+        // getSessionTokenStatus immediately reflects the updated Prefix before sending next turn
+        const tokensAfterPresetSwitch = runner.getSessionTokenStatus(session.id)!.currentTokens;
+        expect(tokensAfterPresetSwitch).toBeGreaterThan(tokensBeforePresetSwitch);
+
+        // Next sendPrompt must NOT reuse the stale empty frozenPrefix!
+        await runner.sendPrompt(session.id, '第二问');
+        const req2Texts = transport.requests[1].messages.map((m) => String(m.content));
+        expect(req2Texts.some((t) => t.includes('CAT_THINK_PREFIX_V1'))).toBe(true);
+        expect(req2Texts).toContain('CAT_CUSTOM_USER_PREFIX');
+        expect(req2Texts).toContain('CAT_CUSTOM_MODEL_PREFIX');
+        expect(req2Texts[req2Texts.length - 1]).toBe('CAT_TAIL_END');
+
+        // 3. Edit Prefix block content and call regenerateLastMessage -> picks up V2 immediately
+        catPreset.agents.main.promptBlocks[0].content = 'CAT_THINK_PREFIX_V2';
+        await runner.regenerateLastMessage(session.id);
+        const req3Texts = transport.requests[2].messages.map((m) => String(m.content));
+        expect(req3Texts).toContain('CAT_THINK_PREFIX_V2');
+        expect(req3Texts.some((t) => t.includes('CAT_THINK_PREFIX_V1'))).toBe(false);
+
+        // 4. Simulate interrupted message with checkpoint, mutate Prefix trigger/content, and continueLastMessage
+        const astThreadId = toAssistantThreadId(session.id);
+        const currentSession = runner.getSession(session.id)!;
+        const lastAssistantMsg = currentSession.messages[currentSession.messages.length - 1];
+        runner.sessionStore.updateMessage(session.id, lastAssistantMsg.id, (prev) => ({
+            ...prev,
+            interrupted: true,
+            canContinue: true,
+        }));
+        runner.sessionStore.setInterruptedCheckpoint(session.id, {
+            messageId: lastAssistantMsg.id,
+            reason: 'user_stop',
+            inFlightMessages: [{ role: 'user', content: '第二问' }],
+            target: { messageId: 0, swipeId: 0 },
+            roundsCompleted: 1,
+            createdAt: Date.now(),
+        });
+
+        catPreset.agents.main.promptBlocks[0].content = 'CAT_THINK_PREFIX_V3_CONTINUED';
+        await runner.continueLastMessage(session.id);
+        const req4Texts = transport.requests[3].messages.map((m) => String(m.content));
+        expect(req4Texts).toContain('CAT_THINK_PREFIX_V3_CONTINUED');
+
+        // 5. Legacy hydrated frozenPrefix lacking prefixFingerprint must be invalidated and re-rendered
+        const existingFrozen = trajectoryStore.getFrozenPrefix(astThreadId)!;
+        trajectoryStore.setFrozenPrefix(
+            {
+                tools: existingFrozen.tools,
+                messages: [existingFrozen.messages[0]], // only built-in systemPrompt, no prefixFingerprint
+                layer0EndIndex: 0,
+            },
+            astThreadId,
+        );
+        await runner.sendPrompt(session.id, '第五问');
+        const req5Texts = transport.requests[4].messages.map((m) => String(m.content));
+        expect(req5Texts).toContain('CAT_THINK_PREFIX_V3_CONTINUED');
+        expect(req5Texts).toContain('CAT_CUSTOM_USER_PREFIX');
+    });
+
+    it('preserves KV-cache invariance when Prefix blocks are unchanged, and clears frozenPrefix on full retract / Turn-1 regenerate', async () => {
+        const bridge = createOffMainlineTestBridge();
+        let prefixEjsCount = 0;
+        bridge.evaluateOptionalEjs = vi.fn(async (text: string, vars: Record<string, unknown>) => {
+            if (text.includes('PREFIX_EJS')) {
+                prefixEjsCount += 1;
+                return text.replace('<%- PREFIX_EJS %>', `run${prefixEjsCount}:${String(vars.scene ?? 'none')}`);
+            }
+            return text;
+        });
+
+        const transport = new ScriptedLLMTransport([
+            { content: 'Reply 1' },
+            { content: 'Reply 2 (KV reused)' },
+            { content: 'Reply 1 regenerated (Turn 1 fresh)' },
+            { content: 'Reply after full retract' },
+        ]);
+        const trajectoryStore = new TrajectoryStore();
+
+        const settings = createDefaultSettings();
+        settings.presets.default.agents.main.promptBlocks = [
+            {
+                id: 'ast_ejs_prefix',
+                name: 'Static EJS Prefix',
+                role: 'system',
+                placement: 'prefix',
+                content: 'FROZEN_PREFIX_<%- PREFIX_EJS %>',
+                enabled: true,
+                triggers: ['assistant'],
+            },
+            {
+                id: 'ast_tail_only',
+                name: 'Dynamic Tail',
+                role: 'system',
+                placement: 'tail',
+                content: 'DYNAMIC_TAIL_SCENE',
+                enabled: true,
+                triggers: ['assistant'],
+            },
+        ];
+
+        const runner = new AssistantRunner({
+            bridge,
+            transport,
+            trajectoryStore,
+            settings: () => settings,
+            stream: false,
+        });
+
+        const session = await runner.createSession({ title: 'KV 缓存复用与清零测试', mode: 'chat' });
+        const threadId = toAssistantThreadId(session.id);
+
+        bridge.setVariable('scene', 's1');
+        await runner.sendPrompt(session.id, 'Turn 1');
+        expect(prefixEjsCount).toBe(1);
+        expect(transport.requests[0].messages[1].content).toBe('FROZEN_PREFIX_run1:s1');
+
+        // Changing runtime variable or tail block does NOT invalidate unchanged Prefix blocks
+        bridge.setVariable('scene', 's2');
+        settings.presets.default.agents.main.promptBlocks[1].content = 'DYNAMIC_TAIL_UPDATED';
+        await runner.sendPrompt(session.id, 'Turn 2');
+        expect(prefixEjsCount).toBe(1);
+        expect(transport.requests[1].messages[1].content).toBe('FROZEN_PREFIX_run1:s1');
+        expect(transport.requests[1].messages[transport.requests[1].messages.length - 1].content).toBe(
+            'DYNAMIC_TAIL_UPDATED',
+        );
+
+        // Retract Turn 2 so only Turn 1 remains, then regenerate Turn 1 (Layer 1 becomes empty -> Prefix re-evaluates)
+        const sAfterTurn2 = runner.getSession(session.id)!;
+        const turn2UserMsg = sAfterTurn2.messages[2];
+        await runner.retractMessage(session.id, turn2UserMsg.id);
+        expect(trajectoryStore.getFrozenPrefix(threadId)).not.toBeNull();
+
+        await runner.regenerateLastMessage(session.id);
+        expect(prefixEjsCount).toBe(2);
+        expect(transport.requests[2].messages[1].content).toBe('FROZEN_PREFIX_run2:s2');
+
+        // Retracting all messages from Turn 1 clears frozenPrefix completely
+        const sBeforeFullRetract = runner.getSession(session.id)!;
+        await runner.retractMessage(session.id, sBeforeFullRetract.messages[0].id);
+        expect(runner.getSession(session.id)!.messages).toHaveLength(0);
+        expect(trajectoryStore.getFrozenPrefix(threadId)).toBeNull();
+
+        bridge.setVariable('scene', 's3');
+        await runner.sendPrompt(session.id, 'Fresh Turn 1 after retract');
+        expect(prefixEjsCount).toBe(3);
+        expect(transport.requests[3].messages[1].content).toBe('FROZEN_PREFIX_run3:s3');
     });
 
     it('injects sidegen-triggered preset blocks in SideGenService.runOnce and persistent SideSessions', async () => {

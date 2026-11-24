@@ -415,4 +415,41 @@ describe('TrajectoryStore', () => {
         expect(anchorOnly.remainingCheckpoints).toBe(1);
         expect(store.restoreBranch({ messageId: 99, swipeId: 0 }, 'main')).toBe(true);
     });
+
+    it('preserves optional prefixFingerprint on frozenPrefix across serialize, deserialize, and replaceFrom', () => {
+        const store = new TrajectoryStore();
+
+        store.setFrozenPrefix(
+            {
+                tools: [],
+                messages: [{ role: 'system', content: 'No fingerprint' }],
+                layer0EndIndex: 0,
+            },
+            'legacy_thread',
+        );
+        store.setFrozenPrefix(
+            {
+                tools: [],
+                messages: [{ role: 'system', content: 'With fingerprint' }],
+                layer0EndIndex: 0,
+                prefixFingerprint: 'fp_preset_1',
+            },
+            'assistant:sess_1',
+        );
+
+        const serialized = store.serialize();
+        expect('prefixFingerprint' in (serialized.threads.legacy_thread.frozenPrefix ?? {})).toBe(false);
+        expect(serialized.threads['assistant:sess_1'].frozenPrefix?.prefixFingerprint).toBe('fp_preset_1');
+
+        const deserialized = TrajectoryStore.deserialize(serialized);
+        expect(deserialized.getFrozenPrefix('legacy_thread')?.prefixFingerprint).toBeUndefined();
+        expect('prefixFingerprint' in (deserialized.getFrozenPrefix('legacy_thread') ?? {})).toBe(false);
+        expect(deserialized.getFrozenPrefix('assistant:sess_1')?.prefixFingerprint).toBe('fp_preset_1');
+
+        const replaced = new TrajectoryStore();
+        replaced.replaceFrom(deserialized);
+        expect(replaced.getFrozenPrefix('legacy_thread')?.prefixFingerprint).toBeUndefined();
+        expect('prefixFingerprint' in (replaced.getFrozenPrefix('legacy_thread') ?? {})).toBe(false);
+        expect(replaced.getFrozenPrefix('assistant:sess_1')?.prefixFingerprint).toBe('fp_preset_1');
+    });
 });

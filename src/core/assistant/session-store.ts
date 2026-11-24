@@ -1327,6 +1327,9 @@ export class AssistantSessionStore {
             },
             threadId,
         );
+        if (compactedMessages.length === 0 && session.messages.length === 0) {
+            this.trajectoryStore.setFrozenPrefix(null, threadId);
+        }
     }
 
     /** Return the `TrajectoryStore` thread ID (`assistant:<sessionId>`). */
@@ -1345,6 +1348,7 @@ export class AssistantSessionStore {
         tools: readonly CanonicalToolSchema[],
         forceRecompile: boolean = false,
         extraPrefixMessages: readonly CanonicalMessage[] = [],
+        prefixFingerprint?: string,
     ): FrozenStaticPrefix {
         const threadId = toAssistantThreadId(sessionId);
         const existing = this.trajectoryStore.getFrozenPrefix(threadId);
@@ -1357,6 +1361,7 @@ export class AssistantSessionStore {
         if (
             !forceRecompile
             && existing
+            && (prefixFingerprint === undefined || existing.prefixFingerprint === prefixFingerprint)
             && canonicalStringify(existing.messages) === canonicalStringify(desiredMessages)
             && canonicalStringify(existing.tools) === canonicalStringify(desiredTools)
         ) {
@@ -1367,6 +1372,7 @@ export class AssistantSessionStore {
             messages: desiredMessages,
             tools: desiredTools,
             layer0EndIndex: Math.max(0, desiredMessages.length - 1),
+            ...(prefixFingerprint !== undefined ? { prefixFingerprint } : {}),
         };
         this.trajectoryStore.setFrozenPrefix(nextPrefix, threadId);
         return this.trajectoryStore.getFrozenPrefix(threadId)!;
@@ -1385,6 +1391,7 @@ export class AssistantSessionStore {
         options?: {
             extraPrefixMessages?: readonly CanonicalMessage[];
             tailMessages?: readonly CanonicalMessage[];
+            prefixFingerprint?: string;
         },
     ): AssistantRequestAssembly {
         const threadId = toAssistantThreadId(sessionId);
@@ -1394,6 +1401,7 @@ export class AssistantSessionStore {
             tools,
             false,
             options?.extraPrefixMessages ?? [],
+            options?.prefixFingerprint,
         );
         const layer0 = canonicalClone([...frozen.messages]);
         const layer1 = canonicalClone([...this.trajectoryStore.getMessages(threadId)]);

@@ -1819,13 +1819,17 @@ export class AssistantRunner {
                 : baseCanonicalTools;
 
             const threadId = toAssistantThreadId(sessionId);
+            const prefixFingerprint = this.computePresetPrefixFingerprint(currentSession);
             const existingFrozenPrefix = this.trajectoryStore.getFrozenPrefix(threadId);
-            const canReuseFrozenPrefix = Boolean(
-                existingFrozenPrefix
-                && existingFrozenPrefix.messages[0]?.role === 'system'
-                && existingFrozenPrefix.messages[0]?.content === systemPrompt
-                && canonicalStringify(existingFrozenPrefix.tools) === canonicalStringify(canonicalTools),
-            );
+            const hasCommittedHistory = this.trajectoryStore.getMessageCount(threadId) > 0;
+            const canReuseFrozenPrefix =
+                (Boolean(resume) || hasCommittedHistory)
+                && this.isMatchingFrozenPrefix(
+                    existingFrozenPrefix,
+                    systemPrompt,
+                    canonicalTools,
+                    prefixFingerprint,
+                );
             const presetPrompts = await this.resolvePresetPromptMessages(currentSession, target, {
                 skipPrefix: canReuseFrozenPrefix,
             });
@@ -1847,6 +1851,7 @@ export class AssistantRunner {
                     {
                         extraPrefixMessages: effectivePrefixMessages,
                         tailMessages: activeTailMessages,
+                        prefixFingerprint,
                     },
                 );
 
@@ -2948,12 +2953,13 @@ export class AssistantRunner {
 
         try {
             const threadId = toAssistantThreadId(existing.sessionId);
+            const prefixFingerprint = this.computePresetPrefixFingerprint(session);
             const existingFrozenPrefix = this.trajectoryStore.getFrozenPrefix(threadId);
-            const canReuseFrozenPrefix = Boolean(
-                existingFrozenPrefix
-                && existingFrozenPrefix.messages[0]?.role === 'system'
-                && existingFrozenPrefix.messages[0]?.content === systemPrompt
-                && canonicalStringify(existingFrozenPrefix.tools) === canonicalStringify(canonicalTools),
+            const canReuseFrozenPrefix = this.isMatchingFrozenPrefix(
+                existingFrozenPrefix,
+                systemPrompt,
+                canonicalTools,
+                prefixFingerprint,
             );
             const presetPrompts = await this.resolvePresetPromptMessages(session, target, {
                 skipPrefix: canReuseFrozenPrefix,
@@ -2969,6 +2975,7 @@ export class AssistantRunner {
                 {
                     extraPrefixMessages: effectivePrefixMessages,
                     tailMessages: presetPrompts.tailMessages,
+                    prefixFingerprint,
                 },
             );
             const useStream = connection.stream ?? this.defaultStream;
@@ -3149,6 +3156,44 @@ export class AssistantRunner {
         return {};
     }
 
+    private computePresetPrefixFingerprint(session: AssistantSession): string {
+        const preset = resolveActivePreset(this.settingsProvider());
+        const selected = selectPresetBlocksForContext(
+            preset,
+            {
+                kind: 'assistant',
+                mode: session.mode,
+                stAdminEnabled: session.stAdminEnabled,
+            },
+            { requireExplicit: true },
+        );
+        return canonicalStringify({
+            presetId: preset.id,
+            agentId: preset.mainAgentId,
+            blocks: selected.prefix.map((block) => ({
+                id: block.id,
+                role: block.role,
+                placement: block.placement,
+                content: block.content,
+            })),
+        });
+    }
+
+    private isMatchingFrozenPrefix(
+        frozen: ReturnType<TrajectoryStore['getFrozenPrefix']>,
+        systemPrompt: string,
+        canonicalTools: readonly CanonicalToolSchema[],
+        prefixFingerprint: string,
+    ): boolean {
+        return Boolean(
+            frozen
+            && frozen.messages[0]?.role === 'system'
+            && frozen.messages[0]?.content === systemPrompt
+            && frozen.prefixFingerprint === prefixFingerprint
+            && canonicalStringify(frozen.tools) === canonicalStringify(canonicalTools),
+        );
+    }
+
     private async resolvePresetPromptMessages(
         session: AssistantSession,
         target?: MessageTarget,
@@ -3302,13 +3347,6 @@ export class AssistantRunner {
         tools: CanonicalToolSchema[];
     } {
         const threadId = toAssistantThreadId(session.id);
-        const frozen = this.trajectoryStore.getFrozenPrefix(threadId);
-        if (frozen) {
-            return {
-                layer0: canonicalClone([...frozen.messages]),
-                tools: canonicalClone([...frozen.tools]),
-            };
-        }
         const connection = this.resolveEffectiveConnection(session.connectionId);
         const systemPrompt = buildAssistantSystemPrompt(session.mode, session.stAdminEnabled);
         const allowedToolDefs = this.getAllowedToolDefinitions(
@@ -3317,6 +3355,14 @@ export class AssistantRunner {
         );
         const baseTools = toCanonicalAssistantToolSchemas(allowedToolDefs);
         const tools = connection.strictToolLoop ? appendFinishTurnTool(baseTools) : baseTools;
+        const prefixFingerprint = this.computePresetPrefixFingerprint(session);
+        const frozen = this.trajectoryStore.getFrozenPrefix(threadId);
+        if (this.isMatchingFrozenPrefix(frozen, systemPrompt, tools, prefixFingerprint)) {
+            return {
+                layer0: canonicalClone([...frozen!.messages]),
+                tools: canonicalClone([...frozen!.tools]),
+            };
+        }
         const presetPrompts = this.resolvePresetPromptMessagesSync(session);
         const layer0: CanonicalMessage[] = [
             { role: 'system', content: systemPrompt },

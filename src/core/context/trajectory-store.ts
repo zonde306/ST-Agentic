@@ -22,6 +22,7 @@ export interface FrozenStaticPrefix {
     tools: readonly CanonicalToolSchema[];
     messages: readonly CanonicalMessage[];
     layer0EndIndex: number;
+    prefixFingerprint?: string;
 }
 
 /** Causal branch checkpoint bound to a `(messageId, swipeId)` coordinate. */
@@ -67,6 +68,7 @@ export interface SerializedAgentTrajectory {
         tools: CanonicalToolSchema[];
         messages: CanonicalMessage[];
         layer0EndIndex: number;
+        prefixFingerprint?: string;
     } | null;
 }
 
@@ -125,6 +127,9 @@ export function freezeStaticPrefix(prefix: FrozenStaticPrefix): FrozenStaticPref
         tools: canonicalClone(prefix.tools),
         messages: canonicalClone(prefix.messages),
         layer0EndIndex: prefix.layer0EndIndex,
+        ...(typeof prefix.prefixFingerprint === 'string'
+            ? { prefixFingerprint: prefix.prefixFingerprint }
+            : {}),
     });
 }
 
@@ -1038,6 +1043,9 @@ function serializeThread(state: InternalTrajectoryState): SerializedAgentTraject
                 tools: canonicalClone(state.frozenPrefix.tools) as CanonicalToolSchema[],
                 messages: canonicalClone(state.frozenPrefix.messages) as CanonicalMessage[],
                 layer0EndIndex: state.frozenPrefix.layer0EndIndex,
+                ...(typeof state.frozenPrefix.prefixFingerprint === 'string'
+                    ? { prefixFingerprint: state.frozenPrefix.prefixFingerprint }
+                    : {}),
             }
             : null,
     };
@@ -1125,6 +1133,9 @@ function deserializeThread(agentId: string, raw: SerializedAgentTrajectory): Int
             layer0EndIndex: typeof raw.frozenPrefix.layer0EndIndex === 'number'
                 ? raw.frozenPrefix.layer0EndIndex
                 : -1,
+            ...(typeof raw.frozenPrefix.prefixFingerprint === 'string'
+                ? { prefixFingerprint: raw.frozenPrefix.prefixFingerprint }
+                : {}),
         });
     }
 
