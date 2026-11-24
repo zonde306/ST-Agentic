@@ -16,6 +16,7 @@ import {
     resolveConnection,
 } from '@/core/config';
 import {
+    buildLayer2MacroOverrides,
     ContextAssembler,
     DEFAULT_FOLD_THRESHOLD_CHARS,
     estimateMessageTokens,
@@ -1462,6 +1463,33 @@ export class AgentRunner {
                 }
             }
 
+            const floatingTailBlocksToRender = promptBlocks.filter(
+                (block) =>
+                    block.enabled
+                    && block.placement === 'floating_tail'
+                    && block.content.trim().length > 0
+                    && matchesPromptTriggers(block.triggers, promptTriggerContext),
+            );
+            if (floatingTailBlocksToRender.length > 0) {
+                const floatingMacroOverrides = buildLayer2MacroOverrides(
+                    workingVars,
+                    input.macroOverrides,
+                );
+                const renderedFloating = await prerenderPromptBlocks(floatingTailBlocksToRender, {
+                    hostBridge: this.bridge,
+                    macroOverrides: floatingMacroOverrides,
+                    vars: workingVars,
+                });
+                throwIfAborted(signal);
+                if (!preRenderedBlocks) {
+                    preRenderedBlocks = renderedFloating;
+                } else {
+                    for (const [blockId, messages] of renderedFloating.entries()) {
+                        preRenderedBlocks.set(blockId, messages);
+                    }
+                }
+            }
+
             const baseAssembleInput = {
                 agent: effectiveAgent,
                 connectionId: connection.id,
@@ -2085,6 +2113,19 @@ export class AgentRunner {
                         content: `${prefixText}${turnOutput.content ?? ''}`,
                     };
                     lastContent = turnOutput.content;
+                } else {
+                    const lastFloatingMsg =
+                        currentAssembled.floatingTailMessages[
+                            currentAssembled.floatingTailMessages.length - 1
+                        ];
+                    if (isPrefillAssistantMessage(lastFloatingMsg)) {
+                        const prefixText = extractMessageText(lastFloatingMsg.content);
+                        turnOutput = {
+                            ...turnOutput,
+                            content: `${prefixText}${turnOutput.content ?? ''}`,
+                        };
+                        lastContent = turnOutput.content;
+                    }
                 }
 
                 if (turnOutput.toolCalls.length === 0) {

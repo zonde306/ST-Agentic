@@ -84,12 +84,13 @@ export type PromptTriggerContext =
     | { kind: 'sidegen'; mode?: 'once' | 'session' };
 
 export type PromptBlockRole = 'system' | 'user' | 'assistant' | 'custom';
+export type PromptBlockPlacement = 'prefix' | 'tail' | 'floating_tail';
 
 export interface PromptBlock {
     id: string;
     name: string;
     role: PromptBlockRole;
-    placement: 'prefix' | 'tail';
+    placement: PromptBlockPlacement;
     content: string;
     enabled: boolean;
     triggers?: PromptTriggerType[];

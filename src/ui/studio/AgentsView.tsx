@@ -43,7 +43,9 @@ import { PresetManagerPanel } from './PresetManagerPanel';
 import { PromptTriggerPicker } from './PromptTriggerPicker';
 import {
     allocateUniqueId,
+    getPromptPlacementMeta,
     moveArrayItem,
+    PROMPT_PLACEMENT_OPTIONS,
     useDraftNumber,
     useDraftString,
     withUpdatedAgent,
@@ -232,9 +234,14 @@ function PromptBlockCard({
         >
             <div class="ag-row-wrap" style={{ justifyContent: 'space-between' }}>
                 <div class="ag-row-wrap" style={{ flex: '1 1 200px', minWidth: 0 }}>
-                    <Badge tone={block.placement === 'prefix' ? 'primary' : 'warning'}>
-                        #{index + 1} · {block.placement === 'prefix' ? 'Prefix' : 'Tail'}
-                    </Badge>
+                    {(() => {
+                        const placementMeta = getPromptPlacementMeta(block.placement);
+                        return (
+                            <Badge tone={placementMeta.tone}>
+                                #{index + 1} · {placementMeta.label}
+                            </Badge>
+                        );
+                    })()}
                     <Badge
                         tone={block.role === 'custom' ? 'primary' : 'neutral'}
                         className="ag-mono"
@@ -300,13 +307,10 @@ function PromptBlockCard({
 
             <div class="ag-grid-2">
                 <FormField label="注入位置 (缓存安全)">
-                    <SelectInput
+                    <SelectInput<PromptBlock['placement']>
                         ariaLabel="积木位置"
                         value={block.placement}
-                        options={[
-                            { value: 'prefix', label: 'Layer 0 Prefix (静态前缀缓存)' },
-                            { value: 'tail', label: 'Layer 2 Tail (当轮尾部追加)' },
-                        ]}
+                        options={PROMPT_PLACEMENT_OPTIONS}
                         onChange={(placement) => onUpdate({ placement })}
                     />
                 </FormField>

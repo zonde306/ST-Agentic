@@ -385,7 +385,7 @@ export function selectPresetBlocksForContext(
         if (!matchesPromptTriggers(block.triggers, context, { requireExplicit })) {
             continue;
         }
-        if (block.placement === 'tail') {
+        if (block.placement === 'tail' || block.placement === 'floating_tail') {
             tail.push(block);
         } else {
             prefix.push(block);

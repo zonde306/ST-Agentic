@@ -281,7 +281,7 @@ export function normalizeConnectionsMap(raw: unknown): Record<string, ApiConnect
 }
 
 const VALID_BLOCK_ROLES = new Set<PromptBlock['role']>(['system', 'user', 'assistant', 'custom']);
-const VALID_BLOCK_PLACEMENTS = new Set<PromptBlock['placement']>(['prefix', 'tail']);
+const VALID_BLOCK_PLACEMENTS = new Set<PromptBlock['placement']>(['prefix', 'tail', 'floating_tail']);
 const VALID_STRICT_TOOL_LOOP_OVERRIDES = new Set<StrictToolLoopOverride>(['inherit', 'on', 'off']);
 
 /** Normalize a `PromptBlock` entry. */

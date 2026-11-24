@@ -45,7 +45,9 @@ import {
     allocateUniqueId,
     copyTextToClipboard,
     downloadTextFile,
+    getPromptPlacementMeta,
     moveArrayItem,
+    PROMPT_PLACEMENT_OPTIONS,
     withUpdatedAgent,
 } from './studio-helpers';
 
@@ -927,17 +929,16 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                                                     >
                                                         {block.name}
                                                     </span>
-                                                    <Badge
-                                                        tone={
-                                                            block.placement === 'prefix'
-                                                                ? 'primary'
-                                                                : 'warning'
-                                                        }
-                                                    >
-                                                        {block.placement === 'prefix'
-                                                            ? 'Prefix'
-                                                            : 'Tail'}
-                                                    </Badge>
+                                                    {(() => {
+                                                        const placementMeta = getPromptPlacementMeta(
+                                                            block.placement,
+                                                        );
+                                                        return (
+                                                            <Badge tone={placementMeta.tone}>
+                                                                {placementMeta.label}
+                                                            </Badge>
+                                                        );
+                                                    })()}
                                                     <Badge
                                                         tone={block.role === 'custom' ? 'primary' : 'neutral'}
                                                         className="ag-mono"
@@ -1127,10 +1128,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                             <SelectInput<PromptBlock['placement']>
                                 ariaLabel="提示词注入位置"
                                 value={draftPlacement}
-                                options={[
-                                    { value: 'prefix', label: 'Layer 0 Prefix (静态前缀缓存)' },
-                                    { value: 'tail', label: 'Layer 2 Tail (当轮尾部追加)' },
-                                ]}
+                                options={PROMPT_PLACEMENT_OPTIONS}
                                 onChange={setDraftPlacement}
                             />
                         </FormField>

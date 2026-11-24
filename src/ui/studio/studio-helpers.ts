@@ -1,7 +1,33 @@
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { isPlainRecord } from '@/core/config';
-import type { AgentProfile, TriggerRule } from '@/core/types';
+import type { AgentProfile, PromptBlock, TriggerRule } from '@/core/types';
+import type { BadgeTone } from '@/ui/components';
+
+export const PROMPT_PLACEMENT_OPTIONS: ReadonlyArray<{
+    value: PromptBlock['placement'];
+    label: string;
+}> = [
+    { value: 'prefix', label: 'Layer 0 Prefix (静态前缀缓存)' },
+    { value: 'tail', label: 'Layer 2 Tail (当轮尾部追加 · 固化入库)' },
+    { value: 'floating_tail', label: 'Floating Tail (瞬态沉底 · 上下文与工具链夹中间)' },
+];
+
+/** Map a `PromptBlock['placement']` to its badge tone and short display label. */
+export function getPromptPlacementMeta(placement: PromptBlock['placement']): {
+    tone: BadgeTone;
+    label: string;
+} {
+    switch (placement) {
+        case 'prefix':
+            return { tone: 'primary', label: 'Prefix' };
+        case 'floating_tail':
+            return { tone: 'success', label: 'Floating Tail' };
+        case 'tail':
+        default:
+            return { tone: 'warning', label: 'Tail' };
+    }
+}
 
 /** Generate a unique identifier avoiding collisions in `existingIds`. */
 export function allocateUniqueId(

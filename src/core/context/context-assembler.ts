@@ -49,6 +49,7 @@ export interface ContextLayerStats {
     layer0MessageCount: number;
     layer1MessageCount: number;
     layer2MessageCount: number;
+    floatingTailMessageCount: number;
     totalMessageCount: number;
     layer0EndIndex: number;
     layer1EndIndex: number;
@@ -60,6 +61,7 @@ export interface AssembledContext {
     layer0Messages: CanonicalMessage[];
     layer1Messages: CanonicalMessage[];
     layer2Messages: CanonicalMessage[];
+    floatingTailMessages: CanonicalMessage[];
     cacheBreakpoints: number[];
     coreManifest: CoreManifestResult;
     systemRuleCount: number;
@@ -278,7 +280,7 @@ function toCanonicalHistoryMessages(
     return out;
 }
 
-function buildLayer2MacroOverrides(
+export function buildLayer2MacroOverrides(
     vars?: Record<string, unknown>,
     macroOverrides?: Record<string, string>,
 ): Record<string, string> | undefined {
@@ -683,7 +685,18 @@ export class ContextAssembler {
             });
         }
 
-        const allMessages = [...layer0Messages, ...layer1Messages, ...layer2Messages];
+        const floatingTailMessages = this.buildFloatingTailMessages(input, [
+            ...layer0Messages,
+            ...layer1Messages,
+            ...layer2Messages,
+        ]);
+
+        const allMessages = [
+            ...layer0Messages,
+            ...layer1Messages,
+            ...layer2Messages,
+            ...floatingTailMessages,
+        ];
         const layer1EndIndex = layer0Messages.length + layer1Messages.length - 1;
 
         const cacheBreakpoints = this.computeCacheBreakpoints({
@@ -711,6 +724,7 @@ export class ContextAssembler {
             layer0Messages,
             layer1Messages,
             layer2Messages,
+            floatingTailMessages,
             cacheBreakpoints,
             coreManifest,
             systemRuleCount,
@@ -720,6 +734,7 @@ export class ContextAssembler {
                 layer0MessageCount: layer0Messages.length,
                 layer1MessageCount: layer1Messages.length,
                 layer2MessageCount: layer2Messages.length,
+                floatingTailMessageCount: floatingTailMessages.length,
                 totalMessageCount: allMessages.length,
                 layer0EndIndex,
                 layer1EndIndex,
@@ -880,6 +895,26 @@ export class ContextAssembler {
             }
         }
 
+        const floatingBlocksToRender = promptBlocks.filter(
+            (b: PromptBlock) =>
+                b.enabled
+                && b.placement === 'floating_tail'
+                && b.content.trim().length > 0
+                && matchesPromptTriggers(b.triggers, rest.promptTriggerContext)
+                && !preRenderedBlocks.has(b.id),
+        );
+        if (floatingBlocksToRender.length > 0) {
+            const floatingMacroOverrides = buildLayer2MacroOverrides(rest.vars, rest.macroOverrides);
+            const renderedFloating = await prerenderPromptBlocks(floatingBlocksToRender, {
+                hostBridge,
+                macroOverrides: floatingMacroOverrides,
+                vars: rest.vars,
+            });
+            for (const [blockId, messages] of renderedFloating.entries()) {
+                preRenderedBlocks.set(blockId, messages);
+            }
+        }
+
         return this.assemble({
             ...rest,
             loreEntries,
@@ -1007,29 +1042,54 @@ export class ContextAssembler {
         }
 
         // 3. Enabled `tail` PromptBlocks (supporting multi-message custom blocks & async pre-rendered EJS)
-        const tailPromptBlocks = (input.agent.promptBlocks ?? []).filter(
+        layer2Messages.push(
+            ...this.renderPlacementBlocks('tail', input, macroOverrides, layer2Messages),
+        );
+
+        return layer2Messages;
+    }
+
+    private renderPlacementBlocks(
+        placement: 'tail' | 'floating_tail',
+        input: ContextAssembleInput,
+        macroOverrides: Record<string, string> | undefined,
+        precedingSeed: readonly CanonicalMessage[],
+    ): CanonicalMessage[] {
+        const blocks = (input.agent.promptBlocks ?? []).filter(
             (b: PromptBlock) =>
                 b.enabled
-                && b.placement === 'tail'
+                && b.placement === placement
                 && b.content.trim().length > 0
                 && matchesPromptTriggers(b.triggers, input.promptTriggerContext),
         );
-        for (const block of tailPromptBlocks) {
+        if (blocks.length === 0) {
+            return [];
+        }
+
+        const out: CanonicalMessage[] = [];
+        for (const block of blocks) {
             if (input.preRenderedBlocks?.has(block.id)) {
                 for (const msg of input.preRenderedBlocks.get(block.id) ?? []) {
-                    layer2Messages.push(canonicalClone(msg));
+                    out.push(canonicalClone(msg));
                 }
             } else {
                 const rendered = renderPromptBlockSync(block, {
                     hostBridge: input.hostBridge,
                     macroOverrides,
-                    precedingMessages: layer2Messages,
+                    precedingMessages: [...precedingSeed, ...out],
                 });
-                layer2Messages.push(...rendered);
+                out.push(...rendered);
             }
         }
+        return out;
+    }
 
-        return layer2Messages;
+    private buildFloatingTailMessages(
+        input: ContextAssembleInput,
+        precedingMessages: readonly CanonicalMessage[],
+    ): CanonicalMessage[] {
+        const macroOverrides = buildLayer2MacroOverrides(input.vars, input.macroOverrides);
+        return this.renderPlacementBlocks('floating_tail', input, macroOverrides, precedingMessages);
     }
 
     private computeCacheBreakpoints(params: {
