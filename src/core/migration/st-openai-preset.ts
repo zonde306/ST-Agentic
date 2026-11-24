@@ -141,13 +141,21 @@ function extractStConnection(
         ? raw.chat_completion_source.trim() || 'openai'
         : 'openai';
     const providerFormat: ApiProviderFormat =
-        source === 'claude' || source === 'anthropic' ? 'anthropic' : 'openai';
+        source === 'claude' || source === 'anthropic'
+            ? 'anthropic'
+            : source === 'makersuite' || source === 'gemini' || source === 'google'
+                ? 'gemini'
+                : 'openai';
     const cachePolicy: CachePolicy =
         providerFormat === 'anthropic' ? 'anthropic_explicit' : 'auto_prefix';
 
     const modelKey = `${source}_model`;
     const urlKey = `${source}_url`;
     const defaults = createDefaultConnection();
+    const fallbackBaseUrl =
+        providerFormat === 'gemini'
+            ? 'https://generativelanguage.googleapis.com/v1beta'
+            : defaults.baseUrl;
 
     const rawPostProc = typeof raw.custom_prompt_post_processing === 'string'
         ? raw.custom_prompt_post_processing.replace('_tools', '')
@@ -170,11 +178,13 @@ function extractStConnection(
             providerFormat,
             baseUrl: typeof raw[urlKey] === 'string' && raw[urlKey]
                 ? raw[urlKey]
-                : defaults.baseUrl,
+                : fallbackBaseUrl,
             apiKey: '',
-            model: typeof raw[modelKey] === 'string'
+            model: typeof raw[modelKey] === 'string' && raw[modelKey]
                 ? raw[modelKey]
-                : (typeof raw.openai_model === 'string' ? raw.openai_model : ''),
+                : providerFormat === 'gemini' && typeof raw.google_model === 'string' && raw.google_model
+                    ? raw.google_model
+                    : (typeof raw.openai_model === 'string' ? raw.openai_model : ''),
             contextSize: raw.openai_max_context,
             maxTokens: raw.openai_max_tokens,
             temperature: raw.temperature,

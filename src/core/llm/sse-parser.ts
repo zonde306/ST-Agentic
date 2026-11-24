@@ -15,7 +15,7 @@ export interface SSEEvent {
 }
 
 export interface SSEParserOptions {
-    /** Hint for provider format ('openai' | 'anthropic'); auto-detected per frame when omitted. */
+    /** Hint for provider format ('openai' | 'anthropic' | 'gemini'); auto-detected per frame when omitted. */
     providerFormat?: ApiProviderFormat;
     /** Parse inline `<think>...</think>` blocks inside text deltas into `reasoning_delta` (default: true). */
     parseThinkTags?: boolean;
@@ -136,6 +136,11 @@ const PERMANENT_STREAM_ERROR_CODES = new Set([
     'insufficient_quota',
     'billing_hard_limit_reached',
     'not_found_error',
+    'invalid_argument',
+    'unauthenticated',
+    'permission_denied',
+    'not_found',
+    'failed_precondition',
 ]);
 
 const RETRYABLE_STREAM_ERROR_CODES = new Set([
@@ -150,6 +155,11 @@ const RETRYABLE_STREAM_ERROR_CODES = new Set([
     'bad_gateway',
     'gateway_timeout',
     'temporarily_unavailable',
+    'resource_exhausted',
+    'unavailable',
+    'internal',
+    'deadline_exceeded',
+    'aborted',
 ]);
 
 const PERMANENT_STREAM_ERROR_MSG_RE =
@@ -164,7 +174,7 @@ function isRetryableStreamError(rawError: unknown, message: string): boolean {
     }
 
     if (isRecord(rawError)) {
-        const status = asNumber(rawError.status);
+        const status = asNumber(rawError.status) ?? asNumber(rawError.code);
         if (status !== undefined) {
             if (isRetryableStatus(status)) {
                 return true;
@@ -176,15 +186,18 @@ function isRetryableStreamError(rawError: unknown, message: string): boolean {
 
         const typeStr = asNonEmptyString(rawError.type)?.trim().toLowerCase() ?? '';
         const codeStr = asNonEmptyString(rawError.code)?.trim().toLowerCase() ?? '';
+        const statusStr = asNonEmptyString(rawError.status)?.trim().toLowerCase() ?? '';
         if (
             PERMANENT_STREAM_ERROR_CODES.has(typeStr)
             || PERMANENT_STREAM_ERROR_CODES.has(codeStr)
+            || PERMANENT_STREAM_ERROR_CODES.has(statusStr)
         ) {
             return false;
         }
         if (
             RETRYABLE_STREAM_ERROR_CODES.has(typeStr)
             || RETRYABLE_STREAM_ERROR_CODES.has(codeStr)
+            || RETRYABLE_STREAM_ERROR_CODES.has(statusStr)
         ) {
             return true;
         }
@@ -207,8 +220,11 @@ function createStreamErrorFromPayload(
         : isRecord(parsed.detail) && isRecord(parsed.detail.error)
             ? parsed.detail.error
             : parsed;
-    const status = asNumber(rawErrObj.status) ?? asNumber(parsed.status);
-    const code = asNonEmptyString(rawErrObj.code) ?? asNonEmptyString(rawErrObj.type);
+    const status = asNumber(rawErrObj.status) ?? asNumber(rawErrObj.code) ?? asNumber(parsed.status);
+    const code =
+        asNonEmptyString(rawErrObj.code)
+        ?? asNonEmptyString(rawErrObj.type)
+        ?? asNonEmptyString(rawErrObj.status);
     return new LLMTransportError(message, {
         ...(status !== undefined ? { status } : {}),
         ...(code !== undefined ? { code } : {}),
@@ -232,6 +248,7 @@ function extractStreamErrorMessage(parsed: Record<string, unknown>): string | nu
                 asNonEmptyString(rawError.message)
                 ?? asNonEmptyString(rawError.code)
                 ?? asNonEmptyString(rawError.type)
+                ?? asNonEmptyString(rawError.status)
                 ?? 'Unknown API error'
             );
         }
@@ -240,6 +257,8 @@ function extractStreamErrorMessage(parsed: Record<string, unknown>): string | nu
     const looksLikeChunk =
         Array.isArray(parsed.choices)
         || Array.isArray(parsed.candidates)
+        || isRecord(parsed.usageMetadata)
+        || isRecord(parsed.promptFeedback)
         || isRecord(parsed.content_block)
         || isRecord(parsed.delta)
         || isRecord(parsed.message)
@@ -359,7 +378,12 @@ function parseAnthropicUsage(rawUsage: Record<string, unknown>, prev?: TokenUsag
 function parseGeminiUsage(rawUsage: Record<string, unknown>, prev?: TokenUsage): TokenUsage {
     const input = asNumber(rawUsage.promptTokenCount) ?? prev?.inputTokens ?? 0;
     const cached = asNumber(rawUsage.cachedContentTokenCount) ?? prev?.cachedTokens ?? 0;
-    const output = asNumber(rawUsage.candidatesTokenCount) ?? prev?.outputTokens ?? 0;
+    const candidatesOut = asNumber(rawUsage.candidatesTokenCount);
+    const thoughtsOut = asNumber(rawUsage.thoughtsTokenCount);
+    const output =
+        candidatesOut !== undefined || thoughtsOut !== undefined
+            ? (candidatesOut ?? 0) + (thoughtsOut ?? 0)
+            : (prev?.outputTokens ?? 0);
     const total = asNumber(rawUsage.totalTokenCount);
     return buildUsage(input, cached, output, total);
 }
@@ -628,12 +652,22 @@ export class SSEParser {
 
         const out: LLMStreamChunk[] = [];
 
-        if (typeof parsed.type === 'string' && !Array.isArray(parsed.choices) && !Array.isArray(parsed.candidates)) {
+        if (
+            typeof parsed.type === 'string'
+            && !Array.isArray(parsed.choices)
+            && !Array.isArray(parsed.candidates)
+            && !isRecord(parsed.usageMetadata)
+            && !isRecord(parsed.promptFeedback)
+        ) {
             this.processAnthropicEvent(sseEvent.event, parsed, out);
             return out;
         }
 
-        if (Array.isArray(parsed.candidates)) {
+        if (
+            Array.isArray(parsed.candidates)
+            || isRecord(parsed.usageMetadata)
+            || isRecord(parsed.promptFeedback)
+        ) {
             this.processGeminiEvent(parsed, out);
             return out;
         }
@@ -1017,8 +1051,13 @@ export class SSEParser {
             }
         }
 
+        const blockReason = isRecord(parsed.promptFeedback)
+            ? asNonEmptyString(parsed.promptFeedback.blockReason)
+            : undefined;
         if (candidate && typeof candidate.finishReason === 'string' && candidate.finishReason) {
             this.finishReason = candidate.finishReason;
+        } else if (!this.finishReason && blockReason) {
+            this.finishReason = blockReason;
         }
 
         if (isRecord(parsed.usageMetadata)) {
@@ -1084,6 +1123,105 @@ export function assembleStreamChunks(chunks: Iterable<LLMStreamChunk>): LLMRespo
     };
 }
 
+function foldGeminiResponseChunks(
+    chunks: unknown[],
+    parseThinkTags: boolean,
+    raw: unknown,
+): LLMResponse {
+    let content = '';
+    let reasoningContent = '';
+    const toolCalls: CanonicalToolCall[] = [];
+    let usage = buildUsage(0, 0, 0, 0);
+    let hasUsage = false;
+    let finishReason: string | undefined;
+    const splitter = parseThinkTags ? new ThinkTagSplitter() : null;
+    const serializedRaw = JSON.stringify(raw);
+
+    for (const chunk of chunks) {
+        if (!isRecord(chunk)) {
+            continue;
+        }
+
+        const errorMsg = extractStreamErrorMessage(chunk);
+        if (errorMsg) {
+            throw createStreamErrorFromPayload(chunk, errorMsg, { responseBody: serializedRaw });
+        }
+
+        const candidates = Array.isArray(chunk.candidates) ? chunk.candidates : [];
+        const firstCandidate = candidates.length > 0 && isRecord(candidates[0]) ? candidates[0] : undefined;
+
+        if (firstCandidate && isRecord(firstCandidate.content) && Array.isArray(firstCandidate.content.parts)) {
+            for (const part of firstCandidate.content.parts) {
+                if (!isRecord(part)) {
+                    continue;
+                }
+                const sig =
+                    asNonEmptyString(part.thoughtSignature)
+                    ?? asNonEmptyString(part.thought_signature);
+                if (isRecord(part.functionCall)) {
+                    toolCalls.push({
+                        id: asNonEmptyString(part.functionCall.id) ?? `call_${toolCalls.length}`,
+                        name: asNonEmptyString(part.functionCall.name) ?? '',
+                        arguments:
+                            part.functionCall.args !== undefined
+                                ? JSON.stringify(part.functionCall.args)
+                                : '{}',
+                        ...(sig ? { thoughtSignature: sig } : {}),
+                    });
+                } else if (typeof part.text === 'string' && part.text.length > 0) {
+                    if (part.thought === true) {
+                        reasoningContent += part.text;
+                    } else if (splitter) {
+                        for (const seg of splitter.feed(part.text)) {
+                            if (seg.kind === 'reasoning') {
+                                reasoningContent += seg.value;
+                            } else {
+                                content += seg.value;
+                            }
+                        }
+                    } else {
+                        content += part.text;
+                    }
+                }
+            }
+        }
+
+        const candidateReason = asNonEmptyString(firstCandidate?.finishReason);
+        const blockReason = isRecord(chunk.promptFeedback)
+            ? asNonEmptyString(chunk.promptFeedback.blockReason)
+            : undefined;
+        if (candidateReason) {
+            finishReason = candidateReason;
+        } else if (!finishReason && blockReason) {
+            finishReason = blockReason;
+        }
+
+        if (isRecord(chunk.usageMetadata)) {
+            usage = parseGeminiUsage(chunk.usageMetadata, hasUsage ? usage : undefined);
+            hasUsage = true;
+        }
+    }
+
+    if (splitter) {
+        for (const seg of splitter.flush()) {
+            if (seg.kind === 'reasoning') {
+                reasoningContent += seg.value;
+            } else {
+                content += seg.value;
+            }
+        }
+    }
+
+    return {
+        content,
+        ...(reasoningContent ? { reasoningContent } : {}),
+        toolCalls,
+        usage,
+        ...(finishReason !== undefined ? { finishReason } : {}),
+        raw,
+    };
+}
+
 /**
  * Parses a non-streaming JSON response from OpenAI, Anthropic, or Gemini into `LLMResponse`.
  */
@@ -1093,6 +1231,28 @@ export function parseCompletionResponse(
     options: { parseThinkTags?: boolean } = {},
 ): LLMResponse {
     const parseThinkTags = options.parseThinkTags ?? true;
+
+    if (Array.isArray(data)) {
+        const looksLikeGeminiArray =
+            providerFormat === 'gemini'
+            || data.some(
+                (item) =>
+                    isRecord(item)
+                    && (Array.isArray(item.candidates)
+                        || isRecord(item.usageMetadata)
+                        || isRecord(item.promptFeedback)
+                        || extractStreamErrorMessage(item) !== null),
+            );
+        if (looksLikeGeminiArray) {
+            return foldGeminiResponseChunks(data, parseThinkTags, data);
+        }
+        return {
+            content: '',
+            toolCalls: [],
+            usage: buildUsage(0, 0, 0, 0),
+            raw: data,
+        };
+    }
 
     if (!isRecord(data)) {
         return {
@@ -1154,51 +1314,13 @@ export function parseCompletionResponse(
     }
 
     // Gemini non-streaming response
-    if (Array.isArray(data.candidates)) {
-        let content = '';
-        let reasoningContent = '';
-        const toolCalls: CanonicalToolCall[] = [];
-        const firstCandidate = isRecord(data.candidates[0]) ? data.candidates[0] : undefined;
-
-        if (firstCandidate && isRecord(firstCandidate.content) && Array.isArray(firstCandidate.content.parts)) {
-            for (const part of firstCandidate.content.parts) {
-                if (!isRecord(part)) {
-                    continue;
-                }
-                const sig =
-                    asNonEmptyString(part.thoughtSignature)
-                    ?? asNonEmptyString(part.thought_signature);
-                if (isRecord(part.functionCall)) {
-                    toolCalls.push({
-                        id: asNonEmptyString(part.functionCall.id) ?? `call_${toolCalls.length}`,
-                        name: asNonEmptyString(part.functionCall.name) ?? '',
-                        arguments:
-                            part.functionCall.args !== undefined
-                                ? JSON.stringify(part.functionCall.args)
-                                : '{}',
-                        ...(sig ? { thoughtSignature: sig } : {}),
-                    });
-                } else if (typeof part.text === 'string') {
-                    if (part.thought === true) {
-                        reasoningContent += part.text;
-                    } else {
-                        content += part.text;
-                    }
-                }
-            }
-        }
-
-        const usage = isRecord(data.usageMetadata) ? parseGeminiUsage(data.usageMetadata) : buildUsage(0, 0, 0, 0);
-        const finishReason = asNonEmptyString(firstCandidate?.finishReason);
-
-        return {
-            content,
-            ...(reasoningContent ? { reasoningContent } : {}),
-            toolCalls,
-            usage,
-            ...(finishReason !== undefined ? { finishReason } : {}),
-            raw: data,
-        };
+    if (
+        Array.isArray(data.candidates)
+        || isRecord(data.usageMetadata)
+        || isRecord(data.promptFeedback)
+        || (providerFormat === 'gemini' && !Array.isArray(data.choices) && !Array.isArray(data.content))
+    ) {
+        return foldGeminiResponseChunks([data], parseThinkTags, data);
     }
 
     // OpenAI Chat Completions non-streaming response

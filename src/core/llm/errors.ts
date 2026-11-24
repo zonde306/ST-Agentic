@@ -102,24 +102,30 @@ function extractCodeAndMessageFromBody(body: string): { code?: string; message?:
     }
     try {
         const parsed = JSON.parse(trimmed) as unknown;
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        const target = Array.isArray(parsed) ? parsed[0] : parsed;
+        if (!target || typeof target !== 'object' || Array.isArray(target)) {
             return {};
         }
-        const record = parsed as Record<string, unknown>;
+        const record = target as Record<string, unknown>;
         const nestedErr =
             record.error && typeof record.error === 'object' && !Array.isArray(record.error)
                 ? (record.error as Record<string, unknown>)
                 : undefined;
-        const codeCandidate = nestedErr?.code ?? nestedErr?.type ?? record.code ?? record.type;
+        const codeCandidate = [
+            nestedErr?.code,
+            nestedErr?.type,
+            nestedErr?.status,
+            record.code,
+            record.type,
+            record.status,
+        ].find((v): v is string => typeof v === 'string' && v.trim().length > 0);
         const msgCandidate =
             nestedErr?.message
             ?? (typeof record.error === 'string' ? record.error : undefined)
             ?? record.message
             ?? (typeof record.detail === 'string' ? record.detail : undefined);
         return {
-            ...(typeof codeCandidate === 'string' && codeCandidate.trim()
-                ? { code: codeCandidate.trim() }
-                : {}),
+            ...(codeCandidate ? { code: codeCandidate.trim() } : {}),
             ...(typeof msgCandidate === 'string' && msgCandidate.trim()
                 ? { message: msgCandidate.trim() }
                 : {}),

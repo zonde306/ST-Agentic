@@ -159,7 +159,7 @@ function YamlRecordEditor({
 
 /**
  * View ⑨: Multi-Connection API & Cache Policy Manager (`tabId: 'connections'`).
- * Manages `settings.connections`, OpenAI/Anthropic formats, masked `apiKey`, sampling parameters,
+ * Manages `settings.connections`, OpenAI/Anthropic/Gemini formats, masked `apiKey`, sampling parameters,
  * concurrency limits, `cachePolicy`, YAML headers/body overrides, sanitized export, and live test.
  */
 export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
@@ -669,7 +669,15 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                                 <span class="ag-list-item-title">{conn.name}</span>
                                 <div class="ag-row-wrap">
                                     {isPrimary ? <Badge tone="success">主连接</Badge> : null}
-                                    <Badge tone={conn.providerFormat === 'anthropic' ? 'primary' : 'neutral'}>
+                                    <Badge
+                                        tone={
+                                            conn.providerFormat === 'anthropic'
+                                                ? 'primary'
+                                                : conn.providerFormat === 'gemini'
+                                                    ? 'warning'
+                                                    : 'neutral'
+                                        }
+                                    >
                                         {conn.providerFormat}
                                     </Badge>
                                 </div>
@@ -750,6 +758,7 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                                     options={[
                                         { value: 'openai', label: 'OpenAI 兼容格式 (/chat/completions)' },
                                         { value: 'anthropic', label: 'Anthropic Messages 格式 (/messages)' },
+                                        { value: 'gemini', label: 'Google Gemini 原生格式 (:generateContent)' },
                                     ]}
                                     onChange={(providerFormat) =>
                                         mutateActiveConn((c) => ({ ...c, providerFormat }))
@@ -763,7 +772,13 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                                 type="url"
                                 className="ag-mono"
                                 value={baseUrlDraft.value}
-                                placeholder="https://api.openai.com/v1"
+                                placeholder={
+                                    activeConn.providerFormat === 'gemini'
+                                        ? 'https://generativelanguage.googleapis.com/v1beta'
+                                        : activeConn.providerFormat === 'anthropic'
+                                            ? 'https://api.anthropic.com/v1'
+                                            : 'https://api.openai.com/v1'
+                                }
                                 onInput={baseUrlDraft.onInput}
                                 onChange={baseUrlDraft.onChange}
                             />
@@ -778,7 +793,13 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                                         type={showApiKey ? 'text' : 'password'}
                                         className="ag-mono"
                                         value={apiKeyDraft.value}
-                                        placeholder="sk-..."
+                                        placeholder={
+                                            activeConn.providerFormat === 'gemini'
+                                                ? 'AIza...'
+                                                : activeConn.providerFormat === 'anthropic'
+                                                    ? 'sk-ant-...'
+                                                    : 'sk-...'
+                                        }
                                         onInput={apiKeyDraft.onInput}
                                         onChange={apiKeyDraft.onChange}
                                     />
@@ -799,7 +820,13 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                                     <TextInput
                                         className="ag-mono"
                                         value={modelDraft.value}
-                                        placeholder="claude-sonnet-4.5 / gpt-4.1"
+                                        placeholder={
+                                            activeConn.providerFormat === 'gemini'
+                                                ? 'gemini-2.5-pro / gemini-2.5-flash'
+                                                : activeConn.providerFormat === 'anthropic'
+                                                    ? 'claude-sonnet-4.5 / claude-opus-4'
+                                                    : 'claude-sonnet-4.5 / gpt-4.1'
+                                        }
                                         onInput={modelDraft.onInput}
                                         onChange={modelDraft.onChange}
                                     />
@@ -1184,8 +1211,16 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                         <YamlRecordEditor
                             resetKey={`${activeConn.id}:includeBody`}
                             label="自定义附加 Body 字段 (includeBody)"
-                            hint="示例：reasoning_effort: medium"
-                            placeholder="reasoning_effort: medium"
+                            hint={
+                                activeConn.providerFormat === 'gemini'
+                                    ? '示例：generationConfig.thinkingConfig.includeThoughts: true'
+                                    : '示例：reasoning_effort: medium'
+                            }
+                            placeholder={
+                                activeConn.providerFormat === 'gemini'
+                                    ? 'generationConfig:\n  thinkingConfig:\n    includeThoughts: true'
+                                    : 'reasoning_effort: medium'
+                            }
                             record={activeConn.includeBody}
                             onCommit={(includeBody) =>
                                 mutateActiveConn((c) => ({ ...c, includeBody }))

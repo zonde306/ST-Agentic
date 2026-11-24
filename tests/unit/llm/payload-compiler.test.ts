@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { LLMRequest } from '@/core/bridge';
 import type { ApiConnection, CanonicalMessage, CanonicalToolSchema } from '@/core/types';
-import { buildModelsEndpointUrl, MAX_ANTHROPIC_CACHE_BREAKPOINTS, PayloadCompiler } from '@/core/llm';
+import { buildModelsEndpointUrl, MAX_ANTHROPIC_CACHE_BREAKPOINTS, PayloadCompiler, sanitizeGeminiSchema } from '@/core/llm';
 
 function makeConnection(overrides: Partial<ApiConnection> = {}): ApiConnection {
     return {
@@ -574,5 +574,392 @@ describe('PayloadCompiler', () => {
                 source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0xLjQ=' },
             },
         ]);
+    });
+
+    it('compiles Gemini endpoint URLs, /models discovery URLs, and x-goog-api-key headers across variants', () => {
+        const baseReq = {
+            connectionId: 'gem',
+            messages: [{ role: 'user' as const, content: 'hi' }],
+            tools: [],
+        };
+
+        const official = compiler.compile(
+            { ...baseReq, stream: false },
+            makeConnection({
+                providerFormat: 'gemini',
+                baseUrl: 'https://generativelanguage.googleapis.com',
+                model: 'gemini-2.5-flash',
+                apiKey: 'AIza-secret',
+            }),
+        );
+        expect(official.url).toBe(
+            'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+        );
+        expect(official.headers['x-goog-api-key']).toBe('AIza-secret');
+        expect(official.headers.Authorization).toBeUndefined();
+
+        const v1betaStream = compiler.compile(
+            { ...baseReq, stream: true },
+            makeConnection({
+                providerFormat: 'gemini',
+                baseUrl: 'https://generativelanguage.googleapis.com/v1beta/',
+                model: 'models/gemini-2.5-pro',
+                apiKey: 'AIza-secret',
+            }),
+        );
+        expect(v1betaStream.url).toBe(
+            'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
+        );
+
+        const v1ModelsPrefix = compiler.compile(
+            { ...baseReq, stream: false },
+            makeConnection({
+                providerFormat: 'gemini',
+                baseUrl: 'https://generativelanguage.googleapis.com/v1',
+                model: 'gemini-2.5-pro',
+                apiKey: '',
+            }),
+        );
+        expect(v1ModelsPrefix.url).toBe(
+            'https://generativelanguage.googleapis.com/v1/models/gemini-2.5-pro:generateContent',
+        );
+        expect(v1ModelsPrefix.headers['x-goog-api-key']).toBeUndefined();
+
+        const modelsDirBase = compiler.compile(
+            { ...baseReq, stream: true },
+            makeConnection({
+                providerFormat: 'gemini',
+                baseUrl: 'https://generativelanguage.googleapis.com/v1beta/models',
+                model: 'gemini-2.5-flash',
+            }),
+        );
+        expect(modelsDirBase.url).toBe(
+            'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse',
+        );
+
+        const pastedGenerateWithKey = compiler.compile(
+            { ...baseReq, stream: true },
+            makeConnection({
+                providerFormat: 'gemini',
+                baseUrl: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=AIzaQ',
+                model: '',
+                apiKey: '',
+            }),
+        );
+        expect(pastedGenerateWithKey.url).toBe(
+            'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?key=AIzaQ&alt=sse',
+        );
+
+        const pastedStreamToNonStream = compiler.compile(
+            { ...baseReq, stream: false },
+            makeConnection({
+                providerFormat: 'gemini',
+                baseUrl: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse&key=AIzaQ',
+                model: '',
+            }),
+        );
+        expect(pastedStreamToNonStream.url).toBe(
+            'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=AIzaQ',
+        );
+
+        const relativeProxy = compiler.compile(
+            { ...baseReq, stream: true },
+            makeConnection({
+                providerFormat: 'gemini',
+                baseUrl: '/proxy/gemini/v1beta',
+                model: 'gemini-2.5-flash',
+                includeHeaders: {
+                    Authorization: 'Bearer custom-oauth-token',
+                },
+            }),
+        );
+        expect(relativeProxy.url).toBe(
+            '/proxy/gemini/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse',
+        );
+        expect(relativeProxy.headers['x-goog-api-key']).toBeUndefined();
+        expect(relativeProxy.headers.Authorization).toBe('Bearer custom-oauth-token');
+
+        expect(() =>
+            compiler.compile(
+                { ...baseReq, stream: false },
+                makeConnection({
+                    providerFormat: 'gemini',
+                    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+                    model: '   ',
+                }),
+            ),
+        ).toThrow(/model is required for Gemini/i);
+
+        // /models discovery URL resolution
+        expect(
+            buildModelsEndpointUrl('https://generativelanguage.googleapis.com', 'gemini'),
+        ).toBe('https://generativelanguage.googleapis.com/v1beta/models');
+        expect(
+            buildModelsEndpointUrl('https://generativelanguage.googleapis.com/v1beta/', 'gemini'),
+        ).toBe('https://generativelanguage.googleapis.com/v1beta/models');
+        expect(
+            buildModelsEndpointUrl('https://generativelanguage.googleapis.com/v1', 'gemini'),
+        ).toBe('https://generativelanguage.googleapis.com/v1/models');
+        expect(
+            buildModelsEndpointUrl('https://generativelanguage.googleapis.com/v1beta/models', 'gemini'),
+        ).toBe('https://generativelanguage.googleapis.com/v1beta/models');
+        expect(
+            buildModelsEndpointUrl(
+                'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse&key=AIzaQ',
+                'gemini',
+            ),
+        ).toBe('https://generativelanguage.googleapis.com/v1beta/models?key=AIzaQ');
+
+        const modelsReq = compiler.compileModelsRequest(
+            makeConnection({
+                providerFormat: 'gemini',
+                baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+                apiKey: 'AIza-models-key',
+            }),
+        );
+        expect(modelsReq.method).toBe('GET');
+        expect(modelsReq.url).toBe('https://generativelanguage.googleapis.com/v1beta/models');
+        expect(modelsReq.headers['x-goog-api-key']).toBe('AIza-models-key');
+        expect(modelsReq.headers.Accept).toBe('application/json');
+        expect(modelsReq.headers['Content-Type']).toBeUndefined();
+    });
+
+    it('compiles Gemini systemInstruction, contents, thoughtSignature, functionResponse, generationConfig, schema sanitization, and multimodal parts', () => {
+        const sanitizedNested = sanitizeGeminiSchema({
+            $schema: 'https://json-schema.org/draft/2020-12/schema',
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+                path: { type: 'string', description: 'File path' },
+                filter: { anyOf: [{ type: 'string' }, { type: 'null' }], description: 'Optional filter' },
+                mode: { const: 'fast' },
+                count: { type: 'integer', exclusiveMinimum: 1, format: 'int32' },
+                tags: { type: 'array' },
+            },
+            required: ['path', 'nonexistent'],
+        });
+        expect(sanitizedNested).toEqual({
+            type: 'object',
+            properties: {
+                path: { type: 'string', description: 'File path' },
+                filter: { type: 'string', nullable: true, description: 'Optional filter' },
+                mode: { type: 'string', enum: ['fast'] },
+                count: { type: 'integer', minimum: 1, format: 'int32' },
+                tags: { type: 'array', items: { type: 'string' } },
+            },
+            required: ['path'],
+        });
+
+        const messages: CanonicalMessage[] = [
+            { role: 'system', content: 'Rule 1' },
+            { role: 'system', content: 'Rule 2' },
+            { role: 'user', content: 'Check /a.md and /b.md' },
+            {
+                role: 'assistant',
+                content: 'Reading both files.',
+                toolCalls: [
+                    {
+                        id: 'call_a',
+                        name: 'read_file',
+                        arguments: '{"path":"/a.md"}',
+                        thoughtSignature: 'sig-abc-123',
+                    },
+                    {
+                        id: 'call_b',
+                        name: 'list_root',
+                        arguments: '{}',
+                    },
+                ],
+            },
+            // First tool uses explicit toolName + JSON object string
+            {
+                role: 'tool',
+                toolCallId: 'call_a',
+                toolName: 'read_file',
+                content: '{"content":"Hello"}',
+            },
+            // Second tool omits toolName -> resolved via call_b -> list_root, plain string wrapped as { result }
+            {
+                role: 'tool',
+                toolCallId: 'call_b',
+                content: 'root-ok',
+            },
+            {
+                role: 'user',
+                content: [
+                    { type: 'text', text: 'Analyze media' },
+                    { type: 'image_url', imageUrl: 'data:image/png;base64,iVBORw0KGgo=' },
+                    { type: 'input_audio', data: 'data:audio/mp3;base64,SUQzAw==', format: 'mp3' },
+                    { type: 'input_audio', data: 'SUQzAw==', format: 'mp3' },
+                    { type: 'video_url', videoUrl: 'https://example.com/clip.mp4', mimeType: 'video/mp4' },
+                    { type: 'file', data: 'data:application/pdf;base64,JVBERi0xLjQ=', mimeType: 'application/pdf' },
+                ],
+            },
+        ];
+
+        const connZeroPenalties = makeConnection({
+            providerFormat: 'gemini',
+            baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+            model: 'gemini-2.5-pro',
+            topK: 40,
+            frequencyPenalty: 0,
+            presencePenalty: 0,
+            cachePolicy: 'auto_prefix',
+            includeBody: {
+                generationConfig: {
+                    thinkingConfig: { includeThoughts: true },
+                },
+            },
+        });
+
+        const outA = compiler.compile(
+            {
+                connectionId: connZeroPenalties.id,
+                messages,
+                tools: [
+                    {
+                        name: 'read_file',
+                        description: 'Read a file',
+                        parameters: {
+                            type: 'object',
+                            additionalProperties: false,
+                            properties: { path: { type: 'string' } },
+                            required: ['path'],
+                        },
+                    },
+                    {
+                        name: 'list_root',
+                        description: 'List root files',
+                        parameters: {
+                            type: 'object',
+                            additionalProperties: false,
+                            properties: {},
+                        },
+                    },
+                ],
+                stream: false,
+            },
+            connZeroPenalties,
+        );
+
+        expect(outA.cacheBreakpointsApplied).toBe(0);
+        expect(outA.body.systemInstruction).toEqual({
+            parts: [{ text: 'Rule 1' }, { text: 'Rule 2' }],
+        });
+        expect(outA.body.tools).toEqual([
+            {
+                functionDeclarations: [
+                    {
+                        name: 'read_file',
+                        description: 'Read a file',
+                        parameters: {
+                            type: 'object',
+                            properties: { path: { type: 'string' } },
+                            required: ['path'],
+                        },
+                    },
+                    {
+                        name: 'list_root',
+                        description: 'List root files',
+                    },
+                ],
+            },
+        ]);
+
+        const contents = outA.body.contents as Array<{ role: string; parts: Array<Record<string, unknown>> }>;
+        expect(contents).toHaveLength(3);
+        expect(contents[0]).toEqual({
+            role: 'user',
+            parts: [{ text: 'Check /a.md and /b.md' }],
+        });
+        expect(contents[1]).toEqual({
+            role: 'model',
+            parts: [
+                { text: 'Reading both files.' },
+                {
+                    functionCall: { name: 'read_file', args: { path: '/a.md' } },
+                    thoughtSignature: 'sig-abc-123',
+                },
+                {
+                    functionCall: { name: 'list_root', args: {} },
+                },
+            ],
+        });
+        expect(contents[2]).toEqual({
+            role: 'user',
+            parts: [
+                { functionResponse: { name: 'read_file', response: { content: 'Hello' } } },
+                { functionResponse: { name: 'list_root', response: { result: 'root-ok' } } },
+                { text: 'Analyze media' },
+                { inlineData: { mimeType: 'image/png', data: 'iVBORw0KGgo=' } },
+                { inlineData: { mimeType: 'audio/mp3', data: 'SUQzAw==' } },
+                { inlineData: { mimeType: 'audio/mpeg', data: 'SUQzAw==' } },
+                { fileData: { mimeType: 'video/mp4', fileUri: 'https://example.com/clip.mp4' } },
+                { inlineData: { mimeType: 'application/pdf', data: 'JVBERi0xLjQ=' } },
+            ],
+        });
+
+        expect(outA.body.generationConfig).toEqual({
+            maxOutputTokens: 4096,
+            temperature: 0.7,
+            topP: 0.95,
+            topK: 40,
+            thinkingConfig: { includeThoughts: true },
+        });
+
+        // Non-zero penalties ARE forwarded
+        const outPenalties = compiler.compile(
+            {
+                connectionId: 'gem-pen',
+                messages: [{ role: 'user', content: 'hi' }],
+                tools: [],
+                stream: false,
+            },
+            makeConnection({
+                providerFormat: 'gemini',
+                baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+                model: 'gemini-2.5-flash',
+                frequencyPenalty: 0.25,
+                presencePenalty: -0.1,
+            }),
+        );
+        expect((outPenalties.body.generationConfig as Record<string, unknown>).frequencyPenalty).toBe(0.25);
+        expect((outPenalties.body.generationConfig as Record<string, unknown>).presencePenalty).toBe(-0.1);
+
+        // auto_prefix canonical key ordering remains byte-identical
+        const connReordered = makeConnection({
+            ...connZeroPenalties,
+            includeBody: {
+                generationConfig: {
+                    thinkingConfig: { includeThoughts: true },
+                },
+            },
+        });
+        const outB = compiler.compile(
+            {
+                connectionId: connReordered.id,
+                messages,
+                tools: [
+                    {
+                        parameters: {
+                            required: ['path'],
+                            properties: { path: { type: 'string' } },
+                            additionalProperties: false,
+                            type: 'object',
+                        },
+                        description: 'Read a file',
+                        name: 'read_file',
+                    },
+                    {
+                        parameters: { properties: {}, type: 'object', additionalProperties: false },
+                        description: 'List root files',
+                        name: 'list_root',
+                    },
+                ],
+                stream: false,
+            },
+            connReordered,
+        );
+        expect(outA.serializedBody).toBe(outB.serializedBody);
     });
 });

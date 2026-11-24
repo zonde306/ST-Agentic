@@ -288,4 +288,138 @@ describe('SSEParser', () => {
             })(),
         ).rejects.toMatchObject({ name: 'AbortError' });
     });
+
+    it('handles Gemini SSE streams with thoughtsTokenCount, usage-only frames, promptFeedback.blockReason, array JSON responses, and error classification', () => {
+        const parser = new SSEParser({ providerFormat: 'gemini' });
+        const sse = [
+            'data: {"candidates":[{"content":{"parts":[{"text":"Thinking step","thought":true},{"text":"<think>inline</think>Visible"}]}}]}\n\n',
+            'data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"read_file","args":{"path":"/a.md"}},"thoughtSignature":"sig-gem-1"}]}}]}\n\n',
+            'data: {"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1000,"cachedContentTokenCount":800,"candidatesTokenCount":30,"thoughtsTokenCount":20,"totalTokenCount":1050}}\n\n',
+        ].join('');
+
+        const chunks = [...parser.feed(sse), ...parser.flush()];
+        const res = assembleStreamChunks(chunks);
+        expect(res.reasoningContent).toBe('Thinking stepinline');
+        expect(res.content).toBe('Visible');
+        expect(res.toolCalls).toEqual([
+            {
+                id: 'call_0',
+                name: 'read_file',
+                arguments: '{"path":"/a.md"}',
+                thoughtSignature: 'sig-gem-1',
+            },
+        ]);
+        expect(res.usage).toEqual({
+            inputTokens: 1000,
+            cachedTokens: 800,
+            outputTokens: 50,
+            totalTokens: 1050,
+            cacheHitRate: 0.8,
+        });
+        expect(res.finishReason).toBe('STOP');
+
+        // Usage-only trailing chunk + promptFeedback.blockReason
+        const blockedParser = new SSEParser({ providerFormat: 'gemini' });
+        blockedParser.feed(
+            'data: {"promptFeedback":{"blockReason":"SAFETY"}}\n\n'
+            + 'data: {"usageMetadata":{"promptTokenCount":40,"candidatesTokenCount":0,"totalTokenCount":40}}\n\n',
+        );
+        blockedParser.flush();
+        const blocked = blockedParser.getResult();
+        expect(blocked.finishReason).toBe('SAFETY');
+        expect(blocked.usage.inputTokens).toBe(40);
+
+        // Non-streaming single object with <think> tags
+        const singleNonStream = parseCompletionResponse(
+            {
+                candidates: [
+                    {
+                        content: { parts: [{ text: '<think>plan</think>Answer' }] },
+                        finishReason: 'STOP',
+                    },
+                ],
+                usageMetadata: {
+                    promptTokenCount: 200,
+                    cachedContentTokenCount: 100,
+                    candidatesTokenCount: 10,
+                    thoughtsTokenCount: 5,
+                },
+            },
+            'gemini',
+        );
+        expect(singleNonStream.reasoningContent).toBe('plan');
+        expect(singleNonStream.content).toBe('Answer');
+        expect(singleNonStream.usage).toEqual({
+            inputTokens: 200,
+            cachedTokens: 100,
+            outputTokens: 15,
+            totalTokens: 215,
+            cacheHitRate: 0.5,
+        });
+
+        // Non-streaming array-wrapped Gemini JSON chunks
+        const arrayNonStream = parseCompletionResponse(
+            [
+                {
+                    candidates: [
+                        { content: { parts: [{ text: 'First ', thought: true }, { text: 'Hello ' }] } },
+                    ],
+                },
+                {
+                    candidates: [
+                        {
+                            content: {
+                                parts: [
+                                    { text: 'world' },
+                                    { functionCall: { name: 'ping', args: { ok: true } }, thoughtSignature: 'sig-arr' },
+                                ],
+                            },
+                            finishReason: 'STOP',
+                        },
+                    ],
+                    usageMetadata: { promptTokenCount: 300, candidatesTokenCount: 12 },
+                },
+            ],
+            'gemini',
+        );
+        expect(arrayNonStream.reasoningContent).toBe('First ');
+        expect(arrayNonStream.content).toBe('Hello world');
+        expect(arrayNonStream.toolCalls).toEqual([
+            { id: 'call_0', name: 'ping', arguments: '{"ok":true}', thoughtSignature: 'sig-arr' },
+        ]);
+        expect(arrayNonStream.finishReason).toBe('STOP');
+        expect(arrayNonStream.usage.inputTokens).toBe(300);
+        expect(arrayNonStream.usage.outputTokens).toBe(12);
+
+        // Gemini error classification: RESOURCE_EXHAUSTED / UNAVAILABLE retryable vs INVALID_ARGUMENT / PERMISSION_DENIED permanent
+        for (const frame of [
+            'data: {"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED"}}\n\n',
+            'data: {"error":{"code":503,"message":"Backend unavailable","status":"UNAVAILABLE"}}\n\n',
+        ]) {
+            const p = new SSEParser({ providerFormat: 'gemini' });
+            let err: unknown;
+            try {
+                p.feed(frame);
+            } catch (e) {
+                err = e;
+            }
+            expect(err).toBeInstanceOf(LLMTransportError);
+            expect((err as LLMTransportError).retryable).toBe(true);
+        }
+
+        for (const frame of [
+            'data: {"error":{"code":400,"message":"Bad schema","status":"INVALID_ARGUMENT"}}\n\n',
+            'data: {"error":{"status":"PERMISSION_DENIED","message":"Key lacks permission"}}\n\n',
+        ]) {
+            const p = new SSEParser({ providerFormat: 'gemini' });
+            let err: unknown;
+            try {
+                p.feed(frame);
+            } catch (e) {
+                err = e;
+            }
+            expect(err).toBeInstanceOf(LLMTransportError);
+            expect((err as LLMTransportError).retryable).toBe(false);
+        }
+    });
 });

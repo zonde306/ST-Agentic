@@ -6,7 +6,7 @@ export type ThemeMode = 'dark' | 'light' | 'auto';
 export type CapsulePosition = 'top' | 'bottom';
 export type CapsulePersistMode = 'keep' | 'auto_hide';
 export type CachePolicy = 'auto_prefix' | 'anthropic_explicit' | 'none';
-export type ApiProviderFormat = 'openai' | 'anthropic';
+export type ApiProviderFormat = 'openai' | 'anthropic' | 'gemini';
 
 export interface ApiConnection {
     id: string;

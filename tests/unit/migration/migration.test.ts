@@ -274,6 +274,16 @@ describe('src/core/migration', () => {
         });
         expect(claude.connection.providerFormat).toBe('anthropic');
         expect(claude.connection.cachePolicy).toBe('anthropic_explicit');
+
+        const gemini = importSillyTavernOpenAIPreset({
+            chat_completion_source: 'makersuite',
+            google_model: 'gemini-2.5-pro',
+            prompts: [],
+        });
+        expect(gemini.connection.providerFormat).toBe('gemini');
+        expect(gemini.connection.cachePolicy).toBe('auto_prefix');
+        expect(gemini.connection.baseUrl).toBe('https://generativelanguage.googleapis.com/v1beta');
+        expect(gemini.connection.model).toBe('gemini-2.5-pro');
     });
 
     it('dual-reads embedded character card cg_embed_* and agentic_embed_* payloads', () => {

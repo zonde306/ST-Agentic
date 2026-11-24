@@ -677,4 +677,167 @@ describe('FetchLLMTransport', () => {
         expect(midErr).toBeInstanceOf(LLMTransportError);
         expect((midErr as LLMTransportError).retryable).toBe(true);
     });
+
+    it('supports end-to-end Gemini complete(), stream(), model discovery pagination, and array-wrapped HTTP errors', async () => {
+        const calls: Array<{ url: string; init?: RequestInit }> = [];
+
+        const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+            const url = typeof input === 'string' ? input : input.toString();
+            calls.push({ url, init });
+
+            if (url.includes(':streamGenerateContent')) {
+                const body = makeSSEStream([
+                    'data: {"candidates":[{"content":{"parts":[{"text":"Plan","thought":true},{"text":"Done "}]}}]}\n\n',
+                    'data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"read_file","args":{"path":"/x.md"}},"thoughtSignature":"sig-stream"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":400,"cachedContentTokenCount":200,"candidatesTokenCount":15,"thoughtsTokenCount":5,"totalTokenCount":420}}\n\n',
+                ]);
+                return new Response(body, {
+                    status: 200,
+                    headers: { 'Content-Type': 'text/event-stream' },
+                });
+            }
+
+            if (url.includes(':generateContent')) {
+                return new Response(
+                    JSON.stringify({
+                        candidates: [
+                            {
+                                content: {
+                                    parts: [{ text: 'Gemini complete OK' }],
+                                },
+                                finishReason: 'STOP',
+                            },
+                        ],
+                        usageMetadata: {
+                            promptTokenCount: 100,
+                            cachedContentTokenCount: 80,
+                            candidatesTokenCount: 10,
+                            totalTokenCount: 110,
+                        },
+                    }),
+                    { status: 200, headers: { 'Content-Type': 'application/json' } },
+                );
+            }
+
+            // /models discovery with nextPageToken pagination & supportedGenerationMethods filtering
+            if (!url.includes('pageToken=')) {
+                return new Response(
+                    JSON.stringify({
+                        models: [
+                            {
+                                name: 'models/gemini-2.5-pro',
+                                displayName: 'Gemini 2.5 Pro',
+                                inputTokenLimit: 1048576,
+                                supportedGenerationMethods: ['generateContent', 'countTokens'],
+                            },
+                            {
+                                name: 'models/text-embedding-004',
+                                displayName: 'Embedding 004',
+                                supportedGenerationMethods: ['embedContent'],
+                            },
+                        ],
+                        nextPageToken: 'page-2-token',
+                    }),
+                    { status: 200, headers: { 'Content-Type': 'application/json' } },
+                );
+            }
+
+            return new Response(
+                JSON.stringify({
+                    models: [
+                        {
+                            name: 'models/gemini-2.5-flash',
+                            displayName: 'Gemini 2.5 Flash',
+                            inputTokenLimit: 1048576,
+                            supportedGenerationMethods: ['generateContent'],
+                        },
+                    ],
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } },
+            );
+        });
+
+        const geminiConn = makeConnection({
+            id: 'conn-gemini',
+            providerFormat: 'gemini',
+            baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+            apiKey: 'AIza-test-key',
+            model: 'gemini-2.5-pro',
+        });
+
+        const transport = new FetchLLMTransport({
+            fetchImpl: fetchMock,
+            connections: { [geminiConn.id]: geminiConn },
+            retry: false,
+        });
+
+        const completed = await transport.complete({
+            connectionId: geminiConn.id,
+            messages: [{ role: 'user', content: 'Hello Gemini' }],
+            tools: [],
+        });
+        expect(completed.content).toBe('Gemini complete OK');
+        expect(completed.usage.cachedTokens).toBe(80);
+        expect(calls[0].url).toBe(
+            'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent',
+        );
+        expect((calls[0].init?.headers as Record<string, string>)['x-goog-api-key']).toBe('AIza-test-key');
+
+        const streamed: LLMStreamChunk[] = [];
+        for await (const chunk of transport.stream({
+            connectionId: geminiConn.id,
+            messages: [{ role: 'user', content: 'Stream Gemini' }],
+            tools: [],
+        })) {
+            streamed.push(chunk);
+        }
+        expect(calls[1].url).toBe(
+            'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
+        );
+        expect(streamed.find((c) => c.type === 'reasoning_delta')?.reasoningDelta).toBe('Plan');
+        expect(streamed.find((c) => c.type === 'text_delta')?.textDelta).toBe('Done ');
+        expect(streamed.find((c) => c.type === 'tool_call_delta')?.thoughtSignature).toBe('sig-stream');
+        expect(streamed.find((c) => c.type === 'usage')?.usage?.outputTokens).toBe(20);
+
+        const models = await transport.listModels({ connectionId: geminiConn.id });
+        expect(calls[2].url).toBe('https://generativelanguage.googleapis.com/v1beta/models');
+        expect(calls[3].url).toBe(
+            'https://generativelanguage.googleapis.com/v1beta/models?pageToken=page-2-token',
+        );
+        expect(models).toEqual([
+            {
+                id: 'gemini-2.5-flash',
+                displayName: 'Gemini 2.5 Flash',
+                contextLength: 1048576,
+            },
+            {
+                id: 'gemini-2.5-pro',
+                displayName: 'Gemini 2.5 Pro',
+                contextLength: 1048576,
+            },
+        ]);
+
+        // Array-wrapped Gemini HTTP 400 error extraction
+        const errTransport = new FetchLLMTransport({
+            fetchImpl: async () =>
+                new Response(
+                    JSON.stringify([
+                        { error: { code: 400, message: 'Invalid field in generationConfig', status: 'INVALID_ARGUMENT' } },
+                    ]),
+                    { status: 400, headers: { 'Content-Type': 'application/json' } },
+                ),
+            retry: false,
+        });
+        await expect(
+            errTransport.complete({
+                connectionId: geminiConn.id,
+                connection: geminiConn,
+                messages: [{ role: 'user', content: 'hi' }],
+                tools: [],
+            }),
+        ).rejects.toMatchObject({
+            name: 'LLMTransportError',
+            status: 400,
+            message: 'Invalid field in generationConfig',
+        });
+    });
 });

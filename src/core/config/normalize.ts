@@ -155,7 +155,7 @@ export function normalizeFileMap(
     return result;
 }
 
-const VALID_PROVIDER_FORMATS = new Set<ApiProviderFormat>(['openai', 'anthropic']);
+const VALID_PROVIDER_FORMATS = new Set<ApiProviderFormat>(['openai', 'anthropic', 'gemini']);
 const VALID_CACHE_POLICIES = new Set<CachePolicy>(['auto_prefix', 'anthropic_explicit', 'none']);
 const VALID_POST_PROCESSING = new Set<NonNullable<ApiConnection['promptPostProcessing']>>([
     'none',

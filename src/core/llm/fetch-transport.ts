@@ -99,6 +99,7 @@ export interface ParsedModelsPage {
     models: RemoteModelInfo[];
     hasMore: boolean;
     lastId?: string;
+    nextPageToken?: string;
 }
 
 function firstNonEmptyString(...values: unknown[]): string | undefined {
@@ -141,6 +142,9 @@ function extractErrorMessageFromRecord(parsed: Record<string, unknown>): string 
         if (typeof errObj.type === 'string' && errObj.type) {
             return errObj.type;
         }
+        if (typeof errObj.status === 'string' && errObj.status) {
+            return errObj.status;
+        }
     }
     if (typeof parsed.detail === 'string' && parsed.detail) {
         return parsed.detail;
@@ -161,6 +165,15 @@ function parseModelEntry(entry: unknown): RemoteModelInfo | null {
     }
 
     const obj = entry as Record<string, unknown>;
+    if (Array.isArray(obj.supportedGenerationMethods) && obj.supportedGenerationMethods.length > 0) {
+        const supportsGenerate = obj.supportedGenerationMethods.some(
+            (method) => method === 'generateContent' || method === 'streamGenerateContent',
+        );
+        if (!supportsGenerate) {
+            return null;
+        }
+    }
+
     const rawId = firstNonEmptyString(obj.id);
     const rawName = firstNonEmptyString(obj.name);
     const rawModel = firstNonEmptyString(obj.model);
@@ -183,6 +196,7 @@ function parseModelEntry(entry: unknown): RemoteModelInfo | null {
     const contextLength = firstPositiveInt(
         obj.context_length,
         obj.contextLength,
+        obj.inputTokenLimit,
         obj.input_token_limit,
         obj.max_context_length,
     );
@@ -203,6 +217,7 @@ export function parseModelsResponse(rawJson: unknown): ParsedModelsPage {
     let rawList: unknown[] | null = null;
     let hasMore = false;
     let lastId: string | undefined;
+    let nextPageToken: string | undefined;
 
     if (Array.isArray(rawJson)) {
         rawList = rawJson;
@@ -214,6 +229,7 @@ export function parseModelsResponse(rawJson: unknown): ParsedModelsPage {
             lastId = firstNonEmptyString(record.last_id);
         } else if (Array.isArray(record.models)) {
             rawList = record.models;
+            nextPageToken = firstNonEmptyString(record.nextPageToken, record.next_page_token);
         } else {
             const inlineError = extractErrorMessageFromRecord(record);
             if (inlineError) {
@@ -236,7 +252,7 @@ export function parseModelsResponse(rawJson: unknown): ParsedModelsPage {
         }
     }
 
-    return { models, hasMore, lastId };
+    return { models, hasMore, lastId, nextPageToken };
 }
 
 function extractHttpErrorMessage(rawText: string, status: number, statusText: string): string {
@@ -245,11 +261,12 @@ function extractHttpErrorMessage(rawText: string, status: number, statusText: st
         return fallback;
     }
     try {
-        const parsed = JSON.parse(rawText) as Record<string, unknown>;
-        if (!parsed || typeof parsed !== 'object') {
+        const parsed = JSON.parse(rawText) as unknown;
+        const target = Array.isArray(parsed) ? parsed[0] : parsed;
+        if (!target || typeof target !== 'object' || Array.isArray(target)) {
             return rawText.trim() || fallback;
         }
-        const extracted = extractErrorMessageFromRecord(parsed);
+        const extracted = extractErrorMessageFromRecord(target as Record<string, unknown>);
         if (extracted) {
             return extracted;
         }
@@ -547,6 +564,20 @@ export class FetchLLMTransport implements LLMTransport {
             seenCursors.add(page.lastId);
             const separator = compiled.url.includes('?') ? '&' : '?';
             const nextUrl = `${compiled.url}${separator}after_id=${encodeURIComponent(page.lastId)}`;
+            page = await this.performModelsFetch(compiled, nextUrl, request.signal);
+            allModels.push(...page.models);
+            pageCount += 1;
+        }
+
+        while (
+            compiled.providerFormat === 'gemini'
+            && page.nextPageToken
+            && !seenCursors.has(page.nextPageToken)
+            && pageCount < 5
+        ) {
+            seenCursors.add(page.nextPageToken);
+            const separator = compiled.url.includes('?') ? '&' : '?';
+            const nextUrl = `${compiled.url}${separator}pageToken=${encodeURIComponent(page.nextPageToken)}`;
             page = await this.performModelsFetch(compiled, nextUrl, request.signal);
             allModels.push(...page.models);
             pageCount += 1;

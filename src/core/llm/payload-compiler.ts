@@ -285,12 +285,79 @@ export function postProcessCanonicalMessages(
     return squashConsecutiveRoles(msgs, current.indexMap);
 }
 
-function buildEndpointUrl(baseUrl: string, providerFormat: ApiProviderFormat): string {
-    const base = baseUrl.trim().replace(/\/+$/, '');
-    if (!base) {
+function splitUrlQuery(rawUrl: string): { path: string; query: string } {
+    const trimmed = rawUrl.trim();
+    const queryIdx = trimmed.indexOf('?');
+    const rawPath = queryIdx >= 0 ? trimmed.slice(0, queryIdx) : trimmed;
+    const query = queryIdx >= 0 ? trimmed.slice(queryIdx + 1) : '';
+    const path = rawPath.replace(/\/+$/, '');
+    return { path, query };
+}
+
+function withQueryParams(
+    path: string,
+    query: string,
+    mutate?: (params: URLSearchParams) => void,
+): string {
+    if (!mutate) {
+        return query ? `${path}?${query}` : path;
+    }
+    const params = new URLSearchParams(query);
+    mutate(params);
+    const qs = params.toString();
+    return qs ? `${path}?${qs}` : path;
+}
+
+function buildEndpointUrl(
+    baseUrl: string,
+    providerFormat: ApiProviderFormat,
+    options?: { model?: string; stream?: boolean },
+): string {
+    const { path, query } = splitUrlQuery(baseUrl);
+    if (!path) {
         throw new LLMTransportError('API connection baseUrl is required', { retryable: false });
     }
 
+    if (providerFormat === 'gemini') {
+        const action = options?.stream ? 'streamGenerateContent' : 'generateContent';
+        const actionMatch = /:(streamGenerateContent|generateContent)$/i.exec(path);
+        let endpointPath: string;
+
+        if (actionMatch) {
+            endpointPath = `${path.slice(0, actionMatch.index)}:${action}`;
+        } else {
+            const cleanModel = (options?.model ?? '').trim().replace(/^models\//, '').replace(/^\/+/, '');
+            const encodedModel = cleanModel
+                .split('/')
+                .filter(Boolean)
+                .map((seg) => encodeURIComponent(seg))
+                .join('/');
+            if (!encodedModel) {
+                throw new LLMTransportError(
+                    'API connection model is required for Gemini providerFormat',
+                    { retryable: false },
+                );
+            }
+
+            if (path.endsWith('/models')) {
+                endpointPath = `${path}/${encodedModel}:${action}`;
+            } else if (/\/v\d+(?:beta\d*|alpha\d*)?$/i.test(path)) {
+                endpointPath = `${path}/models/${encodedModel}:${action}`;
+            } else {
+                endpointPath = `${path}/v1beta/models/${encodedModel}:${action}`;
+            }
+        }
+
+        return withQueryParams(endpointPath, query, (params) => {
+            if (options?.stream) {
+                params.set('alt', 'sse');
+            } else if (params.get('alt')?.toLowerCase() === 'sse') {
+                params.delete('alt');
+            }
+        });
+    }
+
+    const base = baseUrl.trim().replace(/\/+$/, '');
     if (providerFormat === 'anthropic') {
         if (base.endsWith('/messages')) {
             return base;
@@ -308,17 +375,34 @@ function buildEndpointUrl(baseUrl: string, providerFormat: ApiProviderFormat): s
 }
 
 /**
- * Resolves the `/models` endpoint URL for OpenAI-compatible and Anthropic connections,
+ * Resolves the `/models` endpoint URL for OpenAI-compatible, Anthropic, and Gemini connections,
  * preserving optional query strings and supporting relative proxy paths.
  */
 export function buildModelsEndpointUrl(baseUrl: string, providerFormat: ApiProviderFormat): string {
-    const trimmed = baseUrl.trim();
-    const queryIdx = trimmed.indexOf('?');
-    const rawPath = queryIdx >= 0 ? trimmed.slice(0, queryIdx) : trimmed;
-    const querySuffix = queryIdx >= 0 ? trimmed.slice(queryIdx) : '';
-    const base = rawPath.replace(/\/+$/, '');
+    const { path: base, query } = splitUrlQuery(baseUrl);
+    const querySuffix = query ? `?${query}` : '';
     if (!base) {
         throw new LLMTransportError('API connection baseUrl is required', { retryable: false });
+    }
+
+    if (providerFormat === 'gemini') {
+        const actionMatch = /^(.*\/models)\/[^/]+:(?:streamGenerateContent|generateContent)$/i.exec(base);
+        let modelsPath: string;
+        if (actionMatch) {
+            modelsPath = actionMatch[1];
+        } else if (base.endsWith('/models')) {
+            modelsPath = base;
+        } else if (/\/v\d+(?:beta\d*|alpha\d*)?$/i.test(base)) {
+            modelsPath = `${base}/models`;
+        } else {
+            modelsPath = `${base}/v1beta/models`;
+        }
+
+        return withQueryParams(modelsPath, query, (params) => {
+            if (params.get('alt')?.toLowerCase() === 'sse') {
+                params.delete('alt');
+            }
+        });
     }
 
     if (base.endsWith('/models')) {
@@ -395,6 +479,14 @@ function buildHeaders(
         }
         if (!hasHeaderCaseInsensitive(headers, 'anthropic-version')) {
             headers['anthropic-version'] = anthropicVersion;
+        }
+    } else if (connection.providerFormat === 'gemini') {
+        if (
+            apiKey
+            && !hasHeaderCaseInsensitive(headers, 'x-goog-api-key')
+            && !hasHeaderCaseInsensitive(headers, 'authorization')
+        ) {
+            headers['x-goog-api-key'] = apiKey;
         }
     } else if (apiKey && !hasHeaderCaseInsensitive(headers, 'authorization')) {
         headers.Authorization = `Bearer ${apiKey}`;
@@ -896,10 +988,507 @@ function compileAnthropicPayload(
     return { body, cacheBreakpointsApplied };
 }
 
+const GEMINI_SUPPORTED_FORMATS = new Set([
+    'enum',
+    'date-time',
+    'float',
+    'double',
+    'int32',
+    'int64',
+]);
+
+const GEMINI_SCALAR_SCHEMA_KEYS = [
+    'title',
+    'description',
+    'nullable',
+    'minimum',
+    'maximum',
+    'minLength',
+    'maxLength',
+    'minItems',
+    'maxItems',
+    'minProperties',
+    'maxProperties',
+    'pattern',
+    'default',
+    'example',
+    'propertyOrdering',
+] as const;
+
+const AUDIO_FORMAT_MIME_MAP: Record<string, string> = {
+    mp3: 'audio/mpeg',
+    mpeg: 'audio/mpeg',
+    wav: 'audio/wav',
+    ogg: 'audio/ogg',
+    flac: 'audio/flac',
+    aac: 'audio/aac',
+    m4a: 'audio/mp4',
+    mp4: 'audio/mp4',
+    webm: 'audio/webm',
+};
+
+const EXTENSION_MIME_MAP: Record<string, string> = {
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    webp: 'image/webp',
+    gif: 'image/gif',
+    heic: 'image/heic',
+    heif: 'image/heif',
+    svg: 'image/svg+xml',
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    ogg: 'audio/ogg',
+    flac: 'audio/flac',
+    aac: 'audio/aac',
+    m4a: 'audio/mp4',
+    mp4: 'video/mp4',
+    webm: 'video/webm',
+    mov: 'video/quicktime',
+    avi: 'video/x-msvideo',
+    mkv: 'video/x-matroska',
+    pdf: 'application/pdf',
+    txt: 'text/plain',
+    md: 'text/markdown',
+    json: 'application/json',
+    csv: 'text/csv',
+    html: 'text/html',
+    htm: 'text/html',
+};
+
+function parseDataUrl(value: string): { mimeType?: string; data: string } | null {
+    if (!value.startsWith('data:')) {
+        return null;
+    }
+    const commaIdx = value.indexOf(',');
+    const meta = commaIdx >= 0 ? value.slice(5, commaIdx) : '';
+    const data = commaIdx >= 0 ? value.slice(commaIdx + 1) : '';
+    const rawMime = meta.split(';')[0]?.trim();
+    return {
+        ...(rawMime ? { mimeType: rawMime } : {}),
+        data,
+    };
+}
+
+function inferMimeFromUrl(url: string, fallback: string): string {
+    const clean = url.split(/[?#]/, 1)[0].toLowerCase();
+    const lastSlash = clean.lastIndexOf('/');
+    const filename = lastSlash >= 0 ? clean.slice(lastSlash + 1) : clean;
+    const dotIdx = filename.lastIndexOf('.');
+    if (dotIdx >= 0 && dotIdx < filename.length - 1) {
+        const ext = filename.slice(dotIdx + 1);
+        if (EXTENSION_MIME_MAP[ext]) {
+            return EXTENSION_MIME_MAP[ext];
+        }
+    }
+    return fallback;
+}
+
+function mapAudioFormatToMime(format: string | undefined): string {
+    const normalized = format?.trim().toLowerCase();
+    if (normalized && AUDIO_FORMAT_MIME_MAP[normalized]) {
+        return AUDIO_FORMAT_MIME_MAP[normalized];
+    }
+    if (normalized && normalized.includes('/')) {
+        return normalized;
+    }
+    return `audio/${normalized || 'mpeg'}`;
+}
+
+function convertPartToGemini(part: CanonicalContentPart): Record<string, unknown> {
+    if (part.type === 'text') {
+        return { text: part.text || '\u200b' };
+    }
+    if (part.type === 'image_url') {
+        const parsed = parseDataUrl(part.imageUrl);
+        if (parsed) {
+            return {
+                inlineData: {
+                    mimeType: parsed.mimeType || 'image/png',
+                    data: parsed.data,
+                },
+            };
+        }
+        return {
+            fileData: {
+                mimeType: inferMimeFromUrl(part.imageUrl, 'image/png'),
+                fileUri: part.imageUrl,
+            },
+        };
+    }
+    if (part.type === 'input_audio') {
+        const parsed = parseDataUrl(part.data);
+        return {
+            inlineData: {
+                mimeType: part.mimeType ?? parsed?.mimeType ?? mapAudioFormatToMime(part.format),
+                data: parsed ? parsed.data : stripDataUrlPrefix(part.data),
+            },
+        };
+    }
+    if (part.type === 'video_url') {
+        const parsed = parseDataUrl(part.videoUrl);
+        if (parsed) {
+            return {
+                inlineData: {
+                    mimeType: part.mimeType ?? parsed.mimeType ?? 'video/mp4',
+                    data: parsed.data,
+                },
+            };
+        }
+        return {
+            fileData: {
+                mimeType: part.mimeType ?? inferMimeFromUrl(part.videoUrl, 'video/mp4'),
+                fileUri: part.videoUrl,
+            },
+        };
+    }
+    if (/^(?:https?:\/\/|gs:\/\/)/i.test(part.data)) {
+        const mimeType = part.mimeType ?? inferMimeFromUrl(part.data, '');
+        return {
+            fileData: {
+                ...(mimeType ? { mimeType } : {}),
+                fileUri: part.data,
+            },
+        };
+    }
+    const parsed = parseDataUrl(part.data);
+    return {
+        inlineData: {
+            mimeType: part.mimeType ?? parsed?.mimeType ?? 'application/pdf',
+            data: parsed ? parsed.data : stripDataUrlPrefix(part.data),
+        },
+    };
+}
+
 /**
- * Compiles canonical `LLMRequest` + `ApiConnection` into OpenAI Chat Completions
- * or Anthropic Messages HTTP request payloads with KV-cache prefix stabilization
- * and explicit Anthropic cache breakpoint placement (capped at 4).
+ * Recursively converts a JSON Schema (including Zod v4 `z.toJSONSchema` output) into
+ * the OpenAPI 3.0 Schema subset accepted by Gemini `functionDeclarations.parameters`.
+ */
+export function sanitizeGeminiSchema(schema: unknown): Record<string, unknown> {
+    if (!isPlainObject(schema)) {
+        return { type: 'object' };
+    }
+
+    const raw = schema;
+    const out: Record<string, unknown> = {};
+
+    for (const key of GEMINI_SCALAR_SCHEMA_KEYS) {
+        const value = raw[key];
+        if (value !== undefined) {
+            out[key] = canonicalClone(value);
+        }
+    }
+
+    if (typeof raw.exclusiveMinimum === 'number' && out.minimum === undefined) {
+        out.minimum = raw.exclusiveMinimum;
+    }
+    if (typeof raw.exclusiveMaximum === 'number' && out.maximum === undefined) {
+        out.maximum = raw.exclusiveMaximum;
+    }
+
+    if (raw.const !== undefined) {
+        if (typeof raw.const === 'string') {
+            out.type = 'string';
+            out.enum = [raw.const];
+        } else if (typeof raw.const === 'number') {
+            out.type = Number.isInteger(raw.const) ? 'integer' : 'number';
+        } else if (typeof raw.const === 'boolean') {
+            out.type = 'boolean';
+        }
+    }
+
+    if (Array.isArray(raw.type)) {
+        const nonNull = raw.type.filter((t): t is string => typeof t === 'string' && t !== 'null');
+        if (raw.type.includes('null')) {
+            out.nullable = true;
+        }
+        if (nonNull.length === 1) {
+            out.type = nonNull[0];
+        } else if (nonNull.length > 1) {
+            out.anyOf = nonNull.map((t) => ({ type: t }));
+        }
+    } else if (typeof raw.type === 'string' && raw.type !== 'null' && out.type === undefined) {
+        out.type = raw.type;
+    }
+
+    const unionSource = Array.isArray(raw.anyOf)
+        ? raw.anyOf
+        : Array.isArray(raw.oneOf)
+            ? raw.oneOf
+            : undefined;
+    if (unionSource) {
+        let hasNullBranch = false;
+        const nonNullBranches: Array<Record<string, unknown>> = [];
+        for (const branch of unionSource) {
+            if (isPlainObject(branch) && branch.type === 'null') {
+                hasNullBranch = true;
+                continue;
+            }
+            nonNullBranches.push(sanitizeGeminiSchema(branch));
+        }
+        if (hasNullBranch) {
+            out.nullable = true;
+        }
+        if (nonNullBranches.length === 1) {
+            const single = nonNullBranches[0];
+            for (const [k, v] of Object.entries(single)) {
+                if (out[k] === undefined) {
+                    out[k] = v;
+                } else if (k === 'nullable' && v === true) {
+                    out.nullable = true;
+                }
+            }
+        } else if (nonNullBranches.length > 1) {
+            out.anyOf = nonNullBranches;
+        }
+    }
+
+    if (typeof raw.format === 'string' && GEMINI_SUPPORTED_FORMATS.has(raw.format)) {
+        out.format = raw.format;
+    }
+
+    if (Array.isArray(raw.enum) && raw.enum.length > 0 && raw.enum.every((v) => typeof v === 'string')) {
+        out.enum = [...raw.enum];
+        if (!out.type && !out.anyOf) {
+            out.type = 'string';
+        }
+    }
+
+    if (isPlainObject(raw.properties)) {
+        const sanitizedProps: Record<string, unknown> = {};
+        for (const [propKey, propSchema] of Object.entries(raw.properties)) {
+            if (FORBIDDEN_MERGE_KEYS.has(propKey)) {
+                continue;
+            }
+            sanitizedProps[propKey] = sanitizeGeminiSchema(propSchema);
+        }
+        if (Object.keys(sanitizedProps).length > 0) {
+            out.properties = sanitizedProps;
+            if (!out.type && !out.anyOf) {
+                out.type = 'object';
+            }
+            if (Array.isArray(raw.required)) {
+                const filteredRequired = raw.required.filter(
+                    (req): req is string =>
+                        typeof req === 'string'
+                        && Object.prototype.hasOwnProperty.call(sanitizedProps, req),
+                );
+                if (filteredRequired.length > 0) {
+                    out.required = filteredRequired;
+                }
+            }
+        }
+    }
+
+    if (raw.items !== undefined) {
+        const rawItems = Array.isArray(raw.items) ? raw.items[0] : raw.items;
+        const sanitizedItems = rawItems !== undefined ? sanitizeGeminiSchema(rawItems) : { type: 'string' };
+        if (sanitizedItems.type === undefined && sanitizedItems.anyOf === undefined) {
+            sanitizedItems.type = 'string';
+        }
+        out.items = sanitizedItems;
+    } else if (out.type === 'array') {
+        out.items = { type: 'string' };
+    }
+
+    return out;
+}
+
+function parsePlainObjectOrResult(text: string): Record<string, unknown> {
+    const trimmed = text.trim();
+    if (trimmed.startsWith('{')) {
+        try {
+            const parsed = JSON.parse(trimmed);
+            if (isPlainObject(parsed)) {
+                return parsed;
+            }
+        } catch {
+            // Fall through to string wrapper
+        }
+    }
+    return { result: text };
+}
+
+function compileGeminiPayload(
+    request: LLMRequest,
+    connection: ApiConnection,
+    processed: PostProcessResult,
+): { body: Record<string, unknown>; cacheBreakpointsApplied: number } {
+    const msgs = processed.messages;
+    const systemParts: Array<Record<string, unknown>> = [];
+
+    let idx = 0;
+    while (idx < msgs.length && msgs[idx].role === 'system') {
+        const content = msgs[idx].content;
+        if (typeof content === 'string') {
+            if (content.length > 0) {
+                systemParts.push({ text: content });
+            }
+        } else {
+            for (const part of content) {
+                if (part.type === 'text' && !part.text) {
+                    continue;
+                }
+                systemParts.push(convertPartToGemini(part));
+            }
+        }
+        idx += 1;
+    }
+
+    const toolCallIdToName = new Map<string, string>();
+    const contents: Array<{ role: 'user' | 'model'; parts: Array<Record<string, unknown>> }> = [];
+
+    for (; idx < msgs.length; idx += 1) {
+        const msg = msgs[idx];
+        let targetRole: 'user' | 'model';
+        const parts: Array<Record<string, unknown>> = [];
+
+        if (msg.role === 'tool') {
+            targetRole = 'user';
+            const name =
+                msg.toolName
+                || (msg.toolCallId ? toolCallIdToName.get(msg.toolCallId) : undefined)
+                || 'unknown_tool';
+
+            let responseObj: Record<string, unknown>;
+            const extraParts: Array<Record<string, unknown>> = [];
+
+            if (typeof msg.content === 'string') {
+                responseObj = parsePlainObjectOrResult(msg.content);
+            } else {
+                const textSegments: string[] = [];
+                for (const part of msg.content) {
+                    if (part.type === 'text') {
+                        if (part.text) {
+                            textSegments.push(part.text);
+                        }
+                    } else {
+                        extraParts.push(convertPartToGemini(part));
+                    }
+                }
+                responseObj = parsePlainObjectOrResult(textSegments.join('\n\n'));
+            }
+
+            parts.push({ functionResponse: { name, response: responseObj } }, ...extraParts);
+        } else if (msg.role === 'assistant') {
+            targetRole = 'model';
+            const contentWithPrefix = msg.name ? applyNamePrefixToContent(msg) : msg.content;
+            if (typeof contentWithPrefix === 'string') {
+                if (contentWithPrefix.length > 0) {
+                    parts.push({ text: contentWithPrefix });
+                }
+            } else {
+                for (const part of contentWithPrefix) {
+                    if (part.type === 'text' && !part.text) {
+                        continue;
+                    }
+                    parts.push(convertPartToGemini(part));
+                }
+            }
+
+            if (msg.toolCalls?.length) {
+                for (const tc of msg.toolCalls) {
+                    if (tc.id && tc.name) {
+                        toolCallIdToName.set(tc.id, tc.name);
+                    }
+                    parts.push({
+                        functionCall: {
+                            name: tc.name,
+                            args: safeParseToolInput(tc.arguments),
+                        },
+                        ...(tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : {}),
+                    });
+                }
+            }
+
+            if (parts.length === 0) {
+                parts.push({ text: '\u200b' });
+            }
+        } else {
+            // 'user' or mid-conversation 'system' converted to 'user'
+            targetRole = 'user';
+            const contentWithPrefix =
+                msg.name && msg.role !== 'system' ? applyNamePrefixToContent(msg) : msg.content;
+            if (typeof contentWithPrefix === 'string') {
+                parts.push({ text: contentWithPrefix || '\u200b' });
+            } else if (contentWithPrefix.length > 0) {
+                for (const part of contentWithPrefix) {
+                    parts.push(convertPartToGemini(part));
+                }
+            } else {
+                parts.push({ text: '\u200b' });
+            }
+        }
+
+        const prev = contents[contents.length - 1];
+        if (prev && prev.role === targetRole) {
+            prev.parts.push(...parts);
+        } else {
+            contents.push({ role: targetRole, parts });
+        }
+    }
+
+    if (contents.length === 0) {
+        contents.push({ role: 'user', parts: [{ text: PROMPT_PLACEHOLDER }] });
+    } else if (contents[0].role !== 'user') {
+        contents.unshift({ role: 'user', parts: [{ text: PROMPT_PLACEHOLDER }] });
+    }
+
+    const body: Record<string, unknown> = {
+        contents,
+    };
+
+    if (systemParts.length > 0) {
+        body.systemInstruction = { parts: systemParts };
+    }
+
+    if (request.tools.length > 0) {
+        const functionDeclarations = request.tools.map((tool) => {
+            const sanitized = sanitizeGeminiSchema(tool.parameters);
+            const hasProperties =
+                isPlainObject(sanitized.properties) && Object.keys(sanitized.properties).length > 0;
+            const hasUnion = Array.isArray(sanitized.anyOf) && sanitized.anyOf.length > 0;
+            const omitParameters =
+                (!sanitized.type || sanitized.type === 'object') && !hasProperties && !hasUnion;
+            return {
+                name: tool.name,
+                description: tool.description,
+                ...(omitParameters ? {} : { parameters: sanitized }),
+            };
+        });
+        body.tools = [{ functionDeclarations }];
+    }
+
+    const generationConfig: Record<string, unknown> = {};
+    if (Number.isFinite(connection.maxTokens) && connection.maxTokens > 0) {
+        generationConfig.maxOutputTokens = Math.floor(connection.maxTokens);
+    }
+    if (Number.isFinite(connection.temperature)) {
+        generationConfig.temperature = connection.temperature;
+    }
+    if (Number.isFinite(connection.topP)) {
+        generationConfig.topP = connection.topP;
+    }
+    if (Number.isFinite(connection.topK) && connection.topK > 0) {
+        generationConfig.topK = Math.floor(connection.topK);
+    }
+    if (Number.isFinite(connection.frequencyPenalty) && connection.frequencyPenalty !== 0) {
+        generationConfig.frequencyPenalty = connection.frequencyPenalty;
+    }
+    if (Number.isFinite(connection.presencePenalty) && connection.presencePenalty !== 0) {
+        generationConfig.presencePenalty = connection.presencePenalty;
+    }
+    if (Object.keys(generationConfig).length > 0) {
+        body.generationConfig = generationConfig;
+    }
+
+    return { body, cacheBreakpointsApplied: 0 };
+}
+
+/**
+ * Compiles canonical `LLMRequest` + `ApiConnection` into OpenAI Chat Completions,
+ * Anthropic Messages, or Google Gemini `generateContent` HTTP request payloads with
+ * KV-cache prefix stabilization and explicit Anthropic cache breakpoint placement (capped at 4).
  */
 export class PayloadCompiler {
     private readonly anthropicVersion: string;
@@ -910,9 +1499,12 @@ export class PayloadCompiler {
 
     compile(request: LLMRequest, connection: ApiConnection): CompiledPayload {
         const providerFormat = connection.providerFormat;
-        const url = buildEndpointUrl(connection.baseUrl, providerFormat);
-        const headers = buildHeaders(connection, this.anthropicVersion);
         const useStream = request.stream ?? connection.stream;
+        const url = buildEndpointUrl(connection.baseUrl, providerFormat, {
+            model: connection.model,
+            stream: useStream,
+        });
+        const headers = buildHeaders(connection, this.anthropicVersion);
 
         const postMode = connection.promptPostProcessing ?? 'none';
         const processed = postProcessCanonicalMessages(request.messages, postMode);
@@ -920,7 +1512,9 @@ export class PayloadCompiler {
         const compiled =
             providerFormat === 'anthropic'
                 ? compileAnthropicPayload(request, connection, processed, useStream)
-                : compileOpenAIPayload(request, connection, processed, useStream);
+                : providerFormat === 'gemini'
+                    ? compileGeminiPayload(request, connection, processed)
+                    : compileOpenAIPayload(request, connection, processed, useStream);
 
         const body = compiled.body;
 

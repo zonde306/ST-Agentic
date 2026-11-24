@@ -58,6 +58,15 @@ describe('src/core/config defaults, normalization, and secret-free exports', () 
         expect(conn.maxCacheBreakpoints).toBe(4);
         expect(conn.apiKey).toBe('sk-ant-123');
 
+        const geminiConn = normalizeConnection({
+            id: 'gemini_conn',
+            providerFormat: 'gemini',
+            baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+            model: 'gemini-2.5-pro',
+        });
+        expect(geminiConn.providerFormat).toBe('gemini');
+        expect(geminiConn.cachePolicy).toBe('auto_prefix');
+
         const preset = normalizePreset({
             id: 'p1',
             name: 'Custom',

@@ -1664,7 +1664,28 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
                             contextLength: 200000,
                         },
                     ]
-                    : [
+                    : connection.providerFormat === 'gemini'
+                        ? [
+                            {
+                                id: 'gemini-2.5-pro',
+                                displayName: 'Gemini 2.5 Pro',
+                                ownedBy: 'google',
+                                contextLength: 1048576,
+                            },
+                            {
+                                id: 'gemini-2.5-flash',
+                                displayName: 'Gemini 2.5 Flash',
+                                ownedBy: 'google',
+                                contextLength: 1048576,
+                            },
+                            {
+                                id: 'gemini-2.5-flash-lite',
+                                displayName: 'Gemini 2.5 Flash-Lite',
+                                ownedBy: 'google',
+                                contextLength: 1048576,
+                            },
+                        ]
+                        : [
                         {
                             id: 'gemini-2.5-flash',
                             displayName: 'Gemini 2.5 Flash',
