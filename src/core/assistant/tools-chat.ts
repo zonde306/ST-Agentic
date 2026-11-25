@@ -1167,7 +1167,7 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
                         degradedToCatalog: true,
                         reason: !hasFilter ? 'unfiltered_request' : 'content_exceeded_24kb',
                         totalContentBytes,
-                        hint: 'Returned World Info catalog summary (omitting full content). Specify bookName and/or query to read full content for specific entries, or use read_file("/lorebooks/<bookName>/...") for targeted reads.',
+                        hint: 'Returned World Info catalog summary (omitting full content). Specify bookName and/or query to read full content for specific entries, use wi_read_raw_book({ bookName, uid, start_line?, end_line? }) in author/full mode for raw paginated reads, or use read_file("/lorebooks/<bookName>/...") for targeted reads.',
                     }
                     : {}),
                 books: summaries,

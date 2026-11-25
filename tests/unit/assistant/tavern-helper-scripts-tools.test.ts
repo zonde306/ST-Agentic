@@ -326,4 +326,134 @@ describe('Large TavernHelper scripts & raw World Info progressive drill-down', (
         expect(searchData.matchCount).toBe(3);
         expect(searchData.matches[0]).toMatchObject({ uid: 12, line: 3 });
     });
+
+    it('allows wi_read_raw_book to read globally enabled books without a primary bound lorebook, and disabled books only with stAdminEnabled', async () => {
+        const { bridge, ctx, tools } = setupEnv();
+        bridge.primaryWorldName = null;
+        const activeChar = bridge.characters.find((c) => c.chid === bridge.activeCharacterId);
+        if (activeChar) {
+            activeChar.primaryWorld = undefined;
+            if (activeChar.extensions) {
+                delete activeChar.extensions.world;
+            }
+            if (activeChar.data && typeof activeChar.data === 'object') {
+                const ext = (activeChar.data as Record<string, unknown>).extensions;
+                if (ext && typeof ext === 'object') {
+                    delete (ext as Record<string, unknown>).world;
+                }
+            }
+        }
+
+        bridge.setLorebook('___生理系统v3', [
+            {
+                uid: 1,
+                world: '___生理系统v3',
+                comment: 'EJS 状态结算',
+                keys: ['生理'],
+                keysecondary: [],
+                content: '@@activate\n<% const hp = getvar("hp"); %>\n状态=<%= hp %>',
+                selective: false,
+                disable: false,
+                constant: true,
+                position: 0,
+                depth: 4,
+                order: 10,
+                role: 0,
+            },
+        ]);
+        bridge.setDisabledLorebook('DisabledBook', [
+            {
+                uid: 9,
+                world: 'DisabledBook',
+                comment: 'Disabled Entry',
+                keys: ['secret'],
+                keysecondary: [],
+                content: '@@system\n<% if (true) { %>hidden<% } %>',
+                selective: false,
+                disable: false,
+                constant: false,
+                position: 0,
+                depth: 4,
+                order: 10,
+                role: 0,
+            },
+        ]);
+
+        const wiRead = tools.get('wi_read_raw_book')!;
+        const wiUpsertPrimary = tools.get('wi_upsert_primary_entry')!;
+
+        // 1. Reading globally enabled book succeeds in author & full without stAdminEnabled
+        for (const mode of ['author', 'full'] as const) {
+            const modeCtx: AssistantToolContext = { ...ctx, mode, stAdminEnabled: false };
+            const res = await executeAssistantTool(
+                wiRead,
+                { bookName: '___生理系统v3' },
+                modeCtx,
+            );
+            expect(res.ok).toBe(true);
+            const data = res.data as {
+                bookName: string;
+                entries: Array<{ uid: number; content: string }>;
+            };
+            expect(data.bookName).toBe('___生理系统v3');
+            expect(data.entries[0]?.content).toContain('@@activate');
+            expect(data.entries[0]?.content).toContain('<% const hp = getvar("hp"); %>');
+
+            const uidRes = await executeAssistantTool(
+                wiRead,
+                { bookName: '___生理系统v3', uid: 1 },
+                modeCtx,
+            );
+            expect(uidRes.ok).toBe(true);
+            expect((uidRes.data as { content: string }).content).toContain('1| @@activate');
+
+            const queryRes = await executeAssistantTool(
+                wiRead,
+                { bookName: '___生理系统v3', query: 'getvar' },
+                modeCtx,
+            );
+            expect(queryRes.ok).toBe(true);
+            expect((queryRes.data as { matchCount: number }).matchCount).toBe(1);
+        }
+
+        // 2. Omitting bookName when no primary is bound returns helpful error listing enabled books
+        const omittedRes = await executeAssistantTool(wiRead, {}, { ...ctx, stAdminEnabled: false });
+        expect(omittedRes.ok).toBe(false);
+        expect(omittedRes.error).toContain('no primary bound World Info book');
+        expect(omittedRes.error).toContain('___生理系统v3');
+
+        // 3. Primary mutation tools remain strictly gated to bound primary book
+        const upsertPrimaryRes = await executeAssistantTool(
+            wiUpsertPrimary,
+            { bookName: '___生理系统v3', content: 'blocked' },
+            { ...ctx, mode: 'full', stAdminEnabled: false },
+        );
+        expect(upsertPrimaryRes.ok).toBe(false);
+        expect(upsertPrimaryRes.error).toContain('no primary bound World Info book');
+
+        // 4. Disabled book is rejected when stAdminEnabled is false (in both author & full)
+        for (const mode of ['author', 'full'] as const) {
+            const disabledBlocked = await executeAssistantTool(
+                wiRead,
+                { bookName: 'DisabledBook' },
+                { ...ctx, mode, stAdminEnabled: false },
+            );
+            expect(disabledBlocked.ok).toBe(false);
+            expect(disabledBlocked.error).toContain('not currently enabled');
+        }
+
+        // 5. Disabled book succeeds in full + stAdminEnabled: true
+        const disabledAdminOk = await executeAssistantTool(
+            wiRead,
+            { bookName: 'DisabledBook' },
+            { ...ctx, mode: 'full', stAdminEnabled: true },
+        );
+        expect(disabledAdminOk.ok).toBe(true);
+        const disabledData = disabledAdminOk.data as {
+            bookName: string;
+            entries: Array<{ content: string }>;
+        };
+        expect(disabledData.bookName).toBe('DisabledBook');
+        expect(disabledData.entries[0]?.content).toContain('<% if (true) { %>hidden<% } %>');
+    });
 });

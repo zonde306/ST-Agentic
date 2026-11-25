@@ -22,8 +22,8 @@
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **当前角色卡** | `card_read_active` | — | `card_read_full` / `card_patch_active` / `card_embed_agentic` | 同 `author` | 同左 + `card_admin_*` |
 | **主世界书** | `wi_read_enabled` | VFS `/lorebooks/**` 分支覆写 | `wi_read_raw_book` / `wi_upsert_primary_entry` / `wi_delete_primary_entry` | 同 `author` | 同左 |
-| **任意已启用世界书** | `wi_read_enabled` | — | — | `wi_list_enabled_books` / `wi_upsert_enabled_entry` / `wi_delete_enabled_entry` | 同左 |
-| **全部/未启用世界书与绑定** | — | — | — | — | `wi_admin_list_all` / `wi_admin_create_book` / `wi_admin_bind_book` / `wi_admin_upsert_entry` / `wi_admin_delete_entry` |
+| **任意已启用世界书** | `wi_read_enabled` | — | `wi_read_raw_book`（传入 `bookName`） | `wi_read_raw_book` / `wi_list_enabled_books` / `wi_upsert_enabled_entry` / `wi_delete_enabled_entry` | 同左 |
+| **全部/未启用世界书与绑定** | — | — | — | — | `wi_read_raw_book`（含未启用书） / `wi_admin_list_all` / `wi_admin_create_book` / `wi_admin_bind_book` / `wi_admin_upsert_entry` / `wi_admin_delete_entry` |
 | **ST 原生正则** | — | — | `regex_list_scoped` / `regex_upsert_scoped` / `regex_delete_scoped` | 同 `author` | 同左 + `regex_admin_global_upsert` / `regex_admin_global_delete` |
 | **刷新前端消息显示** | — | — | `chat_reload_messages` | `chat_reload_messages` | `chat_reload_messages` |
 | **聊天消息楼层** | `search_history` / `read_history` | `chat_create_message` / `chat_edit_message` / `chat_delete_message` / `chat_toggle_hide_message` / `message_override_display` | 同 `adjust` | 同 `adjust` | 同 `adjust` |
@@ -60,7 +60,7 @@ ST-Agentic 的三层变量已与 SillyTavern 原生存储完全打通，不存�
 ### 世界书（World Info）
 - 所有 `wi_upsert_*` 均**原样保留**开头的 `@@` 装饰器和 `<% ... %>` EJS 块（不转义 `@`）。
 - 新建条目省略 `uid`，更新条目传入已有 `uid`。
-- `wi_read_raw_book` 遇到超大世界书（> 24 KB）时会自动降级为条目目录，可传 `uid`（配 `start_line` / `end_line`）逐段读取或 `query` 跨条目检索（默认自动折叠超长 Base64）。
+- `wi_read_raw_book` 省略 `bookName` 时默认读取当前角色绑定的主世界书；传入 `bookName` 时可直接读取任意**已启用/全局启用**世界书（即使当前角色未绑定主世界书），开启 `full + stAdmin` 时还可读未启用的世界书。遇到超大世界书（> 24 KB）时会自动降级为条目目录，可传 `uid`（配 `start_line` / `end_line`）逐段读取或 `query` 跨条目检索（默认自动折叠超长 Base64）。
 - `wi_upsert_primary_entry` 只写主绑定世界书；如主角色卡未绑定主世界书或需要改额外附加世界书，用 `wi_upsert_enabled_entry`（`full`）或 `wi_admin_bind_book` + `wi_admin_upsert_entry`（`full + stAdmin`）。
 
 ### 正则（不要混淆两套正则）

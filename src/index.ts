@@ -2423,6 +2423,11 @@ jQuery(async () => {
                 }
 
                 if (existingCapsule) {
+                    placeAgenticCapsule(
+                        mesElement,
+                        existingCapsule,
+                        currentSettings.capsulePosition ?? 'bottom',
+                    );
                     const hasCheckpoint = hasTargetCheckpoint(msgTarget);
                     existingCapsule.setState({
                         status: hasCheckpoint ? 'done' : 'idle',

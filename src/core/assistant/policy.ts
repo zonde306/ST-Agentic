@@ -357,7 +357,7 @@ const TOOL_CATALOG: Record<string, ToolPolicySpec> = {
         baseRequiresApproval: false,
         baseMandatoryConfirm: false,
         baseRiskLevel: 'low',
-        defaultScopeLabel: 'Primary WI',
+        defaultScopeLabel: 'Raw WI',
     },
     wi_upsert_primary_entry: {
         requiredMode: 'author',

@@ -5,6 +5,7 @@ import type { ConsoleTabId } from '@/core/types';
 import { registerAssistantView } from '@/ui/assistant';
 import {
     type AgenticCapsuleElement,
+    placeAgenticCapsule,
     registerAgenticCapsuleElement,
 } from '@/ui/capsule';
 import { registerSessionViews } from '@/ui/session';
@@ -1024,5 +1025,103 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
         const { shadowRoot: mobileShadowRoot } = getShellElements();
         expect(mobileShadowRoot.querySelector('button[aria-label="网页全屏"]')).toBeNull();
         expect(mobileShadowRoot.querySelector('button[aria-label="还原窗口"]')).toBeNull();
+    });
+
+    it('mounts <agentic-capsule> inside .mes_block without squeezing SillyTavern .mes flex-row layout', async () => {
+        await page.viewport(1280, 800);
+        activeHarness = createHarness({ initialTab: 'files', initialOpen: false });
+        await settleLayout(4);
+
+        const chatStyle = document.createElement('style');
+        chatStyle.textContent = `
+            #test-st-chat { width: 900px; box-sizing: border-box; }
+            #test-st-chat .mes {
+                display: flex;
+                align-items: flex-start;
+                width: 100%;
+                box-sizing: border-box;
+                padding: 10px 10px 0 10px;
+            }
+            #test-st-chat .mesAvatarWrapper { width: 50px; flex-shrink: 0; }
+            #test-st-chat .mes_block {
+                padding-left: 10px;
+                width: 100%;
+                overflow-x: hidden;
+                overflow-y: clip;
+                box-sizing: border-box;
+            }
+            #test-st-chat .mes_text { padding: 5px 0; }
+            #test-st-chat .swipeRightBlock { width: 25px; flex-shrink: 0; }
+        `;
+
+        const chatContainer = document.createElement('div');
+        chatContainer.id = 'test-st-chat';
+        chatContainer.innerHTML = `
+            <div class="mes" mesid="0">
+                <div class="mesAvatarWrapper"><div class="avatar"></div></div>
+                <div class="mes_block">
+                    <div class="ch_name"><span>角色名</span></div>
+                    <div class="mes_text"><p>开场白与自定义卡片内容</p></div>
+                    <div class="mes_media_wrapper"></div>
+                </div>
+                <div class="swipeRightBlock"></div>
+            </div>
+        `;
+
+        document.head.appendChild(chatStyle);
+        document.body.appendChild(chatContainer);
+
+        try {
+            const mesEl = chatContainer.querySelector<HTMLElement>('.mes')!;
+            const mesBlock = chatContainer.querySelector<HTMLElement>('.mes_block')!;
+            const mesText = chatContainer.querySelector<HTMLElement>('.mes_text')!;
+
+            await settleLayout(3);
+            const baselineBlockWidth = mesBlock.getBoundingClientRect().width;
+            expect(baselineBlockWidth).toBeGreaterThan(700);
+
+            // Simulate runtime callers passing `#chat .mes[mesid="0"]`
+            placeAgenticCapsule(mesEl, activeHarness.capsule, 'bottom');
+            await settleLayout(4);
+
+            expect(activeHarness.capsule.parentElement).toBe(mesBlock);
+            expect(mesEl.querySelectorAll('agentic-capsule').length).toBe(1);
+            expect(mesText.querySelector('agentic-capsule')).toBeNull();
+            expect(mesText.nextElementSibling).toBe(activeHarness.capsule);
+
+            const blockRectAfterBottom = mesBlock.getBoundingClientRect();
+            const textRectAfterBottom = mesText.getBoundingClientRect();
+            const capsuleRectBottom = activeHarness.capsule.getBoundingClientRect();
+
+            expect(Math.abs(blockRectAfterBottom.width - baselineBlockWidth)).toBeLessThanOrEqual(2);
+            expect(Math.abs(capsuleRectBottom.width - textRectAfterBottom.width)).toBeLessThanOrEqual(2);
+            expect(capsuleRectBottom.top).toBeGreaterThanOrEqual(textRectAfterBottom.bottom - 1);
+
+            // Idempotent re-placement keeps the exact same DOM position
+            placeAgenticCapsule(mesEl, activeHarness.capsule, 'bottom');
+            await settleLayout(2);
+            expect(activeHarness.capsule.parentElement).toBe(mesBlock);
+            expect(mesText.nextElementSibling).toBe(activeHarness.capsule);
+
+            // Toggling capsulePosition in settings dynamically moves mounted capsule above .mes_text
+            await activeHarness.store.updateSettings((prev) => ({
+                ...prev,
+                capsulePosition: 'top',
+            }));
+            await settleLayout(4);
+
+            expect(activeHarness.capsule.parentElement).toBe(mesBlock);
+            expect(activeHarness.capsule.nextElementSibling).toBe(mesText);
+
+            const blockRectAfterTop = mesBlock.getBoundingClientRect();
+            const textRectAfterTop = mesText.getBoundingClientRect();
+            const capsuleRectTop = activeHarness.capsule.getBoundingClientRect();
+
+            expect(Math.abs(blockRectAfterTop.width - baselineBlockWidth)).toBeLessThanOrEqual(2);
+            expect(capsuleRectTop.bottom).toBeLessThanOrEqual(textRectAfterTop.top + 1);
+        } finally {
+            chatContainer.remove();
+            chatStyle.remove();
+        }
     });
 });

@@ -746,6 +746,14 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
         ) {
             this.setAttribute('position', patch.position);
         }
+        if (patch.position && typeof this.closest === 'function') {
+            const hostContainer =
+                this.closest<HTMLElement>('.mes_block')
+                ?? this.closest<HTMLElement>('.mes');
+            if (hostContainer) {
+                placeAgenticCapsule(hostContainer, this, patch.position);
+            }
+        }
         this.render();
         this.syncTicker();
     }
@@ -1395,28 +1403,52 @@ export function registerAgenticCapsuleElement(tagName = 'agentic-capsule'): void
 /**
  * Mount or reposition an `<agentic-capsule>` inside a SillyTavern `.mes_block`
  * strictly OUTSIDE `.mes_text` (above or below depending on `position`).
+ * Accepts either the outer `.mes` message element or `.mes_block` itself.
  */
 export function placeAgenticCapsule(
-    mesBlock: HTMLElement,
+    mesOrBlock: HTMLElement,
     capsule: HTMLElement,
     position: CapsulePosition = 'bottom',
 ): void {
-    capsule.setAttribute('position', position);
-    const mesText = mesBlock.querySelector('.mes_text');
-    if (mesText && mesText.parentElement === mesBlock) {
+    if (
+        typeof capsule.getAttribute !== 'function'
+        || capsule.getAttribute('position') !== position
+    ) {
+        capsule.setAttribute('position', position);
+    }
+
+    const mesBlock = mesOrBlock.classList?.contains('mes_block')
+        ? mesOrBlock
+        : mesOrBlock.querySelector<HTMLElement>('.mes_block');
+    const targetContainer = mesBlock ?? mesOrBlock;
+
+    const directMesText =
+        (Array.from(targetContainer.children ?? []).find((child) =>
+            child.classList?.contains('mes_text'),
+        ) as HTMLElement | undefined) ?? null;
+    const mesText = directMesText ?? targetContainer.querySelector<HTMLElement>('.mes_text');
+    const anchorParent = mesText?.parentElement ?? targetContainer;
+
+    if (mesText && mesText.parentElement === anchorParent) {
         if (position === 'top') {
-            mesBlock.insertBefore(capsule, mesText);
-        } else if (mesText.nextSibling) {
-            mesBlock.insertBefore(capsule, mesText.nextSibling);
-        } else {
-            mesBlock.appendChild(capsule);
+            if (capsule.parentElement !== anchorParent || capsule.nextSibling !== mesText) {
+                anchorParent.insertBefore(capsule, mesText);
+            }
+        } else if (capsule.parentElement !== anchorParent || mesText.nextSibling !== capsule) {
+            if (mesText.nextSibling) {
+                anchorParent.insertBefore(capsule, mesText.nextSibling);
+            } else {
+                anchorParent.appendChild(capsule);
+            }
         }
         return;
     }
 
     if (position === 'top') {
-        mesBlock.prepend(capsule);
-    } else {
-        mesBlock.appendChild(capsule);
+        if (capsule.parentElement !== targetContainer || targetContainer.firstChild !== capsule) {
+            targetContainer.prepend(capsule);
+        }
+    } else if (capsule.parentElement !== targetContainer || targetContainer.lastChild !== capsule) {
+        targetContainer.appendChild(capsule);
     }
 }

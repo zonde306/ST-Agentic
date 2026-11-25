@@ -299,7 +299,9 @@ const WI_READ_RAW_BOOK_SCHEMA = z.object({
     bookName: z
         .string()
         .optional()
-        .describe('World Info book name; defaults to the active character primary World Info book.'),
+        .describe(
+            'World Info book name. Omit to read the active character primary World Info book; pass a book name to read any currently enabled book (including globally enabled books) or any book when ST Admin is enabled.',
+        ),
     uid: z
         .number()
         .int()
@@ -392,6 +394,47 @@ async function resolvePrimaryBookName(
         );
     }
     return primary;
+}
+
+async function resolveReadableRawBookName(
+    ctx: AssistantToolContext,
+    author: HostAuthorBridge,
+    requestedBookName?: string,
+): Promise<string> {
+    const requested = requestedBookName?.trim() ?? '';
+    if (requested) {
+        if (ctx.mode === 'full' && ctx.stAdminEnabled) {
+            return requested;
+        }
+        const enabled = await ctx.bridge.listEnabledLorebooks();
+        if (enabled.has(requested)) {
+            return requested;
+        }
+        const primary = await author.getPrimaryWorldName();
+        if (primary === requested) {
+            return primary;
+        }
+        throw new Error(
+            `World Info book "${requested}" is not currently enabled. Enable it or enable ST Admin (stAdminEnabled: true) to read disabled books.`,
+        );
+    }
+
+    const primary = await author.getPrimaryWorldName();
+    if (primary) {
+        return primary;
+    }
+
+    const enabled = await ctx.bridge.listEnabledLorebooks();
+    if (enabled.size > 0) {
+        const enabledNames = Array.from(enabled.keys()).slice(0, 20).join(', ');
+        throw new Error(
+            `Active character has no primary bound World Info book. Pass bookName explicitly to read an enabled book (currently enabled: ${enabledNames}).`,
+        );
+    }
+
+    throw new Error(
+        'Active character has no primary bound World Info book, and no World Info books are currently enabled.',
+    );
 }
 
 /**
@@ -503,18 +546,18 @@ export function createAuthorTools(): AssistantToolDefinition[] {
     const wiReadRawBookTool: AssistantToolDefinition<typeof WI_READ_RAW_BOOK_SCHEMA> = {
         name: 'wi_read_raw_book',
         description:
-            'Read or search raw entries (including raw @@ decorators and <% ... %> EJS code) from the active character primary World Info book. Large books auto-summarize to a catalog; pass uid (with optional start_line/end_line) or query to drill down without hitting output limits. Read-only.',
+            'Read or search raw entries (including raw @@ decorators and <% ... %> EJS code) from the active character primary World Info book, any currently enabled/global World Info book (pass bookName), or any disabled book when ST Admin is enabled. Large books auto-summarize to a catalog; pass uid (with optional start_line/end_line) or query to drill down without hitting output limits. Read-only.',
         parameters: WI_READ_RAW_BOOK_SCHEMA,
         tier: 'author',
         readOnly: true,
         async execute(args, ctx) {
             throwIfAssistantAborted(ctx.signal);
             const author = requireAuthorBridge(ctx);
-            const primaryBook = await resolvePrimaryBookName(author, args.bookName);
-            const snapshot = await author.readWorldInfoBook(primaryBook);
+            const targetBook = await resolveReadableRawBookName(ctx, author, args.bookName);
+            const snapshot = await author.readWorldInfoBook(targetBook);
             if (!snapshot) {
                 return finalizeToolError(
-                    `World Info book "${primaryBook}" was not found.`,
+                    `World Info book "${targetBook}" was not found.`,
                     ctx.signal,
                 );
             }
@@ -600,7 +643,9 @@ export function createAuthorTools(): AssistantToolDefinition[] {
                     charOffset: args.char_offset,
                     charLimit: args.char_limit,
                 });
-                const bookArg = args.bookName ? `, bookName: ${JSON.stringify(args.bookName)}` : '';
+                const bookArg = args.bookName?.trim()
+                    ? `, bookName: ${JSON.stringify(snapshot.name)}`
+                    : '';
                 const nextEnd = Math.min(formatted.totalLines, formatted.shownEndLine + 200);
                 const renderedContent = rewriteReadFooterHint(
                     formatted.text,
@@ -655,6 +700,9 @@ export function createAuthorTools(): AssistantToolDefinition[] {
                         preview,
                     };
                 });
+                const catalogBookArg = args.bookName?.trim()
+                    ? `bookName: ${JSON.stringify(snapshot.name)}, `
+                    : '';
                 return finalizeReadToolResult({
                     ok: true,
                     mode: 'catalog',
@@ -663,7 +711,7 @@ export function createAuthorTools(): AssistantToolDefinition[] {
                     entryCount: snapshot.entries.length,
                     totalBytes,
                     totalSize: formatByteSize(totalBytes),
-                    hint: 'Book exceeded 24 KB; returned entry catalog. Call wi_read_raw_book({ uid, start_line?, end_line? }) to read raw content, or pass query to search.',
+                    hint: `Book exceeded 24 KB; returned entry catalog. Call wi_read_raw_book({ ${catalogBookArg}uid, start_line?, end_line? }) to read raw content, or pass query to search.`,
                     entries: catalog,
                 });
             }
