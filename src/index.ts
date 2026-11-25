@@ -43,9 +43,11 @@ import {
 import { RegexPipeline } from '@/core/regex';
 import { SideGenService } from '@/core/sidegen';
 import {
+    CHAT_VARIABLES_DOC_KEY,
     ChatDataStore,
     DATA_NAMESPACES,
     DataCompactor,
+    GLOBAL_VARIABLES_DOC_KEY,
     invalidateHeadIndex,
     VARIABLES_DOC_KEY,
     worldInfoKey,
@@ -484,7 +486,7 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
         const activePreset = resolveActivePreset(settings);
         const items: FileOverrideItem[] = [];
 
-        // 1. Variables (/state/variables.json)
+        // 1. Native 3-scope Variables (/state/variables.json, /state/chat_variables.json, /state/global_variables.json)
         let varsContent = '{}';
         try {
             varsContent = await vfs.readFile('/state/variables.json', { target });
@@ -507,6 +509,7 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
         items.push({
             id: `variables:${VARIABLES_DOC_KEY}`,
             category: 'variables',
+            storageScope: 'chat_branch',
             namespace: DATA_NAMESPACES.VARIABLES,
             path: '/state/variables.json',
             key: VARIABLES_DOC_KEY,
@@ -514,15 +517,54 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                 varsRow && varsRow.messageId >= 0
                     ? { messageId: varsRow.messageId, swipeId: varsRow.swipeId }
                     : target,
-            layerLabel: formatLayerLabel(
-                varsRow?.messageId ?? target.messageId,
-                varsRow?.swipeId ?? target.swipeId,
-                !varsRow || varsRow.messageId < 0,
-            ),
+            layerLabel:
+                varsRow && varsRow.messageId >= 0
+                    ? formatLayerLabel(varsRow.messageId, varsRow.swipeId, false)
+                    : '初始变量 ([InitVar] / chat)',
             source: varsEntry?.source ?? 'initvar',
             content: varsContent,
             baseContent: baseVarsContent,
             overridden: Boolean(varsRow && varsRow.messageId >= 0),
+            writable: true,
+        });
+
+        const chatVars = bridge.readChatVariables();
+        const chatVarsContent = await vfs
+            .readFile('/state/chat_variables.json', { target })
+            .catch(() => JSON.stringify(chatVars, null, 2));
+        items.push({
+            id: `variables:${CHAT_VARIABLES_DOC_KEY}`,
+            category: 'variables',
+            storageScope: 'chat_base',
+            namespace: DATA_NAMESPACES.VARIABLES,
+            path: '/state/chat_variables.json',
+            key: CHAT_VARIABLES_DOC_KEY,
+            target,
+            layerLabel: '聊天变量 (ST chat_metadata.variables)',
+            source: 'st-chat',
+            content: chatVarsContent,
+            baseContent: '{}',
+            overridden: Object.keys(chatVars).length > 0,
+            writable: true,
+        });
+
+        const globalVars = bridge.readGlobalVariables();
+        const globalVarsContent = await vfs
+            .readFile('/state/global_variables.json', { target })
+            .catch(() => JSON.stringify(globalVars, null, 2));
+        items.push({
+            id: `variables:${GLOBAL_VARIABLES_DOC_KEY}`,
+            category: 'variables',
+            storageScope: 'global',
+            namespace: DATA_NAMESPACES.VARIABLES,
+            path: '/state/global_variables.json',
+            key: GLOBAL_VARIABLES_DOC_KEY,
+            target,
+            layerLabel: '全局变量 (ST extension_settings.variables.global)',
+            source: 'st-global',
+            content: globalVarsContent,
+            baseContent: '{}',
+            overridden: Object.keys(globalVars).length > 0,
             writable: true,
         });
 
@@ -782,6 +824,64 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             }
 
             const normalizedPath = normalizeVfsPath(input.path || `/${input.key || ''}`);
+            const resolveVariablePath = (): string | null => {
+                if (
+                    normalizedPath === '/state/variables.json'
+                    || normalizedPath === '/state/chat_variables.json'
+                    || normalizedPath === '/state/global_variables.json'
+                ) {
+                    return normalizedPath;
+                }
+                if (input.namespace === DATA_NAMESPACES.VARIABLES) {
+                    if (input.key === CHAT_VARIABLES_DOC_KEY) {
+                        return '/state/chat_variables.json';
+                    }
+                    if (input.key === GLOBAL_VARIABLES_DOC_KEY) {
+                        return '/state/global_variables.json';
+                    }
+                    return '/state/variables.json';
+                }
+                return null;
+            };
+            const variablePath = resolveVariablePath();
+            if (variablePath) {
+                await vfs.writeFile(variablePath, input.content, {
+                    target,
+                    staged: false,
+                    source: 'ui-edit',
+                });
+                await saveMetadata();
+                const refreshed = await listFilesAndOverrides(target);
+                const matched = refreshed.find((item) => item.path === variablePath);
+                if (matched) {
+                    return matched;
+                }
+                return {
+                    id: `variables:${variablePath.slice('/state/'.length)}`,
+                    category: 'variables',
+                    storageScope:
+                        variablePath === '/state/global_variables.json'
+                            ? 'global'
+                            : variablePath === '/state/chat_variables.json'
+                                ? 'chat_base'
+                                : 'chat_branch',
+                    namespace: DATA_NAMESPACES.VARIABLES,
+                    path: variablePath,
+                    key: variablePath.slice('/state/'.length),
+                    target,
+                    layerLabel:
+                        variablePath === '/state/global_variables.json'
+                            ? '全局变量 (ST extension_settings.variables.global)'
+                            : variablePath === '/state/chat_variables.json'
+                                ? '聊天变量 (ST chat_metadata.variables)'
+                                : formatLayerLabel(target.messageId, target.swipeId),
+                    source: 'ui-edit',
+                    content: input.content,
+                    overridden: true,
+                    writable: true,
+                };
+            }
+
             const isPresetScope = input.storageScope === 'preset' || normalizedPath.startsWith('/preset/');
             if (isPresetScope) {
                 const relName = (
@@ -953,6 +1053,28 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             }
 
             const normalizedPath = normalizeVfsPath(input.path || `/${input.key || ''}`);
+            const variableDeletePath =
+                normalizedPath === '/state/variables.json'
+                || normalizedPath === '/state/chat_variables.json'
+                || normalizedPath === '/state/global_variables.json'
+                    ? normalizedPath
+                    : input.namespace === DATA_NAMESPACES.VARIABLES
+                        ? input.key === CHAT_VARIABLES_DOC_KEY
+                            ? '/state/chat_variables.json'
+                            : input.key === GLOBAL_VARIABLES_DOC_KEY
+                                ? '/state/global_variables.json'
+                                : '/state/variables.json'
+                        : null;
+            if (variableDeletePath) {
+                await vfs.deleteFile(variableDeletePath, {
+                    target,
+                    staged: false,
+                    source: 'ui-delete',
+                });
+                await saveMetadata();
+                return;
+            }
+
             if (input.storageScope === 'preset' || normalizedPath.startsWith('/preset/')) {
                 const relName = (
                     normalizedPath.startsWith('/preset/')

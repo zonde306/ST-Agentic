@@ -71,6 +71,14 @@ export interface HostBridge {
     saveChatDebounced(): void;
     getActiveIdentity(): HostIdentity;
 
+    // 1b. Native ST 3-scope variables (message / chat / global)
+    readMessageVariables?(target: MessageTarget): Record<string, unknown> | null;
+    writeMessageVariables?(target: MessageTarget, vars: Record<string, unknown> | null): boolean;
+    readChatVariables?(): Record<string, unknown>;
+    writeChatVariables?(vars: Record<string, unknown>): void;
+    readGlobalVariables?(): Record<string, unknown>;
+    writeGlobalVariables?(vars: Record<string, unknown>): void;
+
     /**
      * Read the raw clean markdown content of the specified `(messageId, swipeId)` target
      * (without `display` regex transforms), or `null` when the message or swipe does not exist.

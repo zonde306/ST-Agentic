@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
     AGENTIC_DATA_KEY,
+    CHAT_VARIABLES_DOC_KEY,
     ChatDataStore,
     DATA_NAMESPACES,
+    GLOBAL_VARIABLES_DOC_KEY,
     HOT_WINDOW,
     VARIABLES_DOC_KEY,
     invalidateHeadIndex,
@@ -246,7 +248,7 @@ describe('ChatDataStore', () => {
         expect(store.get(DATA_NAMESPACES.MESSAGE, '', { target: { messageId: 1, swipeId: 0 } })).toBeNull();
 
         const varsEntry = store.get(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY);
-        expect(varsEntry?.source).toBe('legacy-variables');
+        expect(varsEntry?.source).toBe('st-message');
         expect(JSON.parse(varsEntry!.content)).toEqual({ hp: 100, location: '灰港' });
         expect(store.get(DATA_NAMESPACES.VARIABLES, 'hp')?.content).toBe('100');
 
@@ -325,12 +327,81 @@ describe('ChatDataStore', () => {
             'target-version',
         );
         expect(store.get(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, { target: target1 })?.content).toBe(
-            '{"hp":80}',
+            JSON.stringify({ hp: 80 }, null, 2),
         );
+        expect(bridge.chat[1].variables?.[0]).toEqual({ hp: 80 });
 
         // Restoring empty snapshot clears target staged data cleanly
         store.stageSet(DATA_NAMESPACES.FILES, 'memory/stale.md', 'tool', 'x', target1);
         store.restoreStagedData(target1, {});
         expect(store.hasPending(target1)).toBe(false);
+    });
+
+    it('uses ST native storage as Single Source of Truth for message/chat/global variables without stale shadow copies', () => {
+        invalidateHeadIndex();
+        const total = HOT_WINDOW + 4;
+        const bridge = makeChatBridge(total);
+        const store = new ChatDataStore(bridge);
+
+        // 1. Writing message variables lands directly in chat[msgId].variables[swipeId] with zero agentic_data shadow
+        store.set(
+            DATA_NAMESPACES.VARIABLES,
+            VARIABLES_DOC_KEY,
+            'tool',
+            JSON.stringify({ hp: 90, mood: 'calm' }),
+            { messageId: 1, swipeId: 0 },
+        );
+        expect(bridge.chat[1].variables?.[0]).toEqual({ hp: 90, mood: 'calm' });
+        const rawPersisted = bridge.metadata[AGENTIC_DATA_KEY] as
+            | { layers?: Record<string, Record<string, unknown>> }
+            | undefined;
+        expect(rawPersisted?.layers?.['1#0']?.[DATA_NAMESPACES.VARIABLES]).toBeUndefined();
+
+        // 2. External mutation (e.g. JS-Slash-Runner / MVU) even on cold messages (> HOT_WINDOW) is immediately visible
+        bridge.chat[1].variables![0] = { hp: 42, mood: 'injured', fromExternal: true };
+        const tipEntry = store.get(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY);
+        expect(tipEntry?.source).toBe('st-message');
+        expect(JSON.parse(tipEntry!.content)).toEqual({ hp: 42, mood: 'injured', fromExternal: true });
+
+        // 3. Staged 3-scope writes do not mutate ST native storage until commitStagedData; rollback leaves native intact
+        const target = { messageId: total - 1, swipeId: 0 };
+        store.stageSet(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, 'tool', JSON.stringify({ hp: 10 }), target);
+        store.stageSet(DATA_NAMESPACES.VARIABLES, CHAT_VARIABLES_DOC_KEY, 'tool', JSON.stringify({ chapter: 2 }), target);
+        store.stageSet(DATA_NAMESPACES.VARIABLES, GLOBAL_VARIABLES_DOC_KEY, 'tool', JSON.stringify({ theme: 'noir' }), target);
+        expect(bridge.readChatVariables()).toEqual({});
+        expect(bridge.readGlobalVariables()).toEqual({});
+
+        store.rollbackStagedData(target);
+        expect(bridge.readChatVariables()).toEqual({});
+        expect(bridge.readGlobalVariables()).toEqual({});
+
+        // Re-stage & commit atomically into ST native storage
+        store.stageSet(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, 'tool', JSON.stringify({ hp: 15 }), target);
+        store.stageSet(DATA_NAMESPACES.VARIABLES, CHAT_VARIABLES_DOC_KEY, 'tool', JSON.stringify({ chapter: 3 }), target);
+        store.stageSet(DATA_NAMESPACES.VARIABLES, GLOBAL_VARIABLES_DOC_KEY, 'tool', JSON.stringify({ runs: 7 }), target);
+        expect(store.commitStagedData(target)).toBe(3);
+
+        expect(bridge.chat[target.messageId].variables?.[0]).toEqual({ hp: 15 });
+        expect(bridge.metadata.variables).toEqual({ chapter: 3 });
+        expect(bridge.metadata.globalVariables).toEqual({ runs: 7 });
+
+        // 4. Unmigrated legacy agentic_data variables still work as read fallback when native slot is absent
+        bridge.metadata[AGENTIC_DATA_KEY] = {
+            version: 1,
+            watermark: 0,
+            base: {},
+            layers: {
+                '2#0': {
+                    variables: {
+                        [VARIABLES_DOC_KEY]: { source: 'legacy-agentic', content: '{"legacyFlag":true}' },
+                    },
+                },
+            },
+        };
+        const legacyFallback = store.get(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, {
+            target: { messageId: 2, swipeId: 0 },
+        });
+        expect(legacyFallback?.source).toBe('legacy-agentic');
+        expect(JSON.parse(legacyFallback!.content)).toEqual({ legacyFlag: true });
     });
 });

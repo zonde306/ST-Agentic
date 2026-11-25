@@ -714,10 +714,16 @@ export function createAssistantUndoExecutor(deps: {
 
         variables: async (record: UndoRecord) => {
             const previousVars = (record.snapshot.previousVars ?? {}) as Record<string, unknown>;
+            const rawScope = record.snapshot.scope;
+            const scope =
+                rawScope === 'chat' || rawScope === 'global' || rawScope === 'message'
+                    ? rawScope
+                    : 'message';
             await vfs.writeVariables(previousVars, {
                 target: record.target,
                 staged: false,
                 source: 'assistant:undo',
+                scope,
             });
         },
 

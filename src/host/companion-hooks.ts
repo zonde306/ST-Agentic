@@ -1,6 +1,5 @@
 import {
     chat,
-    chat_metadata,
     extension_prompt_roles,
     extension_prompt_types,
     setExtensionPrompt,
@@ -15,8 +14,10 @@ import { resolveActivePreset } from '@/core/config';
 import { formatSideBriefXml, selectUnconsumedSideBriefClues } from '@/core/context';
 import { DecoratorParser, TailRadar } from '@/core/lore';
 import {
+    CHAT_VARIABLES_DOC_KEY,
     ChatDataStore,
     DATA_NAMESPACES,
+    GLOBAL_VARIABLES_DOC_KEY,
     VARIABLES_DOC_KEY,
     worldInfoKey,
 } from '@/core/store';
@@ -132,29 +133,6 @@ function parseNumericUid(rawUid: unknown, fallback: number): number {
         }
     }
     return fallback;
-}
-
-function syncVariablesToChatMetadata(store: ChatDataStore, target: MessageTarget): void {
-    const varsEntry =
-        store.getPending(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, { target }) ??
-        store.get(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, { target });
-    if (!varsEntry?.content) {
-        return;
-    }
-
-    try {
-        const parsed = JSON.parse(varsEntry.content) as Record<string, unknown>;
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            const meta = (chat_metadata ?? {}) as Record<string, unknown>;
-            const existing =
-                meta.variables && typeof meta.variables === 'object'
-                    ? (meta.variables as Record<string, unknown>)
-                    : ((meta.variables = {}) as Record<string, unknown>);
-            Object.assign(existing, parsed);
-        }
-    } catch {
-        // Ignore non-JSON variable snapshot in sync helper.
-    }
 }
 
 function isControlLoreEntry(rawEntry: Record<string, unknown>, idx: number): boolean {
@@ -279,14 +257,41 @@ function buildSyncVfsReader(
 
         const rel = normalized.startsWith('/') ? normalized.slice(1) : normalized;
 
-        if (rel === 'vars' || rel.startsWith('vars/')) {
+        if (normalized === '/state/chat_variables.json' || rel === 'vars/chat') {
+            const staged = store
+                .listPending(target)
+                .find((item) => item.ns === DATA_NAMESPACES.VARIABLES && item.key === CHAT_VARIABLES_DOC_KEY);
+            if (staged) {
+                return staged.entry.deleted ? '{}' : staged.entry.content;
+            }
+            return JSON.stringify(bridge.readChatVariables(), null, 2);
+        }
+
+        if (normalized === '/state/global_variables.json' || rel === 'vars/global') {
+            const staged = store
+                .listPending(target)
+                .find((item) => item.ns === DATA_NAMESPACES.VARIABLES && item.key === GLOBAL_VARIABLES_DOC_KEY);
+            if (staged) {
+                return staged.entry.deleted ? '{}' : staged.entry.content;
+            }
+            return JSON.stringify(bridge.readGlobalVariables(), null, 2);
+        }
+
+        if (
+            normalized === '/state/variables.json'
+            || rel === 'vars'
+            || rel.startsWith('vars/')
+        ) {
             const varsEntry =
                 store.getPending(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, { target }) ??
                 store.get(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, { target });
             if (!varsEntry?.content) {
                 return '';
             }
-            const subKey = rel === 'vars' ? '' : rel.slice('vars/'.length);
+            const subKey =
+                normalized === '/state/variables.json' || rel === 'vars'
+                    ? ''
+                    : rel.slice('vars/'.length);
             if (!subKey || subKey === VARIABLES_DOC_KEY) {
                 return varsEntry.content;
             }
@@ -758,8 +763,6 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
                 pendingCompanionTurn.pendingSideBriefPaths = sideBridge.briefPaths;
             }
 
-            syncVariablesToChatMetadata(orchestrator.store, target);
-
             if (typeof setExtensionPrompt === 'function') {
                 setExtensionPrompt(
                     COMPANION_PROMPT_KEY,
@@ -880,7 +883,6 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         }
 
         await orchestrator.store.commitStagedData(target);
-        syncVariablesToChatMetadata(orchestrator.store, target);
 
         const bufferedOutput = orchestrator.vfs.flushPreCreateBuffer(target);
         if (bufferedOutput !== undefined) {

@@ -23,6 +23,12 @@ export const HOT_WINDOW = 16;
 /** Canonical key used when storing the whole variables snapshot in the `variables` namespace. */
 export const VARIABLES_DOC_KEY = 'variables.json';
 
+/** Canonical key used for chat-level variables (`chat_metadata.variables`). */
+export const CHAT_VARIABLES_DOC_KEY = 'chat_variables.json';
+
+/** Canonical key used for global variables (`extension_settings.variables.global`). */
+export const GLOBAL_VARIABLES_DOC_KEY = 'global_variables.json';
+
 /** Canonical key used for per-message display overrides in the `message` namespace. */
 export const MESSAGE_OVERRIDE_KEY = '';
 
@@ -428,35 +434,33 @@ export class ChatDataStore {
      */
     remove(ns: string, key: string, target?: MessageTarget): boolean {
         const chat = this.bridge.getChat();
-        const metadata = this.bridge.getMetadata();
         const resolved = this.resolveTarget(chat, target);
         if (!resolved) {
             return false;
         }
 
-        const persisted = readPersistedAgenticData(metadata, false);
-        if (!persisted) {
-            return false;
+        let removedNative = false;
+        if (
+            ns === DATA_NAMESPACES.VARIABLES
+            && (key === VARIABLES_DOC_KEY || key === '')
+            && this.bridge.writeMessageVariables
+        ) {
+            const existingNative = this.bridge.readMessageVariables
+                ? this.bridge.readMessageVariables(resolved)
+                : chat[resolved.messageId]?.variables?.[resolved.swipeId];
+            if (isNonEmptyPlainObject(existingNative)) {
+                removedNative = this.bridge.writeMessageVariables(resolved, null);
+            }
         }
 
-        const branchKey = toBranchKey(resolved);
-        const layer = persisted.layers[branchKey];
-        const entries = layer?.[ns];
-        if (!entries || !Object.hasOwn(entries, key)) {
-            return false;
+        const removedPersisted = this.removePersistedLayerEntry(resolved, ns, key);
+        if (removedPersisted) {
+            invalidateHeadIndex();
+            this.bridge.saveChatDebounced();
+        } else if (removedNative) {
+            invalidateHeadIndex();
         }
-
-        delete entries[key];
-        if (Object.keys(entries).length === 0) {
-            delete layer[ns];
-        }
-        if (Object.keys(layer).length === 0) {
-            delete persisted.layers[branchKey];
-        }
-
-        invalidateHeadIndex();
-        this.bridge.saveChatDebounced();
-        return true;
+        return removedNative || removedPersisted;
     }
 
     /**
@@ -616,28 +620,41 @@ export class ChatDataStore {
             return 0;
         }
 
-        const persisted = readPersistedAgenticData(metadata, true);
-        if (!persisted) {
-            throw new Error('HostBridge.getMetadata() did not return a writable metadata object');
-        }
-
-        if (!persisted.layers[branchKey]) {
-            persisted.layers[branchKey] = {};
-        }
-        const layer = persisted.layers[branchKey];
+        let persisted: AgenticPersistedData | null = null;
+        let layer: NamespaceDataMap | null = null;
+        let wrotePersisted = false;
 
         for (const item of planned) {
-            if (!layer[item.ns]) {
-                layer[item.ns] = {};
+            if (
+                item.ns === DATA_NAMESPACES.VARIABLES
+                && this.writeNativeVariableEntry(item.key, item.entry, target)
+            ) {
+                continue;
             }
-            layer[item.ns][item.key] = item.entry;
+            if (!persisted) {
+                persisted = readPersistedAgenticData(metadata, true);
+                if (!persisted) {
+                    throw new Error('HostBridge.getMetadata() did not return a writable metadata object');
+                }
+                if (!persisted.layers[branchKey]) {
+                    persisted.layers[branchKey] = {};
+                }
+                layer = persisted.layers[branchKey];
+            }
+            if (!layer![item.ns]) {
+                layer![item.ns] = {};
+            }
+            layer![item.ns][item.key] = item.entry;
             this.touchIndex(metadata, this.bridge.getChat(), item.ns, item.key, target.messageId, target.swipeId);
+            wrotePersisted = true;
         }
 
         buckets.delete(UNBOUND_STAGED_KEY);
         buckets.delete(branchKey);
         invalidateHeadIndex();
-        this.bridge.saveChatDebounced();
+        if (wrotePersisted) {
+            this.bridge.saveChatDebounced();
+        }
         return planned.length;
     }
 
@@ -974,9 +991,11 @@ export class ChatDataStore {
         return results;
     }
 
-    /** Return legacy `metadata.variables` as a plain record when present and non-empty. */
+    /** Return `chat_metadata.variables` as a plain record when present and non-empty. */
     getLegacyMetadataVariables(): Record<string, unknown> | null {
-        const raw = this.bridge.getMetadata()?.variables;
+        const raw = this.bridge.readChatVariables
+            ? this.bridge.readChatVariables()
+            : this.bridge.getMetadata()?.variables;
         if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
             return null;
         }
@@ -984,7 +1003,7 @@ export class ChatDataStore {
         return Object.keys(record).length > 0 ? record : null;
     }
 
-    /** Read all entries for a single `(messageId, swipeId)` and namespace (including legacy fallback). */
+    /** Read all entries for a single `(messageId, swipeId)` and namespace (native ST vars primary). */
     readLayerEntries(
         metadata: Record<string, unknown>,
         chat: ChatMessageSnapshot[],
@@ -996,7 +1015,7 @@ export class ChatDataStore {
         const msg = chat[messageId];
         const swipeInfo = msg?.swipeInfo?.[swipeId];
 
-        // 1. Legacy fallback (lowest precedence within this layer)
+        // 1. Legacy swipeInfo fallback (lowest precedence within this layer)
         if (swipeInfo) {
             for (const [key, entry] of Object.entries(readLegacySwipeEntries(swipeInfo, ns))) {
                 results[key] = entry;
@@ -1006,17 +1025,7 @@ export class ChatDataStore {
             }
         }
 
-        if (ns === DATA_NAMESPACES.VARIABLES && msg?.variables) {
-            const legacyVars = msg.variables[swipeId];
-            if (isNonEmptyPlainObject(legacyVars)) {
-                results[VARIABLES_DOC_KEY] = {
-                    source: 'legacy-variables',
-                    content: formatVariablesJson(legacyVars),
-                };
-            }
-        }
-
-        // 2. Primary ST-Agentic layer (wins over legacy fields)
+        // 2. ST-Agentic persisted layer (primary for non-variable namespaces; fallback for unmigrated variables)
         const persisted = readPersistedAgenticData(metadata, false);
         const branchKey = toBranchKey({ messageId, swipeId });
         const agenticEntries = persisted?.layers[branchKey]?.[ns];
@@ -1026,19 +1035,34 @@ export class ChatDataStore {
             }
         }
 
+        // 3. Primary native ST message variables (always wins over legacy agentic_data variables)
+        if (ns === DATA_NAMESPACES.VARIABLES) {
+            const nativeVars = this.bridge.readMessageVariables
+                ? this.bridge.readMessageVariables({ messageId, swipeId })
+                : msg?.variables?.[swipeId];
+            if (isNonEmptyPlainObject(nativeVars)) {
+                results[VARIABLES_DOC_KEY] = {
+                    source: 'st-message',
+                    content: formatVariablesJson(nativeVars),
+                };
+            }
+        }
+
         return results;
     }
 
     private canUseIndex(
         chat: ChatMessageSnapshot[],
         ns: string,
-        key: string,
+        _key: string,
         opts: StoreReadOptions,
     ): boolean {
         if (!isLayeredNamespace(ns)) {
             return false;
         }
-        if (ns === DATA_NAMESPACES.VARIABLES && key !== VARIABLES_DOC_KEY && key !== '') {
+        // Always read live native msg.variables[swipeId] directly so external extensions
+        // (ST-Prompt-Template / JS-Slash-Runner / MVU) are never masked by stale HeadIndex.
+        if (ns === DATA_NAMESPACES.VARIABLES) {
             return false;
         }
         if (opts.maxDepth !== undefined) {
@@ -1192,7 +1216,32 @@ export class ChatDataStore {
         ns: string,
         key: string,
     ): StoredDataEntry | null {
-        // 1. Primary ST-Agentic persisted layer
+        const msg = chat[messageId];
+
+        // 1. Native ST message variables (primary Single Source of Truth for message scope)
+        if (ns === DATA_NAMESPACES.VARIABLES && key !== CHAT_VARIABLES_DOC_KEY && key !== GLOBAL_VARIABLES_DOC_KEY) {
+            const nativeVars = this.bridge.readMessageVariables
+                ? this.bridge.readMessageVariables({ messageId, swipeId })
+                : msg?.variables?.[swipeId];
+            if (isNonEmptyPlainObject(nativeVars)) {
+                if (key === VARIABLES_DOC_KEY || key === '') {
+                    return {
+                        source: 'st-message',
+                        content: formatVariablesJson(nativeVars),
+                    };
+                }
+                if (Object.hasOwn(nativeVars, key)) {
+                    const val = nativeVars[key];
+                    return {
+                        source: 'st-message',
+                        content: typeof val === 'string' ? val : canonicalStringify(val),
+                    };
+                }
+                return null;
+            }
+        }
+
+        // 2. ST-Agentic persisted layer (primary for non-variables; fallback for unmigrated variables)
         const persisted = readPersistedAgenticData(metadata, false);
         const branchKey = toBranchKey({ messageId, swipeId });
         const nsMap = persisted?.layers[branchKey]?.[ns];
@@ -1215,8 +1264,7 @@ export class ChatDataStore {
             }
         }
 
-        // 2. Legacy read-only fallback
-        const msg = chat[messageId];
+        // 3. Legacy swipeInfo read-only fallback
         const info = msg?.swipeInfo?.[swipeId];
         if (info) {
             const cgEntry = info.cg_data?.[ns]?.[key];
@@ -1235,25 +1283,6 @@ export class ChatDataStore {
             } else if (ns === DATA_NAMESPACES.MESSAGE && key === MESSAGE_OVERRIDE_KEY) {
                 if (typeof info.mes_override === 'string') {
                     return { source: 'legacy', content: info.mes_override };
-                }
-            }
-        }
-
-        if (ns === DATA_NAMESPACES.VARIABLES && msg?.variables) {
-            const legacyVars = msg.variables[swipeId];
-            if (isNonEmptyPlainObject(legacyVars)) {
-                if (key === VARIABLES_DOC_KEY || key === '') {
-                    return {
-                        source: 'legacy-variables',
-                        content: formatVariablesJson(legacyVars),
-                    };
-                }
-                if (Object.hasOwn(legacyVars, key)) {
-                    const val = legacyVars[key];
-                    return {
-                        source: 'legacy-variables',
-                        content: typeof val === 'string' ? val : canonicalStringify(val),
-                    };
                 }
             }
         }
@@ -1386,6 +1415,10 @@ export class ChatDataStore {
         entry: StoredDataEntry,
         target: MessageTarget,
     ): void {
+        if (ns === DATA_NAMESPACES.VARIABLES && this.writeNativeVariableEntry(key, entry, target)) {
+            return;
+        }
+
         const metadata = this.bridge.getMetadata();
         const persisted = readPersistedAgenticData(metadata, true);
         if (!persisted) {
@@ -1403,6 +1436,86 @@ export class ChatDataStore {
         persisted.layers[branchKey][ns][key] = entry;
         this.touchIndex(metadata, this.bridge.getChat(), ns, key, target.messageId, target.swipeId);
         this.bridge.saveChatDebounced();
+    }
+
+    private writeNativeVariableEntry(
+        key: string,
+        entry: StoredDataEntry,
+        target: MessageTarget,
+    ): boolean {
+        if (key === VARIABLES_DOC_KEY || key === '') {
+            if (!this.bridge.writeMessageVariables) {
+                return false;
+            }
+            const parsed = entry.deleted ? null : parsePlainJsonObject(entry.content);
+            if (!entry.deleted && parsed === null) {
+                return false;
+            }
+            const wrote = this.bridge.writeMessageVariables(target, parsed);
+            if (!wrote) {
+                return false;
+            }
+            this.removePersistedLayerEntry(target, DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY);
+            invalidateHeadIndex();
+            return true;
+        }
+
+        if (key === CHAT_VARIABLES_DOC_KEY) {
+            if (!this.bridge.writeChatVariables) {
+                return false;
+            }
+            const parsed = entry.deleted ? {} : parsePlainJsonObject(entry.content);
+            if (!entry.deleted && parsed === null) {
+                return false;
+            }
+            this.bridge.writeChatVariables(parsed ?? {});
+            this.removePersistedLayerEntry(target, DATA_NAMESPACES.VARIABLES, CHAT_VARIABLES_DOC_KEY);
+            invalidateHeadIndex();
+            return true;
+        }
+
+        if (key === GLOBAL_VARIABLES_DOC_KEY) {
+            if (!this.bridge.writeGlobalVariables) {
+                return false;
+            }
+            const parsed = entry.deleted ? {} : parsePlainJsonObject(entry.content);
+            if (!entry.deleted && parsed === null) {
+                return false;
+            }
+            this.bridge.writeGlobalVariables(parsed ?? {});
+            this.removePersistedLayerEntry(target, DATA_NAMESPACES.VARIABLES, GLOBAL_VARIABLES_DOC_KEY);
+            invalidateHeadIndex();
+            return true;
+        }
+
+        return false;
+    }
+
+    private removePersistedLayerEntry(
+        target: MessageTarget,
+        ns: string,
+        key: string,
+    ): boolean {
+        const persisted = readPersistedAgenticData(this.bridge.getMetadata(), false);
+        if (!persisted) {
+            return false;
+        }
+
+        const branchKey = toBranchKey(target);
+        const layer = persisted.layers[branchKey];
+        const entries = layer?.[ns];
+        if (!entries || !Object.hasOwn(entries, key)) {
+            return false;
+        }
+
+        delete entries[key];
+        if (Object.keys(entries).length === 0) {
+            delete layer[ns];
+        }
+        if (Object.keys(layer).length === 0) {
+            delete persisted.layers[branchKey];
+        }
+        return true;
     }
 
     private stageEntry(
@@ -1678,6 +1791,18 @@ function isNonEmptyPlainObject(value: unknown): value is Record<string, unknown>
 
 function formatVariablesJson(vars: Record<string, unknown>): string {
     return JSON.stringify(canonicalClone(vars), null, 2);
+}
+
+function parsePlainJsonObject(raw: string): Record<string, unknown> | null {
+    try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return parsed as Record<string, unknown>;
+        }
+    } catch {
+        // Ignore invalid JSON
+    }
+    return null;
 }
 
 function extractVariableKeyEntry(doc: StoredDataEntry, key: string): StoredDataEntry | null {

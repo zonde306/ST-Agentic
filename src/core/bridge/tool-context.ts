@@ -2,6 +2,7 @@ import type {
     MediaAttachment,
     MessageTarget,
     ScopedPermissions,
+    VariableScope,
     VfsEntryStat,
     VfsSearchHit,
 } from '../types';
@@ -24,10 +25,17 @@ export interface ToolFsApi {
     glob(pattern: string): Promise<string[]>;
 }
 
+export interface ToolVarsOptions {
+    scope?: VariableScope;
+}
+
 export interface ToolVarsApi {
-    get(path?: string): Promise<unknown>;
-    set(path: string, value: unknown): Promise<void>;
-    patch(ops: Record<string, unknown> | Array<Record<string, unknown>>): Promise<Record<string, unknown>>;
+    get(path?: string, opts?: ToolVarsOptions): Promise<unknown>;
+    set(path: string, value: unknown, opts?: ToolVarsOptions): Promise<void>;
+    patch(
+        ops: Record<string, unknown> | Array<Record<string, unknown>>,
+        opts?: ToolVarsOptions,
+    ): Promise<Record<string, unknown>>;
 }
 
 export interface ToolMessageApi {

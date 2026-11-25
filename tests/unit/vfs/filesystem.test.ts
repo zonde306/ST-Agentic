@@ -69,15 +69,39 @@ describe('VirtualFileSystem', () => {
         expect(await vfs.readFile('/notes/clue.md', { startLine: 2, endLine: 3 })).toBe('第二行\n第三行');
 
         const stateEntries = await vfs.listDir('/state');
-        expect(stateEntries.map((e) => e.name)).toEqual(['generated_context.md', 'variables.json']);
+        expect(stateEntries.map((e) => e.name)).toEqual([
+            'chat_variables.json',
+            'generated_context.md',
+            'global_variables.json',
+            'variables.json',
+        ]);
 
-        // Edit and swipe isolation on /state/variables.json and / workspace
+        // Edit and swipe isolation on /state/variables.json (backed by chat[1].variables[swipeId])
         const editRes = await vfs.editFile('/state/variables.json', '"hp": 100', '"hp": 75', {
             target: { messageId: 1, swipeId: 0 },
         });
         expect(editRes.ok).toBe(true);
         expect((await vfs.readVariables({ target: { messageId: 1, swipeId: 0 } })).hp).toBe(75);
         expect((await vfs.readVariables({ target: { messageId: 1, swipeId: 1 } })).hp).toBe(100);
+        expect(bridge.chat[1].variables?.[0]?.hp).toBe(75);
+
+        // /state/chat_variables.json <-> bridge.metadata.variables & /state/global_variables.json <-> bridge.metadata.globalVariables
+        await vfs.writeFile('/state/chat_variables.json', JSON.stringify({ gold: 120, quest: 'active' }));
+        expect(bridge.metadata.variables).toEqual({ gold: 120, quest: 'active' });
+        bridge.setVariable('externalChatKey', 'hello');
+        expect(JSON.parse(await vfs.readFile('/state/chat_variables.json'))).toEqual({
+            externalChatKey: 'hello',
+            gold: 120,
+            quest: 'active',
+        });
+
+        await vfs.writeFile('/state/global_variables.json', JSON.stringify({ globalMode: 'hardcore' }));
+        expect(bridge.metadata.globalVariables).toEqual({ globalMode: 'hardcore' });
+        bridge.setGlobalVariable('externalGlobal', 42);
+        expect(JSON.parse(await vfs.readFile('/state/global_variables.json'))).toEqual({
+            externalGlobal: 42,
+            globalMode: 'hardcore',
+        });
 
         // Reject invalid JSON write to /state/variables.json
         await expect(vfs.writeFile('/state/variables.json', '{bad json')).rejects.toThrow();

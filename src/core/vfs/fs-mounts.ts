@@ -1,12 +1,15 @@
 import type { HostBridge, ToolEditResult } from '@/core/bridge';
 import {
+    CHAT_VARIABLES_DOC_KEY,
     ChatDataStore,
     DATA_NAMESPACES,
+    GLOBAL_VARIABLES_DOC_KEY,
     VARIABLES_DOC_KEY,
 } from '@/core/store';
 import {
     type BranchKey,
     type MessageTarget,
+    type VariableScope,
     type VfsEntryStat,
     parseBranchKey,
     toBranchKey,
@@ -37,8 +40,44 @@ export const PRESET_MOUNT = 'preset';
 export const HISTORY_MOUNT = 'history';
 export const STATE_MOUNT = 'state';
 export const VARIABLES_FILE_NAME = 'variables.json';
+export const CHAT_VARIABLES_FILE_NAME = 'chat_variables.json';
+export const GLOBAL_VARIABLES_FILE_NAME = 'global_variables.json';
+export const VARIABLES_FILE_NAMES = [
+    VARIABLES_FILE_NAME,
+    CHAT_VARIABLES_FILE_NAME,
+    GLOBAL_VARIABLES_FILE_NAME,
+] as const;
 export const OUTPUT_FILE_NAME = 'output.md';
 export const OUTPUT_FILE_PATH = '/output.md';
+
+export function scopeToVariablesFileName(scope: VariableScope = 'message'): string {
+    switch (scope) {
+        case 'chat':
+            return CHAT_VARIABLES_FILE_NAME;
+        case 'global':
+            return GLOBAL_VARIABLES_FILE_NAME;
+        case 'message':
+        default:
+            return VARIABLES_FILE_NAME;
+    }
+}
+
+export function scopeToVariablesPath(scope: VariableScope = 'message'): string {
+    return `/${STATE_MOUNT}/${scopeToVariablesFileName(scope)}`;
+}
+
+export function variablesFileNameToScope(fileName: string): VariableScope | null {
+    switch (fileName) {
+        case VARIABLES_FILE_NAME:
+            return 'message';
+        case CHAT_VARIABLES_FILE_NAME:
+            return 'chat';
+        case GLOBAL_VARIABLES_FILE_NAME:
+            return 'global';
+        default:
+            return null;
+    }
+}
 
 export const GLOBAL_VFS_EXTENSION_KEY = 'agentic_global_files';
 export const AGENTIC_HISTORY_KEY = 'agentic_history';
@@ -411,7 +450,8 @@ export class WorkspaceMount implements VfsMount {
 }
 
 /**
- * `/state/variables.json` (`rw`, `variables` namespace, aligned with `[InitVar]` & legacy variables).
+ * `/state/{variables,chat_variables,global_variables}.json` (`rw`, `variables` namespace,
+ * unified with SillyTavern native message/chat/global variables and `[InitVar]`).
  */
 export class VariablesMount implements VfsMount {
     public readonly mountName = STATE_MOUNT;
@@ -424,7 +464,8 @@ export class VariablesMount implements VfsMount {
     ) {}
 
     async readVariables(opts?: VfsTargetOptions): Promise<Record<string, unknown>> {
-        const raw = await this.readSerialized(opts);
+        const scope = opts?.scope ?? 'message';
+        const raw = await this.readSerializedForScope(scope, opts);
         try {
             const parsed = JSON.parse(raw) as unknown;
             if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
@@ -440,13 +481,37 @@ export class VariablesMount implements VfsMount {
         vars: Record<string, unknown>,
         opts: VfsWriteOptions = {},
     ): Promise<void> {
-        const serialized = JSON.stringify(canonicalClone(vars), null, 2);
+        const scope = opts.scope ?? 'message';
+        const docKey = scopeToVariablesFileName(scope);
+        const canonical = canonicalClone(vars);
+        const serialized = JSON.stringify(canonical, null, 2);
+
+        if (opts.staged) {
+            this.store.set(
+                DATA_NAMESPACES.VARIABLES,
+                docKey,
+                opts.source ?? 'vfs-vars',
+                serialized,
+                { target: opts.target, staged: true },
+            );
+            return;
+        }
+
+        if (scope === 'chat' && this.bridge.writeChatVariables) {
+            this.bridge.writeChatVariables(canonical);
+            return;
+        }
+        if (scope === 'global' && this.bridge.writeGlobalVariables) {
+            this.bridge.writeGlobalVariables(canonical);
+            return;
+        }
+
         this.store.set(
             DATA_NAMESPACES.VARIABLES,
-            VARIABLES_DOC_KEY,
+            docKey,
             opts.source ?? 'vfs-vars',
             serialized,
-            { target: opts.target, staged: opts.staged },
+            { target: opts.target, staged: false },
         );
     }
 
@@ -461,19 +526,30 @@ export class VariablesMount implements VfsMount {
                 mount: STATE_MOUNT,
             };
         }
-        if (relPath !== VARIABLES_FILE_NAME) {
+        const scope = variablesFileNameToScope(relPath);
+        if (!scope) {
             return null;
         }
-        const content = await this.readSerialized(opts);
-        const stored = this.readLayerEntry(opts);
+        const content = await this.readSerializedForScope(scope, opts);
+        let source: string;
+        if (scope === 'message') {
+            const stored = this.readLayerEntry(opts);
+            source = stored?.source ?? 'initvar';
+        } else {
+            const docKey = scopeToVariablesFileName(scope);
+            const staged = opts?.staged !== false
+                ? this.readStagedDocEntry(docKey, opts?.target)
+                : null;
+            source = staged?.source ?? (scope === 'chat' ? 'st-chat' : 'st-global');
+        }
         return {
-            path: this.canonicalPath,
-            name: VARIABLES_FILE_NAME,
+            path: `/${STATE_MOUNT}/${relPath}`,
+            name: relPath,
             kind: 'file',
             size: utf8ByteLength(content),
             writable: true,
             mount: STATE_MOUNT,
-            source: stored?.source ?? 'initvar',
+            source,
         };
     }
 
@@ -481,21 +557,26 @@ export class VariablesMount implements VfsMount {
         if (relPath) {
             return [];
         }
-        const entry = await this.stat(VARIABLES_FILE_NAME, opts);
-        return entry ? [entry] : [];
+        const entries = await Promise.all(
+            VARIABLES_FILE_NAMES.map((fileName) => this.stat(fileName, opts)),
+        );
+        return sortStats(entries.filter((entry): entry is VfsEntryStat => entry !== null));
     }
 
     async readFile(relPath: string, opts: VfsReadOptions = {}): Promise<string> {
-        if (relPath !== VARIABLES_FILE_NAME) {
+        const scope = variablesFileNameToScope(relPath);
+        if (!scope) {
             throw new VfsNotFoundError(`/${STATE_MOUNT}/${relPath}`);
         }
-        const content = await this.readSerialized(opts);
+        const content = await this.readSerializedForScope(scope, opts);
         return sliceLines(content, opts.startLine, opts.endLine);
     }
 
     async writeFile(relPath: string, content: string, opts: VfsWriteOptions = {}): Promise<void> {
-        if (relPath !== VARIABLES_FILE_NAME) {
-            throw new VfsNotFoundError(`/${STATE_MOUNT}/${relPath}`);
+        const scope = variablesFileNameToScope(relPath);
+        const fullPath = `/${STATE_MOUNT}/${relPath}`;
+        if (!scope) {
+            throw new VfsNotFoundError(fullPath);
         }
 
         let parsed: unknown;
@@ -503,21 +584,21 @@ export class VariablesMount implements VfsMount {
             parsed = JSON.parse(content);
         } catch (error) {
             throw new VfsError(
-                `Invalid JSON for ${this.canonicalPath}: ${(error as Error).message}`,
+                `Invalid JSON for ${fullPath}: ${(error as Error).message}`,
                 'EINVAL',
-                this.canonicalPath,
+                fullPath,
             );
         }
 
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
             throw new VfsError(
-                `${this.canonicalPath} must contain a JSON object`,
+                `${fullPath} must contain a JSON object`,
                 'EINVAL',
-                this.canonicalPath,
+                fullPath,
             );
         }
 
-        await this.writeVariables(parsed as Record<string, unknown>, opts);
+        await this.writeVariables(parsed as Record<string, unknown>, { ...opts, scope });
     }
 
     async editFile(
@@ -526,20 +607,22 @@ export class VariablesMount implements VfsMount {
         newText: string,
         opts: VfsWriteOptions = {},
     ): Promise<ToolEditResult> {
-        if (relPath !== VARIABLES_FILE_NAME) {
+        const scope = variablesFileNameToScope(relPath);
+        const fullPath = `/${STATE_MOUNT}/${relPath}`;
+        if (!scope) {
             return {
                 ok: false,
-                path: `/${STATE_MOUNT}/${relPath}`,
-                message: `File not found: /${STATE_MOUNT}/${relPath}`,
+                path: fullPath,
+                message: `File not found: ${fullPath}`,
             };
         }
 
-        const current = await this.readSerialized(opts);
+        const current = await this.readSerializedForScope(scope, opts);
         if (!oldText || !current.includes(oldText)) {
             return {
                 ok: false,
-                path: this.canonicalPath,
-                message: `Target text not found in ${this.canonicalPath}`,
+                path: fullPath,
+                message: `Target text not found in ${fullPath}`,
             };
         }
 
@@ -550,7 +633,7 @@ export class VariablesMount implements VfsMount {
         } catch (error) {
             return {
                 ok: false,
-                path: this.canonicalPath,
+                path: fullPath,
                 message: `Edit produced invalid JSON: ${(error as Error).message}`,
             };
         }
@@ -558,46 +641,59 @@ export class VariablesMount implements VfsMount {
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
             return {
                 ok: false,
-                path: this.canonicalPath,
-                message: `${this.canonicalPath} must remain a JSON object`,
+                path: fullPath,
+                message: `${fullPath} must remain a JSON object`,
             };
         }
 
-        await this.writeVariables(parsed as Record<string, unknown>, opts);
+        await this.writeVariables(parsed as Record<string, unknown>, { ...opts, scope });
         return {
             ok: true,
-            path: this.canonicalPath,
-            message: `Updated ${this.canonicalPath}`,
+            path: fullPath,
+            message: `Updated ${fullPath}`,
         };
     }
 
     async deleteFile(relPath: string, opts: VfsWriteOptions = {}): Promise<boolean> {
-        if (relPath !== VARIABLES_FILE_NAME) {
+        const scope = variablesFileNameToScope(relPath);
+        if (!scope) {
             return false;
         }
-        this.store.setDeleted(
-            DATA_NAMESPACES.VARIABLES,
-            VARIABLES_DOC_KEY,
-            opts.source ?? 'vfs-delete',
-            { target: opts.target, staged: opts.staged },
-        );
+        const docKey = scopeToVariablesFileName(scope);
+        if (opts.staged) {
+            this.store.setDeleted(
+                DATA_NAMESPACES.VARIABLES,
+                docKey,
+                opts.source ?? 'vfs-delete',
+                { target: opts.target, staged: true },
+            );
+            return true;
+        }
+
+        if (scope === 'message') {
+            this.store.remove(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, opts.target);
+            return true;
+        }
+        await this.writeVariables({}, { ...opts, scope, staged: false });
         return true;
     }
 
     async listFiles(opts?: VfsTargetOptions): Promise<VfsEntryStat[]> {
-        const entry = await this.stat(VARIABLES_FILE_NAME, opts);
-        return entry ? [entry] : [];
+        return await this.listDir('', opts);
     }
 
     async collectSearchDocs(opts?: VfsTargetOptions): Promise<VfsSearchDocument[]> {
-        const content = await this.readSerialized(opts);
-        return [
-            {
-                path: this.canonicalPath,
-                title: VARIABLES_FILE_NAME,
+        const docs: VfsSearchDocument[] = [];
+        for (const fileName of VARIABLES_FILE_NAMES) {
+            const scope = variablesFileNameToScope(fileName) ?? 'message';
+            const content = await this.readSerializedForScope(scope, opts);
+            docs.push({
+                path: `/${STATE_MOUNT}/${fileName}`,
+                title: fileName,
                 content,
-            },
-        ];
+            });
+        }
+        return docs;
     }
 
     private readLayerEntry(opts?: VfsTargetOptions) {
@@ -612,27 +708,70 @@ export class VariablesMount implements VfsMount {
         return this.store.getPending(DATA_NAMESPACES.VARIABLES, VARIABLES_DOC_KEY, readOpts);
     }
 
-    private async readSerialized(opts?: VfsTargetOptions): Promise<string> {
+    private readStagedDocEntry(docKey: string, target?: MessageTarget) {
+        const pending = this.store.listPending(target);
+        const match = pending.find(
+            (item) => item.ns === DATA_NAMESPACES.VARIABLES && item.key === docKey,
+        );
+        return match?.entry ?? null;
+    }
+
+    private canonicalizeSerialized(raw: string): string {
+        try {
+            const parsed = JSON.parse(raw) as unknown;
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                return JSON.stringify(canonicalClone(parsed), null, 2);
+            }
+        } catch {
+            // Fall through to raw content
+        }
+        return raw;
+    }
+
+    private async readSerializedForScope(
+        scope: VariableScope,
+        opts?: VfsTargetOptions,
+    ): Promise<string> {
+        if (scope === 'chat') {
+            if (opts?.staged !== false) {
+                const staged = this.readStagedDocEntry(CHAT_VARIABLES_DOC_KEY, opts?.target);
+                if (staged) {
+                    return staged.deleted ? '{}' : this.canonicalizeSerialized(staged.content);
+                }
+            }
+            const chatVars =
+                this.bridge.readChatVariables?.()
+                ?? this.store.getLegacyMetadataVariables()
+                ?? {};
+            return JSON.stringify(canonicalClone(chatVars), null, 2);
+        }
+
+        if (scope === 'global') {
+            if (opts?.staged !== false) {
+                const staged = this.readStagedDocEntry(GLOBAL_VARIABLES_DOC_KEY, opts?.target);
+                if (staged) {
+                    return staged.deleted ? '{}' : this.canonicalizeSerialized(staged.content);
+                }
+            }
+            const globalVars = this.bridge.readGlobalVariables?.() ?? {};
+            return JSON.stringify(canonicalClone(globalVars), null, 2);
+        }
+
         const stored = this.readLayerEntry(opts);
         if (stored) {
             if (stored.deleted) {
                 return '{}';
             }
-            try {
-                const parsed = JSON.parse(stored.content) as unknown;
-                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-                    return JSON.stringify(canonicalClone(parsed), null, 2);
-                }
-            } catch {
-                return stored.content;
-            }
-            return stored.content;
+            return this.canonicalizeSerialized(stored.content);
         }
 
         const books = await this.bridge.listEnabledLorebooks();
         const initVars = parseInitVarEntries(books);
-        const metaVars = this.store.getLegacyMetadataVariables();
-        const merged = { ...initVars, ...(metaVars ?? {}) };
+        const chatVars =
+            this.bridge.readChatVariables?.()
+            ?? this.store.getLegacyMetadataVariables()
+            ?? {};
+        const merged = { ...initVars, ...chatVars };
         return JSON.stringify(canonicalClone(merged), null, 2);
     }
 }

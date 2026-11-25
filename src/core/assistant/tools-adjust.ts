@@ -3,9 +3,9 @@ import type { DeletedChatMessageSnapshot } from '@/core/bridge';
 import { DEFAULT_MAIN_AGENT_ID } from '@/core/config';
 import { DATA_NAMESPACES, MESSAGE_OVERRIDE_KEY } from '@/core/store';
 import { VfsVarsAdapter } from '@/core/tools';
-import type { ChatEditSyncTrajectory, MessageTarget } from '@/core/types';
+import type { ChatEditSyncTrajectory, MessageTarget, VariableScope } from '@/core/types';
 import { canonicalClone, normalizeVfsPath } from '@/core/utils';
-import { utf8ByteLength, VfsNotFoundError } from '@/core/vfs';
+import { scopeToVariablesPath, utf8ByteLength, VfsNotFoundError } from '@/core/vfs';
 import { computeDiffLines } from './approval';
 import { isVfsWritePathAllowed } from './policy';
 import {
@@ -25,6 +25,13 @@ const JSON_PATCH_OP_SCHEMA = z.object({
 });
 
 const PATCH_VARIABLES_SCHEMA = z.object({
+    scope: z
+        .enum(['message', 'chat', 'global'])
+        .optional()
+        .default('message')
+        .describe(
+            'Variable scope: "message" (default, /state/variables.json), "chat" (/state/chat_variables.json), or "global" (/state/global_variables.json).',
+        ),
     json_merge: z.record(z.string(), z.unknown()).optional(),
     json_patch: z.array(JSON_PATCH_OP_SCHEMA).optional(),
 });
@@ -239,18 +246,24 @@ export function createAdjustTools(): AssistantToolDefinition[] {
     const patchVariablesTool: AssistantToolDefinition<typeof PATCH_VARIABLES_SCHEMA> = {
         name: 'patch_variables',
         description:
-            'Apply an RFC 7396 JSON Merge Patch (`json_merge`) and/or RFC 6902 JSON Patch (`json_patch`) to /state/variables.json for the current branch.',
+            'Apply an RFC 7396 JSON Merge Patch (`json_merge`) and/or RFC 6902 JSON Patch (`json_patch`) to SillyTavern native variables (/state/variables.json for message branch, /state/chat_variables.json for chat, /state/global_variables.json for global).',
         parameters: PATCH_VARIABLES_SCHEMA,
         tier: 'adjust',
         readOnly: false,
         async preview(args, ctx) {
-            const beforeVars = await ctx.vfs.readVariables({ target: ctx.target, staged: false });
+            const scope: VariableScope = args.scope ?? 'message';
+            const filePath = scopeToVariablesPath(scope);
+            const beforeVars = await ctx.vfs.readVariables({
+                target: ctx.target,
+                staged: false,
+                scope,
+            });
             const beforeText = JSON.stringify(beforeVars, null, 2);
             const rawContent = JSON.stringify(args, null, 2);
             return {
-                title: 'Patch branch variables',
-                summary: 'Update /state/variables.json on the current causal branch.',
-                targetLabel: 'VFS: /state/variables.json',
+                title: `Patch ${scope} variables`,
+                summary: `Update ${filePath} (${scope} scope).`,
+                targetLabel: `VFS: ${filePath}`,
                 beforeText,
                 afterText: rawContent,
                 rawContent,
@@ -266,8 +279,10 @@ export function createAdjustTools(): AssistantToolDefinition[] {
                 );
             }
 
+            const scope: VariableScope = args.scope ?? 'message';
+            const filePath = scopeToVariablesPath(scope);
             const beforeVars = canonicalClone(
-                await ctx.vfs.readVariables({ target: ctx.target, staged: false }),
+                await ctx.vfs.readVariables({ target: ctx.target, staged: false, scope }),
             );
             const adapter = new VfsVarsAdapter(ctx.vfs, {
                 target: ctx.target,
@@ -279,10 +294,10 @@ export function createAdjustTools(): AssistantToolDefinition[] {
 
             let updated = beforeVars;
             if (args.json_merge) {
-                updated = await adapter.patch(args.json_merge);
+                updated = await adapter.patch(args.json_merge, { scope });
             }
             if (args.json_patch && args.json_patch.length > 0) {
-                updated = await adapter.patch(args.json_patch);
+                updated = await adapter.patch(args.json_patch, { scope });
             }
 
             const undoId =
@@ -293,23 +308,25 @@ export function createAdjustTools(): AssistantToolDefinition[] {
                         toolCallId: ctx.toolCallId,
                         toolName: 'patch_variables',
                         kind: 'variables',
-                        label: 'Patch branch variables (/state/variables.json)',
-                        scope: 'vfs:/state/variables.json',
+                        label: `Patch ${scope} variables (${filePath})`,
+                        scope: `vfs:${filePath}`,
                         beforeSummary: truncateSummary(JSON.stringify(beforeVars)),
                         afterSummary: truncateSummary(JSON.stringify(updated)),
                         snapshot: {
                             previousVars: beforeVars,
+                            scope,
                         },
                         target: ctx.target,
                     }).id;
 
             return finalizeMutationToolResult(
                 {
-                    path: '/state/variables.json',
+                    scope,
+                    path: filePath,
                     variables: updated,
                     target: ctx.target,
                 },
-                { undoId, fileRefs: ['/state/variables.json'] },
+                { undoId, fileRefs: [filePath] },
             );
         },
     };

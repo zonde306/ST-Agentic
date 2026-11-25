@@ -1,5 +1,7 @@
 import type { MessageTarget } from './messages';
 
+export type VariableScope = 'message' | 'chat' | 'global';
+
 export type DataNamespace =
     | 'files'
     | 'variables'

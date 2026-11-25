@@ -38,11 +38,12 @@ import {
     PRESET_MOUNT,
     PresetMount,
     STATE_MOUNT,
-    VARIABLES_FILE_NAME,
+    VARIABLES_FILE_NAMES,
     VariablesMount,
     WorkspaceMount,
     characterSnapshot,
     personaSnapshot,
+    variablesFileNameToScope,
 } from './fs-mounts';
 import {
     LOREBOOK_MOUNT,
@@ -652,12 +653,15 @@ export class VirtualFileSystem {
 
     private route(rawPath: string): RoutedTarget {
         const normalized = this.normalizePath(rawPath);
-        if (normalized === `/${STATE_MOUNT}/${VARIABLES_FILE_NAME}`) {
-            return {
-                mount: this.variablesMount,
-                relPath: VARIABLES_FILE_NAME,
-                normalizedPath: normalized,
-            };
+        if (normalized.startsWith(`/${STATE_MOUNT}/`)) {
+            const relState = normalized.slice(STATE_MOUNT.length + 2);
+            if (variablesFileNameToScope(relState) !== null) {
+                return {
+                    mount: this.variablesMount,
+                    relPath: relState,
+                    normalizedPath: normalized,
+                };
+            }
         }
 
         if (normalized === OUTPUT_FILE_PATH) {
@@ -746,7 +750,7 @@ export class VirtualFileSystem {
         if (prefix === OUTPUT_FILE_PATH) {
             return [this.outputMount];
         }
-        if (prefix === `/${STATE_MOUNT}/${VARIABLES_FILE_NAME}`) {
+        if (VARIABLES_FILE_NAMES.some((name) => prefix === `/${STATE_MOUNT}/${name}`)) {
             return [this.variablesMount];
         }
         if (prefix === `/${STATE_MOUNT}`) {

@@ -275,4 +275,85 @@ describe('Variable Tools & Dynamic @@json_schema / @@zod_schema Validation', () 
         expect(mergedSchema.safeParse({ stats: { hp: 10, mp: 20 } }).success).toBe(true);
         expect(mergedSchema.safeParse({ stats: { hp: 10, mp: -1 } }).success).toBe(false);
     });
+
+    it('reads and patches message/chat/global scopes natively and keeps message schema isolated from chat/global', async () => {
+        const bridge = setupBridge();
+        bridge.setVariable('day', 1);
+        bridge.setGlobalVariable('difficulty', 'normal');
+        const vfs = new VirtualFileSystem({ bridge });
+        const sandbox = new IframeJsSandbox();
+
+        const messageOnlySchema = await compileVariableSchemaEntries(
+            [
+                {
+                    world: 'Rules',
+                    uid: 99,
+                    comment: 'Message HP Schema',
+                    content:
+                        '@@json_schema {"type":"object","properties":{"hp":{"type":"number","minimum":0,"maximum":100}},"required":["hp"]}',
+                    keys: [],
+                    keysecondary: [],
+                    constant: false,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 0,
+                    order: 1,
+                    role: 0,
+                },
+            ],
+            sandbox,
+        );
+
+        const registry = createBuiltinToolRegistry();
+        const ctx = createToolExecutionContext({
+            bridge,
+            vfs,
+            target: { messageId: 1, swipeId: 0 },
+            getVariableSchema: () => messageOnlySchema,
+        });
+
+        // External write to msg.variables[0] is immediately read by read_variables(scope='message')
+        bridge.chat[1].variables = [{ hp: 66, externalTag: 'mvu' }];
+        const msgRead = JSON.parse(
+            (await registry.executeToolCall('read_variables', { scope: 'message' }, ctx)).output,
+        );
+        expect(msgRead.ok).toBe(true);
+        expect(msgRead.scope).toBe('message');
+        expect(msgRead.variables).toEqual({ hp: 66, externalTag: 'mvu' });
+
+        // patch_variables(scope='chat') writes chat_metadata.variables without failing message-only schema
+        const chatPatch = JSON.parse(
+            (
+                await registry.executeToolCall(
+                    'patch_variables',
+                    { scope: 'chat', json_merge: { day: 2, weather: 'rain' } },
+                    ctx,
+                )
+            ).output,
+        );
+        expect(chatPatch.ok).toBe(true);
+        expect(chatPatch.scope).toBe('chat');
+        expect(bridge.metadata.variables).toEqual({ day: 2, weather: 'rain' });
+
+        // patch_variables(scope='global') writes globalVariables & deletes keys with null
+        const globalPatch = JSON.parse(
+            (
+                await registry.executeToolCall(
+                    'patch_variables',
+                    { scope: 'global', json_merge: { difficulty: null, unlocks: ['ending-a'] } },
+                    ctx,
+                )
+            ).output,
+        );
+        expect(globalPatch.ok).toBe(true);
+        expect(globalPatch.scope).toBe('global');
+        expect(bridge.metadata.globalVariables).toEqual({ unlocks: ['ending-a'] });
+
+        const globalRead = JSON.parse(
+            (await registry.executeToolCall('read_variables', { scope: 'global', path: 'unlocks.0' }, ctx)).output,
+        );
+        expect(globalRead.ok).toBe(true);
+        expect(globalRead.variables).toBe('ending-a');
+    });
 });

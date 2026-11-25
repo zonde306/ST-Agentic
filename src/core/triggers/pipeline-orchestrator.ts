@@ -380,6 +380,7 @@ export class PipelineOrchestrator {
             } else if (input.action === 'regenerate') {
                 this.barrierCoordinator.abortFromMessage(target.messageId, 'Regenerated');
                 this.store.pruneFromMessage(target.messageId);
+                this.clearNativeVariablesFromMessage(target.messageId);
                 this.pruneMainlineTrajectoriesFromMessage(target.messageId);
             } else if (input.action === 'continue') {
                 this.restoreTrajectoriesForBranch(target);
@@ -1536,6 +1537,22 @@ export class PipelineOrchestrator {
         for (const agentId of this.trajectoryStore.listAgentIds()) {
             if (this.isMainlineThreadId(agentId)) {
                 this.trajectoryStore.pruneFromMessage(messageId, agentId);
+            }
+        }
+    }
+
+    private clearNativeVariablesFromMessage(fromMessageId: number): void {
+        if (!this.bridge.writeMessageVariables) {
+            return;
+        }
+        const chat = this.bridge.getChat();
+        for (let messageId = Math.max(0, fromMessageId); messageId < chat.length; messageId += 1) {
+            const variables = chat[messageId]?.variables;
+            if (!Array.isArray(variables)) {
+                continue;
+            }
+            for (let swipeId = 0; swipeId < variables.length; swipeId += 1) {
+                this.bridge.writeMessageVariables({ messageId, swipeId }, null);
             }
         }
     }

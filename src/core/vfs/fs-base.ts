@@ -1,5 +1,5 @@
 import type { ToolEditResult } from '@/core/bridge';
-import type { MessageTarget, VfsEntryStat } from '@/core/types';
+import type { MessageTarget, VariableScope, VfsEntryStat } from '@/core/types';
 
 export class VfsError extends Error {
     constructor(
@@ -48,6 +48,7 @@ export class VfsInvalidPathError extends VfsError {
 export interface VfsTargetOptions {
     target?: MessageTarget;
     staged?: boolean;
+    scope?: VariableScope;
 }
 
 export interface VfsReadOptions extends VfsTargetOptions {

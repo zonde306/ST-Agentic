@@ -26,9 +26,10 @@ import type {
     MessageTarget,
     RawLoreEntry,
     Settings,
+    VariableScope,
 } from '@/core/types';
 import { canonicalClone, normalizeVfsPath, stripJsonSchemaMeta } from '@/core/utils';
-import { VfsError, type VirtualFileSystem } from '@/core/vfs';
+import { scopeToVariablesPath, VfsError, type VirtualFileSystem } from '@/core/vfs';
 import { redactString, redactWithReport } from './redact';
 import type { UndoStore } from './undo-store';
 
@@ -439,6 +440,13 @@ const READ_VARIABLES_SCHEMA = z.object({
         .string()
         .optional()
         .describe('Optional dot-notation or JSON Pointer path (e.g. "player.hp" or "/stats/gold").'),
+    scope: z
+        .enum(['message', 'chat', 'global'])
+        .optional()
+        .default('message')
+        .describe(
+            'Variable scope: "message" (default, /state/variables.json), "chat" (/state/chat_variables.json), or "global" (/state/global_variables.json).',
+        ),
     include_schema: z.boolean().optional().default(false),
     default_value: z.unknown().optional(),
 });
@@ -688,29 +696,33 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
 
     const readVariablesTool: AssistantToolDefinition<typeof READ_VARIABLES_SCHEMA> = {
         name: 'read_variables',
-        description: 'Read causal branch variables from /state/variables.json. Read-only.',
+        description:
+            'Read variables from SillyTavern native storage (/state/variables.json for message branch, /state/chat_variables.json for chat, /state/global_variables.json for global). Read-only.',
         parameters: READ_VARIABLES_SCHEMA,
         tier: 'chat',
         readOnly: true,
         async execute(args, ctx) {
             throwIfAssistantAborted(ctx.signal);
+            const scope: VariableScope = args.scope ?? 'message';
+            const filePath = scopeToVariablesPath(scope);
             const varsAdapter = new VfsVarsAdapter(ctx.vfs, {
                 target: ctx.target,
                 staged: false,
                 signal: ctx.signal,
                 getSchema: ctx.getVariableSchema,
             });
-            const value = await varsAdapter.get(args.path);
+            const value = await varsAdapter.get(args.path, { scope });
             const resolvedValue = value === undefined ? args.default_value : value;
             const response: Record<string, unknown> = {
                 ok: true,
+                scope,
                 path: args.path ?? '',
                 exists: value !== undefined,
                 value: resolvedValue ?? null,
                 target: ctx.target,
             };
 
-            if (args.include_schema) {
+            if (args.include_schema && scope === 'message') {
                 const rawSchema = ctx.getVariableSchema?.();
                 if (rawSchema) {
                     if (typeof rawSchema === 'string') {
@@ -728,7 +740,7 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
                 }
             }
 
-            return finalizeReadToolResult(response, { fileRefs: ['/state/variables.json'] });
+            return finalizeReadToolResult(response, { fileRefs: [filePath] });
         },
     };
 

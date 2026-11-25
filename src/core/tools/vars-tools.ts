@@ -1,7 +1,7 @@
 import { z } from 'zod';
-import type { ToolExecutionContext, ToolVarsApi } from '@/core/bridge';
+import type { ToolExecutionContext, ToolVarsApi, ToolVarsOptions } from '@/core/bridge';
 import { DecoratorParser } from '@/core/lore';
-import type { MessageTarget, RawLoreEntry } from '@/core/types';
+import type { MessageTarget, RawLoreEntry, VariableScope } from '@/core/types';
 import { canonicalClone, canonicalStringify, stripJsonSchemaMeta } from '@/core/utils';
 import type { VirtualFileSystem } from '@/core/vfs';
 import { formatZodIssues, type ToolDefinition, type ToolValidationIssue } from './registry';
@@ -31,7 +31,10 @@ export interface VariableToolOptions {
 
 export interface VariableSchemaAwareApi extends ToolVarsApi {
     getSchema?: () => DynamicVariableSchema | undefined;
-    replaceAll?: (nextVars: Record<string, unknown>) => Promise<Record<string, unknown>>;
+    replaceAll?: (
+        nextVars: Record<string, unknown>,
+        opts?: ToolVarsOptions,
+    ) => Promise<Record<string, unknown>>;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -681,11 +684,13 @@ export class VfsVarsAdapter implements VariableSchemaAwareApi {
         return this.schemaProvider?.();
     }
 
-    async get(path?: string): Promise<unknown> {
+    async get(path?: string, opts?: ToolVarsOptions): Promise<unknown> {
         throwIfAborted(this.signal);
+        const scope: VariableScope = opts?.scope ?? 'message';
         const vars = await this.vfs.readVariables({
             target: this.target,
             staged: this.staged,
+            scope,
         });
         if (!path || !path.trim()) {
             return vars;
@@ -693,14 +698,19 @@ export class VfsVarsAdapter implements VariableSchemaAwareApi {
         return readNestedVarPath(vars, path.trim());
     }
 
-    async set(path: string, value: unknown): Promise<void> {
+    async set(path: string, value: unknown, opts?: ToolVarsOptions): Promise<void> {
         throwIfAborted(this.signal);
+        const scope: VariableScope = opts?.scope ?? 'message';
         const current = await this.vfs.readVariables({
             target: this.target,
             staged: this.staged,
+            scope,
         });
         const candidate = setNestedVarPath(current, path, value);
-        const validation = validateVariablesWithSchema(candidate, this.getSchema());
+        const validation =
+            scope === 'message'
+                ? validateVariablesWithSchema(candidate, this.getSchema())
+                : { ok: true, data: candidate };
         if (!validation.ok) {
             throw new Error(validation.error);
         }
@@ -708,22 +718,29 @@ export class VfsVarsAdapter implements VariableSchemaAwareApi {
             target: this.target,
             staged: this.staged,
             source: this.source,
+            scope,
         });
     }
 
     async patch(
         ops: Record<string, unknown> | Array<Record<string, unknown>>,
+        opts?: ToolVarsOptions,
     ): Promise<Record<string, unknown>> {
         throwIfAborted(this.signal);
+        const scope: VariableScope = opts?.scope ?? 'message';
         const current = await this.vfs.readVariables({
             target: this.target,
             staged: this.staged,
+            scope,
         });
         const candidate = Array.isArray(ops)
             ? applyJsonPatch(current, ops as unknown as JsonPatchOperation[])
             : applyJsonMergePatch(current, ops);
 
-        const validation = validateVariablesWithSchema(candidate, this.getSchema());
+        const validation =
+            scope === 'message'
+                ? validateVariablesWithSchema(candidate, this.getSchema())
+                : { ok: true, data: candidate };
         if (!validation.ok) {
             throw new Error(validation.error);
         }
@@ -733,13 +750,21 @@ export class VfsVarsAdapter implements VariableSchemaAwareApi {
             target: this.target,
             staged: this.staged,
             source: this.source,
+            scope,
         });
         return finalVars;
     }
 
-    async replaceAll(nextVars: Record<string, unknown>): Promise<Record<string, unknown>> {
+    async replaceAll(
+        nextVars: Record<string, unknown>,
+        opts?: ToolVarsOptions,
+    ): Promise<Record<string, unknown>> {
         throwIfAborted(this.signal);
-        const validation = validateVariablesWithSchema(nextVars, this.getSchema());
+        const scope: VariableScope = opts?.scope ?? 'message';
+        const validation =
+            scope === 'message'
+                ? validateVariablesWithSchema(nextVars, this.getSchema())
+                : { ok: true, data: nextVars };
         if (!validation.ok) {
             throw new Error(validation.error);
         }
@@ -748,21 +773,31 @@ export class VfsVarsAdapter implements VariableSchemaAwareApi {
             target: this.target,
             staged: this.staged,
             source: this.source,
+            scope,
         });
         return finalVars;
     }
 }
+
+const VARIABLE_SCOPE_SCHEMA = z
+    .enum(['message', 'chat', 'global'])
+    .optional()
+    .default('message')
+    .describe(
+        'Variable scope: "message" (default, /state/variables.json, chat[id].variables[swipe_id]), "chat" (/state/chat_variables.json, chat_metadata.variables), or "global" (/state/global_variables.json, extension_settings.variables.global).',
+    );
 
 const READ_VARIABLES_SCHEMA = z.object({
     path: z
         .string()
         .optional()
         .describe('Optional dot-notation or JSON pointer path (e.g. "player.hp" or "/stats/gold"). Omit to read all variables.'),
+    scope: VARIABLE_SCOPE_SCHEMA,
     include_schema: z
         .boolean()
         .optional()
         .default(false)
-        .describe('Include the active JSON Schema for variables when available.'),
+        .describe('Include the active JSON Schema for message-scope variables when available.'),
     default_value: z
         .unknown()
         .optional()
@@ -777,6 +812,7 @@ const JSON_PATCH_OP_SCHEMA = z.object({
 });
 
 const PATCH_VARIABLES_SCHEMA = z.object({
+    scope: VARIABLE_SCOPE_SCHEMA,
     json_merge: z
         .record(z.string(), z.unknown())
         .optional()
@@ -797,13 +833,14 @@ export function createVariableTools(options: VariableToolOptions = {}): ToolDefi
     const readVariablesTool: ToolDefinition<typeof READ_VARIABLES_SCHEMA> = {
         name: 'read_variables',
         description:
-            'Read state variables from /state/variables.json for the current causal branch, optionally at a specific path or with the active variable JSON Schema.',
+            'Read state variables from SillyTavern native storage (/state/variables.json for message branch, /state/chat_variables.json for chat, /state/global_variables.json for global), optionally at a specific path or with the active variable JSON Schema.',
         parameters: READ_VARIABLES_SCHEMA,
         source: 'builtin',
         async execute(args, ctx) {
             throwIfAborted(ctx.signal);
             try {
-                const rawValue = await ctx.vars.get(args.path);
+                const scope: VariableScope = args.scope ?? 'message';
+                const rawValue = await ctx.vars.get(args.path, { scope });
                 const value =
                     rawValue !== undefined
                         ? rawValue
@@ -814,7 +851,7 @@ export function createVariableTools(options: VariableToolOptions = {}): ToolDefi
                                 : {};
 
                 let jsonSchema: Record<string, unknown> | undefined;
-                if (args.include_schema) {
+                if (args.include_schema && scope === 'message') {
                     const zodSchema = resolveVariableZodSchema(resolveSchema(ctx));
                     if (zodSchema) {
                         jsonSchema = stripJsonSchemaMeta(
@@ -825,6 +862,7 @@ export function createVariableTools(options: VariableToolOptions = {}): ToolDefi
 
                 return JSON.stringify({
                     ok: true,
+                    scope,
                     ...(args.path ? { path: args.path } : {}),
                     variables: value,
                     ...(jsonSchema ? { json_schema: jsonSchema } : {}),
@@ -842,7 +880,7 @@ export function createVariableTools(options: VariableToolOptions = {}): ToolDefi
     const patchVariablesTool: ToolDefinition<typeof PATCH_VARIABLES_SCHEMA> = {
         name: 'patch_variables',
         description:
-            'Update /state/variables.json using RFC 7396 json_merge and/or RFC 6902 json_patch, validating the resulting object against any active @@json_schema or @@zod_schema before committing.',
+            'Update SillyTavern native variables (/state/variables.json for message branch, /state/chat_variables.json for chat, /state/global_variables.json for global) using RFC 7396 json_merge and/or RFC 6902 json_patch, validating message-scope variables against any active @@json_schema or @@zod_schema before committing.',
         parameters: PATCH_VARIABLES_SCHEMA,
         source: 'builtin',
         async execute(args, ctx) {
@@ -855,7 +893,8 @@ export function createVariableTools(options: VariableToolOptions = {}): ToolDefi
             }
 
             try {
-                const rawCurrent = await ctx.vars.get();
+                const scope: VariableScope = args.scope ?? 'message';
+                const rawCurrent = await ctx.vars.get(undefined, { scope });
                 let candidate: Record<string, unknown> = isPlainObject(rawCurrent)
                     ? deepCloneJson(rawCurrent)
                     : {};
@@ -867,7 +906,7 @@ export function createVariableTools(options: VariableToolOptions = {}): ToolDefi
                     candidate = applyJsonPatch(candidate, args.json_patch);
                 }
 
-                const activeSchema = resolveSchema(ctx);
+                const activeSchema = scope === 'message' ? resolveSchema(ctx) : undefined;
                 const validation = validateVariablesWithSchema(candidate, activeSchema);
                 if (!validation.ok) {
                     return JSON.stringify({
@@ -882,27 +921,30 @@ export function createVariableTools(options: VariableToolOptions = {}): ToolDefi
                 let persisted: Record<string, unknown>;
 
                 if (typeof aware.replaceAll === 'function') {
-                    persisted = await aware.replaceAll(validatedVars);
+                    persisted = await aware.replaceAll(validatedVars, { scope });
                 } else {
                     const schemaMutated = activeSchema !== undefined && !deepEquals(candidate, validatedVars);
                     if (schemaMutated) {
-                        persisted = await ctx.vars.patch(validatedVars);
+                        persisted = await ctx.vars.patch(validatedVars, { scope });
                     } else if (args.json_merge && args.json_patch?.length) {
-                        await ctx.vars.patch(args.json_merge);
+                        await ctx.vars.patch(args.json_merge, { scope });
                         persisted = await ctx.vars.patch(
                             args.json_patch as unknown as Array<Record<string, unknown>>,
+                            { scope },
                         );
                     } else if (args.json_merge) {
-                        persisted = await ctx.vars.patch(args.json_merge);
+                        persisted = await ctx.vars.patch(args.json_merge, { scope });
                     } else {
                         persisted = await ctx.vars.patch(
                             args.json_patch as unknown as Array<Record<string, unknown>>,
+                            { scope },
                         );
                     }
                 }
 
                 return JSON.stringify({
                     ok: true,
+                    scope,
                     target: ctx.target,
                     variables: persisted,
                 });

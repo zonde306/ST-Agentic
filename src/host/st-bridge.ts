@@ -21,7 +21,7 @@ import {
 } from '@st/script.js';
 import { MEDIA_SOURCE, MEDIA_TYPE } from '@st/scripts/constants.js';
 import { eventSource, event_types } from '@st/scripts/events.js';
-import { extension_settings } from '@st/scripts/extensions.js';
+import { extension_settings, saveMetadataDebounced } from '@st/scripts/extensions.js';
 import { user_avatar } from '@st/scripts/personas.js';
 import { power_user } from '@st/scripts/power-user.js';
 import { updateReasoningUI } from '@st/scripts/reasoning.js';
@@ -246,6 +246,32 @@ function cloneHostValue<T>(value: T): T {
     }
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return false;
+    }
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+}
+
+function isNonEmptyPlainRecord(value: unknown): value is Record<string, unknown> {
+    return isPlainRecord(value) && Object.keys(value).length > 0;
+}
+
+function replaceRecordInPlace(
+    target: Record<string, unknown>,
+    next: Record<string, unknown>,
+): void {
+    for (const key of Object.keys(target)) {
+        if (!Object.hasOwn(next, key)) {
+            delete target[key];
+        }
+    }
+    for (const [key, value] of Object.entries(next)) {
+        target[key] = cloneHostValue(value);
+    }
+}
+
 function getDisplayedChatFirstId(): number | null {
     if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') {
         return null;
@@ -375,6 +401,96 @@ export class STHostBridge implements HostBridge {
 
     saveChatDebounced(): void {
         saveChatDebounced();
+    }
+
+    readMessageVariables(target: MessageTarget): Record<string, unknown> | null {
+        if (
+            !Array.isArray(chat) ||
+            !Number.isInteger(target.messageId) ||
+            target.messageId < 0 ||
+            target.messageId >= chat.length ||
+            !Number.isInteger(target.swipeId) ||
+            target.swipeId < 0
+        ) {
+            return null;
+        }
+        const msg = chat[target.messageId] as Record<string, unknown> | undefined;
+        const variables = msg?.variables;
+        if (!Array.isArray(variables) || target.swipeId >= variables.length) {
+            return null;
+        }
+        const slot = variables[target.swipeId];
+        return isNonEmptyPlainRecord(slot) ? cloneHostValue(slot) : null;
+    }
+
+    writeMessageVariables(target: MessageTarget, vars: Record<string, unknown> | null): boolean {
+        if (
+            !Array.isArray(chat) ||
+            !Number.isInteger(target.messageId) ||
+            target.messageId < 0 ||
+            target.messageId >= chat.length ||
+            !Number.isInteger(target.swipeId) ||
+            target.swipeId < 0
+        ) {
+            return false;
+        }
+        const msg = chat[target.messageId] as Record<string, unknown> | undefined;
+        if (!msg) {
+            return false;
+        }
+        const variables = Array.isArray(msg.variables)
+            ? (msg.variables as unknown[])
+            : ((msg.variables = []) as unknown[]);
+        while (variables.length <= target.swipeId) {
+            variables.push({});
+        }
+        variables[target.swipeId] = isPlainRecord(vars) ? cloneHostValue(vars) : {};
+        saveChatDebounced();
+        return true;
+    }
+
+    readChatVariables(): Record<string, unknown> {
+        const meta = chat_metadata as Record<string, unknown> | undefined;
+        return isPlainRecord(meta?.variables) ? cloneHostValue(meta.variables) : {};
+    }
+
+    writeChatVariables(vars: Record<string, unknown>): void {
+        if (!chat_metadata || typeof chat_metadata !== 'object') {
+            return;
+        }
+        const meta = chat_metadata as Record<string, unknown>;
+        const target = isPlainRecord(meta.variables)
+            ? meta.variables
+            : ((meta.variables = {}) as Record<string, unknown>);
+        replaceRecordInPlace(target, isPlainRecord(vars) ? vars : {});
+        if (typeof saveMetadataDebounced === 'function') {
+            saveMetadataDebounced();
+        } else {
+            saveChatDebounced();
+        }
+    }
+
+    readGlobalVariables(): Record<string, unknown> {
+        const ext = extension_settings as Record<string, unknown> | undefined;
+        const varsContainer = ext?.variables as Record<string, unknown> | undefined;
+        return isPlainRecord(varsContainer?.global)
+            ? cloneHostValue(varsContainer.global)
+            : {};
+    }
+
+    writeGlobalVariables(vars: Record<string, unknown>): void {
+        const ext = extension_settings as Record<string, unknown> | undefined;
+        if (!ext || typeof ext !== 'object') {
+            return;
+        }
+        const varsContainer = isPlainRecord(ext.variables)
+            ? ext.variables
+            : ((ext.variables = {}) as Record<string, unknown>);
+        const globalObj = isPlainRecord(varsContainer.global)
+            ? varsContainer.global
+            : ((varsContainer.global = {}) as Record<string, unknown>);
+        replaceRecordInPlace(globalObj, isPlainRecord(vars) ? vars : {});
+        saveSettingsDebounced();
     }
 
     readChatMessage(target: MessageTarget): string | null {

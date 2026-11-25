@@ -313,6 +313,70 @@ export class MemoryHostBridge implements HostBridge {
         this.saveChatCalls += 1;
     }
 
+    readMessageVariables(target: MessageTarget): Record<string, unknown> | null {
+        if (
+            !Number.isInteger(target.messageId) ||
+            target.messageId < 0 ||
+            target.messageId >= this.chat.length ||
+            !Number.isInteger(target.swipeId) ||
+            target.swipeId < 0
+        ) {
+            return null;
+        }
+        const msg = this.chat[target.messageId];
+        if (!msg || !Array.isArray(msg.variables) || target.swipeId >= msg.variables.length) {
+            return null;
+        }
+        const slot = msg.variables[target.swipeId];
+        return isNonEmptyPlainRecord(slot) ? structuredClone(slot) : null;
+    }
+
+    writeMessageVariables(target: MessageTarget, vars: Record<string, unknown> | null): boolean {
+        if (
+            !Number.isInteger(target.messageId) ||
+            target.messageId < 0 ||
+            target.messageId >= this.chat.length ||
+            !Number.isInteger(target.swipeId) ||
+            target.swipeId < 0
+        ) {
+            return false;
+        }
+        const msg = this.chat[target.messageId];
+        if (!msg) {
+            return false;
+        }
+        const variables = Array.isArray(msg.variables)
+            ? msg.variables
+            : (msg.variables = []);
+        while (variables.length <= target.swipeId) {
+            variables.push({});
+        }
+        variables[target.swipeId] = isPlainRecord(vars) ? structuredClone(vars) : {};
+        this.saveChatDebounced();
+        return true;
+    }
+
+    readChatVariables(): Record<string, unknown> {
+        const raw = this.metadata.variables;
+        return isPlainRecord(raw) ? structuredClone(raw) : {};
+    }
+
+    writeChatVariables(vars: Record<string, unknown>): void {
+        const target = this.getMetadataVariables();
+        replaceRecordInPlace(target, isPlainRecord(vars) ? vars : {});
+        this.saveChatDebounced();
+    }
+
+    readGlobalVariables(): Record<string, unknown> {
+        const raw = this.metadata.globalVariables;
+        return isPlainRecord(raw) ? structuredClone(raw) : {};
+    }
+
+    writeGlobalVariables(vars: Record<string, unknown>): void {
+        const target = this.getMetadataGlobalVariables(true);
+        replaceRecordInPlace(target, isPlainRecord(vars) ? vars : {});
+    }
+
     readChatMessage(target: MessageTarget): string | null {
         if (
             !Number.isInteger(target.messageId) ||
@@ -791,6 +855,12 @@ export class MemoryHostBridge implements HostBridge {
         const vars = this.getMetadataVariables();
         vars[name] = value;
         this.metadata.variables = vars;
+    }
+
+    setGlobalVariable(name: string, value: unknown): void {
+        const vars = this.getMetadataGlobalVariables(true);
+        vars[name] = value;
+        this.metadata.globalVariables = vars;
     }
 
     setEjsEvaluator(fn?: EjsEvaluatorStub): void {
@@ -1614,12 +1684,43 @@ export class MemoryHostBridge implements HostBridge {
         return created;
     }
 
-    private getMetadataGlobalVariables(): Record<string, unknown> {
+    private getMetadataGlobalVariables(create: boolean = false): Record<string, unknown> {
         const raw = this.metadata.globalVariables;
         if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
             return raw as Record<string, unknown>;
         }
+        if (create) {
+            const created: Record<string, unknown> = {};
+            this.metadata.globalVariables = created;
+            return created;
+        }
         return {};
+    }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return false;
+    }
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+}
+
+function isNonEmptyPlainRecord(value: unknown): value is Record<string, unknown> {
+    return isPlainRecord(value) && Object.keys(value).length > 0;
+}
+
+function replaceRecordInPlace(
+    target: Record<string, unknown>,
+    next: Record<string, unknown>,
+): void {
+    for (const key of Object.keys(target)) {
+        if (!Object.hasOwn(next, key)) {
+            delete target[key];
+        }
+    }
+    for (const [key, value] of Object.entries(next)) {
+        target[key] = structuredClone(value);
     }
 }
 
