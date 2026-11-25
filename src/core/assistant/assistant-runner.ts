@@ -48,6 +48,7 @@ import type { DynamicVariableSchema } from '@/core/tools';
 import type {
     ApiConnection,
     AssistantAttachment,
+    AssistantActivityStep,
     AssistantCompactOptions,
     AssistantCompactReport,
     AssistantCompactionNotice,
@@ -1960,12 +1961,54 @@ export class AssistantRunner {
         let activeRetryStatus: AssistantRetryStatus | undefined;
         let currentRoundThinkBuffer = '';
 
+        // Per-round activity timeline (UI-only). Each marker records buffer offsets at round
+        // start so every rollback path (which always resets to `roundStart*Buffer`) stays consistent.
+        const priorActivity: AssistantActivityStep[] = resume?.existingAssistantMessage.activity
+            ? canonicalClone(resume.existingAssistantMessage.activity)
+            : [];
+        const roundMarkers: Array<{
+            id: string;
+            startedAt: number;
+            thinkStart: number;
+            contentStart: number;
+            respondedAt?: number;
+            preface?: string;
+            toolCallIds: string[];
+        }> = [];
+        const buildActivity = (): AssistantActivityStep[] => {
+            const steps: AssistantActivityStep[] = [...priorActivity];
+            roundMarkers.forEach((marker, idx) => {
+                const next = roundMarkers[idx + 1];
+                const think = thinkBuffer.slice(
+                    marker.thinkStart,
+                    next ? Math.max(marker.thinkStart, next.thinkStart) : thinkBuffer.length,
+                );
+                const preface = marker.preface ?? '';
+                if (!think.trim() && !preface.trim() && marker.toolCallIds.length === 0) {
+                    return;
+                }
+                steps.push({
+                    id: marker.id,
+                    startedAt: marker.startedAt,
+                    ...(think.trim() ? { think } : {}),
+                    ...(marker.respondedAt !== undefined
+                        ? { thinkMs: Math.max(0, marker.respondedAt - marker.startedAt) }
+                        : {}),
+                    ...(preface.trim() ? { preface } : {}),
+                    toolCallIds: [...marker.toolCallIds],
+                });
+            });
+            return steps;
+        };
+
         const syncAssistantBubble = (patch?: Partial<AssistantMessage>): void => {
+            const activity = buildActivity();
             const nextMessage: AssistantMessage = {
                 ...assistantMessage,
                 content: contentBuffer,
                 ...(thinkBuffer ? { think: thinkBuffer } : {}),
                 ...(toolCallRecords.length > 0 ? { toolCalls: canonicalClone(toolCallRecords) } : {}),
+                ...(activity.length > 0 ? { activity } : {}),
                 ...(approvalIds.length > 0 ? { approvalIds: [...approvalIds] } : {}),
                 ...(fileRefs.size > 0 ? { fileRefs: Array.from(fileRefs) } : {}),
                 ...(cumulativeUsage.inputTokens > 0 || cumulativeUsage.outputTokens > 0
@@ -2216,6 +2259,14 @@ export class AssistantRunner {
                 // Invoke LLM with Context Overflow Auto-Recovery (§3.3) + Transient Auto-Retry (§3.5).
                 const roundStartContentBuffer = contentBuffer;
                 const roundStartThinkBuffer = thinkBuffer;
+                const roundMarker = {
+                    id: this.idGenerator(),
+                    startedAt: this.now(),
+                    thinkStart: thinkBuffer.length,
+                    contentStart: contentBuffer.length,
+                    toolCallIds: [] as string[],
+                } as (typeof roundMarkers)[number];
+                roundMarkers.push(roundMarker);
                 let turnOutput!: TurnLLMOutput;
                 let transientRetriesUsed = 0;
                 let hasNativeReasoning = false;
@@ -2523,6 +2574,7 @@ export class AssistantRunner {
                     );
                 }
 
+                roundMarker.respondedAt = this.now();
                 cumulativeUsage = addTokenUsage(cumulativeUsage, turnOutput.usage);
 
                 // Protect against max_tokens truncation (both partial text and truncated tool JSON).
@@ -2684,6 +2736,14 @@ export class AssistantRunner {
                     }
                     syncAssistantBubble();
                 }
+
+                // Bind this round's visible preface + issued tool calls to its timeline step
+                // before executing, so the UI can show pending rows immediately.
+                roundMarker.preface = contentBuffer.slice(roundMarker.contentStart);
+                roundMarker.toolCallIds = turnOutput.toolCalls
+                    .filter((tc) => !(strictToolLoop && tc.name === FINISH_TURN_TOOL_NAME))
+                    .map((tc) => tc.id);
+                syncAssistantBubble();
 
                 // Tool-calling round: execute tools, committing paired assistant(toolCalls)+tool results atomically.
                 const assistantToolMessage: CanonicalMessage = {

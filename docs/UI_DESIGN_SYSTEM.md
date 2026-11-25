@@ -326,6 +326,19 @@ Dark 主题阴影以**内描边高光 + 深阴影**组合呈现（`inset 0 1px 0
 - 每条回复独立记忆展开状态；流式输出过程中保持折叠，避免列表增长导致滚动跳动。
 - 测试锚点：`[data-assistant-file-refs]`、`[data-assistant-file-refs-toggle]`、`.ag-ast-file-chip[data-file-path]`。
 
+### 3.16 助手回合活动时间线 `ActivityTimeline`
+
+思考与工具调用按**模型轮次**分段（数据源 `AssistantMessage.activity`，旧消息自动合成为单轮），不再把多段 reasoning 拼成一块、把工具平铺成卡片墙。
+
+- **摘要行**（默认折叠）：状态图标（✓ 绿 / ⚠ 黄 / 旋转圈主色）+「已思考 Xs」+「N 轮 · M 次工具」+ 失败徽章 / 🔒 已脱敏 + 右侧旋转箭头。流式期间显示「正在思考 / 正在调用工具 2/3 / 正在回复」+ shimmer + 计时。
+- **自动展开 / 折叠**：模型思考或调用工具时自动展开；最终回复开始输出后自动折叠；用户手动切换后不再自动改变。
+- **轮次节点**：左侧 1px 竖线 + 19px 圆形序号（出错描红、进行中主色旋转）。标题取思考**首句**（≤ 40 字），正文为剩余部分、默认 2 行截断、点标题展开；进行中的思考使用 60px 高、顶部渐隐的尾部窗口。
+- **前言文本**：本轮在调用工具前输出的可见正文并入时间线（`--foreground` 13px Markdown），从最终回复中剔除。
+- **工具行**：无边框单行 = 图标 + 中文动词（`activity-timeline-model.ts` 映射）+ 关键参数（等宽 12px、省略）+ 右侧耗时与状态点；同轮连续同名调用合并为「动词 ×N」可展开组；点击行内展开 Args / Result 面板（唯一的卡片面）。英文工具名只出现在展开面板与 `title` 中。
+- **撤销**：工具行右侧 ghost「↩ 撤销」，悬停显黄；摘要行保留首个可撤销操作的快捷按钮。
+- 所有按钮 ≥ 40×40px（桌面与移动端一致）；移动端参数换到第二行。
+- 测试锚点：`[data-assistant-activity]`、`[data-assistant-activity-toggle]`、`[data-assistant-activity-step]`、`[data-assistant-tool-call]` 内 `.ag-ast-tool-toggle`、`[data-assistant-tool-group]`、`[data-tool-undo-btn]`、`[data-activity-undo-btn]`。
+
 ---
 
 ## 4. 图标

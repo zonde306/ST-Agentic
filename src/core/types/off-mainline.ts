@@ -72,6 +72,26 @@ export interface AssistantToolCallRecord {
     undoId?: string;
 }
 
+/**
+ * One model round inside an assistant turn (UI-only timeline grouping).
+ * Ordered: think -> visible preface text -> tool calls issued in this round.
+ * Never forwarded to the model; `AssistantMessage.think` / `content` remain the
+ * concatenated replay views so KV-cache prefixes are unaffected.
+ */
+export interface AssistantActivityStep {
+    id: string;
+    /** Wall-clock start of this round (ms epoch). */
+    startedAt: number;
+    /** Reasoning / step-brief text produced in this round. */
+    think?: string;
+    /** Duration from round start until the model finished responding. */
+    thinkMs?: number;
+    /** Visible assistant text emitted in this round before its tool calls. */
+    preface?: string;
+    /** Tool call ids issued in this round, in model order (match `toolCalls[].id`). */
+    toolCallIds: string[];
+}
+
 export interface AssistantMessageUsage {
     inputTokens: number;
     cachedTokens: number;
@@ -204,6 +224,8 @@ export interface AssistantMessage {
     attachments?: AssistantAttachment[];
     think?: string;
     toolCalls?: AssistantToolCallRecord[];
+    /** Per-round timeline grouping for the activity UI (absent on legacy messages). */
+    activity?: AssistantActivityStep[];
     approvalIds?: string[];
     fileRefs?: string[];
     usage?: AssistantMessageUsage;

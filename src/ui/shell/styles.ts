@@ -3531,110 +3531,542 @@ textarea:focus-visible {
     animation: ag-ast-pulse 1s ease-in-out infinite;
 }
 
-/* Collapsible Thinking / Tool Bar */
-.ag-ast-activity {
-    border-radius: var(--radius-lg);
-    background: var(--content);
-    border: 1px solid var(--card-border);
-    overflow: hidden;
+/* Activity timeline (per-round think -> preface -> tools); design: activity-timeline */
+.ag-ast-tl {
     min-width: 0;
+    display: flex;
+    flex-direction: column;
 }
 
-.ag-ast-activity-bar {
+.ag-ast-tl-bar {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: 6px;
-    padding: 2px 6px;
     min-width: 0;
 }
 
-.ag-ast-activity-toggle {
+.ag-ast-tl-summary {
     flex: 1 1 auto;
-    min-width: 40px;
+    min-width: 0;
     min-height: 40px;
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 0 6px;
+    gap: 8px;
+    margin: 0 -8px;
+    padding: 4px 8px;
     border: none;
+    border-radius: var(--radius-md);
     background: transparent;
     color: var(--muted-foreground);
-    font-size: 11px;
+    font-size: 13px;
+    line-height: 20px;
     text-align: left;
     cursor: pointer;
     overflow: hidden;
+    transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
 
-.ag-ast-activity-toggle:hover {
+.ag-ast-tl-summary:hover {
+    background: var(--hover);
     color: var(--foreground);
 }
 
-.ag-ast-activity-summary {
+.ag-ast-tl-status {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+}
+
+.ag-ast-tl-status[data-tone="ok"] {
+    color: var(--success);
+}
+
+.ag-ast-tl-status[data-tone="warning"] {
+    color: var(--warning);
+}
+
+.ag-ast-tl-status[data-tone="live"] {
+    color: var(--primary);
+}
+
+.ag-ast-tl-headline {
+    flex-shrink: 0;
+    color: var(--foreground);
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.ag-ast-tl-headline-detail {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    min-width: 0;
+    color: var(--muted-foreground);
 }
 
-.ag-ast-activity-body {
-    padding: 8px 10px 10px;
-    border-top: 1px solid var(--card-border);
+.ag-ast-tl-meta {
+    flex-shrink: 0;
+    font-size: 12px;
+    color: var(--muted-foreground);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.ag-ast-tl-badge {
+    flex-shrink: 0;
+    padding: 1px 6px;
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    line-height: 16px;
+    font-weight: 500;
+}
+
+.ag-ast-tl-badge[data-tone="error"] {
+    color: var(--error);
+    background: color-mix(in srgb, var(--error) 12%, transparent);
+}
+
+.ag-ast-tl-chevron {
+    flex-shrink: 0;
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    color: var(--subtle-foreground);
+    transition: transform var(--dur) var(--ease);
+}
+
+.ag-ast-tl-chevron[data-open="true"] {
+    transform: rotate(90deg);
+}
+
+.ag-ast-tl-undo {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-height: 40px;
+    min-width: 40px;
+    padding: 0 8px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--muted-foreground);
+    font-size: 12px;
+    cursor: pointer;
+    transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.ag-ast-tl-undo:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
+    color: var(--warning);
+}
+
+.ag-ast-tl-undo:disabled {
+    cursor: default;
+    opacity: 0.7;
+}
+
+.ag-ast-tl-undo[data-reverted="true"] {
+    color: var(--success);
+}
+
+/* Steps rail */
+.ag-ast-tl-steps {
+    list-style: none;
+    margin: 2px 0 4px;
+    padding: 0;
     display: flex;
     flex-direction: column;
+    min-width: 0;
+}
+
+.ag-ast-tl-step {
+    position: relative;
+    display: flex;
+    gap: 10px;
+    padding-bottom: 6px;
+    min-width: 0;
+}
+
+.ag-ast-tl-step:last-child {
+    padding-bottom: 4px;
+}
+
+.ag-ast-tl-step::before {
+    content: "";
+    position: absolute;
+    left: 9px;
+    top: 31px;
+    bottom: 0;
+    width: 1px;
+    background: var(--border);
+}
+
+.ag-ast-tl-step:last-child::before {
+    display: none;
+}
+
+.ag-ast-tl-node {
+    position: relative;
+    z-index: 1;
+    flex-shrink: 0;
+    width: 19px;
+    height: 19px;
+    margin-top: 10px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 9999px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--muted-foreground);
+    font-size: 11px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.ag-ast-tl-step[data-error="true"] .ag-ast-tl-node {
+    color: var(--error);
+    border-color: color-mix(in srgb, var(--error) 50%, transparent);
+}
+
+.ag-ast-tl-step[data-live="true"] .ag-ast-tl-node {
+    color: var(--primary);
+    border-color: color-mix(in srgb, var(--primary) 45%, transparent);
+}
+
+.ag-ast-tl-step-main {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.ag-ast-tl-step-head {
+    display: flex;
+    align-items: center;
     gap: 8px;
     min-width: 0;
-}
-
-.ag-ast-think {
-    font-size: 11px;
-    color: var(--muted-foreground);
-    line-height: 1.55;
-    word-break: break-word;
-}
-
-.ag-ast-tool-card {
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border);
-    background: var(--sidebar);
-    overflow: hidden;
-    min-width: 0;
-}
-
-.ag-ast-tool-header {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    justify-content: space-between;
-    gap: 6px;
-    padding: 2px 6px;
-}
-
-.ag-ast-tool-toggle {
-    flex: 1 1 auto;
-    min-width: 40px;
     min-height: 40px;
-    max-width: 100%;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
-    padding: 4px;
+    padding: 0;
     border: none;
     background: transparent;
     color: var(--foreground);
-    font-size: 11px;
     text-align: left;
     cursor: pointer;
 }
 
-.ag-ast-tool-body {
-    padding: 6px 8px 8px;
-    border-top: 1px solid var(--card-border);
+.ag-ast-tl-step-head:disabled {
+    cursor: default;
+}
+
+.ag-ast-tl-step-head:not(:disabled):hover .ag-ast-tl-step-title {
+    color: var(--primary);
+}
+
+.ag-ast-tl-step-title {
+    min-width: 0;
+    font-size: 13px;
+    line-height: 20px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    transition: color var(--dur-fast) var(--ease);
+}
+
+.ag-ast-tl-step-time {
+    flex-shrink: 0;
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--subtle-foreground);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.ag-ast-tl-think {
+    font-size: 13px;
+    line-height: 20px;
+    color: var(--muted-foreground);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.ag-ast-tl-think[data-clamped="true"] {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+/* Live reasoning: fixed 3-line tail window, older lines fade out at the top */
+.ag-ast-tl-live-think {
+    max-height: 60px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, var(--foreground) 45%);
+    mask-image: linear-gradient(to bottom, transparent 0, var(--foreground) 45%);
+}
+
+.ag-ast-tl-live-think-inner {
+    font-size: 13px;
+    line-height: 20px;
+    color: var(--muted-foreground);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.ag-ast-tl-preface {
+    margin-top: 2px;
+    font-size: 13px;
+    line-height: 20px;
+    color: var(--foreground);
+}
+
+.ag-ast-tl-preface > :first-child {
+    margin-top: 0;
+}
+
+.ag-ast-tl-preface > :last-child {
+    margin-bottom: 0;
+}
+
+/* Tool rows: borderless single lines; only the expanded detail is a surface */
+.ag-ast-tl-tools {
+    display: flex;
+    flex-direction: column;
+    margin: 0 0 0 -6px;
+    min-width: 0;
+}
+
+.ag-ast-tl-tool,
+.ag-ast-tl-group {
+    min-width: 0;
+}
+
+.ag-ast-tl-tool-line {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+}
+
+.ag-ast-tl-tool-row {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: 100%;
+    min-height: 40px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 6px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground);
+    font-size: 13px;
+    line-height: 20px;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color var(--dur-fast) var(--ease);
+}
+
+.ag-ast-tl-tool-row:hover:not(:disabled) {
+    background: var(--hover);
+}
+
+.ag-ast-tl-tool-row:disabled {
+    cursor: default;
+}
+
+.ag-ast-tl-tool-icon {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    color: var(--muted-foreground);
+}
+
+.ag-ast-tl-tool[data-state="error"] .ag-ast-tl-tool-icon {
+    color: var(--error);
+}
+
+.ag-ast-tl-tool-verb {
+    flex-shrink: 0;
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.ag-ast-tl-tool-count {
+    margin-left: 4px;
+    font-weight: 400;
+    color: var(--muted-foreground);
+}
+
+.ag-ast-tl-tool-arg {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+    color: var(--muted-foreground);
+}
+
+.ag-ast-tl-tool-meta {
+    flex-shrink: 0;
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--subtle-foreground);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.ag-ast-tl-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background: var(--success);
+}
+
+.ag-ast-tl-dot[data-state="error"] {
+    background: var(--error);
+}
+
+.ag-ast-tl-dot[data-state="pending"] {
+    background: var(--subtle-foreground);
+}
+
+.ag-ast-tl-tool-nested .ag-ast-tl-tool-row {
+    padding-left: 22px;
+}
+
+.ag-ast-tl-group-children {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.ag-ast-tl-tool-detail {
+    margin: 2px 0 6px 28px;
+    padding: 8px;
+    border-radius: var(--radius-md);
+    background: var(--content);
+    border: 1px solid var(--card-border);
     display: flex;
     flex-direction: column;
     gap: 6px;
     min-width: 0;
+}
+
+.ag-ast-tl-tool-detail-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    font-size: 12px;
+    color: var(--muted-foreground);
+}
+
+.ag-ast-tl-tool-detail .ag-ast-tool-pre {
+    max-height: 240px;
+    overflow-y: auto;
+    background: var(--card);
+}
+
+.ag-ast-tool-pre[data-tone="error"] {
+    color: var(--error);
+}
+
+/* Live indicators */
+.ag-ast-tl-spinner {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 9999px;
+    border: 1.5px solid color-mix(in srgb, var(--primary) 30%, transparent);
+    border-top-color: var(--primary);
+    animation: ag-ast-tl-spin 0.9s linear infinite;
+}
+
+@keyframes ag-ast-tl-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.ag-ast-tl-shimmer {
+    background: linear-gradient(
+        90deg,
+        var(--muted-foreground) 0%,
+        var(--foreground) 50%,
+        var(--muted-foreground) 100%
+    );
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: ag-ast-tl-shimmer 1.6s linear infinite;
+}
+
+@keyframes ag-ast-tl-shimmer {
+    from {
+        background-position: 200% 0;
+    }
+    to {
+        background-position: -200% 0;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .ag-ast-tl-shimmer {
+        background: none;
+        color: inherit;
+    }
+}
+
+@media (max-width: 767px) {
+    .ag-ast-tl-summary {
+        min-height: 40px;
+        flex-wrap: wrap;
+        row-gap: 0;
+    }
+
+    .ag-ast-tl-tool-row {
+        min-height: 40px;
+        flex-wrap: wrap;
+        row-gap: 0;
+    }
+
+    .ag-ast-tl-tool-arg {
+        flex-basis: 100%;
+        order: 10;
+        padding-left: 24px;
+    }
+
+    .ag-ast-tl-undo {
+        min-height: 40px;
+        min-width: 40px;
+        justify-content: center;
+    }
+
+    .ag-ast-tl-tool-detail {
+        margin-left: 6px;
+    }
+
+    .ag-ast-tl-tool-detail .ag-ast-tool-pre {
+        max-height: 40dvh;
+    }
 }
 
 .ag-ast-tool-pre {

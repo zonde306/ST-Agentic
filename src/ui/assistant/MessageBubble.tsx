@@ -9,7 +9,6 @@ import type {
     AssistantAttachment,
     AssistantCompactionNotice,
     AssistantMessage,
-    AssistantToolCallRecord,
     PendingApproval,
     UndoRecord,
 } from '@/core/types';
@@ -24,11 +23,12 @@ import {
     IconPlay,
     IconRefresh,
 } from '@/ui/components/Icons';
+import { ActivityTimeline } from './ActivityTimeline';
+import { buildActivityTimeline } from './activity-timeline-model';
 import { AttachedApprovalCard } from './AttachedApprovalCard';
 import {
     formatAssistantTime,
     formatFileSize,
-    renderRedactedText,
     renderSimpleMarkdown,
 } from './assistant-helpers';
 
@@ -351,79 +351,6 @@ function CompactionNoticePill({
     );
 }
 
-interface ToolCallItemProps {
-    toolCall: AssistantToolCallRecord;
-    undoRecord: UndoRecord | null;
-    busyUndoId?: string | null;
-    onApplyUndo: (undoId: string) => void | Promise<void>;
-}
-
-function ToolCallItem({ toolCall, undoRecord, busyUndoId, onApplyUndo }: ToolCallItemProps) {
-    const [expanded, setExpanded] = useState<boolean>(false);
-    const isError = toolCall.status === 'error';
-
-    return (
-        <div class="ag-ast-tool-card" data-assistant-tool-call={toolCall.id}>
-            <div class="ag-ast-tool-header">
-                <button
-                    type="button"
-                    class="ag-ast-tool-toggle"
-                    aria-expanded={expanded}
-                    onClick={() => setExpanded((prev) => !prev)}
-                >
-                    <span
-                        class="ag-mono"
-                        style={{
-                            fontWeight: 600,
-                            color: isError ? 'var(--error)' : 'var(--foreground)',
-                        }}
-                    >
-                        {isError ? '✕ ' : ''}
-                        {toolCall.name}
-                    </span>
-                    <span class="ag-pill ag-pill-primary">{toolCall.scopeLabel}</span>
-                    {isError ? <span class="ag-pill ag-pill-error">失败</span> : null}
-                    {toolCall.hasSecretRedaction ? (
-                        <span class="ag-redacted-badge" data-redacted-badge="true">
-                            🔒 已脱敏
-                        </span>
-                    ) : null}
-                    <span style={{ fontSize: '10px', color: 'var(--muted-foreground)' }}>
-                        {toolCall.durationMs}ms {expanded ? '▾' : '▸'}
-                    </span>
-                </button>
-
-                {undoRecord ? (
-                    <button
-                        type="button"
-                        disabled={undoRecord.reverted || busyUndoId === undoRecord.id}
-                        data-tool-undo-btn={undoRecord.id}
-                        class={
-                            undoRecord.reverted
-                                ? 'ag-btn ag-btn-secondary ag-btn-sm'
-                                : 'ag-btn ag-btn-sm ag-pill-warning'
-                        }
-                        onClick={() => void onApplyUndo(undoRecord.id)}
-                    >
-                        {undoRecord.reverted ? '✓ 已撤销' : '↩ 撤销'}
-                    </button>
-                ) : null}
-            </div>
-
-            {expanded ? (
-                <div class="ag-ast-tool-body">
-                    <pre class="ag-ast-tool-pre ag-thin-scroll">
-                        Args: {renderRedactedText(toolCall.argsSummary)}
-                    </pre>
-                    <pre class="ag-ast-tool-pre ag-thin-scroll">
-                        {renderRedactedText(toolCall.resultSummary)}
-                    </pre>
-                </div>
-            ) : null}
-        </div>
-    );
-}
-
 /**
  * Assistant or User chat bubble, featuring:
  * - Collapsible thinking + tool-call activity strip with redaction badge & quick undo
@@ -464,7 +391,6 @@ export function MessageBubble({
     onCompactAndRetryOverflow,
     onCopy,
 }: MessageBubbleProps) {
-    const [activityExpanded, setActivityExpanded] = useState<boolean>(false);
     const [editDraft, setEditDraft] = useState<string>(message.content);
     const [copied, setCopied] = useState<boolean>(false);
     const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -531,8 +457,12 @@ export function MessageBubble({
 
     const handleCopyClick = async () => {
         onCloseActions?.();
+        const textPayload =
+            message.role === 'assistant'
+                ? buildActivityTimeline(message).finalContent || message.content
+                : message.content;
         const copyPayload =
-            message.content
+            textPayload
             || (hasAttachments ? attachments.map((att) => `[附件: ${att.name}]`).join('\n') : '');
         await onCopy?.(copyPayload);
         setCopied(true);
@@ -825,38 +755,15 @@ export function MessageBubble({
     }
 
     const toolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
-    const hasActivity = Boolean(message.think) || toolCalls.length > 0;
-    const totalMs = toolCalls.reduce((sum, tc) => sum + (tc.durationMs || 0), 0);
-    const hasRedaction = toolCalls.some((tc) => Boolean(tc.hasSecretRedaction));
-    const hasToolError = toolCalls.some((tc) => tc.status === 'error');
-
-    const firstUndoTool = toolCalls.find((tc) => tc.undoId && undoById.has(tc.undoId));
-    const quickUndoRecord = firstUndoTool?.undoId
-        ? (undoById.get(firstUndoTool.undoId) ?? null)
-        : null;
+    const timeline = buildActivityTimeline(message, { isStreaming });
+    const hasActivity = timeline.steps.length > 0;
+    const displayContent = timeline.finalContent;
 
     const approvals: PendingApproval[] = Array.isArray(message.approvalIds)
         ? message.approvalIds
             .map((id) => approvalsById.get(id))
             .filter((item): item is PendingApproval => Boolean(item))
         : [];
-
-    const summaryParts: string[] = [];
-    if (message.think) {
-        summaryParts.push('已思考');
-    }
-    if (toolCalls.length > 0) {
-        const previewNames = toolCalls
-            .map((tc) => tc.name)
-            .slice(0, 2)
-            .join(', ');
-        summaryParts.push(
-            `${toolCalls.length} 次工具 (${previewNames}${toolCalls.length > 2 ? '…' : ''})`,
-        );
-    }
-    if (totalMs > 0) {
-        summaryParts.push(`${totalMs}ms`);
-    }
 
     const fileRefs = Array.isArray(message.fileRefs) ? message.fileRefs : [];
     const hasPendingApprovals = approvals.some((a) => a.status === 'pending');
@@ -869,7 +776,7 @@ export function MessageBubble({
         && (canContinue
             || message.canContinue
             || message.interrupted
-            || (!message.content.trim() && toolCalls.length > 0 && approvals.length === 0)),
+            || (!displayContent.trim() && toolCalls.length > 0 && approvals.length === 0)),
     );
 
     return (
@@ -887,76 +794,14 @@ export function MessageBubble({
                     onClick={handleBubbleTap}
                 >
                     {hasActivity ? (
-                        <div class="ag-ast-activity" data-assistant-activity={message.id}>
-                            <div class="ag-ast-activity-bar">
-                                <button
-                                    type="button"
-                                    class="ag-ast-activity-toggle"
-                                    aria-expanded={activityExpanded}
-                                    data-assistant-activity-toggle={message.id}
-                                    onClick={() => setActivityExpanded((prev) => !prev)}
-                                >
-                                    <span
-                                        style={{
-                                            color: hasToolError ? 'var(--error)' : 'var(--success)',
-                                            flexShrink: 0,
-                                            fontWeight: 700,
-                                        }}
-                                    >
-                                        {hasToolError ? '!' : '✓'}
-                                    </span>
-                                    <span class="ag-ast-activity-summary">
-                                        {summaryParts.join(' · ')}
-                                    </span>
-                                    {hasRedaction ? (
-                                        <span class="ag-redacted-badge" data-redacted-badge="true">
-                                            🔒 已脱敏
-                                        </span>
-                                    ) : null}
-                                    <span style={{ flexShrink: 0, opacity: 0.75 }}>
-                                        {activityExpanded ? '▾' : '▸'}
-                                    </span>
-                                </button>
-
-                                {quickUndoRecord ? (
-                                    <button
-                                        type="button"
-                                        disabled={
-                                            quickUndoRecord.reverted
-                                            || busyUndoId === quickUndoRecord.id
-                                        }
-                                        data-activity-undo-btn={quickUndoRecord.id}
-                                        class={
-                                            quickUndoRecord.reverted
-                                                ? 'ag-btn ag-btn-secondary ag-btn-sm'
-                                                : 'ag-btn ag-btn-sm ag-pill-warning'
-                                        }
-                                        onClick={() => void onApplyUndo(quickUndoRecord.id)}
-                                    >
-                                        {quickUndoRecord.reverted ? '已还原' : '↩ 撤销'}
-                                    </button>
-                                ) : null}
-                            </div>
-
-                            {activityExpanded ? (
-                                <div class="ag-ast-activity-body">
-                                    {message.think ? (
-                                        <div class="ag-ast-think">💭 {message.think}</div>
-                                    ) : null}
-                                    {toolCalls.map((tc) => (
-                                        <ToolCallItem
-                                            key={tc.id}
-                                            toolCall={tc}
-                                            undoRecord={
-                                                tc.undoId ? (undoById.get(tc.undoId) ?? null) : null
-                                            }
-                                            busyUndoId={busyUndoId}
-                                            onApplyUndo={onApplyUndo}
-                                        />
-                                    ))}
-                                </div>
-                            ) : null}
-                        </div>
+                        <ActivityTimeline
+                            message={message}
+                            timeline={timeline}
+                            isStreaming={isStreaming}
+                            undoById={undoById}
+                            busyUndoId={busyUndoId}
+                            onApplyUndo={onApplyUndo}
+                        />
                     ) : null}
 
                     {isStreaming && message.retryStatus ? (
@@ -1016,7 +861,7 @@ export function MessageBubble({
                             class="ag-ast-bubble-content ag-ast-bubble-markdown"
                             data-assistant-message-content={message.id}
                         >
-                            {message.content ? <MarkdownContent content={message.content} /> : null}
+                            {displayContent ? <MarkdownContent content={displayContent} /> : null}
                             {isStreaming ? (
                                 <span class="ag-ast-streaming-cursor" aria-label="生成中" />
                             ) : null}
