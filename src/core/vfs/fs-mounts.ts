@@ -17,6 +17,7 @@ import {
 import { canonicalClone } from '@/core/utils';
 import {
     VfsError,
+    type VfsEditOptions,
     type VfsMount,
     VfsNotFoundError,
     type VfsReadOptions,
@@ -30,6 +31,7 @@ import {
     sortStats,
     utf8ByteLength,
 } from './fs-base';
+import { applyTextEdits, countLines, resolveEditOperations } from './text-ops';
 import { parseInitVarEntries } from './fs-worldinfo';
 import { isChatBaseWorkspacePath } from './workspace-policy';
 
@@ -333,19 +335,21 @@ export class WorkspaceMount implements VfsMount {
         relPath: string,
         oldText: string,
         newText: string,
-        opts: VfsWriteOptions = {},
+        opts: VfsEditOptions = {},
     ): Promise<ToolEditResult> {
         const clean = relPath.replace(/^\/+/, '');
         const fullPath = `/${clean}`;
         const existing = this.readStored(clean, opts);
         if (!existing) {
-            return { ok: false, path: fullPath, message: `File not found: ${fullPath}` };
+            return { ok: false, code: 'ENOENT', path: fullPath, message: `File not found: ${fullPath}` };
         }
-        if (!oldText || !existing.content.includes(oldText)) {
-            return { ok: false, path: fullPath, message: `Target text not found in ${fullPath}` };
+        const ops = resolveEditOperations(oldText, newText, opts);
+        const applied = applyTextEdits({ path: fullPath, content: existing.content, edits: ops });
+        if (!applied.ok || applied.updatedContent === undefined) {
+            return applied;
         }
 
-        const updated = existing.content.replace(oldText, newText);
+        const updated = applied.updatedContent;
         if (updated !== existing.content) {
             if (this.shouldUseBaseLayer(clean, opts)) {
                 this.store.setBase(
@@ -364,7 +368,15 @@ export class WorkspaceMount implements VfsMount {
                 );
             }
         }
-        return { ok: true, path: fullPath, message: `Edited ${fullPath}` };
+        return {
+            ok: true,
+            path: fullPath,
+            message: `Edited ${fullPath}`,
+            replacements: applied.replacements,
+            changedRanges: applied.changedRanges,
+            totalLines: applied.totalLines,
+            bytes: applied.bytes,
+        };
     }
 
     async deleteFile(relPath: string, opts: VfsWriteOptions = {}): Promise<boolean> {
@@ -605,34 +617,34 @@ export class VariablesMount implements VfsMount {
         relPath: string,
         oldText: string,
         newText: string,
-        opts: VfsWriteOptions = {},
+        opts: VfsEditOptions = {},
     ): Promise<ToolEditResult> {
         const scope = variablesFileNameToScope(relPath);
         const fullPath = `/${STATE_MOUNT}/${relPath}`;
         if (!scope) {
             return {
                 ok: false,
+                code: 'ENOENT',
                 path: fullPath,
                 message: `File not found: ${fullPath}`,
             };
         }
 
         const current = await this.readSerializedForScope(scope, opts);
-        if (!oldText || !current.includes(oldText)) {
-            return {
-                ok: false,
-                path: fullPath,
-                message: `Target text not found in ${fullPath}`,
-            };
+        const ops = resolveEditOperations(oldText, newText, opts);
+        const applied = applyTextEdits({ path: fullPath, content: current, edits: ops });
+        if (!applied.ok || applied.updatedContent === undefined) {
+            return applied;
         }
 
-        const candidate = current.replace(oldText, newText);
+        const candidate = applied.updatedContent;
         let parsed: unknown;
         try {
             parsed = JSON.parse(candidate);
         } catch (error) {
             return {
                 ok: false,
+                code: 'INVALID_JSON',
                 path: fullPath,
                 message: `Edit produced invalid JSON: ${(error as Error).message}`,
             };
@@ -641,16 +653,22 @@ export class VariablesMount implements VfsMount {
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
             return {
                 ok: false,
+                code: 'INVALID_JSON',
                 path: fullPath,
                 message: `${fullPath} must remain a JSON object`,
             };
         }
 
         await this.writeVariables(parsed as Record<string, unknown>, { ...opts, scope });
+        const finalSerialized = await this.readSerializedForScope(scope, opts);
         return {
             ok: true,
             path: fullPath,
             message: `Updated ${fullPath}`,
+            replacements: applied.replacements,
+            changedRanges: applied.changedRanges,
+            totalLines: countLines(finalSerialized),
+            bytes: utf8ByteLength(finalSerialized),
         };
     }
 
@@ -855,7 +873,7 @@ export class HybridMount implements VfsMount {
         relPath: string,
         oldText: string,
         newText: string,
-        opts: VfsWriteOptions = {},
+        opts: VfsEditOptions = {},
     ): Promise<ToolEditResult> {
         const fullPath = `/${this.mountName}/${relPath}`;
         if (!(await this.canWrite(relPath))) {
@@ -864,20 +882,30 @@ export class HybridMount implements VfsMount {
 
         const current = this.readOverlayEntry(relPath, opts)?.content;
         if (current === undefined) {
-            return { ok: false, path: fullPath, message: `File not found: ${fullPath}` };
+            return { ok: false, code: 'ENOENT', path: fullPath, message: `File not found: ${fullPath}` };
         }
-        if (!oldText || !current.includes(oldText)) {
-            return { ok: false, path: fullPath, message: `Target text not found in ${fullPath}` };
+        const ops = resolveEditOperations(oldText, newText, opts);
+        const applied = applyTextEdits({ path: fullPath, content: current, edits: ops });
+        if (!applied.ok || applied.updatedContent === undefined) {
+            return applied;
         }
 
         this.store.set(
             this.namespace,
             this.scopedKey(relPath),
             opts.source ?? 'vfs',
-            current.replace(oldText, newText),
+            applied.updatedContent,
             { target: opts.target, staged: opts.staged },
         );
-        return { ok: true, path: fullPath, message: `Edited ${fullPath}` };
+        return {
+            ok: true,
+            path: fullPath,
+            message: `Edited ${fullPath}`,
+            replacements: applied.replacements,
+            changedRanges: applied.changedRanges,
+            totalLines: applied.totalLines,
+            bytes: applied.bytes,
+        };
     }
 
     async deleteFile(relPath: string, opts: VfsWriteOptions = {}): Promise<boolean> {
@@ -1201,20 +1229,35 @@ export class GlobalMount implements VfsMount {
         });
     }
 
-    async editFile(relPath: string, oldText: string, newText: string): Promise<ToolEditResult> {
+    async editFile(
+        relPath: string,
+        oldText: string,
+        newText: string,
+        opts: VfsEditOptions = {},
+    ): Promise<ToolEditResult> {
         const fullPath = `/${GLOBAL_MOUNT}/${relPath}`;
         return await this.enqueueMutation(async () => {
             const data = await this.loadAll();
             if (!Object.hasOwn(data, relPath)) {
-                return { ok: false, path: fullPath, message: `File not found: ${fullPath}` };
+                return { ok: false, code: 'ENOENT', path: fullPath, message: `File not found: ${fullPath}` };
             }
             const current = data[relPath];
-            if (!oldText || !current.includes(oldText)) {
-                return { ok: false, path: fullPath, message: `Target text not found in ${fullPath}` };
+            const ops = resolveEditOperations(oldText, newText, opts);
+            const applied = applyTextEdits({ path: fullPath, content: current, edits: ops });
+            if (!applied.ok || applied.updatedContent === undefined) {
+                return applied;
             }
-            data[relPath] = current.replace(oldText, newText);
+            data[relPath] = applied.updatedContent;
             await this.bridge.saveExtensionData(this.storageKey, data);
-            return { ok: true, path: fullPath, message: `Edited ${fullPath}` };
+            return {
+                ok: true,
+                path: fullPath,
+                message: `Edited ${fullPath}`,
+                replacements: applied.replacements,
+                changedRanges: applied.changedRanges,
+                totalLines: applied.totalLines,
+                bytes: applied.bytes,
+            };
         });
     }
 
@@ -1541,27 +1584,28 @@ export class OutputMount implements VfsMount {
         relPath: string,
         oldText: string,
         newText: string,
-        opts: VfsWriteOptions = {},
+        opts: VfsEditOptions = {},
     ): Promise<ToolEditResult> {
         if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
-            return { ok: false, path: `/${relPath}`, message: `File not found: /${relPath}` };
+            return { ok: false, code: 'ENOENT', path: `/${relPath}`, message: `File not found: /${relPath}` };
         }
         const current = await this.readFile(relPath, opts);
-        if (!oldText || !current.includes(oldText)) {
-            return {
-                ok: false,
-                path: OUTPUT_FILE_PATH,
-                message: `Target text not found in ${OUTPUT_FILE_PATH}`,
-            };
+        const ops = resolveEditOperations(oldText, newText, opts);
+        const applied = applyTextEdits({ path: OUTPUT_FILE_PATH, content: current, edits: ops });
+        if (!applied.ok || applied.updatedContent === undefined) {
+            return applied;
         }
-        const updated = current.replace(oldText, newText);
-        if (updated !== current) {
-            await this.writeFile(relPath, updated, opts);
+        if (applied.updatedContent !== current) {
+            await this.writeFile(relPath, applied.updatedContent, opts);
         }
         return {
             ok: true,
             path: OUTPUT_FILE_PATH,
             message: `Edited ${OUTPUT_FILE_PATH}`,
+            replacements: applied.replacements,
+            changedRanges: applied.changedRanges,
+            totalLines: applied.totalLines,
+            bytes: applied.bytes,
         };
     }
 

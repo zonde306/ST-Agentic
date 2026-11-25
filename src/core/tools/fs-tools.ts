@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import type { ToolExecutionContext } from '@/core/bridge';
+import type { ToolEditOperation, ToolExecutionContext } from '@/core/bridge';
+import { isSpillPath } from '@/core/context';
 import type { VfsEntryStat, VfsSearchHit } from '@/core/types';
 import { hashText, normalizeVfsPath } from '@/core/utils';
 import {
@@ -10,8 +11,11 @@ import {
     ScopedToolGuard,
     VfsError,
     VfsNotFoundError,
+    applyTextEdits,
+    countLines,
+    formatFileReadResult,
+    grepLinesInText,
     isAgentQuotaScopedPath,
-    sliceLines,
     utf8ByteLength,
 } from '@/core/vfs';
 import type { ToolDefinition } from './registry';
@@ -207,13 +211,6 @@ async function checkAgentWorkspaceQuota(
     return null;
 }
 
-function supportsReadRangeOptions(fs: ToolExecutionContext['fs']): boolean {
-    if (fs instanceof ScopedToolGuard) {
-        return true;
-    }
-    return Boolean((fs as { supportsReadOptions?: boolean }).supportsReadOptions);
-}
-
 async function fallbackGrep(
     ctx: ToolExecutionContext,
     query: string,
@@ -221,19 +218,15 @@ async function fallbackGrep(
     caseSensitive: boolean,
     isRegex: boolean,
     limit: number,
+    contextLines?: number,
+    maxMatchesPerFile?: number,
 ): Promise<VfsSearchHit[]> {
-    let matcher: (line: string) => boolean;
     if (isRegex) {
-        let re: RegExp;
         try {
-            re = new RegExp(query, caseSensitive ? '' : 'i');
+            new RegExp(query, caseSensitive ? '' : 'i');
         } catch (error) {
             throw new VfsError(`Invalid grep regex: ${(error as Error).message}`, 'EINVAL', pathPrefix);
         }
-        matcher = (line) => re.test(line);
-    } else {
-        const needle = caseSensitive ? query : query.toLowerCase();
-        matcher = (line) => (caseSensitive ? line : line.toLowerCase()).includes(needle);
     }
 
     const pattern = pathPrefix === '/' ? '/**/*' : `${pathPrefix}/**/*`;
@@ -251,19 +244,26 @@ async function fallbackGrep(
         } catch {
             continue;
         }
-        const lines = content.split('\n');
-        for (let idx = 0; idx < lines.length; idx += 1) {
-            if (matcher(lines[idx])) {
-                hits.push({
-                    path: filePath,
-                    score: 1,
-                    line: idx + 1,
-                    snippet: lines[idx].trim().slice(0, 160),
-                });
-                if (hits.length >= limit) {
-                    return hits;
-                }
-            }
+        const remaining = limit - hits.length;
+        if (remaining <= 0) {
+            break;
+        }
+        const maxMatches =
+            maxMatchesPerFile !== undefined
+                ? Math.min(remaining, Math.max(1, Math.floor(maxMatchesPerFile)))
+                : remaining;
+        const fileHits = grepLinesInText({
+            path: filePath,
+            content,
+            query,
+            caseSensitive,
+            regex: isRegex,
+            contextLines,
+            maxMatches,
+        });
+        hits.push(...fileHits);
+        if (hits.length >= limit) {
+            return hits.slice(0, limit);
         }
     }
 
@@ -301,7 +301,9 @@ const GREP_SEARCH_SCHEMA = z.object({
         .string()
         .optional()
         .default('/')
-        .describe('Optional VFS directory prefix to restrict search, e.g. "/lorebooks".'),
+        .describe(
+            'Optional directory prefix, exact single VFS file path, or /tmp/tool-spill/* path to restrict search, e.g. "/lorebooks" or "/lorebooks/World/city-5.md".',
+        ),
     case_sensitive: z
         .boolean()
         .optional()
@@ -312,6 +314,21 @@ const GREP_SEARCH_SCHEMA = z.object({
         .optional()
         .default(false)
         .describe('Interpret query as a JavaScript regular expression.'),
+    context_lines: z
+        .number()
+        .int()
+        .min(0)
+        .max(10)
+        .optional()
+        .default(2)
+        .describe('Number of surrounding lines before and after each hit to include (0-10, default 2).'),
+    max_matches_per_file: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe('Optional cap on matches returned per file so one large file does not exhaust limit.'),
     limit: z
         .number()
         .int()
@@ -345,21 +362,37 @@ const READ_FILE_SCHEMA = z.object({
     path: z
         .string()
         .min(1)
-        .describe(
-            'VFS file path, e.g. "/lorebooks/World/entry-1.md", "/character/description.md", or "/memory/notes.md".',
-        ),
+        .describe('VFS or /tmp/tool-spill/* file path.'),
     start_line: z
         .number()
         .int()
         .min(1)
         .optional()
-        .describe('Optional 1-based inclusive start line for partial reads.'),
+        .describe('1-based inclusive start line.'),
     end_line: z
         .number()
         .int()
         .min(1)
         .optional()
-        .describe('Optional 1-based inclusive end line for partial reads.'),
+        .describe('1-based inclusive end line.'),
+    line_numbers: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe('Prefix lines with "N| ".'),
+    char_offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('0-based char offset for huge single lines.'),
+    char_limit: z
+        .number()
+        .int()
+        .min(200)
+        .max(20_000)
+        .optional()
+        .describe('Max chars per line (200-20000).'),
 });
 
 const WRITE_FILE_SCHEMA = z.object({
@@ -380,15 +413,38 @@ const APPEND_FILE_SCHEMA = z.object({
         .describe('Writable VFS file path (e.g. "/output.md" or "/memory/notes.md").'),
 });
 
+const EDIT_OPERATION_SCHEMA = z.object({
+    search: z.string().min(1).describe('Verbatim snippet to match (no "N| " prefix).'),
+    replace: z.string().describe('Replacement text.'),
+    start_line: z.number().int().min(1).optional().describe('1-based start line.'),
+    end_line: z.number().int().min(1).optional().describe('1-based end line.'),
+    replace_all: z.boolean().optional().default(false).describe('Replace all matches in scope.'),
+});
+
 const EDIT_FILE_SCHEMA = z.object({
     path: z.string().min(1).describe('VFS file path to edit.'),
     search: z
         .string()
         .min(1)
-        .describe('Exact verbatim text snippet to locate and replace (copy from read_file output).'),
+        .optional()
+        .describe('Verbatim text to replace (omit if using edits[]; no "N| " prefix).'),
     replace: z
         .string()
-        .describe('Replacement text. Use an empty string "" to delete the matched snippet.'),
+        .optional()
+        .describe('Replacement text ("" to delete).'),
+    start_line: z.number().int().min(1).optional().describe('1-based start line scope.'),
+    end_line: z.number().int().min(1).optional().describe('1-based end line scope.'),
+    replace_all: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe('Replace all matches in scope.'),
+    edits: z
+        .array(EDIT_OPERATION_SCHEMA)
+        .min(1)
+        .max(50)
+        .optional()
+        .describe('Atomic batch of non-overlapping edits.'),
 });
 
 /** Create the 8 built-in VFS tools backed by `ctx.fs` (`ScopedToolGuard`). */
@@ -436,12 +492,50 @@ export function createFsTools(): ToolDefinition[] {
     const grepSearchTool: ToolDefinition<typeof GREP_SEARCH_SCHEMA> = {
         name: 'grep_search',
         description:
-            'Search VFS files line-by-line for an exact substring or regular expression, returning matching file paths, line numbers, and snippets.',
+            'Search VFS files (or /tmp/tool-spill/*) line-by-line for an exact substring or regex, returning 1-based line numbers aligned with read_file, totalLines, centered snippets, and surrounding context lines.',
         parameters: GREP_SEARCH_SCHEMA,
         source: 'builtin',
         async execute(args, ctx) {
             throwIfAborted(ctx.signal);
             try {
+                const rawPrefix = (args.path_prefix ?? '/').trim();
+                if (isSpillPath(rawPrefix)) {
+                    const pathPrefix = normalizeDirectoryInput(rawPrefix);
+                    if (!ctx.spillStore) {
+                        return JSON.stringify({
+                            ok: false,
+                            error: `Spill path not found or expired: "${pathPrefix}" (no active spill store).`,
+                        });
+                    }
+                    if (pathPrefix !== '/tmp/tool-spill') {
+                        const hasExact = ctx.spillStore.get(pathPrefix) !== null;
+                        const prefixWithSlash = `${pathPrefix}/`;
+                        const hasPrefix = ctx.spillStore
+                            .listPaths()
+                            .some((p) => p.startsWith(prefixWithSlash));
+                        if (!hasExact && !hasPrefix) {
+                            return JSON.stringify({
+                                ok: false,
+                                error: `Spill entry not found or expired: "${pathPrefix}". It may have been evicted or cleared.`,
+                            });
+                        }
+                    }
+                    const hits = ctx.spillStore.grep(pathPrefix, args.query, {
+                        caseSensitive: args.case_sensitive,
+                        regex: args.regex,
+                        limit: args.limit,
+                        contextLines: args.context_lines,
+                        maxMatchesPerFile: args.max_matches_per_file,
+                    });
+                    return JSON.stringify({
+                        ok: true,
+                        query: args.query,
+                        pathPrefix,
+                        total: hits.length,
+                        results: hits,
+                    });
+                }
+
                 const pathPrefix = normalizeDirectoryInput(args.path_prefix);
                 const scoped = ctx.fs as ToolExecutionContext['fs'] & {
                     grep?: ScopedToolGuard['grep'];
@@ -453,6 +547,8 @@ export function createFsTools(): ToolDefinition[] {
                             caseSensitive: args.case_sensitive,
                             regex: args.regex,
                             limit: args.limit,
+                            contextLines: args.context_lines,
+                            maxMatchesPerFile: args.max_matches_per_file,
                         })
                         : await fallbackGrep(
                             ctx,
@@ -461,6 +557,8 @@ export function createFsTools(): ToolDefinition[] {
                             args.case_sensitive,
                             args.regex,
                             args.limit,
+                            args.context_lines,
+                            args.max_matches_per_file,
                         );
                 return JSON.stringify({
                     ok: true,
@@ -478,7 +576,7 @@ export function createFsTools(): ToolDefinition[] {
     const searchFilesTool: ToolDefinition<typeof SEARCH_FILES_SCHEMA> = {
         name: 'search_files',
         description:
-            'Perform ranked full-text and fuzzy search across VFS files (including lorebooks, character sheets, memory, and history).',
+            'Perform ranked full-text and fuzzy search across VFS files (including lorebooks, character sheets, memory, and history). Hits include 1-based line, totalLines, matchedIn, and centered snippet.',
         parameters: SEARCH_FILES_SCHEMA,
         source: 'builtin',
         async execute(args, ctx) {
@@ -505,7 +603,7 @@ export function createFsTools(): ToolDefinition[] {
     const readFileTool: ToolDefinition<typeof READ_FILE_SCHEMA> = {
         name: 'read_file',
         description:
-            'Read the contents of a file from the VFS. Use start_line/end_line for large files. Full reads record the content hash in the agent Read-Set for radar deduplication.',
+            'Read a VFS or /tmp/tool-spill/* file with 1-based "N| " line numbers. Soft-paginates at 200 lines / 24 KB; pass start_line/end_line (or char_offset/char_limit) to page. Full reads update Read-Set.',
         parameters: READ_FILE_SCHEMA,
         source: 'builtin',
         async execute(args, ctx) {
@@ -523,26 +621,48 @@ export function createFsTools(): ToolDefinition[] {
 
             try {
                 const normalizedPath = normalizeVfsPath(args.path);
-                const hasRange = args.start_line !== undefined || args.end_line !== undefined;
-
-                let content: string;
-                if (hasRange && supportsReadRangeOptions(ctx.fs)) {
-                    content = await (ctx.fs as ScopedToolGuard).read(normalizedPath, {
+                if (isSpillPath(args.path)) {
+                    if (!ctx.spillStore) {
+                        return JSON.stringify({
+                            ok: false,
+                            error: `Spill entry not found or expired: "${normalizedPath}" (no active spill store).`,
+                        });
+                    }
+                    const entry = ctx.spillStore.get(normalizedPath);
+                    if (!entry) {
+                        return JSON.stringify({
+                            ok: false,
+                            error: `Spill entry not found or expired: "${normalizedPath}". It may have been evicted or cleared.`,
+                        });
+                    }
+                    const formatted = formatFileReadResult({
+                        path: normalizedPath,
+                        rawContent: entry.content,
                         startLine: args.start_line,
                         endLine: args.end_line,
+                        lineNumbers: args.line_numbers,
+                        charOffset: args.char_offset,
+                        charLimit: args.char_limit,
                     });
-                } else {
-                    const raw = await ctx.fs.read(normalizedPath);
-                    content = hasRange
-                        ? sliceLines(raw, args.start_line, args.end_line)
-                        : raw;
+                    return formatted.text;
                 }
 
-                if (!hasRange) {
-                    await recordReadSetDigest(ctx, normalizedPath, content);
+                const rawContent = await ctx.fs.read(normalizedPath);
+                const formatted = formatFileReadResult({
+                    path: normalizedPath,
+                    rawContent,
+                    startLine: args.start_line,
+                    endLine: args.end_line,
+                    lineNumbers: args.line_numbers,
+                    charOffset: args.char_offset,
+                    charLimit: args.char_limit,
+                });
+
+                if (formatted.coveredFullFile) {
+                    await recordReadSetDigest(ctx, normalizedPath, rawContent);
                 }
 
-                return content;
+                return formatted.text;
             } catch (error) {
                 const isNotFoundOrDenied =
                     error instanceof VfsNotFoundError
@@ -589,6 +709,7 @@ export function createFsTools(): ToolDefinition[] {
                     ok: true,
                     path: normalizedPath,
                     bytes: utf8ByteLength(args.content),
+                    totalLines: countLines(args.content),
                     target: ctx.target,
                 });
             } catch (error) {
@@ -638,19 +759,22 @@ export function createFsTools(): ToolDefinition[] {
                     await ctx.fs.write(normalizedPath, `${existing}${args.content}`);
                 }
 
-                if (ctx.readSet && normalizedPath !== OUTPUT_FILE_PATH) {
-                    try {
-                        const finalContent = await ctx.fs.read(normalizedPath);
+                let totalLines: number | undefined;
+                try {
+                    const finalContent = await ctx.fs.read(normalizedPath);
+                    totalLines = countLines(finalContent);
+                    if (ctx.readSet && normalizedPath !== OUTPUT_FILE_PATH) {
                         await recordReadSetDigest(ctx, normalizedPath, finalContent);
-                    } catch {
-                        // Skip Read-Set self-dedup if read permission is absent.
                     }
+                } catch {
+                    // Skip Read-Set self-dedup / line count if read permission is absent.
                 }
 
                 return JSON.stringify({
                     ok: true,
                     path: normalizedPath,
                     appendedBytes: utf8ByteLength(args.content),
+                    ...(totalLines !== undefined ? { totalLines } : {}),
                     target: ctx.target,
                 });
             } catch (error) {
@@ -662,19 +786,56 @@ export function createFsTools(): ToolDefinition[] {
     const editFileTool: ToolDefinition<typeof EDIT_FILE_SCHEMA> = {
         name: 'edit_file',
         description:
-            'Replace the first exact occurrence of a verbatim text snippet in a writable VFS file. Re-read the file if the search anchor is not found.',
+            'Safely edit a writable VFS file using verbatim matching. Rejects ambiguous matches unless scoped via start_line/end_line or replace_all, and supports atomic edits[]. Omit "N| " prefixes.',
         parameters: EDIT_FILE_SCHEMA,
         source: 'builtin',
         async execute(args, ctx) {
             throwIfAborted(ctx.signal);
             try {
+                const ops: ToolEditOperation[] = args.edits && args.edits.length > 0
+                    ? args.edits.map((op) => ({
+                        search: op.search,
+                        replace: op.replace,
+                        ...(op.start_line !== undefined ? { startLine: op.start_line } : {}),
+                        ...(op.end_line !== undefined ? { endLine: op.end_line } : {}),
+                        ...(op.replace_all !== undefined ? { replaceAll: op.replace_all } : {}),
+                    }))
+                    : args.search !== undefined && args.replace !== undefined
+                        ? [
+                            {
+                                search: args.search,
+                                replace: args.replace,
+                                ...(args.start_line !== undefined ? { startLine: args.start_line } : {}),
+                                ...(args.end_line !== undefined ? { endLine: args.end_line } : {}),
+                                ...(args.replace_all !== undefined ? { replaceAll: args.replace_all } : {}),
+                            },
+                        ]
+                        : [];
+
+                if (ops.length === 0) {
+                    return JSON.stringify({
+                        ok: false,
+                        code: 'INVALID_EDITS',
+                        path: args.path,
+                        error: 'edit_file requires either "search" and "replace", or a non-empty "edits" array.',
+                    });
+                }
+
                 const normalizedPath = normalizeVfsPath(args.path);
-                if (isAgentQuotaScopedPath(normalizedPath) && args.search) {
+                if (isAgentQuotaScopedPath(normalizedPath)) {
                     try {
                         const existing = await ctx.fs.read(normalizedPath);
-                        if (existing.includes(args.search)) {
-                            const updated = existing.replace(args.search, args.replace);
-                            const quotaError = await checkAgentWorkspaceQuota(ctx, normalizedPath, updated);
+                        const preview = applyTextEdits({
+                            path: normalizedPath,
+                            content: existing,
+                            edits: ops,
+                        });
+                        if (preview.ok && preview.updatedContent !== undefined) {
+                            const quotaError = await checkAgentWorkspaceQuota(
+                                ctx,
+                                normalizedPath,
+                                preview.updatedContent,
+                            );
                             if (quotaError) {
                                 return quotaError;
                             }
@@ -684,12 +845,20 @@ export function createFsTools(): ToolDefinition[] {
                     }
                 }
 
-                const result = await ctx.fs.edit(normalizedPath, args.search, args.replace);
+                const first = ops[0];
+                const result = await ctx.fs.edit(normalizedPath, first.search, first.replace, {
+                    ...(first.startLine !== undefined ? { startLine: first.startLine } : {}),
+                    ...(first.endLine !== undefined ? { endLine: first.endLine } : {}),
+                    ...(first.replaceAll !== undefined ? { replaceAll: first.replaceAll } : {}),
+                    edits: ops,
+                });
                 if (!result.ok) {
                     return JSON.stringify({
                         ok: false,
                         path: result.path,
-                        error: `${result.message}. Re-read "${result.path}" and copy the exact anchor text.`,
+                        ...(result.code ? { code: result.code } : {}),
+                        ...(result.matchLines ? { matchLines: result.matchLines } : {}),
+                        error: result.message,
                     });
                 }
 
@@ -706,6 +875,10 @@ export function createFsTools(): ToolDefinition[] {
                     ok: true,
                     path: result.path,
                     message: result.message,
+                    ...(result.replacements !== undefined ? { replacements: result.replacements } : {}),
+                    ...(result.changedRanges ? { changedRanges: result.changedRanges } : {}),
+                    ...(result.totalLines !== undefined ? { totalLines: result.totalLines } : {}),
+                    ...(result.bytes !== undefined ? { bytes: result.bytes } : {}),
                     target: ctx.target,
                 });
             } catch (error) {

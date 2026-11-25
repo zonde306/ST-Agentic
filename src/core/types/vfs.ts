@@ -46,6 +46,9 @@ export interface VfsSearchHit {
     title?: string;
     snippet?: string;
     line?: number;
+    totalLines?: number;
+    context?: string[];
+    matchedIn?: 'content' | 'meta';
     matchedTerms?: string[];
 }
 

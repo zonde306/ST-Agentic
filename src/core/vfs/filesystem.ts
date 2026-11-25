@@ -15,6 +15,7 @@ import type {
 import { matchGlob, normalizeVfsPath } from '@/core/utils';
 import {
     VfsError,
+    type VfsEditOptions,
     VfsInvalidPathError,
     type VfsMount,
     VfsNotFoundError,
@@ -25,6 +26,7 @@ import {
     type VfsWriteOptions,
     sortStats,
 } from './fs-base';
+import { countLines, grepLinesInText, lineNumberAtOffset } from './text-ops';
 import {
     CHARACTER_MOUNT,
     GLOBAL_MOUNT,
@@ -80,6 +82,8 @@ export interface VfsGrepOptions extends VfsTargetOptions {
     caseSensitive?: boolean;
     regex?: boolean;
     limit?: number;
+    contextLines?: number;
+    maxMatchesPerFile?: number;
 }
 
 interface RoutedTarget {
@@ -157,13 +161,19 @@ export function searchDocuments(
     const cap = Math.max(1, limit);
     const trimmed = query.trim();
     if (!trimmed || docs.length === 0) {
-        return docs.slice(0, cap).map((doc) => ({
-            path: doc.path,
-            score: 0,
-            title: doc.title,
-            snippet: buildSnippet(doc.content, []),
-            matchedTerms: [],
-        }));
+        return docs.slice(0, cap).map((doc) => {
+            const fullText = doc.frontmatter ? `${doc.frontmatter}${doc.content}` : doc.content;
+            const totalLines = countLines(fullText);
+            return {
+                path: doc.path,
+                score: 0,
+                title: doc.title,
+                ...(totalLines > 0 ? { line: 1 } : {}),
+                totalLines,
+                snippet: buildSnippet(doc.content, []),
+                matchedTerms: [],
+            };
+        });
     }
 
     const index = new MiniSearch<VfsSearchDocument & { id: number }>({
@@ -195,16 +205,63 @@ export function searchDocuments(
     });
 
     return results.slice(0, cap).map((res) => {
-        const content = String(res.content ?? '');
+        const sourceDoc = docs[Number(res.id)];
+        const content = sourceDoc?.content ?? String(res.content ?? '');
+        const frontmatter = sourceDoc?.frontmatter ?? '';
+        const contentLineOffset = sourceDoc?.contentLineOffset ?? 0;
+        const fullText = frontmatter ? `${frontmatter}${content}` : content;
+        const totalLines = countLines(fullText);
         const terms = Array.isArray(res.terms) ? res.terms : [];
+
+        const bodyHitIdx = findFirstTermOffset(content, terms, trimmed);
+        let line: number | undefined;
+        let matchedIn: 'content' | 'meta';
+        if (bodyHitIdx >= 0) {
+            line = lineNumberAtOffset(content, bodyHitIdx) + contentLineOffset;
+            matchedIn = 'content';
+        } else if (frontmatter) {
+            const fmHitIdx = findFirstTermOffset(frontmatter, terms, trimmed);
+            line = fmHitIdx >= 0 ? lineNumberAtOffset(frontmatter, fmHitIdx) : 1;
+            matchedIn = 'meta';
+        } else {
+            line = totalLines > 0 ? 1 : undefined;
+            matchedIn = 'meta';
+        }
+
         return {
             path: String(res.path ?? ''),
             score: res.score,
             title: typeof res.title === 'string' ? res.title : undefined,
+            ...(line !== undefined ? { line } : {}),
+            totalLines,
+            matchedIn,
             snippet: buildSnippet(content, terms, trimmed),
             matchedTerms: terms,
         };
     });
+}
+
+function findFirstTermOffset(
+    text: string,
+    matchedTerms: readonly string[],
+    rawQuery: string = '',
+): number {
+    if (!text) {
+        return -1;
+    }
+    const lower = text.toLowerCase();
+    const candidates = [
+        rawQuery.trim().toLowerCase(),
+        ...matchedTerms.map((t) => t.toLowerCase()),
+    ].filter(Boolean);
+
+    for (const term of candidates) {
+        const idx = lower.indexOf(term);
+        if (idx >= 0) {
+            return idx;
+        }
+    }
+    return -1;
 }
 
 function buildSnippet(content: string, matchedTerms: string[], rawQuery: string = ''): string {
@@ -212,17 +269,7 @@ function buildSnippet(content: string, matchedTerms: string[], rawQuery: string 
         return '';
     }
     const maxLen = 140;
-    const lower = content.toLowerCase();
-    const candidates = [rawQuery.trim().toLowerCase(), ...matchedTerms.map((t) => t.toLowerCase())].filter(Boolean);
-
-    let hitIdx = -1;
-    for (const term of candidates) {
-        const idx = lower.indexOf(term);
-        if (idx >= 0) {
-            hitIdx = idx;
-            break;
-        }
-    }
+    const hitIdx = findFirstTermOffset(content, matchedTerms, rawQuery);
 
     if (hitIdx < 0 || content.length <= maxLen) {
         return content.slice(0, maxLen).replace(/\s+/g, ' ').trim();
@@ -452,7 +499,7 @@ export class VirtualFileSystem {
         path: string,
         oldText: string,
         newText: string,
-        opts?: VfsWriteOptions,
+        opts?: VfsEditOptions,
     ): Promise<ToolEditResult> {
         const routed = this.route(path);
         if (routed.isVirtualStateDir || !routed.relPath) {
@@ -498,41 +545,40 @@ export class VirtualFileSystem {
         const limit = Math.max(1, opts.limit ?? 100);
         const merged = this.mergeReadOpts(opts);
 
-        let matcher: (line: string) => boolean;
         if (opts.regex) {
-            let re: RegExp;
             try {
-                re = new RegExp(query, caseSensitive ? '' : 'i');
+                new RegExp(query, caseSensitive ? '' : 'i');
             } catch (error) {
                 throw new VfsError(`Invalid grep regex: ${(error as Error).message}`, 'EINVAL', prefix);
             }
-            matcher = (line) => re.test(line);
-        } else {
-            const needle = caseSensitive ? query : query.toLowerCase();
-            matcher = (line) => (caseSensitive ? line : line.toLowerCase()).includes(needle);
         }
 
         const docs = await this.collectScopedSearchDocs(prefix, merged);
         const hits: VfsSearchHit[] = [];
 
         for (const doc of docs) {
-            const text = doc.keys || doc.title
-                ? `${doc.title ? `# ${doc.title}\n` : ''}${doc.keys ? `keys: ${doc.keys}\n` : ''}${doc.content}`
-                : doc.content;
-            const lines = text.split('\n');
-            for (let idx = 0; idx < lines.length; ++idx) {
-                if (matcher(lines[idx])) {
-                    hits.push({
-                        path: doc.path,
-                        score: 1,
-                        title: doc.title,
-                        line: idx + 1,
-                        snippet: lines[idx].trim().slice(0, 160),
-                    });
-                    if (hits.length >= limit) {
-                        return hits;
-                    }
-                }
+            const remaining = limit - hits.length;
+            if (remaining <= 0) {
+                break;
+            }
+            const perFileMax =
+                opts.maxMatchesPerFile !== undefined
+                    ? Math.min(remaining, Math.max(1, Math.floor(opts.maxMatchesPerFile)))
+                    : remaining;
+            const fullText = doc.frontmatter ? `${doc.frontmatter}${doc.content}` : doc.content;
+            const fileHits = grepLinesInText({
+                path: doc.path,
+                title: doc.title,
+                content: fullText,
+                query,
+                caseSensitive,
+                regex: Boolean(opts.regex),
+                contextLines: opts.contextLines,
+                maxMatches: perFileMax,
+            });
+            hits.push(...fileHits);
+            if (hits.length >= limit) {
+                return hits.slice(0, limit);
             }
         }
 

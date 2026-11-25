@@ -18,6 +18,7 @@ import {
 } from '@/core/utils';
 import {
     VfsError,
+    type VfsEditOptions,
     VfsInvalidPathError,
     type VfsMount,
     VfsNotFoundError,
@@ -30,6 +31,7 @@ import {
     sortStats,
     utf8ByteLength,
 } from './fs-base';
+import { applyTextEdits, resolveEditOperations } from './text-ops';
 
 export const SIDE_MOUNT = 'side';
 export const SIDE_MOUNT_PREFIX = `/${SIDE_MOUNT}`;
@@ -297,23 +299,25 @@ export class SideMount implements VfsMount {
         relPath: string,
         oldText: string,
         newText: string,
-        opts: VfsWriteOptions = {},
+        opts: VfsEditOptions = {},
     ): Promise<ToolEditResult> {
         const clean = normalizeSideRelPath(relPath);
         const fullPath = clean ? `${SIDE_MOUNT_PREFIX}/${clean}` : SIDE_MOUNT_PREFIX;
         if (!clean || SIDE_SUBDIR_SET.has(clean)) {
-            return { ok: false, path: fullPath, message: `Path is a directory: ${fullPath}` };
+            return { ok: false, code: 'EISDIR', path: fullPath, message: `Path is a directory: ${fullPath}` };
         }
 
         const existing = this.readStored(clean, opts);
         if (!existing) {
-            return { ok: false, path: fullPath, message: `File not found: ${fullPath}` };
+            return { ok: false, code: 'ENOENT', path: fullPath, message: `File not found: ${fullPath}` };
         }
-        if (!oldText || !existing.content.includes(oldText)) {
-            return { ok: false, path: fullPath, message: `Target text not found in ${fullPath}` };
+        const ops = resolveEditOperations(oldText, newText, opts);
+        const applied = applyTextEdits({ path: fullPath, content: existing.content, edits: ops });
+        if (!applied.ok || applied.updatedContent === undefined) {
+            return applied;
         }
 
-        const updated = existing.content.replace(oldText, newText);
+        const updated = applied.updatedContent;
         if (updated !== existing.content) {
             this.store.set(
                 DATA_NAMESPACES.SIDE_FILES,
@@ -324,7 +328,15 @@ export class SideMount implements VfsMount {
             );
         }
 
-        return { ok: true, path: fullPath, message: `Edited ${fullPath}` };
+        return {
+            ok: true,
+            path: fullPath,
+            message: `Edited ${fullPath}`,
+            replacements: applied.replacements,
+            changedRanges: applied.changedRanges,
+            totalLines: applied.totalLines,
+            bytes: applied.bytes,
+        };
     }
 
     async deleteFile(relPath: string, opts: VfsWriteOptions = {}): Promise<boolean> {

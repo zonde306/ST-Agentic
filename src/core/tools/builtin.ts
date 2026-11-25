@@ -1,4 +1,10 @@
-import type { HostBridge, ToolExecutionContext, ToolSideGenApi, ToolStApi } from '@/core/bridge';
+import type {
+    HostBridge,
+    ToolExecutionContext,
+    ToolSideGenApi,
+    ToolSpillStoreApi,
+    ToolStApi,
+} from '@/core/bridge';
 import { ChatDataStore } from '@/core/store';
 import type { MessageTarget, ScopedPermissions } from '@/core/types';
 import { VirtualFileSystem } from '@/core/vfs';
@@ -58,6 +64,7 @@ export interface CreateToolContextOptions {
     signal?: AbortSignal;
     permissions?: ScopedPermissions;
     readSet?: Map<string, string>;
+    spillStore?: ToolSpillStoreApi;
     staged?: boolean;
     source?: string;
     getVariableSchema?: () => DynamicVariableSchema | undefined;
@@ -127,5 +134,6 @@ export function createToolExecutionContext(
         signal,
         permissions,
         ...(options.readSet ? { readSet: options.readSet } : {}),
+        ...(options.spillStore ? { spillStore: options.spillStore } : {}),
     };
 }

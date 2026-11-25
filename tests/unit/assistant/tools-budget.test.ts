@@ -611,7 +611,7 @@ describe('C1.1 Host Admin Bridge Slimming, Drill-Down & Assistant Output Gate', 
     });
 
     describe('Assistant 32 KB output gate, spillStore redaction safety, and /tmp/tool-spill/* read_file/grep_search', () => {
-        it('gates oversized plain text in executeAssistantTool, spills redacted text, and serves slices & grep via /tmp/tool-spill/*', async () => {
+        it('soft-paginates large VFS files without spilling, and gates oversized plain text via redacted /tmp/tool-spill/*', async () => {
             const { vfs, spillStore, ctx, tools } = createToolHarness({
                 toolCallId: 'call_big_file_1',
             });
@@ -637,11 +637,30 @@ describe('C1.1 Host Admin Bridge Slimming, Drill-Down & Assistant Output Gate', 
             const readTool = tools.get('read_file')!;
             const grepTool = tools.get('grep_search')!;
 
-            const readRes = await executeAssistantTool(
+            // 1. VFS read_file soft-paginates directly (no redundant spill entry created for VFS file)
+            const vfsReadRes = await executeAssistantTool(
                 readTool,
                 { path: '/workspace/huge.log' },
                 ctx,
             );
+            expect(vfsReadRes.ok).toBe(true);
+            expect(vfsReadRes.truncated).toBe(true);
+            expect(vfsReadRes.spillPath).toBeUndefined();
+            expect(utf8ByteLength(vfsReadRes.output)).toBeLessThanOrEqual(24 * 1024);
+            expect(vfsReadRes.output).toContain('lines 1-200 of 500');
+            expect(vfsReadRes.output).toContain('next: start_line=201');
+            expect(spillStore.get('/tmp/tool-spill/call_big_file_1.txt')).toBeNull();
+
+            // 2. Non-VFS oversized plain-text tool output hits 32 KB gate and spills redacted content
+            const giantPlainTool: AssistantToolDefinition = {
+                name: 'giant_plain_dump',
+                description: 'Simulates an oversized non-VFS text tool output.',
+                parameters: z.object({}),
+                tier: 'chat',
+                readOnly: true,
+                execute: () => finalizeReadToolResult(hugeText),
+            };
+            const readRes = await executeAssistantTool(giantPlainTool, {}, ctx);
             expect(readRes.ok).toBe(true);
             expect(readRes.truncated).toBe(true);
             expect(readRes.spillPath).toBe('/tmp/tool-spill/call_big_file_1.txt');
@@ -659,7 +678,7 @@ describe('C1.1 Host Admin Bridge Slimming, Drill-Down & Assistant Output Gate', 
             expect(spilled!.content).not.toContain('sk-proj-spill-secret-999');
             expect(spilled!.content).toContain(REDACTED_PLACEHOLDER);
 
-            // read_file against /tmp/tool-spill/* returns requested line slice
+            // read_file against /tmp/tool-spill/* returns numbered line slice
             const sliceRes = await executeAssistantTool(
                 readTool,
                 {
@@ -671,11 +690,11 @@ describe('C1.1 Host Admin Bridge Slimming, Drill-Down & Assistant Output Gate', 
             );
             expect(sliceRes.ok).toBe(true);
             expect(sliceRes.truncated).toBeUndefined();
-            expect(sliceRes.output).toContain('LINE_250_NEEDLE');
+            expect(sliceRes.output).toContain('250| LINE_250_NEEDLE');
             expect(sliceRes.output).toContain(REDACTED_PLACEHOLDER);
             expect(sliceRes.output).not.toContain('live_spill_secret_777');
 
-            // grep_search against /tmp/tool-spill/* finds exact line
+            // grep_search against /tmp/tool-spill/* finds exact line + context
             const grepRes = await executeAssistantTool(
                 grepTool,
                 {
@@ -685,11 +704,13 @@ describe('C1.1 Host Admin Bridge Slimming, Drill-Down & Assistant Output Gate', 
                 { ...ctx, toolCallId: 'call_grep_1' },
             );
             expect(grepRes.ok).toBe(true);
-            const hits = (grepRes.data as { results: Array<{ path: string; line: number }> })
-                .results;
+            const hits = (
+                grepRes.data as { results: Array<{ path: string; line: number; context?: string[] }> }
+            ).results;
             expect(hits).toHaveLength(1);
             expect(hits[0].path).toBe('/tmp/tool-spill/call_big_file_1.txt');
             expect(hits[0].line).toBe(250);
+            expect(hits[0].context?.some((c) => c.startsWith('>250|'))).toBe(true);
 
             // After session scope is cleared, /tmp/tool-spill/* returns clean error
             spillStore.clearScope(ctx.sessionId);

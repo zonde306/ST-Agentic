@@ -1,4 +1,5 @@
 import type { ApiConnection, VfsSearchHit } from '@/core/types';
+import { grepLinesInText } from '@/core/vfs';
 
 export const DEFAULT_MAX_TOOL_RESULT_BYTES = 32 * 1024;
 export const DEFAULT_SPILL_MAX_ENTRY_BYTES = 2 * 1024 * 1024;
@@ -285,6 +286,8 @@ export interface SpillGrepOptions {
     caseSensitive?: boolean;
     regex?: boolean;
     limit?: number;
+    contextLines?: number;
+    maxMatchesPerFile?: number;
 }
 
 interface InternalSpillRecord {
@@ -424,20 +427,6 @@ export class TransientToolSpillStore {
         const caseSensitive = opts.caseSensitive !== false;
         const limit = Math.max(1, Math.floor(opts.limit ?? 100));
 
-        let matcher: (line: string) => boolean;
-        if (opts.regex) {
-            let re: RegExp;
-            try {
-                re = new RegExp(query, caseSensitive ? '' : 'i');
-            } catch (error) {
-                throw new Error(`Invalid grep regex: ${(error as Error).message}`);
-            }
-            matcher = (line) => re.test(line);
-        } else {
-            const needle = caseSensitive ? query : query.toLowerCase();
-            matcher = (line) => (caseSensitive ? line : line.toLowerCase()).includes(needle);
-        }
-
         const targetEntries: SpillEntry[] = [];
         const exact = this.get(normalized);
         if (exact) {
@@ -455,23 +444,39 @@ export class TransientToolSpillStore {
             }
         }
 
+        // Validate regex even when targetEntries is empty to preserve consistent error behavior.
+        if (opts.regex) {
+            try {
+                new RegExp(query, caseSensitive ? '' : 'i');
+            } catch (error) {
+                throw new Error(`Invalid grep regex: ${(error as Error).message}`);
+            }
+        }
+
         const hits: VfsSearchHit[] = [];
         for (const entry of targetEntries) {
-            const lines = entry.content.split('\n');
-            for (let idx = 0; idx < lines.length; idx += 1) {
-                if (matcher(lines[idx])) {
-                    hits.push({
-                        path: entry.path,
-                        score: 1,
-                        title: entry.toolName,
-                        line: idx + 1,
-                        snippet: lines[idx].trim().slice(0, 160),
-                        matchedTerms: [query],
-                    });
-                    if (hits.length >= limit) {
-                        return hits;
-                    }
-                }
+            const remaining = limit - hits.length;
+            if (remaining <= 0) {
+                break;
+            }
+            const maxMatches =
+                opts.maxMatchesPerFile !== undefined
+                    ? Math.min(remaining, Math.max(1, Math.floor(opts.maxMatchesPerFile)))
+                    : remaining;
+            const entryHits = grepLinesInText({
+                path: entry.path,
+                title: entry.toolName,
+                content: entry.content,
+                query,
+                caseSensitive,
+                regex: Boolean(opts.regex),
+                contextLines: opts.contextLines,
+                maxMatches,
+                matchedTerms: [query],
+            });
+            hits.push(...entryHits);
+            if (hits.length >= limit) {
+                return hits.slice(0, limit);
             }
         }
 

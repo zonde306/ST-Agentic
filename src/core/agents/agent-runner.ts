@@ -1207,6 +1207,7 @@ export class AgentRunner {
             signal,
             permissions,
             readSet: effectiveReadSet,
+            spillStore: registry.getSpillStore() ?? this.spillStore,
             staged,
             source: `agent:${agent.id}`,
             getVariableSchema: input.getVariableSchema,

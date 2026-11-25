@@ -789,7 +789,7 @@ describe('AgentRunner & TraceLogger', () => {
             },
             (req) => {
                 const toolRes = req.messages.find((m) => m.role === 'tool');
-                expect(String(toolRes?.content)).toBe('灰港守夜人佩戴银色徽章。');
+                expect(String(toolRes?.content)).toContain('1| 灰港守夜人佩戴银色徽章。');
                 return {
                     content: '问题：徽章应为三瓣银莲花铜徽，非银色。',
                 };

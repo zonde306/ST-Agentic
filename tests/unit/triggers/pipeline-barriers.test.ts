@@ -1319,7 +1319,7 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
             },
             (req) => {
                 const readMsg = req.messages.filter((m) => m.role === 'tool')[1];
-                expect(String(readMsg?.content)).toBe('林晚走近生锈铁门。');
+                expect(String(readMsg?.content)).toContain('1| 林晚走近生锈铁门。');
                 return {
                     content: '',
                     toolCalls: [
@@ -1349,7 +1349,7 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
             },
             (req) => {
                 const readMsg = req.messages.find((m) => m.role === 'tool');
-                expect(String(readMsg?.content)).toBe('林晚走近铜锁暗门。');
+                expect(String(readMsg?.content)).toContain('1| 林晚走近铜锁暗门。');
                 return {
                     content: '',
                     toolCalls: [

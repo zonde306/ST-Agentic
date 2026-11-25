@@ -29,7 +29,12 @@ import type {
     VariableScope,
 } from '@/core/types';
 import { canonicalClone, normalizeVfsPath, stripJsonSchemaMeta } from '@/core/utils';
-import { scopeToVariablesPath, VfsError, type VirtualFileSystem } from '@/core/vfs';
+import {
+    formatFileReadResult,
+    scopeToVariablesPath,
+    VfsError,
+    type VirtualFileSystem,
+} from '@/core/vfs';
 import { redactString, redactWithReport } from './redact';
 import type { UndoStore } from './undo-store';
 
@@ -417,9 +422,30 @@ const GLOB_FILES_SCHEMA = z.object({
 
 const GREP_SEARCH_SCHEMA = z.object({
     query: z.string().min(1).describe('Literal substring or regex to match line-by-line.'),
-    path_prefix: z.string().optional().default('/'),
+    path_prefix: z
+        .string()
+        .optional()
+        .default('/')
+        .describe(
+            'Optional directory prefix, exact single VFS file path, or /tmp/tool-spill/* path.',
+        ),
     case_sensitive: z.boolean().optional().default(true),
     regex: z.boolean().optional().default(false),
+    context_lines: z
+        .number()
+        .int()
+        .min(0)
+        .max(10)
+        .optional()
+        .default(2)
+        .describe('Number of surrounding lines before and after each hit (0-10, default 2).'),
+    max_matches_per_file: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe('Optional max matches returned per file.'),
     limit: z.number().int().min(1).max(200).optional().default(50),
 });
 
@@ -430,9 +456,27 @@ const SEARCH_FILES_SCHEMA = z.object({
 });
 
 const READ_FILE_SCHEMA = z.object({
-    path: z.string().min(1).describe('VFS file path to read.'),
+    path: z.string().min(1).describe('VFS file path or /tmp/tool-spill/* spilled output path.'),
     start_line: z.number().int().min(1).optional(),
     end_line: z.number().int().min(1).optional(),
+    line_numbers: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe('Include 1-based "N| " line-number prefixes (default true).'),
+    char_offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('Optional 0-based character offset within very long lines.'),
+    char_limit: z
+        .number()
+        .int()
+        .min(200)
+        .max(20_000)
+        .optional()
+        .describe('Optional max characters per line (200-20000, default 4000).'),
 });
 
 const READ_VARIABLES_SCHEMA = z.object({
@@ -455,6 +499,21 @@ const SEARCH_HISTORY_SCHEMA = z.object({
     query: z.string().describe('Keywords or phrase to search across /history/* archive chunks.'),
     mode: z.enum(['fuzzy', 'grep']).optional().default('fuzzy'),
     case_sensitive: z.boolean().optional().default(false),
+    context_lines: z
+        .number()
+        .int()
+        .min(0)
+        .max(10)
+        .optional()
+        .default(2)
+        .describe('Surrounding lines per hit when mode is "grep" (0-10, default 2).'),
+    max_matches_per_file: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe('Optional max matches per chunk file when mode is "grep".'),
     limit: z.number().int().min(1).max(100).optional().default(20),
 });
 
@@ -465,6 +524,24 @@ const READ_HISTORY_SCHEMA = z.object({
         .describe('History file inside /history/, e.g. "chunk-001.md" or "/history/summary.md".'),
     start_line: z.number().int().min(1).optional(),
     end_line: z.number().int().min(1).optional(),
+    line_numbers: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe('Include 1-based "N| " line-number prefixes (default true).'),
+    char_offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('Optional 0-based character offset within very long lines.'),
+    char_limit: z
+        .number()
+        .int()
+        .min(200)
+        .max(20_000)
+        .optional()
+        .describe('Optional max characters per line (200-20000, default 4000).'),
 });
 
 const AGENTIC_READ_STATUS_SCHEMA = z.object({});
@@ -589,6 +666,8 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
                     caseSensitive: args.case_sensitive,
                     regex: args.regex,
                     limit: args.limit,
+                    contextLines: args.context_lines,
+                    maxMatchesPerFile: args.max_matches_per_file,
                 });
                 return finalizeReadToolResult({
                     ok: true,
@@ -605,6 +684,8 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
                 caseSensitive: args.case_sensitive,
                 regex: args.regex,
                 limit: args.limit,
+                contextLines: args.context_lines,
+                maxMatchesPerFile: args.max_matches_per_file,
                 target: ctx.target,
                 staged: false,
             });
@@ -620,7 +701,8 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
 
     const searchFilesTool: AssistantToolDefinition<typeof SEARCH_FILES_SCHEMA> = {
         name: 'search_files',
-        description: 'Ranked full-text and fuzzy search across VFS files. Read-only.',
+        description:
+            'Ranked full-text and fuzzy search across VFS files (returns 1-based line, totalLines, matchedIn, and snippet). Read-only.',
         parameters: SEARCH_FILES_SCHEMA,
         tier: 'chat',
         readOnly: true,
@@ -646,7 +728,7 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
     const readFileTool: AssistantToolDefinition<typeof READ_FILE_SCHEMA> = {
         name: 'read_file',
         description:
-            'Read a VFS file or /tmp/tool-spill/* spilled tool output (supports optional 1-based start_line/end_line). Read-only.',
+            'Read a VFS file or /tmp/tool-spill/* spilled tool output with 1-based "N| " line prefixes and metadata header. Soft-paginates at 200 lines / 24 KB; pass start_line/end_line or char_offset/char_limit to page. Read-only.',
         parameters: READ_FILE_SCHEMA,
         tier: 'chat',
         readOnly: true,
@@ -670,27 +752,41 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
                         ctx.signal,
                     );
                 }
-                const slice = ctx.spillStore.readSlice(
-                    normalizedPath,
-                    args.start_line,
-                    args.end_line,
-                );
-                if (slice === null) {
+                const entry = ctx.spillStore.get(normalizedPath);
+                if (!entry) {
                     return finalizeToolError(
                         `Spill entry not found or expired: "${normalizedPath}". It may have been evicted or cleared.`,
                         ctx.signal,
                     );
                 }
-                return finalizeReadToolResult(slice, { fileRefs: [normalizedPath] });
+                const formatted = formatFileReadResult({
+                    path: normalizedPath,
+                    rawContent: entry.content,
+                    startLine: args.start_line,
+                    endLine: args.end_line,
+                    lineNumbers: args.line_numbers,
+                    charOffset: args.char_offset,
+                    charLimit: args.char_limit,
+                });
+                const res = finalizeReadToolResult(formatted.text, { fileRefs: [normalizedPath] });
+                return formatted.truncated ? { ...res, truncated: true } : res;
             }
 
-            const content = await ctx.vfs.readFile(normalizedPath, {
-                startLine: args.start_line,
-                endLine: args.end_line,
+            const rawContent = await ctx.vfs.readFile(normalizedPath, {
                 target: ctx.target,
                 staged: false,
             });
-            return finalizeReadToolResult(content, { fileRefs: [normalizedPath] });
+            const formatted = formatFileReadResult({
+                path: normalizedPath,
+                rawContent,
+                startLine: args.start_line,
+                endLine: args.end_line,
+                lineNumbers: args.line_numbers,
+                charOffset: args.char_offset,
+                charLimit: args.char_limit,
+            });
+            const res = finalizeReadToolResult(formatted.text, { fileRefs: [normalizedPath] });
+            return formatted.truncated ? { ...res, truncated: true } : res;
         },
     };
 
@@ -758,6 +854,8 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
                         pathPrefix: '/history',
                         caseSensitive: args.case_sensitive,
                         limit: args.limit,
+                        contextLines: args.context_lines,
+                        maxMatchesPerFile: args.max_matches_per_file,
                         target: ctx.target,
                         staged: false,
                     })
@@ -779,7 +877,8 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
 
     const readHistoryTool: AssistantToolDefinition<typeof READ_HISTORY_SCHEMA> = {
         name: 'read_history',
-        description: 'Read a compacted conversation chunk or summary from /history/*. Read-only.',
+        description:
+            'Read a compacted conversation chunk or summary from /history/* with 1-based line numbers and soft pagination. Read-only.',
         parameters: READ_HISTORY_SCHEMA,
         tier: 'chat',
         readOnly: true,
@@ -796,13 +895,21 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
                 );
             }
             const targetPath = resolveHistoryPath(args.chunk);
-            const content = await ctx.vfs.readFile(targetPath, {
-                startLine: args.start_line,
-                endLine: args.end_line,
+            const rawContent = await ctx.vfs.readFile(targetPath, {
                 target: ctx.target,
                 staged: false,
             });
-            return finalizeReadToolResult(content, { fileRefs: [targetPath] });
+            const formatted = formatFileReadResult({
+                path: targetPath,
+                rawContent,
+                startLine: args.start_line,
+                endLine: args.end_line,
+                lineNumbers: args.line_numbers,
+                charOffset: args.char_offset,
+                charLimit: args.char_limit,
+            });
+            const res = finalizeReadToolResult(formatted.text, { fileRefs: [targetPath] });
+            return formatted.truncated ? { ...res, truncated: true } : res;
         },
     };
 

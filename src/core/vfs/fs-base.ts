@@ -1,4 +1,4 @@
-import type { ToolEditResult } from '@/core/bridge';
+import type { ToolEditOptions, ToolEditResult } from '@/core/bridge';
 import type { MessageTarget, VariableScope, VfsEntryStat } from '@/core/types';
 
 export class VfsError extends Error {
@@ -61,10 +61,14 @@ export interface VfsWriteOptions extends VfsTargetOptions {
     layerMode?: 'auto' | 'base' | 'branch';
 }
 
+export interface VfsEditOptions extends VfsWriteOptions, ToolEditOptions {}
+
 export interface VfsSearchDocument {
     path: string;
     title: string;
     content: string;
+    frontmatter?: string;
+    contentLineOffset?: number;
     keys?: string;
     keysecondary?: string;
     world?: string;
@@ -83,7 +87,7 @@ export interface VfsMount {
         relPath: string,
         oldText: string,
         newText: string,
-        opts?: VfsWriteOptions,
+        opts?: VfsEditOptions,
     ): Promise<ToolEditResult>;
     deleteFile(relPath: string, opts?: VfsWriteOptions): Promise<boolean>;
     listFiles(opts?: VfsTargetOptions): Promise<VfsEntryStat[]>;

@@ -1,11 +1,17 @@
 import { z } from 'zod';
-import type { DeletedChatMessageSnapshot } from '@/core/bridge';
+import type { DeletedChatMessageSnapshot, ToolEditOperation } from '@/core/bridge';
 import { DEFAULT_MAIN_AGENT_ID } from '@/core/config';
 import { DATA_NAMESPACES, MESSAGE_OVERRIDE_KEY } from '@/core/store';
 import { VfsVarsAdapter } from '@/core/tools';
 import type { ChatEditSyncTrajectory, MessageTarget, VariableScope } from '@/core/types';
 import { canonicalClone, normalizeVfsPath } from '@/core/utils';
-import { scopeToVariablesPath, utf8ByteLength, VfsNotFoundError } from '@/core/vfs';
+import {
+    applyTextEdits,
+    countLines,
+    scopeToVariablesPath,
+    utf8ByteLength,
+    VfsNotFoundError,
+} from '@/core/vfs';
 import { computeDiffLines } from './approval';
 import { isVfsWritePathAllowed } from './policy';
 import {
@@ -52,16 +58,73 @@ const APPEND_FILE_SCHEMA = z.object({
     content: z.string().describe('Content to append verbatim.'),
 });
 
+const ADJUST_EDIT_OPERATION_SCHEMA = z.object({
+    search: z.string().min(1).optional().describe('Exact text snippet to replace (do NOT include "N| " line-number prefixes).'),
+    replace: z.string().optional().describe('Replacement text.'),
+    oldText: z.string().min(1).optional().describe('Alias for search.'),
+    newText: z.string().optional().describe('Alias for replace.'),
+    start_line: z.number().int().min(1).optional().describe('Optional 1-based inclusive start line to scope matching.'),
+    end_line: z.number().int().min(1).optional().describe('Optional 1-based inclusive end line to scope matching.'),
+    replace_all: z.boolean().optional().default(false).describe('Replace every match within scope.'),
+});
+
 const EDIT_FILE_SCHEMA = z.object({
     path: z
         .string()
         .min(1)
         .describe('Writable VFS path strictly under /workspace/**, /state/**, /lorebooks/**, or /side/**.'),
-    search: z.string().min(1).optional().describe('Exact text snippet to replace.'),
+    search: z.string().min(1).optional().describe('Exact text snippet to replace (do NOT include "N| " line-number prefixes).'),
     replace: z.string().optional().describe('Replacement text.'),
     oldText: z.string().min(1).optional().describe('Alias for search.'),
     newText: z.string().optional().describe('Alias for replace.'),
+    start_line: z.number().int().min(1).optional().describe('Optional 1-based inclusive start line to disambiguate matching.'),
+    end_line: z.number().int().min(1).optional().describe('Optional 1-based inclusive end line to disambiguate matching.'),
+    replace_all: z.boolean().optional().default(false).describe('Replace every match within scope instead of failing on ambiguity.'),
+    edits: z
+        .array(ADJUST_EDIT_OPERATION_SCHEMA)
+        .min(1)
+        .max(50)
+        .optional()
+        .describe('Optional batch of atomic non-overlapping edits (all line numbers refer to the file before edits).'),
 });
+
+function resolveAdjustEditOps(
+    args: z.infer<typeof EDIT_FILE_SCHEMA>,
+): ToolEditOperation[] | null {
+    if (args.edits && args.edits.length > 0) {
+        const ops: ToolEditOperation[] = [];
+        for (const item of args.edits) {
+            const search = item.search ?? item.oldText;
+            const replace = item.replace ?? item.newText;
+            if (!search || replace === undefined) {
+                return null;
+            }
+            ops.push({
+                search,
+                replace,
+                ...(item.start_line !== undefined ? { startLine: item.start_line } : {}),
+                ...(item.end_line !== undefined ? { endLine: item.end_line } : {}),
+                ...(item.replace_all !== undefined ? { replaceAll: item.replace_all } : {}),
+            });
+        }
+        return ops;
+    }
+
+    const search = args.search ?? args.oldText;
+    const replace = args.replace ?? args.newText;
+    if (!search || replace === undefined) {
+        return null;
+    }
+    return [
+        {
+            search,
+            replace,
+            ...(args.start_line !== undefined ? { startLine: args.start_line } : {}),
+            ...(args.end_line !== undefined ? { endLine: args.end_line } : {}),
+            ...(args.replace_all !== undefined ? { replaceAll: args.replace_all } : {}),
+        },
+    ];
+}
 
 const MESSAGE_TARGET_SCHEMA = z.object({
     messageId: z.number().int().min(0),
@@ -368,6 +431,7 @@ export function createAdjustTools(): AssistantToolDefinition[] {
                 {
                     path: normalizedPath,
                     bytes: utf8ByteLength(args.content),
+                    totalLines: countLines(args.content),
                     target: ctx.target,
                 },
                 { undoId, fileRefs: [normalizedPath] },
@@ -414,6 +478,7 @@ export function createAdjustTools(): AssistantToolDefinition[] {
                 {
                     path: normalizedPath,
                     appendedBytes: utf8ByteLength(args.content),
+                    totalLines: countLines(afterContent),
                     target: ctx.target,
                 },
                 { undoId, fileRefs: [normalizedPath] },
@@ -424,22 +489,28 @@ export function createAdjustTools(): AssistantToolDefinition[] {
     const editFileTool: AssistantToolDefinition<typeof EDIT_FILE_SCHEMA> = {
         name: 'edit_file',
         description:
-            'Replace the first exact match of `search` with `replace` in a VFS file under /workspace/** (/workspace/AGENTS.md requires confirmation; /workspace/docs/** and /workspace/shared/** apply directly), /state/**, /lorebooks/**, or /side/**. Captures pre-write UndoRecord.',
+            'Safely replace exact match(es) in a VFS file under /workspace/**, /state/**, /lorebooks/**, or /side/**. Rejects ambiguous multi-matches unless scoped via start_line/end_line or replace_all: true, and supports atomic batch edits[]. Do NOT copy "N| " line-number prefixes. Captures pre-write UndoRecord.',
         parameters: EDIT_FILE_SCHEMA,
         tier: 'adjust',
         readOnly: false,
         async preview(args, ctx) {
             const normalizedPath = assertAllowedAdjustPath(args.path);
-            const search = args.search ?? args.oldText ?? '';
-            const replace = args.replace ?? args.newText ?? '';
             const snap = await captureVfsSnapshot(normalizedPath, ctx);
             const beforeText = snap.previousContent ?? '';
-            const afterText = search && beforeText.includes(search)
-                ? beforeText.replace(search, replace)
-                : beforeText;
+            const ops = resolveAdjustEditOps(args);
+            const previewApplied = ops
+                ? applyTextEdits({ path: normalizedPath, content: beforeText, edits: ops })
+                : null;
+            const afterText =
+                previewApplied?.ok && previewApplied.updatedContent !== undefined
+                    ? previewApplied.updatedContent
+                    : beforeText;
             return {
                 title: `Edit ${normalizedPath}`,
-                summary: `Replace snippet in ${normalizedPath}.`,
+                summary:
+                    ops && ops.length > 1
+                        ? `Apply ${ops.length} edits in ${normalizedPath}.`
+                        : `Replace snippet in ${normalizedPath}.`,
                 targetLabel: `VFS: ${normalizedPath}`,
                 beforeText,
                 afterText,
@@ -450,25 +521,33 @@ export function createAdjustTools(): AssistantToolDefinition[] {
         async execute(args, ctx) {
             throwIfAssistantAborted(ctx.signal);
             const normalizedPath = assertAllowedAdjustPath(args.path);
-            const search = args.search ?? args.oldText;
-            const replace = args.replace ?? args.newText;
+            const ops = resolveAdjustEditOps(args);
 
-            if (!search || replace === undefined) {
+            if (!ops) {
                 return finalizeToolError(
-                    'edit_file requires "search" (or "oldText") and "replace" (or "newText").',
+                    'edit_file requires "search" (or "oldText") and "replace" (or "newText"), or a valid "edits" array.',
                     ctx.signal,
                 );
             }
 
             const snapshot = await captureVfsSnapshot(normalizedPath, ctx);
-            const result = await ctx.vfs.editFile(normalizedPath, search, replace, {
+            const first = ops[0];
+            const result = await ctx.vfs.editFile(normalizedPath, first.search, first.replace, {
+                ...(first.startLine !== undefined ? { startLine: first.startLine } : {}),
+                ...(first.endLine !== undefined ? { endLine: first.endLine } : {}),
+                ...(first.replaceAll !== undefined ? { replaceAll: first.replaceAll } : {}),
+                edits: ops,
                 target: ctx.target,
                 staged: false,
                 source: 'assistant:edit_file',
             });
 
             if (!result.ok) {
-                return finalizeToolError(result.message, ctx.signal, { path: result.path });
+                return finalizeToolError(result.message, ctx.signal, {
+                    path: result.path,
+                    ...(result.code ? { code: result.code } : {}),
+                    ...(result.matchLines ? { matchLines: result.matchLines } : {}),
+                });
             }
 
             const afterContent = await ctx.vfs
@@ -479,6 +558,10 @@ export function createAdjustTools(): AssistantToolDefinition[] {
                 {
                     path: result.path,
                     message: result.message,
+                    ...(result.replacements !== undefined ? { replacements: result.replacements } : {}),
+                    ...(result.changedRanges ? { changedRanges: result.changedRanges } : {}),
+                    ...(result.totalLines !== undefined ? { totalLines: result.totalLines } : {}),
+                    ...(result.bytes !== undefined ? { bytes: result.bytes } : {}),
                     target: ctx.target,
                 },
                 { undoId, fileRefs: [normalizedPath] },

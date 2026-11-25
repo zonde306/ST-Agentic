@@ -4,6 +4,7 @@ import { ChatDataStore, DATA_NAMESPACES, worldInfoKey } from '@/core/store';
 import type { LoreReadHook, RawLoreEntry, VfsEntryStat } from '@/core/types';
 import {
     VfsError,
+    type VfsEditOptions,
     type VfsMount,
     VfsNotFoundError,
     type VfsReadOptions,
@@ -16,6 +17,7 @@ import {
     sortStats,
     utf8ByteLength,
 } from './fs-base';
+import { applyTextEdits, countLines, resolveEditOperations } from './text-ops';
 
 export const LOREBOOK_MOUNT = 'lorebooks';
 export const SKILLS_MOUNT = 'skills';
@@ -538,13 +540,14 @@ export class WorldInfoMount implements VfsMount {
         relPath: string,
         oldText: string,
         newText: string,
-        opts: VfsWriteOptions = {},
+        opts: VfsEditOptions = {},
     ): Promise<ToolEditResult> {
         const fullPath = `/${LOREBOOK_MOUNT}/${relPath}`;
         const resolved = await this.resolveEntry(relPath);
         if (!resolved) {
             return {
                 ok: false,
+                code: 'ENOENT',
                 path: fullPath,
                 message: `Lorebook entry not found: ${fullPath}`,
             };
@@ -552,17 +555,24 @@ export class WorldInfoMount implements VfsMount {
 
         const { book, entry } = resolved;
         const normalizedEntry: RawLoreEntry = entry.world ? entry : { ...entry, world: book };
+        const canonicalPath = this.entryPath(book, normalizedEntry);
         const currentBody = this.currentStoredBody(normalizedEntry, opts);
+        const frontmatter = withFrontmatter(normalizedEntry, '');
+        const lineOffset = frontmatter.split('\n').length - 1;
+        const ops = resolveEditOperations(oldText, newText, opts);
+        const applied = applyTextEdits({
+            path: canonicalPath,
+            content: currentBody,
+            edits: ops,
+            lineOffset,
+            readonlyHeaderLabel: 'YAML frontmatter',
+        });
 
-        if (!oldText || !currentBody.includes(oldText)) {
-            return {
-                ok: false,
-                path: this.entryPath(book, normalizedEntry),
-                message: `Target text not found in ${this.entryPath(book, normalizedEntry)}`,
-            };
+        if (!applied.ok || applied.updatedContent === undefined) {
+            return applied;
         }
 
-        const updatedBody = currentBody.replace(oldText, newText);
+        const updatedBody = applied.updatedContent;
         this.store.set(
             DATA_NAMESPACES.WORLDINFO,
             worldInfoKey(normalizedEntry.world, normalizedEntry.uid),
@@ -571,10 +581,15 @@ export class WorldInfoMount implements VfsMount {
             { target: opts.target, staged: opts.staged },
         );
 
+        const finalDoc = withFrontmatter(normalizedEntry, updatedBody);
         return {
             ok: true,
-            path: this.entryPath(book, normalizedEntry),
-            message: `Updated override for ${this.entryPath(book, normalizedEntry)}`,
+            path: canonicalPath,
+            message: `Updated override for ${canonicalPath}`,
+            replacements: applied.replacements,
+            changedRanges: applied.changedRanges,
+            totalLines: countLines(finalDoc),
+            bytes: utf8ByteLength(finalDoc),
         };
     }
 
@@ -624,10 +639,14 @@ export class WorldInfoMount implements VfsMount {
                 }
                 const normalizedEntry: RawLoreEntry = entry.world ? entry : { ...entry, world: book };
                 const body = this.currentStoredBody(normalizedEntry, opts);
+                const frontmatter = withFrontmatter(normalizedEntry, '');
+                const contentLineOffset = frontmatter.split('\n').length - 1;
                 docs.push({
                     path: this.entryPath(book, normalizedEntry),
                     title: normalizedEntry.comment || entryFileName(normalizedEntry),
                     content: body,
+                    frontmatter,
+                    contentLineOffset,
                     keys: (normalizedEntry.keys ?? []).join(' '),
                     keysecondary: (normalizedEntry.keysecondary ?? []).join(' '),
                     world: book,

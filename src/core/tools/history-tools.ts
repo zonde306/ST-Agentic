@@ -2,7 +2,12 @@ import { z } from 'zod';
 import type { ToolExecutionContext } from '@/core/bridge';
 import type { VfsSearchHit } from '@/core/types';
 import { normalizeVfsPath } from '@/core/utils';
-import { ScopedToolGuard, VfsError, sliceLines } from '@/core/vfs';
+import {
+    ScopedToolGuard,
+    VfsError,
+    formatFileReadResult,
+    grepLinesInText,
+} from '@/core/vfs';
 import type { ToolDefinition } from './registry';
 import { createAbortError, isAbortError, throwIfAborted } from './script-sandbox';
 
@@ -48,21 +53,15 @@ function formatHistoryError(error: unknown, signal?: AbortSignal): string {
     return JSON.stringify({ ok: false, error: message });
 }
 
-function supportsReadRangeOptions(fs: ToolExecutionContext['fs']): boolean {
-    if (fs instanceof ScopedToolGuard) {
-        return true;
-    }
-    return Boolean((fs as { supportsReadOptions?: boolean }).supportsReadOptions);
-}
-
 async function grepHistoryFallback(
     ctx: ToolExecutionContext,
     query: string,
     caseSensitive: boolean,
     limit: number,
+    contextLines?: number,
+    maxMatchesPerFile?: number,
 ): Promise<VfsSearchHit[]> {
     const files = await ctx.fs.glob('/history/**');
-    const needle = caseSensitive ? query : query.toLowerCase();
     const hits: VfsSearchHit[] = [];
 
     for (const filePath of files) {
@@ -73,21 +72,26 @@ async function grepHistoryFallback(
         } catch {
             continue;
         }
-        const lines = content.split('\n');
-        for (let idx = 0; idx < lines.length; idx += 1) {
-            const line = lines[idx];
-            const haystack = caseSensitive ? line : line.toLowerCase();
-            if (haystack.includes(needle)) {
-                hits.push({
-                    path: filePath,
-                    score: 1,
-                    line: idx + 1,
-                    snippet: line.trim().slice(0, 160),
-                });
-                if (hits.length >= limit) {
-                    return hits;
-                }
-            }
+        const remaining = limit - hits.length;
+        if (remaining <= 0) {
+            break;
+        }
+        const maxMatches =
+            maxMatchesPerFile !== undefined
+                ? Math.min(remaining, Math.max(1, Math.floor(maxMatchesPerFile)))
+                : remaining;
+        const fileHits = grepLinesInText({
+            path: filePath,
+            content,
+            query,
+            caseSensitive,
+            regex: false,
+            contextLines,
+            maxMatches,
+        });
+        hits.push(...fileHits);
+        if (hits.length >= limit) {
+            return hits.slice(0, limit);
         }
     }
 
@@ -108,6 +112,21 @@ const SEARCH_HISTORY_SCHEMA = z.object({
         .optional()
         .default(false)
         .describe('Case sensitivity when mode is "grep".'),
+    context_lines: z
+        .number()
+        .int()
+        .min(0)
+        .max(10)
+        .optional()
+        .default(2)
+        .describe('Surrounding lines per hit when mode is "grep" (0-10, default 2).'),
+    max_matches_per_file: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe('Optional max matches per chunk file when mode is "grep".'),
     limit: z
         .number()
         .int()
@@ -135,6 +154,24 @@ const READ_HISTORY_SCHEMA = z.object({
         .min(1)
         .optional()
         .describe('Optional 1-based inclusive end line.'),
+    line_numbers: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe('Include 1-based "N| " line-number prefixes (default true).'),
+    char_offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('Optional 0-based character offset within very long lines.'),
+    char_limit: z
+        .number()
+        .int()
+        .min(200)
+        .max(20_000)
+        .optional()
+        .describe('Optional max characters per line (200-20000, default 4000).'),
 });
 
 /** Create built-in `search_history` and `read_history` tools for `/history/*` archives. */
@@ -159,8 +196,17 @@ export function createHistoryTools(): ToolDefinition[] {
                                 pathPrefix: '/history',
                                 caseSensitive: args.case_sensitive,
                                 limit: args.limit,
+                                contextLines: args.context_lines,
+                                maxMatchesPerFile: args.max_matches_per_file,
                             })
-                            : await grepHistoryFallback(ctx, args.query, args.case_sensitive, args.limit);
+                            : await grepHistoryFallback(
+                                ctx,
+                                args.query,
+                                args.case_sensitive,
+                                args.limit,
+                                args.context_lines,
+                                args.max_matches_per_file,
+                            );
                 } else {
                     results = await ctx.fs.search(args.query, {
                         pathPrefix: '/history',
@@ -184,7 +230,7 @@ export function createHistoryTools(): ToolDefinition[] {
     const readHistoryTool: ToolDefinition<typeof READ_HISTORY_SCHEMA> = {
         name: 'read_history',
         description:
-            'Read an archived conversation chunk or summary file from /history/* (e.g. "chunk-001.md" or "/history/summary.md").',
+            'Read an archived conversation chunk or summary file from /history/* (e.g. "chunk-001.md" or "/history/summary.md") with 1-based line numbers and soft pagination.',
         parameters: READ_HISTORY_SCHEMA,
         source: 'builtin',
         async execute(args, ctx) {
@@ -202,17 +248,16 @@ export function createHistoryTools(): ToolDefinition[] {
 
             try {
                 const targetPath = resolveHistoryPath(args.chunk);
-                const hasRange = args.start_line !== undefined || args.end_line !== undefined;
-
-                if (hasRange && supportsReadRangeOptions(ctx.fs)) {
-                    return await (ctx.fs as ScopedToolGuard).read(targetPath, {
-                        startLine: args.start_line,
-                        endLine: args.end_line,
-                    });
-                }
-
-                const raw = await ctx.fs.read(targetPath);
-                return hasRange ? sliceLines(raw, args.start_line, args.end_line) : raw;
+                const rawContent = await ctx.fs.read(targetPath);
+                return formatFileReadResult({
+                    path: targetPath,
+                    rawContent,
+                    startLine: args.start_line,
+                    endLine: args.end_line,
+                    lineNumbers: args.line_numbers,
+                    charOffset: args.char_offset,
+                    charLimit: args.char_limit,
+                }).text;
             } catch (error) {
                 return formatHistoryError(error, ctx.signal);
             }

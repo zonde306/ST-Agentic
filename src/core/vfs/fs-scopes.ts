@@ -1,4 +1,4 @@
-import type { ToolEditResult, ToolFsApi } from '@/core/bridge';
+import type { ToolEditOptions, ToolEditResult, ToolFsApi } from '@/core/bridge';
 import type {
     MessageTarget,
     ScopedPermissions,
@@ -131,9 +131,15 @@ export class ScopedToolGuard implements ToolFsApi {
         });
     }
 
-    async edit(path: string, oldText: string, newText: string): Promise<ToolEditResult> {
+    async edit(
+        path: string,
+        oldText: string,
+        newText: string,
+        opts?: ToolEditOptions,
+    ): Promise<ToolEditResult> {
         const normalized = this.assertCanWrite(path);
         return await this.vfs.editFile(normalized, oldText, newText, {
+            ...opts,
             target: this.options.target,
             staged: this.options.staged,
             source: this.options.source ?? 'tool',
@@ -230,6 +236,7 @@ export class ScopedToolGuard implements ToolFsApi {
         }
         const rawHits = await this.vfs.grepSearch(query, {
             ...opts,
+            limit: opts.limit ? opts.limit * 3 : 100,
             pathPrefix: prefix,
             target: this.options.target,
             staged: this.options.staged,

@@ -42,7 +42,7 @@ export const DEFAULT_MAIN_AGENT_PERMISSIONS: ScopedPermissions = {
 const DEFAULT_SYSTEM_BASE_PROMPT = [
     'You operate on top of a Virtual File System (VFS) mounting /output.md, /character/, /persona/, /lorebooks/, /skills/, /preset/, /global/, /workspace/, /state/variables.json, and /history/.',
     'This workspace may represent a single-character roleplay, a multi-character ensemble, or an open world simulation; follow the system rules and core manifest rather than assuming a single fixed persona.',
-    'Retrieve details on demand via read_file, search_files, grep_search, and list_dir before asserting specific lore, character history, or state values.',
+    'Retrieve details on demand via read_file, search_files, grep_search, and list_dir before asserting lore or state. For large files, locate lines with grep_search/search_files, page with read_file(start_line, end_line), and edit via edit_file (omit "N| " prefixes).',
     'Treat <lore-hint> entries as literal keyword suggestions and read only the files relevant to the current scene.',
     'Instruction indexes (AGENTS.md under /global/, /preset/, /workspace/) and docs/** are read-only guides: resolve relative paths in an AGENTS.md relative to its directory and read linked docs only when relevant; use /workspace/shared/ for cross-agent collaboration notes.',
     'Output Protocol: Plain assistant text is strictly internal (for planning, tool reasoning, or review notes) and is NEVER displayed to the user.',

@@ -173,8 +173,14 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         );
         expect(grepRes.ok).toBe(true);
         expect(grepRes.results[0].path).toBe('/memory/notes.md');
-        expect(grepRes.results[0].line).toBeGreaterThan(0);
+        expect(grepRes.results[0].line).toBe(2);
+        expect(grepRes.results[0].totalLines).toBe(3);
         expect(grepRes.results[0].snippet).toContain('银莲花');
+        expect(grepRes.results[0].context).toEqual([
+            ' 1| 第一行',
+            '>2| 关键词：银莲花',
+            ' 3| 第三行',
+        ]);
 
         const searchRes = JSON.parse(
             (await registry.executeToolCall('search_files', { query: '银莲花', path_prefix: '/lorebooks' }, ctx)).output,
@@ -203,9 +209,9 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
             ).output,
         );
         expect(editRes.ok).toBe(true);
-        expect((await registry.executeToolCall('read_file', { path: '/memory/clue.md' }, ctx)).output).toBe(
-            '线索：银徽（已核实）',
-        );
+        const readClue = await registry.executeToolCall('read_file', { path: '/memory/clue.md' }, ctx);
+        expect(readClue.output).toContain('[File: /memory/clue.md | lines 1-1 of 1');
+        expect(readClue.output).toContain('1| 线索：银徽（已核实）');
 
         // append_file on /output.md writes verbatim without auto-newline directly to bound message
         const outWrite = JSON.parse(
@@ -302,7 +308,7 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         // Full read of /output.md MUST NEVER pollute ctx.readSet
         const outRead = await registry.executeToolCall('read_file', { path: '/output.md' }, ctx);
         expect(outRead.ok).toBe(true);
-        expect(outRead.output).toBe('初始回复正文。');
+        expect(outRead.output).toContain('1| 初始回复正文。');
         expect(readSet.has('/output.md')).toBe(false);
     });
 
@@ -331,13 +337,14 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         );
         expect(grep.ok).toBe(true);
         expect(grep.results[0].path).toBe('/history/chunk-001.md');
-        expect(grep.results[0].line).toBeGreaterThan(0);
+        expect(grep.results[0].line).toBe(2);
         expect(grep.results[0].snippet).toContain('铜徽');
 
         // Accepts bare chunk filename or full /history/ path
         const chunk = await registry.executeToolCall('read_history', { chunk: 'chunk-001.md', start_line: 2, end_line: 2 }, ctx);
         expect(chunk.ok).toBe(true);
-        expect(chunk.output).toBe('第2轮：发现铜徽。');
+        expect(chunk.output).toContain('[File: /history/chunk-001.md | lines 2-2 of 2');
+        expect(chunk.output).toContain('2| 第2轮：发现铜徽。');
 
         // Rejects non-history paths & traversal
         const escaped = await registry.executeToolCall('read_history', { chunk: '/character/description.md' }, ctx);
@@ -489,7 +496,8 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
             ctx,
         );
         expect(sliceRes.ok).toBe(true);
-        expect(sliceRes.output).toBe('line 2 target');
+        expect(sliceRes.output).toContain('[File: /notes/a.md | lines 2-2 of 3');
+        expect(sliceRes.output).toContain('2| line 2 target');
 
         const appendFallbackExisting = await registry.executeToolCall(
             'append_file',
@@ -512,7 +520,14 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         );
         expect(grepRes.ok).toBe(true);
         expect(grepRes.results).toEqual([
-            { path: '/notes/a.md', score: 1, line: 2, snippet: 'line 2 target' },
+            {
+                path: '/notes/a.md',
+                score: 1,
+                line: 2,
+                totalLines: 4,
+                snippet: 'line 2 target',
+                context: [' 1| line 1', '>2| line 2 target', ' 3| line 3', ' 4| line 4'],
+            },
         ]);
     });
 });
