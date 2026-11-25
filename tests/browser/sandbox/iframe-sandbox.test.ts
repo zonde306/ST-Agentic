@@ -203,6 +203,33 @@ describe('IframeJsSandbox & SandboxLifecycleManager (Chromium Browser)', () => {
             scriptCtx,
         );
         expect(scriptVal).toBe(85);
+
+        // Cross-realm plain object literals in @@script ctx.vars.patch() must succeed in iframe
+        await sandbox.evaluateScript(
+            `
+            await ctx.vars.patch(
+                { bf: { alice: { cycle: '排卵期', days: 2 } }, bf_pending_time: { minute: 15 } },
+                { scope: 'message' },
+            );
+            await ctx.vars.patch(
+                { bf: { alice: { days: 3, sperms: { bob: 50 } } }, bf_pending_time: null },
+                { scope: 'message' },
+            );
+            await ctx.vars.patch(
+                [{ op: 'replace', path: '/bf/alice/days', value: 4 }],
+                { scope: 'message' },
+            );
+            `,
+            scriptCtx,
+        );
+        const iframePatchedVars = (await scriptCtx.vars.get(undefined, { scope: 'message' })) as Record<
+            string,
+            unknown
+        >;
+        expect(iframePatchedVars.bf).toEqual({
+            alice: { cycle: '排卵期', days: 4, sperms: { bob: 50 } },
+        });
+        expect('bf_pending_time' in iframePatchedVars).toBe(false);
     });
 
     it('tracks timers and listeners in SandboxLifecycleManager, cleans up on hot-reload, and clears all on disposeAll()', async () => {

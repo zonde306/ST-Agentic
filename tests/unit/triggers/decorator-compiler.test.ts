@@ -170,6 +170,8 @@ describe('DecoratorCompiler & Trigger Grouping', () => {
         const [appendRule, ejsRule, triggerRule, scriptRule] = compiled.triggers;
 
         expect(appendRule.targetPath).toBe('/output.md');
+        expect(appendRule.sourceWorld).toBe('霜烬纪元');
+        expect(appendRule.sourceEntryUid).toBe(20);
         expect(compiled.derivedAgents[appendRule.agentProfileId].enabledTools).toEqual(
             expect.arrayContaining(['read_file', 'append_file', 'edit_file', 'read_variables', 'append_reply_view']),
         );
@@ -180,6 +182,8 @@ describe('DecoratorCompiler & Trigger Grouping', () => {
         expect(ejsRule.phase).toBe('before_turn');
         expect(ejsRule.barrier).toBe('turn');
         expect(ejsRule.decorator).toBe('@@evaluate_ejs_before');
+        expect(ejsRule.sourceWorld).toBe('霜烬纪元');
+        expect(ejsRule.sourceEntryUid).toBe(21);
 
         expect(triggerRule.kind).toBe('agent');
         expect(triggerRule.phase).toBe('after_turn');
@@ -187,12 +191,16 @@ describe('DecoratorCompiler & Trigger Grouping', () => {
         expect(triggerRule.barrier).toBe('none');
         expect(triggerRule.agentProfileId).toBe('chronicler');
         expect(triggerRule.targetPath).toBe('/memory/chronicle.md');
+        expect(triggerRule.sourceWorld).toBe('霜烬纪元');
+        expect(triggerRule.sourceEntryUid).toBe(22);
 
         expect(scriptRule.kind).toBe('script');
         expect(scriptRule.phase).toBe('before_turn');
         expect(scriptRule.order).toBe(1);
         expect(scriptRule.barrier).toBe('turn');
         expect(scriptRule.scriptCode).toContain('vars.set("turnPhase"');
+        expect(scriptRule.sourceWorld).toBe('霜烬纪元');
+        expect(scriptRule.sourceEntryUid).toBe(23);
 
         expect(compiled.subAgents).toHaveLength(1);
         expect(compiled.subAgents[0]).toMatchObject({

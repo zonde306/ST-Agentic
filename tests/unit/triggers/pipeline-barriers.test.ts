@@ -2094,4 +2094,172 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
         await orchestrator.barrierCoordinator.awaitAllSettled();
         expect(mainPrompts[3]).toContain('HUD=[]');
     });
+
+    it('records triggerSource and deduplicated lorebookNames on 0-token-script error traces and WI trigger agent traces', async () => {
+        const presetBoomRule: TriggerRule = {
+            id: 'tr_preset_script_boom',
+            label: 'Preset Boom Script',
+            source: 'preset',
+            phase: 'after_turn',
+            order: 1,
+            barrier: 'none',
+            agentProfileId: 'script',
+            kind: 'script',
+            condition: { type: 'always' },
+            instructionTemplate: '',
+            scriptCode: 'throw new Error("preset script boom");',
+            enabled: true,
+        };
+
+        const observer = createDefaultMainAgent({
+            id: 'observer',
+            connectionId: 'conn_main',
+            sessionMode: 'ephemeral',
+            enabledTools: ['read_variables'],
+            permissions: { read: ['/state/variables.json'], write: [] },
+        });
+
+        const lorebooks: Record<string, RawLoreEntry[]> = {
+            ScriptBookA: [
+                {
+                    world: 'ScriptBookA',
+                    uid: 101,
+                    comment: 'WI Script Boom',
+                    content: '@@script phase=after order=2 barrier=none\nthrow new Error("wi script boom");',
+                    keys: [],
+                    keysecondary: [],
+                    constant: true,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 4,
+                    order: 1,
+                    role: 0,
+                },
+            ],
+            GroupBookA: [
+                {
+                    world: 'GroupBookA',
+                    uid: 201,
+                    comment: 'Single WI Trigger',
+                    content: '@@trigger phase=after order=3 barrier=self profile=observer\n检查状态A',
+                    keys: [],
+                    keysecondary: [],
+                    constant: true,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 4,
+                    order: 1,
+                    role: 0,
+                },
+                {
+                    world: 'GroupBookA',
+                    uid: 202,
+                    comment: 'Grouped WI A1',
+                    content: '@@trigger phase=after order=4 barrier=self profile=observer group=shared_pack\n合组任务1',
+                    keys: [],
+                    keysecondary: [],
+                    constant: true,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 4,
+                    order: 1,
+                    role: 0,
+                },
+                {
+                    world: 'GroupBookA',
+                    uid: 203,
+                    comment: 'Grouped WI A2',
+                    content: '@@trigger phase=after order=4 barrier=self profile=observer group=shared_pack\n合组任务2',
+                    keys: [],
+                    keysecondary: [],
+                    constant: true,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 4,
+                    order: 1,
+                    role: 0,
+                },
+            ],
+            GroupBookB: [
+                {
+                    world: 'GroupBookB',
+                    uid: 301,
+                    comment: 'Grouped WI B1',
+                    content: '@@trigger phase=after order=4 barrier=self profile=observer group=shared_pack\n合组任务3',
+                    keys: [],
+                    keysecondary: [],
+                    constant: true,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 4,
+                    order: 1,
+                    role: 0,
+                },
+            ],
+        };
+
+        const fixture = createPipelineFixture({
+            triggers: [presetBoomRule],
+            lorebooks,
+            agents: { observer },
+        });
+
+        fixture.bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '检查世界书日志来源' });
+        fixture.bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+
+        // 1. Main turn
+        fixture.transport.enqueue(
+            writeOutputTurn('主回复完成。', 'w_lore_trace_main'),
+            { content: 'main done' },
+        );
+        // 2. Single WI trigger (order=3)
+        fixture.transport.enqueue({ content: 'single wi trigger ok' });
+        // 3. Grouped WI trigger (order=4, spanning GroupBookA + GroupBookB)
+        fixture.transport.enqueue({ content: 'grouped wi trigger ok' });
+
+        await fixture.orchestrator.runTurn({
+            action: 'normal',
+            target: { messageId: 1, swipeId: 0 },
+            userInput: '检查世界书日志来源',
+            turnNumber: 1,
+        });
+        await fixture.orchestrator.barrierCoordinator.awaitAllSettled();
+
+        const scriptTraces = fixture.traceLogger.listTraces({ agentProfileId: 'script', order: 'asc' });
+        expect(scriptTraces).toHaveLength(2);
+
+        const presetScriptTrace = scriptTraces.find((t) => t.triggerId === 'tr_preset_script_boom');
+        expect(presetScriptTrace).toBeDefined();
+        expect(presetScriptTrace).toMatchObject({
+            model: '0-token-script',
+            status: 'error',
+            triggerSource: 'preset',
+        });
+        expect(presetScriptTrace?.lorebookNames).toBeUndefined();
+
+        const wiScriptTrace = scriptTraces.find((t) => t.triggerLabel === 'WI Script Boom');
+        expect(wiScriptTrace).toBeDefined();
+        expect(wiScriptTrace).toMatchObject({
+            model: '0-token-script',
+            status: 'error',
+            triggerSource: 'worldinfo',
+            lorebookNames: ['ScriptBookA'],
+        });
+
+        const observerTraces = fixture.traceLogger.listTraces({ agentProfileId: 'observer', order: 'asc' });
+        expect(observerTraces).toHaveLength(2);
+        expect(observerTraces[0]).toMatchObject({
+            triggerSource: 'worldinfo',
+            lorebookNames: ['GroupBookA'],
+        });
+        expect(observerTraces[1]).toMatchObject({
+            triggerSource: 'worldinfo',
+            lorebookNames: ['GroupBookA', 'GroupBookB'],
+        });
+    });
 });

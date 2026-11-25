@@ -1124,4 +1124,82 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
             chatStyle.remove();
         }
     });
+
+    it('displays lorebook names and preset trigger source in LogsView and supports filtering by lorebook name', async () => {
+        await page.viewport(1280, 800);
+        activeHarness = createHarness({ initialTab: 'logs', initialOpen: true });
+        await settleLayout(3);
+
+        const longBookName = '超长世界书名称测试_ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789';
+        const now = Date.now();
+        activeHarness.store.setTraces([
+            {
+                runId: 'run_wi_script_err',
+                target: { messageId: 2, swipeId: 1 },
+                phase: 'after_turn',
+                agentProfileId: 'script',
+                agentName: '@@script 脚本 1',
+                triggerId: 'wi_phys_1',
+                triggerLabel: '@@script 脚本 1',
+                triggerSource: 'worldinfo',
+                lorebookNames: [longBookName],
+                connectionId: 'conn_1',
+                model: '0-token-script',
+                status: 'error',
+                startedAt: now - 1000,
+                endedAt: now - 960,
+                durationMs: 40,
+                usage: { inputTokens: 0, cachedTokens: 0, outputTokens: 0, totalTokens: 0, cacheHitRate: 0 },
+                toolSteps: [],
+                error: 'JSON Merge Patch payload must be a plain object.',
+            },
+            {
+                runId: 'run_preset_script_err',
+                target: { messageId: 2, swipeId: 1 },
+                phase: 'after_turn',
+                agentProfileId: 'script',
+                agentName: '预设结算脚本',
+                triggerId: 'preset_script_1',
+                triggerLabel: '预设结算脚本',
+                triggerSource: 'preset',
+                connectionId: 'conn_1',
+                model: '0-token-script',
+                status: 'error',
+                startedAt: now - 2000,
+                endedAt: now - 1970,
+                durationMs: 30,
+                usage: { inputTokens: 0, cachedTokens: 0, outputTokens: 0, totalTokens: 0, cacheHitRate: 0 },
+                toolSteps: [],
+                error: 'preset script error',
+            },
+        ]);
+        await settleLayout(5);
+
+        const { dialog, shadowRoot } = getShellElements();
+        const listItems = Array.from(shadowRoot.querySelectorAll('.ag-list-item')) as HTMLButtonElement[];
+        expect(listItems).toHaveLength(2);
+        expect(listItems[0].textContent).toContain(longBookName);
+        expect(listItems[1].textContent).toContain('来源：预设触发器');
+
+        // Default selection is first trace (WI script error) -> detail header shows lorebook badge
+        expect(shadowRoot.textContent).toContain(`世界书：${longBookName}`);
+        assertNoHorizontalOverflow(dialog, shadowRoot, 'desktop:logs:lorebook-name');
+
+        // Click second trace (preset script) -> detail header shows preset source badge
+        listItems[1].click();
+        await settleLayout(4);
+        expect(shadowRoot.textContent).toContain('来源：预设触发器');
+
+        // Global search by lorebook name filters down to the matching WI trace
+        const searchInput = shadowRoot.querySelector(
+            'input[aria-label="全局搜索生成日志"]',
+        ) as HTMLInputElement | null;
+        expect(searchInput).toBeTruthy();
+        await userEvent.fill(searchInput!, '超长世界书名称测试');
+        await settleLayout(4);
+
+        const filteredItems = Array.from(shadowRoot.querySelectorAll('.ag-list-item')) as HTMLButtonElement[];
+        expect(filteredItems).toHaveLength(1);
+        expect(filteredItems[0].textContent).toContain(longBookName);
+    });
 });

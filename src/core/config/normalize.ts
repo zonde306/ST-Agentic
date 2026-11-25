@@ -453,6 +453,12 @@ export function normalizeTriggerRule(input: unknown, fallbackId = 'trigger_1'): 
         enabled: raw.enabled === undefined ? true : Boolean(raw.enabled),
     };
 
+    if (typeof raw.sourceWorld === 'string' && raw.sourceWorld.trim()) {
+        rule.sourceWorld = raw.sourceWorld.trim();
+    }
+    if (typeof raw.sourceEntryUid === 'number' && Number.isFinite(raw.sourceEntryUid)) {
+        rule.sourceEntryUid = Math.trunc(raw.sourceEntryUid);
+    }
     if (typeof raw.tag === 'string') {
         rule.tag = raw.tag;
     }

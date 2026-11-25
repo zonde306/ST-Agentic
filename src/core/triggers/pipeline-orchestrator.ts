@@ -1465,6 +1465,8 @@ export class PipelineOrchestrator {
         const triggerTools = resolveUnitTools(profile.enabledTools, unit.triggers);
 
         const triggerIds = unit.triggers.map((t) => t.id);
+        const lorebookNames = collectUnitLorebookNames(unit.triggers);
+        const triggerSource = resolveUnitTriggerSource(unit.triggers, lorebookNames);
         const decorators = unit.triggers
             .map((t) => t.decorator)
             .filter((d): d is string => Boolean(d));
@@ -1496,6 +1498,8 @@ export class PipelineOrchestrator {
             getVariableSchema: unitSchema ? () => unitSchema : undefined,
             triggerId: triggerIds.join(','),
             triggerLabel: unit.label,
+            ...(triggerSource ? { triggerSource } : {}),
+            ...(lorebookNames.length > 0 ? { lorebookNames } : {}),
             staged: ctx.staged,
             ...(ctx.injectionSession ? { injectionSession: ctx.injectionSession } : {}),
             stream: false,
@@ -1620,6 +1624,8 @@ export class PipelineOrchestrator {
                 const endedAt = Date.now();
                 const conn = resolveConnection(this.settingsProvider(), 'inherit');
                 const errorMessage = error instanceof Error ? error.message : String(error);
+                const lorebookNames = collectUnitLorebookNames([rule]);
+                const triggerSource = resolveUnitTriggerSource([rule], lorebookNames);
                 this.traceLogger.recordTrace(
                     {
                         runId,
@@ -1629,6 +1635,8 @@ export class PipelineOrchestrator {
                         agentName: rule.label,
                         triggerId: rule.id,
                         triggerLabel: rule.label,
+                        ...(triggerSource ? { triggerSource } : {}),
+                        ...(lorebookNames.length > 0 ? { lorebookNames } : {}),
                         connectionId: conn.id,
                         model: '0-token-script',
                         status: 'error',
@@ -2048,6 +2056,30 @@ function resolveUnitTools(
         }
     }
     return Array.from(tools);
+}
+
+function collectUnitLorebookNames(triggers: readonly TriggerRule[]): string[] {
+    const names = new Set<string>();
+    for (const rule of triggers) {
+        const world = rule.sourceWorld?.trim();
+        if (world) {
+            names.add(world);
+        }
+    }
+    return Array.from(names);
+}
+
+function resolveUnitTriggerSource(
+    triggers: readonly TriggerRule[],
+    lorebookNames: readonly string[],
+): 'preset' | 'worldinfo' | undefined {
+    if (lorebookNames.length > 0 || triggers.some((t) => t.source === 'worldinfo')) {
+        return 'worldinfo';
+    }
+    if (triggers.length > 0) {
+        return 'preset';
+    }
+    return undefined;
 }
 
 export type { CanonicalMessage };

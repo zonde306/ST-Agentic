@@ -37,6 +37,8 @@ export interface AgentRunTrace {
     agentName: string;
     triggerId?: string;
     triggerLabel?: string;
+    triggerSource?: 'preset' | 'worldinfo';
+    lorebookNames?: string[];
     connectionId: string;
     model: string;
     status: AgentRunStatus;

@@ -42,7 +42,13 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
         return false;
     }
     const proto = Object.getPrototypeOf(value);
-    return proto === Object.prototype || proto === null;
+    if (proto === null) {
+        return true;
+    }
+    return (
+        Object.prototype.toString.call(value) === '[object Object]' &&
+        Object.getPrototypeOf(proto) === null
+    );
 }
 
 function deepCloneJson<T>(value: T): T {
@@ -761,14 +767,15 @@ export class VfsVarsAdapter implements VariableSchemaAwareApi {
     ): Promise<Record<string, unknown>> {
         throwIfAborted(this.signal);
         const scope: VariableScope = opts?.scope ?? 'message';
+        const normalized = isPlainObject(nextVars) ? deepCloneJson(nextVars) : nextVars;
         const validation =
             scope === 'message'
-                ? validateVariablesWithSchema(nextVars, this.getSchema())
-                : { ok: true, data: nextVars };
+                ? validateVariablesWithSchema(normalized, this.getSchema())
+                : { ok: true, data: normalized };
         if (!validation.ok) {
             throw new Error(validation.error);
         }
-        const finalVars = validation.data ?? nextVars;
+        const finalVars = validation.data ?? normalized;
         await this.vfs.writeVariables(finalVars, {
             target: this.target,
             staged: this.staged,

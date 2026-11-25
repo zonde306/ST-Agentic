@@ -496,6 +496,13 @@ export class DecoratorCompiler {
         const vfsPath = buildLoreVfsPath(entry, decorators);
         const ruleId = `wi_${sanitizeSegment(entry.world)}_${entry.uid}`;
         const label = entry.comment?.trim() || `${entry.world}#${entry.uid}`;
+        const sourceWorld = entry.world?.trim() || undefined;
+        const sourceMeta = {
+            ...(sourceWorld ? { sourceWorld } : {}),
+            ...(typeof entry.uid === 'number' && Number.isFinite(entry.uid)
+                ? { sourceEntryUid: entry.uid }
+                : {}),
+        };
         const rawGroupValue =
             triggerDec?.params.group
             || scriptDec?.params.group
@@ -534,6 +541,7 @@ export class DecoratorCompiler {
                     id: ruleId,
                     label,
                     source: 'worldinfo',
+                    ...sourceMeta,
                     phase,
                     order: baseOrder,
                     barrier,
@@ -604,6 +612,7 @@ export class DecoratorCompiler {
                 id: ruleId,
                 label,
                 source: 'worldinfo',
+                ...sourceMeta,
                 phase,
                 order: baseOrder,
                 barrier,
@@ -652,6 +661,7 @@ export class DecoratorCompiler {
                 id: ruleId,
                 label,
                 source: 'worldinfo',
+                ...sourceMeta,
                 phase,
                 order: baseOrder,
                 barrier,
@@ -707,6 +717,7 @@ export class DecoratorCompiler {
                 id: ruleId,
                 label,
                 source: 'worldinfo',
+                ...sourceMeta,
                 phase,
                 order: baseOrder,
                 barrier,
@@ -764,6 +775,7 @@ export class DecoratorCompiler {
                 id: ruleId,
                 label,
                 source: 'worldinfo',
+                ...sourceMeta,
                 phase,
                 order: baseOrder,
                 barrier,
@@ -799,6 +811,7 @@ export class DecoratorCompiler {
                 id: ruleId,
                 label,
                 source: 'worldinfo',
+                ...sourceMeta,
                 phase,
                 order: baseOrder,
                 barrier,

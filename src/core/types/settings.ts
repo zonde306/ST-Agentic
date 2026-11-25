@@ -127,6 +127,8 @@ export interface TriggerRule {
     id: string;
     label: string;
     source: 'preset' | 'worldinfo';
+    sourceWorld?: string;
+    sourceEntryUid?: number;
     phase: PipelinePhase;
     order: number;
     barrier: BarrierPolicy;

@@ -280,7 +280,13 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
         return false;
     }
     const proto = Object.getPrototypeOf(value);
-    return proto === Object.prototype || proto === null;
+    if (proto === null) {
+        return true;
+    }
+    return (
+        Object.prototype.toString.call(value) === '[object Object]' &&
+        Object.getPrototypeOf(proto) === null
+    );
 }
 
 function isNonEmptyPlainRecord(value: unknown): value is Record<string, unknown> {

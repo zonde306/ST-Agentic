@@ -1,5 +1,7 @@
+import vm from 'node:vm';
 import { describe, expect, it } from 'vitest';
 import {
+    applyJsonMergePatch,
     compileVariableSchemaEntries,
     createBuiltinToolRegistry,
     createToolExecutionContext,
@@ -355,5 +357,76 @@ describe('Variable Tools & Dynamic @@json_schema / @@zod_schema Validation', () 
         );
         expect(globalRead.ok).toBe(true);
         expect(globalRead.variables).toBe('ending-a');
+    });
+
+    it('accepts cross-realm plain objects in applyJsonMergePatch and ctx.vars.patch/set while rejecting non-plain objects', async () => {
+        const crossRealmTarget = vm.runInNewContext(
+            '({ bf: { alice: { cycle: "卵泡期", days: 1 } }, keep: true, removeMe: "old" })',
+        ) as Record<string, unknown>;
+        const crossRealmPatch = vm.runInNewContext(
+            '({ bf: { alice: { days: 2, sperms: { bob: 40 } } }, removeMe: null })',
+        ) as Record<string, unknown>;
+
+        const merged = applyJsonMergePatch(crossRealmTarget, crossRealmPatch);
+        expect(merged).toEqual({
+            bf: { alice: { cycle: '卵泡期', days: 2, sperms: { bob: 40 } } },
+            keep: true,
+        });
+        expect('removeMe' in merged).toBe(false);
+
+        const nonPlainCandidates: unknown[] = [
+            new Date(),
+            new Map(),
+            [1, 2],
+            vm.runInNewContext('new Date()'),
+            vm.runInNewContext('new Map()'),
+            vm.runInNewContext('[1, 2]'),
+            vm.runInNewContext('class Foo {}; new Foo()'),
+        ];
+        for (const bad of nonPlainCandidates) {
+            expect(() =>
+                applyJsonMergePatch({}, bad as Record<string, unknown>),
+            ).toThrow('JSON Merge Patch payload must be a plain object.');
+        }
+
+        const bridge = setupBridge();
+        const vfs = new VirtualFileSystem({ bridge });
+        const ctx = createToolExecutionContext({
+            bridge,
+            vfs,
+            target: { messageId: 1, swipeId: 0 },
+        });
+
+        await ctx.vars.patch(
+            vm.runInNewContext(
+                '({ bf: { alice: { cycle: "排卵期", days: 2 } }, bf_pending_time: { minute: 15 } })',
+            ) as Record<string, unknown>,
+            { scope: 'message' },
+        );
+        await ctx.vars.patch(
+            vm.runInNewContext(
+                '({ bf: { alice: { days: 3, sperms: { bob: 50 } } }, bf_pending_time: null })',
+            ) as Record<string, unknown>,
+            { scope: 'message' },
+        );
+        await ctx.vars.patch(
+            vm.runInNewContext(
+                '([{ op: "replace", path: "/bf/alice/days", value: 4 }])',
+            ) as Array<Record<string, unknown>>,
+            { scope: 'message' },
+        );
+
+        const patchedVars = await vfs.readVariables({ target: { messageId: 1, swipeId: 0 } });
+        expect(patchedVars.bf).toEqual({
+            alice: { cycle: '排卵期', days: 4, sperms: { bob: 50 } },
+        });
+        expect('bf_pending_time' in patchedVars).toBe(false);
+
+        const crossRealmRoot = vm.runInNewContext('({ reset: true, count: 1 })');
+        await ctx.vars.set('', crossRealmRoot, { scope: 'message' });
+        expect(await vfs.readVariables({ target: { messageId: 1, swipeId: 0 } })).toEqual({
+            reset: true,
+            count: 1,
+        });
     });
 });

@@ -454,6 +454,8 @@ export function createMockTraces(): AgentRunTrace[] {
             agentName: '变量管家',
             triggerId: 'tr_vars',
             triggerLabel: '@@variables_jsonpatch',
+            triggerSource: 'worldinfo',
+            lorebookNames: ['玄幻世界'],
             connectionId: 'conn_flash',
             model: 'gemini-2.5-flash',
             status: 'completed',

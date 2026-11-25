@@ -16,6 +16,7 @@ import {
 } from '@/ui/components';
 import {
     IconAlertTriangle,
+    IconBookOpen,
     IconCheck,
     IconCopy,
     IconRefresh,
@@ -93,6 +94,11 @@ function extractToolCallsFromTrace(trace: AgentRunTrace): {
     return { fromMessages, fromSteps };
 }
 
+function formatTraceLorebooks(trace: AgentRunTrace): string | null {
+    const names = trace.lorebookNames?.map((name) => name.trim()).filter(Boolean) ?? [];
+    return names.length > 0 ? names.join(' · ') : null;
+}
+
 function matchesSearch(trace: AgentRunTrace, query: string): boolean {
     if (!query) {
         return true;
@@ -104,6 +110,7 @@ function matchesSearch(trace: AgentRunTrace, query: string): boolean {
         || trace.model.toLowerCase().includes(q)
         || trace.runId.toLowerCase().includes(q)
         || (trace.triggerLabel?.toLowerCase().includes(q) ?? false)
+        || (trace.lorebookNames?.some((name) => name.toLowerCase().includes(q)) ?? false)
         || (trace.outputPreview?.toLowerCase().includes(q) ?? false)
         || (trace.error?.toLowerCase().includes(q) ?? false)
         || `#${trace.target.messageId}`.includes(q)
@@ -332,7 +339,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             <TextInput
                 type="search"
                 value={searchQuery}
-                placeholder="全局搜索 Agent / 模型 / 工具名 / 输出..."
+                placeholder="全局搜索 Agent / 世界书 / 模型 / 工具名..."
                 ariaLabel="全局搜索生成日志"
                 onInput={setSearchQuery}
             />
@@ -348,6 +355,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                     {filteredTraces.map((trace) => {
                         const isSelected = selectedTrace?.runId === trace.runId;
                         const isScriptTrace = trace.model === '0-token-script';
+                        const lorebookLabel = formatTraceLorebooks(trace);
                         const hitRate = computeCacheHitPercent(trace.usage);
                         const statusMeta = getRunStatusMeta(trace.status);
                         return (
@@ -407,6 +415,43 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                             {formatDurationMs(trace.durationMs)}
                                         </span>
                                     </div>
+                                    {lorebookLabel ? (
+                                        <div
+                                            class="ag-row"
+                                            title={`世界书：${lorebookLabel}`}
+                                            style={{
+                                                gap: '4px',
+                                                fontSize: '11px',
+                                                color: 'var(--muted-foreground)',
+                                                minWidth: 0,
+                                                marginTop: '2px',
+                                            }}
+                                        >
+                                            <span style={{ display: 'inline-flex', flexShrink: 0 }}>
+                                                <IconBookOpen size={12} />
+                                            </span>
+                                            <span
+                                                style={{
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap',
+                                                    minWidth: 0,
+                                                }}
+                                            >
+                                                {lorebookLabel}
+                                            </span>
+                                        </div>
+                                    ) : trace.triggerSource === 'preset' ? (
+                                        <div
+                                            style={{
+                                                fontSize: '11px',
+                                                color: 'var(--muted-foreground)',
+                                                marginTop: '2px',
+                                            }}
+                                        >
+                                            来源：预设触发器
+                                        </div>
+                                    ) : null}
                                 </button>
 
                                 {trace.toolSteps.length > 0 ? (
@@ -489,6 +534,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
 
     const detailPane = selectedTrace ? (() => {
         const isScriptTrace = selectedTrace.model === '0-token-script';
+        const selectedLorebookLabel = formatTraceLorebooks(selectedTrace);
         const hitRate = computeCacheHitPercent(selectedTrace.usage);
         const statusMeta = getRunStatusMeta(selectedTrace.status);
         const extractedCalls = extractToolCallsFromTrace(selectedTrace);
@@ -498,6 +544,12 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             phase: selectedTrace.phase,
             agentProfileId: selectedTrace.agentProfileId,
             agentName: selectedTrace.agentName,
+            ...(selectedTrace.triggerId ? { triggerId: selectedTrace.triggerId } : {}),
+            ...(selectedTrace.triggerLabel ? { triggerLabel: selectedTrace.triggerLabel } : {}),
+            ...(selectedTrace.triggerSource ? { triggerSource: selectedTrace.triggerSource } : {}),
+            ...(selectedTrace.lorebookNames?.length
+                ? { lorebookNames: selectedTrace.lorebookNames }
+                : {}),
             model: selectedTrace.model,
             status: selectedTrace.status,
             durationMs: selectedTrace.durationMs,
@@ -530,6 +582,23 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                     <span class="ag-mono">{selectedTrace.model}</span>
                                     {selectedTrace.triggerLabel ? (
                                         <Badge tone="neutral">{selectedTrace.triggerLabel}</Badge>
+                                    ) : null}
+                                    {selectedLorebookLabel ? (
+                                        <Badge tone="neutral" title={`世界书：${selectedLorebookLabel}`}>
+                                            <IconBookOpen size={12} />
+                                            <span
+                                                style={{
+                                                    maxWidth: isMobile ? '200px' : '320px',
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap',
+                                                }}
+                                            >
+                                                世界书：{selectedLorebookLabel}
+                                            </span>
+                                        </Badge>
+                                    ) : selectedTrace.triggerSource === 'preset' ? (
+                                        <Badge tone="neutral">来源：预设触发器</Badge>
                                     ) : null}
                                     <span>开始：{formatTimestamp(selectedTrace.startedAt)}</span>
                                 </div>

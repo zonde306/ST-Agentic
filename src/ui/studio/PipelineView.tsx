@@ -118,10 +118,15 @@ function inferRuleFromLoreEntry(
     const jsonSchemaDec = item.decorators.find((d) => d.name === '@@json_schema');
     const zodSchemaDec = item.decorators.find((d) => d.name === '@@zod_schema');
 
+    const sourceWorld = item.entry.world?.trim() || undefined;
     return {
         id: `wi:${item.entry.world}:${item.entry.uid}`,
         label: item.entry.comment?.trim() || `${decName} (${item.slug})`,
         source: 'worldinfo',
+        ...(sourceWorld ? { sourceWorld } : {}),
+        ...(typeof item.entry.uid === 'number' && Number.isFinite(item.entry.uid)
+            ? { sourceEntryUid: item.entry.uid }
+            : {}),
         phase,
         order,
         barrier,

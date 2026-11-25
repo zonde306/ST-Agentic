@@ -267,6 +267,8 @@ export interface AgentRunInput {
     includeSubAgentTools?: boolean;
     triggerId?: string;
     triggerLabel?: string;
+    triggerSource?: 'preset' | 'worldinfo';
+    lorebookNames?: readonly string[];
     staged?: boolean;
     stream?: boolean;
     signal?: AbortSignal;
@@ -1192,6 +1194,16 @@ export class AgentRunner {
         let lastReasoning = '';
         let roundsCompleted = 0;
 
+        const normalizedLorebookNames = input.lorebookNames
+            ? Array.from(new Set(input.lorebookNames.map((n) => n.trim()).filter(Boolean)))
+            : [];
+        const traceTriggerMeta = {
+            ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+            ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+            ...(input.triggerSource ? { triggerSource: input.triggerSource } : {}),
+            ...(normalizedLorebookNames.length > 0 ? { lorebookNames: normalizedLorebookNames } : {}),
+        };
+
         this.traceLogger.emit({
             kind: 'phase_started',
             target: { ...target },
@@ -1208,8 +1220,7 @@ export class AgentRunner {
                 phase: input.phase,
                 agentProfileId: agent.id,
                 agentName: agent.name,
-                ...(input.triggerId ? { triggerId: input.triggerId } : {}),
-                ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+                ...traceTriggerMeta,
                 connectionId: connection.id,
                 model: connection.model,
                 status: 'running',
@@ -1288,8 +1299,7 @@ export class AgentRunner {
                     phase: input.phase,
                     agentProfileId: agent.id,
                     agentName: agent.name,
-                    ...(input.triggerId ? { triggerId: input.triggerId } : {}),
-                    ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+                    ...traceTriggerMeta,
                     connectionId: connection.id,
                     model: connection.model,
                     status: aborted ? 'aborted' : 'error',
@@ -1385,8 +1395,7 @@ export class AgentRunner {
                     phase: input.phase,
                     agentProfileId: agent.id,
                     agentName: agent.name,
-                    ...(input.triggerId ? { triggerId: input.triggerId } : {}),
-                    ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+                    ...traceTriggerMeta,
                     connectionId: connection.id,
                     model: connection.model,
                     status: 'interrupted',
@@ -1937,8 +1946,7 @@ export class AgentRunner {
                         phase: input.phase,
                         agentProfileId: agent.id,
                         agentName: agent.name,
-                        ...(input.triggerId ? { triggerId: input.triggerId } : {}),
-                        ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+                        ...traceTriggerMeta,
                         connectionId: connection.id,
                         model: connection.model,
                         status: 'completed',
@@ -1989,8 +1997,7 @@ export class AgentRunner {
                         phase: input.phase,
                         agentProfileId: agent.id,
                         agentName: agent.name,
-                        ...(input.triggerId ? { triggerId: input.triggerId } : {}),
-                        ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
+                        ...traceTriggerMeta,
                         connectionId: connection.id,
                         model: connection.model,
                         status: 'error',
@@ -3172,6 +3179,7 @@ export class AgentRunner {
                 description: desc.description,
             };
 
+        const sourceWorld = desc.sourceEntry?.world?.trim();
         try {
             const childResult = await this.run({
                 agent: childProfile,
@@ -3187,6 +3195,9 @@ export class AgentRunner {
                 includeSubAgentTools: false,
                 allowSubAgentDelegation: false,
                 delegationDepth: parentParams.delegationDepth + 1,
+                ...(sourceWorld
+                    ? { triggerSource: 'worldinfo' as const, lorebookNames: [sourceWorld] }
+                    : {}),
                 staged: false,
                 stream: false,
                 signal: ctx.signal,
