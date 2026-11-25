@@ -99,7 +99,11 @@ import {
 } from '@/core/vfs';
 import type { AgenticAssistantPublicApi, AgenticPublicApi } from '@/globals';
 import { type CompanionHooksHandle, setupCompanionHooks } from '@/host/companion-hooks';
-import { evaluateOptionalEjs } from '@/host/ejs-adapter';
+import {
+    createHostPromptInjectionSession,
+    evaluateOptionalEjs,
+    getEjsTemplateFeatures,
+} from '@/host/ejs-adapter';
 import {
     embedFilesToCard,
     embedPresetToCard,
@@ -1594,6 +1598,7 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
         ): Promise<ToolTestResult> {
             const startedAt = performance.now();
             const target = resolveTarget(targetInput);
+            const createdTestSandboxIds: string[] = [];
             try {
                 const parsedArgs: unknown = argsJson.trim() ? JSON.parse(argsJson) : {};
                 const argsRecord = isPlainObject(parsedArgs) ? parsedArgs : {};
@@ -1613,7 +1618,12 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                     const def = compileSlashBridgeTool(tool);
                     resultValue = await def.execute(argsRecord, ctx);
                 } else if ('kind' in tool && tool.kind === 'js') {
-                    const defs = await compileCustomToolConfig(tool, sandbox, { timeoutMs: 15_000 });
+                    const testSandboxId = `sandbox_test:${Date.now()}_${Math.random().toString(36).slice(2, 8)}:${tool.id?.trim() || tool.name?.trim() || 'custom'}`;
+                    createdTestSandboxIds.push(testSandboxId);
+                    const defs = await compileCustomToolConfig(tool, sandbox, {
+                        sandboxId: testSandboxId,
+                        timeoutMs: 15_000,
+                    });
                     const picked = defs.find((d) => d.name === tool.name) ?? defs[0];
                     resultValue = await picked.execute(argsRecord, ctx);
                 } else if ('commandTemplate' in tool && tool.commandTemplate?.trim()) {
@@ -1629,6 +1639,8 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                     resultValue = await def.execute(argsRecord, ctx);
                 } else if ('code' in tool && tool.code?.trim()) {
                     if (/defineTool\s*\(/.test(tool.code)) {
+                        const testSandboxId = `sandbox_test:${Date.now()}_${Math.random().toString(36).slice(2, 8)}:ad_hoc:${tool.name?.trim() || 'tool'}`;
+                        createdTestSandboxIds.push(testSandboxId);
                         const tempJs: CustomToolConfig = {
                             id: `test_js_${tool.name}`,
                             name: tool.name,
@@ -1638,12 +1650,15 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                             code: tool.code,
                             allowNetwork: true,
                         };
-                        const defs = await compileCustomToolConfig(tempJs, sandbox, { timeoutMs: 15_000 });
+                        const defs = await compileCustomToolConfig(tempJs, sandbox, {
+                            sandboxId: testSandboxId,
+                            timeoutMs: 15_000,
+                        });
                         const picked = defs.find((d) => d.name === tool.name) ?? defs[0];
                         resultValue = await picked.execute(argsRecord, ctx);
                     } else {
                         resultValue = await sandbox.evaluateScript(tool.code, ctx, {
-                            id: `test_script_${tool.name}`,
+                            id: `test_script_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${tool.name}`,
                             allowNetwork: true,
                             timeoutMs: 15_000,
                         });
@@ -1677,6 +1692,10 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                     error: msg,
                     target,
                 };
+            } finally {
+                for (const sbId of createdTestSandboxIds) {
+                    sandbox.dispose(sbId);
+                }
             }
         },
 
@@ -1828,10 +1847,23 @@ jQuery(async () => {
             companionHooksHandle?: CompanionHooksHandle;
         } = {};
 
+        const reportedCompatWarnings = new Set<string>();
+        const reportCompatWarning = (code: string, message: string): void => {
+            if (reportedCompatWarnings.has(code)) {
+                return;
+            }
+            reportedCompatWarnings.add(code);
+            console.warn(`[ST-Agentic] ${message}`);
+            runtimeRefs.appStore?.pushToast(message, 'warning');
+        };
+
         const bridge = new STHostBridge({
             extensionKey: DEFAULT_EXTENSION_SETTINGS_KEY,
             executeSlashCommand: executeStSlashCommand,
-            evaluateOptionalEjs: async (text: string, vars?: Record<string, unknown>) =>
+            createPromptInjectionSession: createHostPromptInjectionSession,
+            getEjsFeatures: getEjsTemplateFeatures,
+            reportCompatWarning,
+            evaluateOptionalEjs: async (text: string, vars?: Record<string, unknown>, options?) =>
                 await evaluateOptionalEjs(
                     text,
                     vars,
@@ -1840,6 +1872,10 @@ jQuery(async () => {
                         () => runtimeRefs.store,
                         () => resolveValidTarget(runtimeRefs.appStore?.getSnapshot().activeTarget),
                     ),
+                    {
+                        ...options,
+                        onCompatWarning: reportCompatWarning,
+                    },
                 ),
         });
 

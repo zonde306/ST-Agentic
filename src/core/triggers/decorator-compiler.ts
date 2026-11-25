@@ -1,5 +1,5 @@
 import { extractSubAgentDescriptors, type SubAgentDescriptor } from '@/core/agents';
-import { buildLoreVfsPath, DecoratorParser } from '@/core/lore';
+import { buildLoreVfsPath, DecoratorParser, extractIfConditions } from '@/core/lore';
 import type {
     AgentProfile,
     BarrierPolicy,
@@ -18,11 +18,13 @@ export interface LoreToolDescriptor {
     name: string;
     entry: RawLoreEntry;
     allowNetwork: boolean;
+    timeoutMs?: number;
 }
 
 export interface CompiledWorldInfoArtifacts {
     triggers: TriggerRule[];
     derivedAgents: Record<string, AgentProfile>;
+    derivedAgentsByRuleId: Record<string, AgentProfile>;
     subAgents: SubAgentDescriptor[];
     toolEntries: LoreToolDescriptor[];
     schemaEntries: RawLoreEntry[];
@@ -186,7 +188,7 @@ function uniqueStrings(items: readonly string[]): string[] {
     return result;
 }
 
-function mergeDerivedAgentProfiles(
+export function mergeDerivedAgentProfiles(
     existing: AgentProfile,
     incoming: AgentProfile,
     groupName?: string,
@@ -368,6 +370,7 @@ export class DecoratorCompiler {
         const entries = unwrapLoreInputs(lorebooksOrEntries);
         const triggers: TriggerRule[] = [];
         const derivedAgents: Record<string, AgentProfile> = {};
+        const derivedAgentsByRuleId: Record<string, AgentProfile> = {};
         const toolEntries: LoreToolDescriptor[] = [];
         const schemaEntries: RawLoreEntry[] = [];
         const warnings: string[] = [];
@@ -394,6 +397,9 @@ export class DecoratorCompiler {
                 triggers.push(compiled.trigger);
             }
             if (compiled.derivedAgent) {
+                if (compiled.trigger) {
+                    derivedAgentsByRuleId[compiled.trigger.id] = canonicalClone(compiled.derivedAgent);
+                }
                 const existingAgent = derivedAgents[compiled.derivedAgent.id];
                 derivedAgents[compiled.derivedAgent.id] = existingAgent
                     ? mergeDerivedAgentProfiles(
@@ -411,6 +417,7 @@ export class DecoratorCompiler {
         return {
             triggers,
             derivedAgents,
+            derivedAgentsByRuleId,
             subAgents,
             toolEntries,
             schemaEntries,
@@ -448,8 +455,19 @@ export class DecoratorCompiler {
                 toolDec.params.allowNetwork === undefined
                     ? true
                     : toolDec.params.allowNetwork.toLowerCase() !== 'false';
+            const rawTimeout = toolDec.params.timeoutMs ?? toolDec.params.timeout;
+            const parsedTimeout = rawTimeout !== undefined ? Number(rawTimeout) : NaN;
+            const timeoutMs =
+                Number.isFinite(parsedTimeout) && parsedTimeout > 0
+                    ? Math.min(Math.max(1, Math.floor(parsedTimeout)), 600_000)
+                    : undefined;
             return {
-                toolEntry: { name, entry, allowNetwork },
+                toolEntry: {
+                    name,
+                    entry,
+                    allowNetwork,
+                    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+                },
                 warnings,
             };
         }
@@ -490,6 +508,8 @@ export class DecoratorCompiler {
             triggerDec?.params.order ?? scriptDec?.params.order,
             batchOrderDec,
         );
+        const ifConditions = extractIfConditions(decorators);
+        const ifField = ifConditions.length > 0 ? { ifConditions } : {};
 
         const presetAgents = options.preset?.agents ?? {};
 
@@ -525,6 +545,7 @@ export class DecoratorCompiler {
                     instructionTemplate: scriptCode,
                     ...(targetPath ? { targetPath } : {}),
                     decorator: triggerDec ? '@@trigger' : '@@script',
+                    ...ifField,
                     scriptCode,
                     enabled: true,
                 };
@@ -595,6 +616,7 @@ export class DecoratorCompiler {
                 ...(targetPath ? { targetPath } : {}),
                 ...(schemaSource ? { schemaSource } : {}),
                 decorator: '@@trigger',
+                ...ifField,
                 enabled: true,
             };
 
@@ -641,6 +663,7 @@ export class DecoratorCompiler {
                 instructionTemplate: parsed.cleanContent.trim(),
                 targetPath: vfsPath,
                 decorator: replaceDec.name,
+                ...ifField,
                 enabled: true,
             };
 
@@ -696,6 +719,7 @@ export class DecoratorCompiler {
                 targetPath: '/state/variables.json',
                 ...(schemaSource ? { schemaSource } : {}),
                 decorator: varsDec.name,
+                ...ifField,
                 enabled: true,
             };
 
@@ -751,6 +775,7 @@ export class DecoratorCompiler {
                 instructionTemplate: parsed.cleanContent.trim(),
                 targetPath: '/output.md',
                 decorator: activeDec.name,
+                ...ifField,
                 enabled: true,
             };
 
@@ -785,6 +810,7 @@ export class DecoratorCompiler {
                 instructionTemplate: parsed.cleanContent,
                 ...(targetPath ? { targetPath } : {}),
                 decorator: ejsDec.name,
+                ...ifField,
                 scriptCode: parsed.cleanContent,
                 enabled: true,
             };

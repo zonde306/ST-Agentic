@@ -1,5 +1,10 @@
 import type { ClassifiedLoreEntry, ParsedDecorator, RawLoreEntry, WICategory } from '@/core/types';
-import { DecoratorParser } from './decorators';
+import {
+    DecoratorParser,
+    extractIfConditions,
+    isEjsForceDisabledEntry,
+    isEjsSpecialEntry,
+} from './decorators';
 
 /** SillyTavern World Info insertion position constants. */
 export const WORLD_INFO_POSITION = {
@@ -63,9 +68,16 @@ const CATEGORY_4_DECORATORS = new Set([
     '@@script',
     '@@group',
     '@@dont_activate',
+    '@@dont_deactivate',
+    '@@initial_variables',
+    '@@only_preload',
+    '@@generate_before',
+    '@@generate_after',
+    '@@render_before',
+    '@@render_after',
 ]);
 
-const INIT_VAR_PATTERN = /\[initvar\]/i;
+const INIT_VAR_PATTERN = /\[(?:initvar|initialvariables)\]/i;
 const GENERATE_DIRECTIVE_PATTERN = /\[generate:(?:before|after)\]/i;
 const VAR_MUTATION_PATTERN = /\{\{(?:setvar|addvar|incvar|decvar|setglobalvar|addglobalvar)::|(?:^|\n)\s*\/setvar\b|\b(?:setvar|setglobalvar)\s*\(/i;
 const DYNAMIC_EXPR_PATTERN = /\{\{(?:getvar|getglobalvar|var|random|roll|time|date)(?:::|\}\})|<%[\s\S]*?%>|\bgetvar\s*\(/i;
@@ -353,6 +365,10 @@ function determineCategory(
     decorators: readonly ParsedDecorator[],
     cleanContent: string,
 ): { category: WICategory; reason: string } {
+    if (isEjsForceDisabledEntry(decorators)) {
+        return { category: 'dynamic_or_trigger', reason: 'ejs_disabled' };
+    }
+
     const hasSystemDecorator = decorators.some((d) => d.name === '@@system');
     if (hasSystemDecorator) {
         return { category: 'system_rule', reason: 'decorator:@@system' };
@@ -365,6 +381,14 @@ function determineCategory(
 
     if (INIT_VAR_PATTERN.test(entry.comment ?? '') || INIT_VAR_PATTERN.test(cleanContent)) {
         return { category: 'dynamic_or_trigger', reason: 'init_var' };
+    }
+
+    if (isEjsSpecialEntry(entry, decorators)) {
+        return { category: 'dynamic_or_trigger', reason: 'ejs_special' };
+    }
+
+    if (entry.position === WORLD_INFO_POSITION.outlet && entry.outletName?.trim()) {
+        return { category: 'dynamic_or_trigger', reason: 'wi_outlet' };
     }
 
     if (GENERATE_DIRECTIVE_PATTERN.test(cleanContent)) {
@@ -380,6 +404,10 @@ function determineCategory(
     }
 
     if (entry.constant) {
+        if (extractIfConditions(decorators).length > 0) {
+            return { category: 'dynamic_or_trigger', reason: 'conditional_dynamic' };
+        }
+
         if (
             entry.position === WORLD_INFO_POSITION.atDepth
             && DYNAMIC_EXPR_PATTERN.test(cleanContent)

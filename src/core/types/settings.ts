@@ -139,6 +139,7 @@ export interface TriggerRule {
     targetPath?: string;
     schemaSource?: { kind: 'json' | 'zod'; raw: string };
     decorator?: string;
+    ifConditions?: string[];
     scriptCode?: string;
     findRegex?: string;
     enabled: boolean;

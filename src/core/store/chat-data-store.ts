@@ -32,6 +32,9 @@ export const GLOBAL_VARIABLES_DOC_KEY = 'global_variables.json';
 /** Canonical key used for per-message display overrides in the `message` namespace. */
 export const MESSAGE_OVERRIDE_KEY = '';
 
+/** Canonical key used for per-branch sticky EJS `injectPrompt` state. */
+export const EJS_INJECTIONS_DOC_KEY = 'sticky.json';
+
 /** Well-known namespaces in ST-Agentic. */
 export const DATA_NAMESPACES = {
     FILES: 'files',
@@ -41,6 +44,7 @@ export const DATA_NAMESPACES = {
     CHARACTER_FILES: 'character-files',
     PERSONA_FILES: 'persona-files',
     SIDE_FILES: 'side-files',
+    EJS_INJECTIONS: 'ejs-injections',
 } as const;
 
 export interface NamespacePolicy {
@@ -60,6 +64,7 @@ export const NAMESPACE_POLICY: Record<DataNamespace, NamespacePolicy> = {
     'character-files': { layered: true },
     'persona-files': { layered: true },
     'side-files': { layered: true },
+    'ejs-injections': { layered: true },
 };
 
 export interface AgenticPersistedData {

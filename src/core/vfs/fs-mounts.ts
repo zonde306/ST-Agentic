@@ -784,7 +784,8 @@ export class VariablesMount implements VfsMount {
         }
 
         const books = await this.bridge.listEnabledLorebooks();
-        const initVars = parseInitVarEntries(books);
+        const invertEnabled = Boolean(this.bridge.getEjsFeatures?.()?.invertEnabled);
+        const initVars = parseInitVarEntries(books, { invertEnabled });
         const chatVars =
             this.bridge.readChatVariables?.()
             ?? this.store.getLegacyMetadataVariables()

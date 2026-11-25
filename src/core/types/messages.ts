@@ -135,6 +135,7 @@ export interface RawLoreEntry {
     groupOverride?: boolean;
     groupWeight?: number;
     scanDepth?: number | null;
+    outletName?: string;
     decorators?: string[];
     extensions?: Record<string, unknown>;
 }

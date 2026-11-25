@@ -38,10 +38,14 @@ import type {
     CreateChatMessageOptions,
     DeleteChatMessageOptions,
     DeletedChatMessageSnapshot,
+    EjsEvaluateOptions,
+    EjsFeaturesSnapshot,
     HostAdminBridge,
     HostAuthorBridge,
     HostBridge,
     HostIdentity,
+    PromptInjectionSession,
+    SerializedPromptInjected,
     WriteChatMessageOptions,
 } from '@/core/bridge';
 import { resolveActivePreset } from '@/core/config';
@@ -68,6 +72,7 @@ export const DEFAULT_EXTENSION_SETTINGS_KEY = 'Agentic';
 
 const VALID_MACRO_IDENTIFIER = /^[a-zA-Z][\w-_]*$/;
 const GETVAR_MACRO_PATTERN = /\{\{getvar::([^}]+)\}\}/gi;
+const OUTLET_MACRO_PATTERN = /\{\{\s*outlet::([^}]+?)\s*\}\}/gi;
 const FILE_MACRO_PATTERN = /\{\{file::([^}]+)\}\}/gi;
 const SINGLE_MACRO_TOKEN_PATTERN = /\{\{([^{}]+)\}\}/g;
 const PRE_SUBSTITUTE_OVERRIDE_KEYS = new Set(['lastgenerationtype']);
@@ -77,7 +82,16 @@ const CHARACTER_NON_SETTING_KEYS = new Set(['name', 'avatar']);
 export type EvaluateOptionalEjsHook = (
     text: string,
     vars: Record<string, unknown>,
+    options?: EjsEvaluateOptions,
 ) => Promise<string>;
+
+export type CreatePromptInjectionSessionHook = (
+    initialSnapshot?: SerializedPromptInjected,
+) => { session: PromptInjectionSession; mode: 'native' | 'fallback' };
+
+export type GetEjsFeaturesHook = () => EjsFeaturesSnapshot | null;
+
+export type ReportCompatWarningHook = (code: string, message: string) => void;
 
 export type ExecuteSlashCommandHook = (
     command: string,
@@ -90,6 +104,9 @@ export interface STHostBridgeOptions {
     getSettings?: () => Settings | undefined;
     resolveFileMacroSync?: (path: string) => string;
     evaluateOptionalEjs?: EvaluateOptionalEjsHook;
+    createPromptInjectionSession?: CreatePromptInjectionSessionHook;
+    getEjsFeatures?: GetEjsFeaturesHook;
+    reportCompatWarning?: ReportCompatWarningHook;
     executeSlashCommand?: ExecuteSlashCommandHook;
 }
 
@@ -185,6 +202,17 @@ function convertStLoreEntry(worldName: string, rawInput: unknown, fallbackIndex:
     const keys = normalizeStringArray(raw.key ?? raw.keys);
     const keysecondary = normalizeStringArray(raw.keysecondary ?? raw.secondaryKeys);
 
+    const ext = isPlainRecord(rawInput) && isPlainRecord((rawInput as { extensions?: unknown }).extensions)
+        ? ((rawInput as { extensions: Record<string, unknown> }).extensions)
+        : undefined;
+    const rawOutlet =
+        typeof (raw as { outletName?: unknown }).outletName === 'string'
+            ? (raw as { outletName: string }).outletName
+            : typeof ext?.outlet_name === 'string'
+                ? ext.outlet_name
+                : '';
+    const trimmedOutlet = rawOutlet.trim();
+
     return {
         world: worldName,
         uid: parseNumericUid(raw.uid, fallbackIndex),
@@ -200,6 +228,7 @@ function convertStLoreEntry(worldName: string, rawInput: unknown, fallbackIndex:
         depth: typeof raw.depth === 'number' ? raw.depth : 4,
         order: typeof raw.order === 'number' ? raw.order : 100,
         role: typeof raw.role === 'number' ? raw.role : 0,
+        ...(trimmedOutlet ? { outletName: trimmedOutlet } : {}),
         ...(raw.caseSensitive !== undefined ? { caseSensitive: raw.caseSensitive } : {}),
         ...(raw.matchWholeWords !== undefined ? { matchWholeWords: raw.matchWholeWords } : {}),
         ...(typeof raw.probability === 'number' ? { probability: raw.probability } : {}),
@@ -316,6 +345,9 @@ export class STHostBridge implements HostBridge {
     private cachedLorebooks = new Map<string, RawLoreEntry[]>();
 
     evaluateOptionalEjs?: EvaluateOptionalEjsHook;
+    createPromptInjectionSession?: CreatePromptInjectionSessionHook;
+    getEjsFeatures?: GetEjsFeaturesHook;
+    reportCompatWarning?: ReportCompatWarningHook;
     executeSlashCommand?: ExecuteSlashCommandHook;
     readonly author: HostAuthorBridge;
     readonly admin: HostAdminBridge;
@@ -327,6 +359,15 @@ export class STHostBridge implements HostBridge {
         this.resolveFileMacroSyncFn = options.resolveFileMacroSync;
         if (options.evaluateOptionalEjs) {
             this.evaluateOptionalEjs = options.evaluateOptionalEjs;
+        }
+        if (options.createPromptInjectionSession) {
+            this.createPromptInjectionSession = options.createPromptInjectionSession;
+        }
+        if (options.getEjsFeatures) {
+            this.getEjsFeatures = options.getEjsFeatures;
+        }
+        if (options.reportCompatWarning) {
+            this.reportCompatWarning = options.reportCompatWarning;
         }
         if (options.executeSlashCommand) {
             this.executeSlashCommand = options.executeSlashCommand;
@@ -370,10 +411,22 @@ export class STHostBridge implements HostBridge {
     /** Attach optional host bridges (`ejs-adapter`, `slash-bridge`) without static imports. */
     setOptionalHooks(hooks: {
         evaluateOptionalEjs?: EvaluateOptionalEjsHook;
+        createPromptInjectionSession?: CreatePromptInjectionSessionHook;
+        getEjsFeatures?: GetEjsFeaturesHook;
+        reportCompatWarning?: ReportCompatWarningHook;
         executeSlashCommand?: ExecuteSlashCommandHook;
     }): void {
         if (hooks.evaluateOptionalEjs) {
             this.evaluateOptionalEjs = hooks.evaluateOptionalEjs;
+        }
+        if (hooks.createPromptInjectionSession) {
+            this.createPromptInjectionSession = hooks.createPromptInjectionSession;
+        }
+        if (hooks.getEjsFeatures) {
+            this.getEjsFeatures = hooks.getEjsFeatures;
+        }
+        if (hooks.reportCompatWarning) {
+            this.reportCompatWarning = hooks.reportCompatWarning;
         }
         if (hooks.executeSlashCommand) {
             this.executeSlashCommand = hooks.executeSlashCommand;
@@ -962,7 +1015,17 @@ export class STHostBridge implements HostBridge {
             }
 
             const varOverrides = new Map<string, string>();
+            const outletOverrides = new Map<string, string>();
+            let hasOutletTable = false;
             for (const [key, value] of Object.entries(overrides)) {
+                if (key === '__has_outlet_table__') {
+                    hasOutletTable = value === '1';
+                    continue;
+                }
+                if (key.startsWith('outlet:')) {
+                    outletOverrides.set(key.slice(7), value);
+                    continue;
+                }
                 if (key.startsWith('var:')) {
                     varOverrides.set(key.slice(4), value);
                     continue;
@@ -978,6 +1041,13 @@ export class STHostBridge implements HostBridge {
                 if (presentTemplateMacros.has(lowerKey)) {
                     fallbackMap.set(lowerKey, value);
                 }
+            }
+
+            if (hasOutletTable || outletOverrides.size > 0) {
+                working = working.replace(OUTLET_MACRO_PATTERN, (_full, rawOutletKey: string) => {
+                    const key = rawOutletKey.trim();
+                    return outletOverrides.get(key) ?? '';
+                });
             }
 
             if (varOverrides.size > 0) {

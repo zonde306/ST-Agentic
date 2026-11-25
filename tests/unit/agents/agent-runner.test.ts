@@ -1100,4 +1100,152 @@ describe('AgentRunner & TraceLogger', () => {
         expect(zeroProgressErr).toBeInstanceOf(AgentExecutionError);
         expect(zeroProgressErr).not.toBeInstanceOf(TurnInterruptedError);
     });
+
+    it('isolates @@tool sandboxes across concurrent runs and disposes them cleanly after each run', async () => {
+        const loreEntry: RawLoreEntry = {
+            world: 'ComfyUI生图',
+            uid: 5,
+            comment: 'comfyui_generate',
+            content: [
+                '@@tool comfyui_generate allowNetwork=false',
+                'export default defineTool({',
+                '  name: "comfyui_generate",',
+                '  description: "Mock image generator",',
+                '  parameters: z.object({ prompt: z.string() }),',
+                '  async execute(args) {',
+                '    return { ok: true, imgTag: `<img src="${args.prompt}.png" />` };',
+                '  },',
+                '});',
+            ].join('\n'),
+            keys: [],
+            keysecondary: [],
+            constant: false,
+            selective: false,
+            disable: false,
+            position: 0,
+            depth: 0,
+            order: 1,
+            role: 0,
+        };
+
+        const bridge = new MemoryHostBridge({
+            identity: { userName: '沈默', charName: '林晚' },
+            lorebooks: { 'ComfyUI生图': [loreEntry] },
+        });
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '画一张图' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+
+        const conn = createDefaultConnection({ id: 'conn_main', model: 'test-model', stream: false });
+        const drawAgent = createDefaultMainAgent({
+            id: 'draw_agent',
+            connectionId: 'conn_main',
+            sessionMode: 'ephemeral',
+            enabledTools: ['comfyui_generate'],
+            permissions: { read: ['/**'], write: [] },
+        });
+        const otherAgent = createDefaultMainAgent({
+            id: 'other_agent',
+            connectionId: 'conn_main',
+            sessionMode: 'ephemeral',
+            enabledTools: ['read_variables'],
+            permissions: { read: ['/**'], write: [] },
+        });
+        const preset = createDefaultPreset({
+            id: 'preset_concurrent',
+            mainAgentId: 'draw_agent',
+            agents: { draw_agent: drawAgent, other_agent: otherAgent },
+        });
+        const settings = createDefaultSettings({
+            connections: { [conn.id]: conn },
+            currentConnectionId: conn.id,
+            presets: { [preset.id]: preset },
+            currentPresetId: preset.id,
+        });
+
+        const sandbox = new IframeJsSandbox();
+        const traceLogger = new TraceLogger({ maxTraces: 50 });
+
+        const run1EnteredGate = new DeferredGate();
+        const releaseRun1Gate = new DeferredGate();
+
+        const transport = {
+            async complete(req: Parameters<ScriptedLLMTransport['complete']>[0]) {
+                const isDrawRun = req.tools.some((t) => t.name === 'comfyui_generate');
+                if (!isDrawRun) {
+                    return {
+                        content: 'other done',
+                        toolCalls: [],
+                        usage: { inputTokens: 10, cachedTokens: 0, outputTokens: 5, totalTokens: 15 },
+                    };
+                }
+                const hasToolResult = req.messages.some((m) => m.role === 'tool');
+                if (!hasToolResult) {
+                    run1EnteredGate.resolve();
+                    await releaseRun1Gate.promise;
+                    return {
+                        content: '',
+                        toolCalls: [
+                            {
+                                id: 'call_comfy_1',
+                                name: 'comfyui_generate',
+                                arguments: JSON.stringify({ prompt: 'white_tiger_girl' }),
+                            },
+                        ],
+                        usage: { inputTokens: 10, cachedTokens: 0, outputTokens: 10, totalTokens: 20 },
+                    };
+                }
+                const toolMsg = req.messages.find((m) => m.role === 'tool');
+                return {
+                    content: `done:${String(toolMsg?.content ?? '')}`,
+                    toolCalls: [],
+                    usage: { inputTokens: 15, cachedTokens: 0, outputTokens: 10, totalTokens: 25 },
+                };
+            },
+            async *stream() {
+                if (Date.now() < 0) {
+                    yield { type: 'text_delta' as const, textDelta: '' };
+                }
+                throw new Error('stream not expected');
+            },
+        };
+
+        const runner = new AgentRunner({
+            bridge,
+            transport,
+            settings,
+            traceLogger,
+            sandbox,
+        });
+
+        // Start Run 1 (uses comfyui_generate), wait until it has compiled @@tool and entered LLM call
+        const run1Promise = runner.run({
+            agent: 'draw_agent',
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'after_turn',
+            userInput: '生图调用',
+        });
+        await run1EnteredGate.promise;
+
+        // Run 2 starts & completes concurrently while Run 1 is mid-flight
+        const run2Res = await runner.run({
+            agent: 'other_agent',
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'after_turn',
+            userInput: '变量更新',
+        });
+        expect(run2Res.content).toBe('other done');
+
+        // Release Run 1 so it invokes comfyui_generate (must NOT throw "has been disposed")
+        releaseRun1Gate.resolve();
+        const run1Res = await run1Promise;
+
+        expect(run1Res.toolSteps).toHaveLength(1);
+        expect(run1Res.toolSteps[0].toolName).toBe('comfyui_generate');
+        expect(run1Res.toolSteps[0].ok).toBe(true);
+        expect(run1Res.toolSteps[0].result).toContain('white_tiger_girl.png');
+        expect(run1Res.content).toContain('white_tiger_girl.png');
+
+        // All per-run sandboxes must be disposed after both runs complete
+        expect(sandbox.lifecycle.getActiveIds()).toEqual([]);
+    });
 });

@@ -23,6 +23,7 @@ import {
 } from '@/core/store';
 import {
     groupTriggersForExecution,
+    mergeDerivedAgentProfiles,
     PipelineOrchestrator,
     type TriggerExecutionUnit,
 } from '@/core/triggers';
@@ -463,26 +464,40 @@ async function runCompanionBeforeTurnUnits(
         return '';
     }
 
-    const units: TriggerExecutionUnit[] = groupTriggersForExecution(beforeRules);
+    const sortedRules = beforeRules
+        .map((rule, idx) => ({ rule, idx }))
+        .sort((a, b) => a.rule.order - b.rule.order || a.idx - b.idx);
+    const ruleBatches: TriggerRule[][] = [];
+    let currentOrder: number | undefined;
+    let currentBatch: TriggerRule[] = [];
+    for (const { rule } of sortedRules) {
+        if (currentOrder === undefined || rule.order !== currentOrder) {
+            if (currentBatch.length > 0) {
+                ruleBatches.push(currentBatch);
+            }
+            currentOrder = rule.order;
+            currentBatch = [rule];
+        } else {
+            currentBatch.push(rule);
+        }
+    }
+    if (currentBatch.length > 0) {
+        ruleBatches.push(currentBatch);
+    }
+
     const briefFragments: string[] = [];
 
-    const executeRule = async (rule: TriggerRule): Promise<void> => {
+    const executeRule = async (
+        rule: TriggerRule,
+        matchOverrides?: Record<string, string>,
+        overrideAgentProfile?: typeof preset.agents[string],
+    ): Promise<void> => {
         if (signal.aborted) {
             return;
         }
-        const evaluation = await orchestrator.evaluateCondition(rule, {
-            target,
-            turnNumber,
-            scanText,
-            signal,
-        });
-        if (!evaluation.matched || signal.aborted) {
-            return;
-        }
-
         const substitutedPrompt = bridge.substituteMacros(
             rule.instructionTemplate,
-            evaluation.matchOverrides,
+            matchOverrides,
         );
         if (!substitutedPrompt.trim()) {
             return;
@@ -491,6 +506,8 @@ async function runCompanionBeforeTurnUnits(
         if (rule.kind === 'agent' && rule.agentProfileId) {
             const agentProfile =
                 preset?.agents?.[rule.agentProfileId]
+                ?? overrideAgentProfile
+                ?? compiled.derivedAgentsByRuleId?.[rule.id]
                 ?? compiled.derivedAgents?.[rule.agentProfileId]
                 ?? rule.agentProfileId;
             const result = await orchestrator.agentRunner.run({
@@ -519,15 +536,57 @@ async function runCompanionBeforeTurnUnits(
         }
     };
 
-    for (const unit of units) {
+    for (const ruleBatch of ruleBatches) {
         if (signal.aborted) {
             break;
         }
-        if (unit.isGrouped && unit.triggers.length > 1) {
-            await Promise.all(unit.triggers.map((rule) => executeRule(rule)));
-        } else {
-            for (const rule of unit.triggers) {
-                await executeRule(rule);
+        const matchedRules: TriggerRule[] = [];
+        const matchOverridesByRuleId = new Map<string, Record<string, string>>();
+        for (const rule of ruleBatch) {
+            if (signal.aborted) {
+                break;
+            }
+            const evaluation = await orchestrator.evaluateCondition(rule, {
+                target,
+                turnNumber,
+                scanText,
+                signal,
+                staged: true,
+            });
+            if (evaluation.matched) {
+                matchedRules.push(rule);
+                if (evaluation.matchOverrides) {
+                    matchOverridesByRuleId.set(rule.id, evaluation.matchOverrides);
+                }
+            }
+        }
+        if (matchedRules.length === 0 || signal.aborted) {
+            continue;
+        }
+
+        const units: TriggerExecutionUnit[] = groupTriggersForExecution(matchedRules);
+        for (const unit of units) {
+            if (signal.aborted) {
+                break;
+            }
+            const derivedProfiles = unit.triggers
+                .map((r) => compiled.derivedAgentsByRuleId?.[r.id])
+                .filter((p): p is NonNullable<typeof p> => Boolean(p));
+            let mergedDerived = derivedProfiles[0];
+            for (let i = 1; i < derivedProfiles.length; i += 1) {
+                mergedDerived = mergeDerivedAgentProfiles(mergedDerived, derivedProfiles[i], unit.groupName);
+            }
+
+            if (unit.isGrouped && unit.triggers.length > 1) {
+                await Promise.all(
+                    unit.triggers.map((rule) =>
+                        executeRule(rule, matchOverridesByRuleId.get(rule.id), mergedDerived),
+                    ),
+                );
+            } else {
+                for (const rule of unit.triggers) {
+                    await executeRule(rule, matchOverridesByRuleId.get(rule.id), mergedDerived);
+                }
             }
         }
     }

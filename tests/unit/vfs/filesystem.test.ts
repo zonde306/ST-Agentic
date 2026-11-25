@@ -353,4 +353,112 @@ describe('VirtualFileSystem', () => {
         });
         await expect(emptyVfs.writeFile('/output.md', 'x')).rejects.toBeInstanceOf(VfsError);
     });
+
+    it('excludes ST-Prompt-Template special entries from /lorebooks/* and parses @@initial_variables into /state/variables.json', async () => {
+        const specialEntries: RawLoreEntry[] = [
+            {
+                world: 'SpecialBook',
+                uid: 1,
+                comment: 'Normal Setting',
+                content: '灰港北街设定。',
+                keys: ['北街'],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 4,
+                order: 10,
+                role: 0,
+            },
+            {
+                world: 'SpecialBook',
+                uid: 2,
+                comment: 'Status Bar',
+                content: '@@render_after\n@@iframe 状态栏\n<div><%- vars.hp %></div>',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 4,
+                depth: 0,
+                order: 10,
+                role: 0,
+            },
+            {
+                world: 'SpecialBook',
+                uid: 3,
+                comment: 'Only Preload',
+                content: '@@only_preload\n<% define("x", 1); %>',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 4,
+                order: 10,
+                role: 0,
+            },
+            {
+                world: 'SpecialBook',
+                uid: 4,
+                comment: '@INJECT pos=1',
+                content: '注入内容',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 4,
+                order: 10,
+                role: 0,
+            },
+            {
+                world: 'SpecialBook',
+                uid: 5,
+                comment: 'Initial Vars',
+                content: '@@initial_variables\nhp: 120\nrank: "A"',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 4,
+                order: 10,
+                role: 0,
+            },
+            {
+                world: 'SpecialBook',
+                uid: 6,
+                comment: 'Blocked Entry',
+                content: '@@dont_activate\n隐藏条目',
+                keys: ['隐藏'],
+                keysecondary: [],
+                constant: false,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 4,
+                order: 10,
+                role: 0,
+            },
+        ];
+
+        const bridge = new MemoryHostBridge({
+            lorebooks: { SpecialBook: specialEntries },
+        });
+        bridge.pushMessage({ name: 'User', isUser: true, mes: 'hi' });
+        const vfs = new VirtualFileSystem({ bridge });
+
+        const files = await vfs.listDir('/lorebooks/SpecialBook');
+        expect(files.map((f) => f.name)).toEqual(['Normal-Setting-1.md']);
+        expect(JSON.parse(await vfs.readFile('/state/variables.json'))).toEqual({
+            hp: 120,
+            rank: 'A',
+        });
+    });
 });

@@ -265,4 +265,83 @@ describe('Slash Bridge & Custom JS Tool Compilation (Node Fallback)', () => {
         sandbox.disposeAll();
         expect(sandbox.lifecycle.getStats().activeSandboxes).toBe(0);
     });
+
+    it('isolates concurrent @@tool sandboxes via distinct sandboxId and honors timeoutMs on @@tool / defineTool', async () => {
+        const bridge = setupBridge();
+        const sandbox = new IframeJsSandbox();
+
+        const loreEntry: RawLoreEntry = {
+            world: 'ConcurrentBook',
+            uid: 5,
+            comment: 'Slow echo tool',
+            content: [
+                '@@tool slow_echo allowNetwork=false timeoutMs=60',
+                'export default defineTool({',
+                '  name: "slow_echo",',
+                '  description: "Echo after delay",',
+                '  parameters: z.object({ delayMs: z.number(), text: z.string() }),',
+                '  async execute(args) {',
+                '    await new Promise((r) => setTimeout(r, args.delayMs));',
+                '    return `echo:${args.text}`;',
+                '  },',
+                '});',
+            ].join('\n'),
+            keys: [],
+            keysecondary: [],
+            constant: false,
+            selective: false,
+            disable: false,
+            position: 0,
+            depth: 0,
+            order: 1,
+            role: 0,
+        };
+
+        const [toolA] = await compileLoreToolEntry(loreEntry, sandbox, { sandboxId: 'run_a:lore:5' });
+        const [toolB] = await compileLoreToolEntry(loreEntry, sandbox, { sandboxId: 'run_b:lore:5' });
+
+        const ctx = createToolExecutionContext({
+            bridge,
+            target: { messageId: 1, swipeId: 0 },
+        });
+
+        // Disposing run B must NOT dispose run A
+        expect(sandbox.dispose('run_b:lore:5')).toBe(true);
+        await expect(toolB.execute({ delayMs: 5, text: 'gone' }, ctx)).rejects.toThrow(/has been disposed/);
+        await expect(toolA.execute({ delayMs: 5, text: 'alive' }, ctx)).resolves.toBe('echo:alive');
+
+        // @@tool timeoutMs=60 aborts slow call (> 60ms)
+        await expect(toolA.execute({ delayMs: 250, text: 'too-slow' }, ctx)).rejects.toThrow(/timed out/i);
+
+        // defineTool({ timeoutMs }) overrides default timeout when specified on the tool itself
+        const [customTimeoutTool] = await compileCustomToolConfig(
+            {
+                id: 'custom_timeout_test',
+                name: 'custom_timeout_test',
+                kind: 'js',
+                description: 'Custom timeout test',
+                enabled: true,
+                allowNetwork: false,
+                code: `
+                    export default defineTool({
+                        name: 'custom_timeout_test',
+                        description: 'Respects defineTool timeoutMs',
+                        timeoutMs: 60,
+                        parameters: z.object({ delayMs: z.number() }),
+                        async execute(args) {
+                            await new Promise((r) => setTimeout(r, args.delayMs));
+                            return 'ok';
+                        },
+                    });
+                `,
+            },
+            sandbox,
+            { sandboxId: 'run_c:custom_timeout' },
+        );
+        await expect(customTimeoutTool.execute({ delayMs: 5 }, ctx)).resolves.toBe('ok');
+        await expect(customTimeoutTool.execute({ delayMs: 250 }, ctx)).rejects.toThrow(/timed out/i);
+
+        sandbox.disposeAll();
+        expect(sandbox.lifecycle.getStats().activeSandboxes).toBe(0);
+    });
 });

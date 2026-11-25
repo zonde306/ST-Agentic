@@ -2,12 +2,20 @@ import { describe, expect, it } from 'vitest';
 import {
     AGENTIC_DECORATORS,
     DecoratorParser,
+    EJS_TEMPLATE_DECORATORS,
     KNOWN_DECORATORS,
     LEGACY_DECORATORS,
-    parseDecorators,
     ST_NATIVE_DECORATORS,
+    evaluateIfConditions,
+    extractIfConditions,
+    hasPrivateDecorator,
+    isEjsEntryEnabled,
+    isEjsForceDisabledEntry,
+    isEjsSpecialEntry,
+    parseDecorators,
 } from '@/core/lore';
 import type { RawLoreEntry } from '@/core/types';
+import { MemoryHostBridge } from '../../mocks';
 
 function makeEntry(content: string, decorators?: string[]): RawLoreEntry {
     return {
@@ -173,5 +181,72 @@ describe('DecoratorParser', () => {
         expect(preStripped.has('@@trigger')).toBe(true);
         expect(preStripped.params('@@trigger')).toEqual({ phase: 'after', order: '2' });
         expect(preStripped.cleanContent).toBe('纯净正文');
+    });
+
+    it('supports all 16 ST-Prompt-Template decorators, verbatim @@if/@@iframe, special entry flags, and @@if evaluation', async () => {
+        for (const name of EJS_TEMPLATE_DECORATORS) {
+            expect(DecoratorParser.isKnownDecorator(name)).toBe(true);
+            expect(KNOWN_DECORATORS.has(name)).toBe(true);
+        }
+
+        const statusEntry = makeEntry(
+            [
+                '@@render_after',
+                '@@iframe 状态栏（点击展开）',
+                '@@if !is_user && !is_system && vars.hp > 0',
+                '@@private',
+                '<div>HP: <%- vars.hp %></div>',
+            ].join('\n'),
+        );
+        const parsed = new DecoratorParser(statusEntry);
+        expect(parsed.decorators.map((d) => d.name)).toEqual([
+            '@@render_after',
+            '@@iframe',
+            '@@if',
+            '@@private',
+        ]);
+        expect(parsed.rawArgs('@@iframe')).toBe('状态栏（点击展开）');
+        expect(extractIfConditions(parsed.decorators)).toEqual([
+            '!is_user && !is_system && vars.hp > 0',
+        ]);
+        expect(hasPrivateDecorator(parsed.decorators)).toBe(true);
+        expect(parsed.cleanContent).toBe('<div>HP: <%- vars.hp %></div>');
+        expect(isEjsSpecialEntry(statusEntry, parsed.decorators)).toBe(true);
+
+        const disabledEntry = makeEntry('@@dont_activate\n屏蔽');
+        expect(isEjsForceDisabledEntry(new DecoratorParser(disabledEntry).decorators)).toBe(true);
+        expect(isEjsEntryEnabled(disabledEntry)).toBe(false);
+
+        const alwaysEnabledEntry: RawLoreEntry = {
+            ...makeEntry('@@render_after\n@@always_enabled\n<div>ok</div>'),
+            disable: true,
+        };
+        expect(isEjsEntryEnabled(alwaysEnabledEntry)).toBe(true);
+
+        const invertedSpecial: RawLoreEntry = {
+            ...makeEntry('@@generate_before\n<% injectPrompt("a", "b"); %>'),
+            disable: true,
+        };
+        expect(isEjsEntryEnabled(invertedSpecial, undefined, { invertEnabled: false })).toBe(false);
+        expect(isEjsEntryEnabled(invertedSpecial, undefined, { invertEnabled: true })).toBe(true);
+
+        // evaluateIfConditions with EJS evaluator
+        const bridgeWithEjs = new MemoryHostBridge({
+            ejsEvaluator: async (code, vars) => {
+                if (code.includes('vars.hp > 50')) {
+                    return Number(vars.hp) > 50 ? 'true' : 'false';
+                }
+                return 'true';
+            },
+        });
+        expect(await evaluateIfConditions(['vars.hp > 50'], bridgeWithEjs, { hp: 80 })).toBe(true);
+        expect(await evaluateIfConditions(['vars.hp > 50'], bridgeWithEjs, { hp: 20 })).toBe(false);
+
+        // Missing EJS gracefully warns once and fails open
+        const bridgeNoEjs = new MemoryHostBridge();
+        expect(await evaluateIfConditions(['vars.hp > 50'], bridgeNoEjs, { hp: 20 })).toBe(true);
+        expect(await evaluateIfConditions(['vars.hp > 50'], bridgeNoEjs, { hp: 10 })).toBe(true);
+        expect(bridgeNoEjs.compatWarnings).toHaveLength(1);
+        expect(bridgeNoEjs.compatWarnings[0].code).toBe('ejs_missing_for_if');
     });
 });

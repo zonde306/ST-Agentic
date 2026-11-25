@@ -13,6 +13,7 @@ import { IframeJsSandbox } from '@/sandbox';
 import {
     assertAppendOnlyPrefix,
     DeferredGate,
+    type EjsEvaluatorStub,
     MemoryHostBridge,
     ScriptedLLMTransport,
 } from '../../mocks';
@@ -34,7 +35,7 @@ function createPipelineFixture(options: {
     triggers?: TriggerRule[];
     lorebooks?: Record<string, RawLoreEntry[]>;
     agents?: Record<string, ReturnType<typeof createDefaultMainAgent>>;
-    ejsEvaluator?: (text: string, vars: Record<string, unknown>) => string | Promise<string>;
+    ejsEvaluator?: EjsEvaluatorStub;
     watermark?: { high: number; low: number };
 } = {}) {
     const bridge = new MemoryHostBridge({
@@ -1805,5 +1806,292 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
         });
         expect(scriptTraces[0].error).toContain('script boom');
         expect(transport.requests).toHaveLength(0);
+    });
+
+    it('filters grouped triggers by @@if/keyword BEFORE merging (narrowing permissions, barrier, and label) and reacts across order batches', async () => {
+        const lorebooks: Record<string, RawLoreEntry[]> = {
+            FilterBook: [
+                // order=0 before_turn script sets flag=true
+                {
+                    world: 'FilterBook',
+                    uid: 1,
+                    comment: 'Init Flag',
+                    content: '@@evaluate_ejs_before\n@@batch_order 0\n<% set_flag %>',
+                    keys: [],
+                    keysecondary: [],
+                    constant: true,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 4,
+                    order: 0,
+                    role: 0,
+                },
+                // order=1 grouped before_turn: vars rule (@@if vars.allowVars === true -> FALSE)
+                {
+                    world: 'FilterBook',
+                    uid: 2,
+                    comment: 'Filtered Vars',
+                    content: '@@variables_json_before\n@@group b_group\n@@batch_order 1\n@@if vars.allowVars\n更新变量。',
+                    keys: [],
+                    keysecondary: [],
+                    constant: true,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 4,
+                    order: 1,
+                    role: 0,
+                },
+                // order=1 grouped before_turn: replace rule (@@if vars.flag === true -> TRUE after order=0!)
+                {
+                    world: 'FilterBook',
+                    uid: 3,
+                    comment: 'Surviving Lore',
+                    content: '@@replace_before\n@@group b_group\n@@batch_order 1\n@@if vars.flag\n更新日志：<%- vars.note %>',
+                    keys: [],
+                    keysecondary: [],
+                    constant: true,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 4,
+                    order: 1,
+                    role: 0,
+                },
+                // order=1 after_turn turn-barrier EJS sets afterReady=true
+                {
+                    world: 'FilterBook',
+                    uid: 4,
+                    comment: 'After Step 1',
+                    content: '@@evaluate_ejs\n@@batch_order 1\n<% set_after_ready %>',
+                    keys: [],
+                    keysecondary: [],
+                    constant: true,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 4,
+                    order: 1,
+                    role: 0,
+                },
+                // order=2 after_turn gated by @@if vars.afterReady (depends on order=1!)
+                {
+                    world: 'FilterBook',
+                    uid: 5,
+                    comment: 'After Step 2',
+                    content: '@@replace\n@@batch_order 2\n@@if vars.afterReady\n根据阶段一结果归档。',
+                    keys: [],
+                    keysecondary: [],
+                    constant: true,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 4,
+                    order: 2,
+                    role: 0,
+                },
+            ],
+        };
+
+        const seenTriggerPrompts: string[] = [];
+        const seenTriggerTools: string[][] = [];
+        const target = { messageId: 1, swipeId: 0 };
+
+        const fixture = createPipelineFixture({
+            lorebooks,
+            ejsEvaluator: async (text, vars) => {
+                if (text.includes('set_flag')) {
+                    await fixture.orchestrator.vfs.writeVariables(
+                        { flag: true, allowVars: false, note: '夜巡完成' },
+                        { target, staged: true },
+                    );
+                    return '';
+                }
+                if (text.includes('set_after_ready')) {
+                    await fixture.orchestrator.vfs.writeVariables(
+                        { flag: true, allowVars: false, note: '夜巡完成', afterReady: true },
+                        { target, staged: true },
+                    );
+                    return '';
+                }
+                if (text.includes('!!(vars.allowVars)')) {
+                    return vars.allowVars ? 'true' : 'false';
+                }
+                if (text.includes('!!(vars.flag)')) {
+                    return vars.flag ? 'true' : 'false';
+                }
+                if (text.includes('!!(vars.afterReady)')) {
+                    return vars.afterReady ? 'true' : 'false';
+                }
+                return text.replace(/<%-\s*vars\.note\s*%>/g, String(vars.note ?? ''));
+            },
+        });
+        const { bridge, transport, orchestrator } = fixture;
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '开始巡查' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+
+        transport.enqueue(
+            // 1. before_turn surviving single rule (Surviving Lore) — should NOT be grouped and should NOT see patch_variables!
+            (req) => {
+                seenTriggerPrompts.push(String(req.messages[req.messages.length - 1]?.content ?? ''));
+                seenTriggerTools.push((req.tools ?? []).map((t) => t.name));
+                return { content: 'before lore ok' };
+            },
+            // 2. main_turn
+            writeOutputTurn('正文完成。', 'w_filter_main'),
+            { content: 'main done' },
+            // 3. after_turn order=2 surviving rule (triggered after order=1 set afterReady=true)
+            (req) => {
+                seenTriggerPrompts.push(String(req.messages[req.messages.length - 1]?.content ?? ''));
+                seenTriggerTools.push((req.tools ?? []).map((t) => t.name));
+                return { content: 'after step 2 ok' };
+            },
+        );
+
+        await orchestrator.runTurn({
+            action: 'normal',
+            target,
+            userInput: '开始巡查',
+            turnNumber: 1,
+        });
+        await orchestrator.barrierCoordinator.awaitAllSettled();
+
+        expect(seenTriggerPrompts).toHaveLength(2);
+        // Surviving Lore ran alone (not Grouped Trigger Batch) and rendered its EJS instruction
+        expect(seenTriggerPrompts[0]).not.toContain('Grouped Trigger Batch');
+        expect(seenTriggerPrompts[0]).toContain('更新日志：夜巡完成');
+        // patch_variables from filtered-out Filtered Vars did NOT leak into Surviving Lore's tools!
+        expect(seenTriggerTools[0]).not.toContain('patch_variables');
+        // after_turn order=2 ran after order=1 set afterReady=true
+        expect(seenTriggerPrompts[1]).toContain('根据阶段一结果归档。');
+    });
+
+    it('persists sticky injectPrompt across turns and isolates sticky state across swipe/regenerate branches', async () => {
+        const lorebooks: Record<string, RawLoreEntry[]> = {
+            StickyBook: [
+                {
+                    world: 'StickyBook',
+                    uid: 10,
+                    comment: 'Sticky Injector',
+                    content: '@@evaluate_ejs_before\n<% inject_turn1 %>',
+                    keys: [],
+                    keysecondary: [],
+                    constant: true,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 4,
+                    order: 1,
+                    role: 0,
+                },
+            ],
+        };
+
+        let shouldInjectOnTurn = true;
+        const mainPrompts: string[] = [];
+        const fixture = createPipelineFixture({
+            lorebooks,
+            ejsEvaluator: async (text, _vars, opts) => {
+                const session = opts?.injectionSession;
+                if (text.includes('inject_turn1')) {
+                    if (shouldInjectOnTurn) {
+                        // sticky: 1 -> survives Turn 1 tick (1-1=0 >=0 -> kept for Turn 2), expires after Turn 2 tick (0-1=-1)
+                        session?.injectPrompt('sticky_hud', 'BUFF_ACTIVE', 10, 1, 'buff_1');
+                    }
+                    return '';
+                }
+                if (text.includes('read_sticky_hud')) {
+                    return `HUD=[${session?.getPromptsInjected('sticky_hud') ?? ''}]`;
+                }
+                return text;
+            },
+        });
+
+        const { bridge, settings, transport, orchestrator } = fixture;
+        settings.presets[settings.currentPresetId].agents.main.promptBlocks.push({
+            id: 'tail_hud',
+            name: 'Tail HUD',
+            role: 'system',
+            placement: 'tail',
+            content: '<% read_sticky_hud %>',
+            enabled: true,
+        });
+
+        // Turn 1 (msg 1, swipe 0): injects sticky=1
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: 'Turn 1' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+        transport.enqueue(
+            (req) => {
+                mainPrompts.push(String(req.messages[req.messages.length - 1]?.content ?? ''));
+                return writeOutputTurn('T1 out', 'w_t1');
+            },
+            { content: 'done1' },
+        );
+        await orchestrator.runTurn({
+            action: 'normal',
+            target: { messageId: 1, swipeId: 0 },
+            userInput: 'Turn 1',
+            turnNumber: 1,
+        });
+        await orchestrator.barrierCoordinator.awaitAllSettled();
+        expect(mainPrompts[0]).toContain('HUD=[BUFF_ACTIVE]');
+
+        // Swipe Turn 1 (msg 1, swipe 1) with injector disabled -> MUST NOT inherit swipe 0's sticky state!
+        shouldInjectOnTurn = false;
+        transport.enqueue(
+            (req) => {
+                mainPrompts.push(String(req.messages[req.messages.length - 1]?.content ?? ''));
+                return writeOutputTurn('T1 swipe1 out', 'w_t1s1');
+            },
+            { content: 'done1s1' },
+        );
+        await orchestrator.runTurn({
+            action: 'swipe',
+            target: { messageId: 1, swipeId: 1 },
+            previousSwipeId: 0,
+            turnNumber: 1,
+        });
+        await orchestrator.barrierCoordinator.awaitAllSettled();
+        expect(mainPrompts[1]).toContain('HUD=[]');
+
+        // Switch active swipe back to 0 on msg 1, then Turn 2 (msg 3, swipe 0) without new inject -> sticky=1 from Turn 1 swipe 0 is STILL active!
+        bridge.chat[1].swipeId = 0;
+        bridge.pushMessage({ id: 2, name: '沈默', isUser: true, mes: 'Turn 2' });
+        bridge.pushMessage({ id: 3, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+        transport.enqueue(
+            (req) => {
+                mainPrompts.push(String(req.messages[req.messages.length - 1]?.content ?? ''));
+                return writeOutputTurn('T2 out', 'w_t2');
+            },
+            { content: 'done2' },
+        );
+        await orchestrator.runTurn({
+            action: 'normal',
+            target: { messageId: 3, swipeId: 0 },
+            userInput: 'Turn 2',
+            turnNumber: 2,
+        });
+        await orchestrator.barrierCoordinator.awaitAllSettled();
+        expect(mainPrompts[2]).toContain('HUD=[BUFF_ACTIVE]');
+
+        // Turn 3 (msg 5, swipe 0) -> sticky expired after Turn 2 -> HUD=[]
+        bridge.pushMessage({ id: 4, name: '沈默', isUser: true, mes: 'Turn 3' });
+        bridge.pushMessage({ id: 5, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+        transport.enqueue(
+            (req) => {
+                mainPrompts.push(String(req.messages[req.messages.length - 1]?.content ?? ''));
+                return writeOutputTurn('T3 out', 'w_t3');
+            },
+            { content: 'done3' },
+        );
+        await orchestrator.runTurn({
+            action: 'normal',
+            target: { messageId: 5, swipeId: 0 },
+            userInput: 'Turn 3',
+            turnNumber: 3,
+        });
+        await orchestrator.barrierCoordinator.awaitAllSettled();
+        expect(mainPrompts[3]).toContain('HUD=[]');
     });
 });

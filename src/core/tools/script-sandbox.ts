@@ -26,6 +26,7 @@ export interface SandboxToolDefinition<TParams extends z.ZodTypeAny = z.ZodTypeA
     parameters: TParams;
     execute(args: z.infer<TParams>, ctx: ToolExecutionContext): Promise<unknown> | unknown;
     strict?: boolean;
+    timeoutMs?: number;
 }
 
 export interface CompiledSandboxTool {
@@ -34,6 +35,7 @@ export interface CompiledSandboxTool {
     parameters: z.ZodTypeAny;
     execute(args: Record<string, unknown>, ctx: ToolExecutionContext): Promise<unknown>;
     strict?: boolean;
+    timeoutMs?: number;
 }
 
 export interface SchemaEvalOptions {
@@ -93,6 +95,16 @@ export function defineTool<TParams extends z.ZodTypeAny>(
     }
     if (typeof definition.execute !== 'function') {
         throw new Error(`defineTool("${definition.name}") requires an "execute" function.`);
+    }
+    if (
+        definition.timeoutMs !== undefined
+        && (
+            typeof definition.timeoutMs !== 'number'
+            || !Number.isFinite(definition.timeoutMs)
+            || definition.timeoutMs <= 0
+        )
+    ) {
+        throw new Error(`defineTool("${definition.name}") "timeoutMs" must be a positive finite number.`);
     }
     return definition;
 }

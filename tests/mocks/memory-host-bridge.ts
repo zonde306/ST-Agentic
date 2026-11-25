@@ -3,15 +3,19 @@ import type {
     CreateChatMessageOptions,
     DeleteChatMessageOptions,
     DeletedChatMessageSnapshot,
+    EjsEvaluateOptions,
+    EjsFeaturesSnapshot,
     HostAdminBridge,
     HostAuthorBridge,
     HostBridge,
     HostIdentity,
     ListPresetsOptions,
+    PromptInjectionSession,
     ReadHostSettingsOptions,
+    SerializedPromptInjected,
     WriteChatMessageOptions,
 } from '@/core/bridge';
-import { utf8ByteLength } from '@/core/context';
+import { LocalPromptInjectionSession, utf8ByteLength } from '@/core/context';
 import type {
     AuthorUndoMeta,
     ChatMessageSnapshot,
@@ -45,7 +49,11 @@ import type {
 } from '@/core/types';
 import { hashText as computeXxHash } from '@/core/utils';
 
-export type EjsEvaluatorStub = (text: string, vars: Record<string, unknown>) => Promise<string> | string;
+export type EjsEvaluatorStub = (
+    text: string,
+    vars: Record<string, unknown>,
+    options?: EjsEvaluateOptions,
+) => Promise<string> | string;
 export type SlashCommandStub = (command: string, signal?: AbortSignal) => Promise<string> | string;
 
 export interface MemoryHostBridgeInit {
@@ -66,6 +74,8 @@ export interface MemoryHostBridgeInit {
     hostSettings?: Record<string, Record<string, unknown>>;
     extensionData?: Record<string, unknown>;
     ejsEvaluator?: EjsEvaluatorStub;
+    ejsFeatures?: EjsFeaturesSnapshot;
+    injectionSessionMode?: 'native' | 'fallback';
     slashHandler?: SlashCommandStub;
     hostLuminance?: 'dark' | 'light';
     enableAuthorBridge?: boolean;
@@ -161,7 +171,16 @@ export class MemoryHostBridge implements HostBridge {
         undoMeta?: AuthorUndoMeta;
     }> = [];
 
-    public evaluateOptionalEjs?: (text: string, vars: Record<string, unknown>) => Promise<string>;
+    public compatWarnings: Array<{ code: string; message: string }> = [];
+    public ejsFeatures: EjsFeaturesSnapshot | null;
+    public injectionSessionMode: 'native' | 'fallback';
+    private reportedCompatCodes = new Set<string>();
+
+    public evaluateOptionalEjs?: (
+        text: string,
+        vars: Record<string, unknown>,
+        options?: EjsEvaluateOptions,
+    ) => Promise<string>;
     public executeSlashCommand?: (command: string, signal?: AbortSignal) => Promise<string>;
     public author?: HostAuthorBridge;
     public admin?: HostAdminBridge;
@@ -171,6 +190,8 @@ export class MemoryHostBridge implements HostBridge {
     constructor(init: MemoryHostBridgeInit = {}) {
         this.chat = init.chat ? [...init.chat] : [];
         this.metadata = init.metadata ? { ...init.metadata } : {};
+        this.ejsFeatures = init.ejsFeatures ?? { invertEnabled: false };
+        this.injectionSessionMode = init.injectionSessionMode ?? 'native';
         this.extensionCapabilities = {
             tavernHelperScripts: init.extensionCapabilities?.tavernHelperScripts ?? false,
             tavernHelperAudio: init.extensionCapabilities?.tavernHelperAudio ?? false,
@@ -635,8 +656,18 @@ export class MemoryHostBridge implements HostBridge {
         const variables = this.getMetadataVariables();
         const globalVariables = this.getMetadataGlobalVariables();
         const overrideMap = new Map<string, string>();
+        const outletMap = new Map<string, string>();
+        let hasOutletTable = false;
         if (overrides) {
             for (const [key, value] of Object.entries(overrides)) {
+                if (key === '__has_outlet_table__') {
+                    hasOutletTable = value === '1';
+                    continue;
+                }
+                if (key.startsWith('outlet:')) {
+                    outletMap.set(key.slice(7), value);
+                    continue;
+                }
                 if (!key.startsWith('var:')) {
                     overrideMap.set(key.toLowerCase(), value);
                 }
@@ -684,6 +715,14 @@ export class MemoryHostBridge implements HostBridge {
         return text.replace(/\{\{([^{}]+)\}\}/g, (match, rawInner: string) => {
             const trimmed = rawInner.trim();
             const lower = trimmed.toLowerCase();
+
+            if (lower.startsWith('outlet::')) {
+                const outletName = trimmed.slice('outlet::'.length).trim();
+                if (hasOutletTable || outletMap.size > 0) {
+                    return outletMap.get(outletName) ?? '';
+                }
+                return match;
+            }
 
             if (lower.startsWith('getvar::')) {
                 const varName = trimmed.slice('getvar::'.length).trim();
@@ -868,7 +907,38 @@ export class MemoryHostBridge implements HostBridge {
             delete this.evaluateOptionalEjs;
             return;
         }
-        this.evaluateOptionalEjs = async (text: string, vars: Record<string, unknown>) => fn(text, vars);
+        this.evaluateOptionalEjs = async (
+            text: string,
+            vars: Record<string, unknown>,
+            options?: EjsEvaluateOptions,
+        ) => {
+            const code = options?.isPrivate && text.includes('<%')
+                ? `<% await (async () => { %>${text}<% })(); %>`
+                : text;
+            return fn(code, vars, options);
+        };
+    }
+
+    createPromptInjectionSession(initialSnapshot?: SerializedPromptInjected): {
+        session: PromptInjectionSession;
+        mode: 'native' | 'fallback';
+    } {
+        return {
+            session: new LocalPromptInjectionSession(initialSnapshot),
+            mode: this.injectionSessionMode,
+        };
+    }
+
+    getEjsFeatures(): EjsFeaturesSnapshot | null {
+        return this.ejsFeatures ? { ...this.ejsFeatures } : null;
+    }
+
+    reportCompatWarning(code: string, message: string): void {
+        if (this.reportedCompatCodes.has(code)) {
+            return;
+        }
+        this.reportedCompatCodes.add(code);
+        this.compatWarnings.push({ code, message });
     }
 
     setSlashHandler(fn?: SlashCommandStub): void {

@@ -539,4 +539,31 @@ describe('DecoratorCompiler & Trigger Grouping', () => {
         ]);
         expect(syncAgent.promptBlocks[0].content).toContain('Complete EVERY task');
     });
+
+    it('captures @@if conditions on TriggerRule and keeps per-rule derivedAgentsByRuleId isolated for filter-then-merge', () => {
+        const compiler = new DecoratorCompiler();
+        const compiled = compiler.compile([
+            makeEntry({
+                uid: 301,
+                comment: 'Group Vars',
+                content: '@@variables_json\n@@group sync_pack\n@@if vars.allowVars\n更新变量。',
+            }),
+            makeEntry({
+                uid: 302,
+                comment: 'Group Lore',
+                content: '@@replace\n@@group sync_pack\n@@if vars.allowLore\n更新档案。',
+            }),
+        ]);
+
+        expect(compiled.triggers).toHaveLength(2);
+        const varsRule = compiled.triggers.find((t) => t.label === 'Group Vars')!;
+        const loreRule = compiled.triggers.find((t) => t.label === 'Group Lore')!;
+        expect(varsRule.ifConditions).toEqual(['vars.allowVars']);
+        expect(loreRule.ifConditions).toEqual(['vars.allowLore']);
+
+        const isolatedVarsAgent = compiled.derivedAgentsByRuleId[varsRule.id];
+        const isolatedLoreAgent = compiled.derivedAgentsByRuleId[loreRule.id];
+        expect(isolatedVarsAgent.permissions.write).toEqual(['/state/variables.json']);
+        expect(isolatedLoreAgent.permissions.write).toEqual(['/lorebooks/霜烬纪元/Group-Lore-302.md']);
+    });
 });

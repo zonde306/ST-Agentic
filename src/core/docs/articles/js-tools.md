@@ -18,6 +18,7 @@ export default defineTool({
     dc: z.number().int().min(1).max(30).describe('难度等级'),
   }),
   // strict: true, // 可选：启用严格 schema 标志
+  // timeoutMs: 150000, // 可选：覆盖默认 30s 超时（毫秒，上限 600000）
   async execute(args, ctx) {
     if (ctx.signal.aborted) {
       throw new Error('Aborted');
@@ -54,6 +55,7 @@ export default defineTool({
 ```
 ```
 - `allowNetwork` 默认 `true`，设为 `false` 会拦截沙箱内的 `fetch` / `XMLHttpRequest` / `WebSocket` / `EventSource` / `Worker` 等网络 API。
+- 可选 `timeoutMs=<毫秒>`（如 `@@tool comfyui_generate allowNetwork=true timeoutMs=150000`）或在 `defineTool({ ..., timeoutMs })` 中指定单次执行超时时间；默认 `30000` ms，上限 `600000` ms。
 - 代码允许使用 ```` ```js ```` 包裹，也支持 `export const helper = ...` 与顶层 `export default`。
 
 ---

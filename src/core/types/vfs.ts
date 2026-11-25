@@ -9,7 +9,8 @@ export type DataNamespace =
     | 'message'
     | 'character-files'
     | 'persona-files'
-    | 'side-files';
+    | 'side-files'
+    | 'ejs-injections';
 
 export interface CompactionReport {
     dryRun: boolean;

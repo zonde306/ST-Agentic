@@ -291,4 +291,29 @@ describe('TailRadar', () => {
         expect(multiTurn.overflowCount).toBe(1);
         expect(multiTurn.candidates[0].uid).toBe(903);
     });
+
+    it('filters out keyword-matched entries whose @@if condition evaluates to false', async () => {
+        const bridge = new MemoryHostBridge({
+            ejsEvaluator: async (text, vars) => {
+                if (text.includes('!!(vars.chapter >= 2)')) {
+                    return Number(vars.chapter) >= 2 ? 'true' : 'false';
+                }
+                return text;
+            },
+        });
+        const radar = TailRadar.fromBridge(bridge);
+        const gatedEntry = makeArchiveEntry({
+            uid: 950,
+            comment: '二章暗线',
+            keys: ['暗门'],
+            content: '@@if vars.chapter >= 2\n通往地下船坞的暗门已经打开。',
+        });
+
+        const ch1 = await radar.scan([gatedEntry], { input: '寻找暗门', vars: { chapter: 1 } });
+        expect(ch1.candidates).toHaveLength(0);
+
+        const ch2 = await radar.scan([gatedEntry], { input: '寻找暗门', vars: { chapter: 2 } });
+        expect(ch2.candidates).toHaveLength(1);
+        expect(ch2.candidates[0].uid).toBe(950);
+    });
 });

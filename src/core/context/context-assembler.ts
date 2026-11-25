@@ -1,12 +1,23 @@
-import type { HostBridge, LLMRequest } from '@/core/bridge';
+import type { HostBridge, LLMRequest, PromptInjectionSession } from '@/core/bridge';
 import {
     DEFAULT_MAIN_AGENT_ID,
     createDefaultPromptBlocks,
     matchesPromptTriggers,
 } from '@/core/config';
 import {
+    DecoratorParser,
+    LoreReadEvaluator,
+    WORLD_INFO_POSITION,
     buildCoreManifest,
     classifyEntry,
+    evaluateIfConditions,
+    extractIfConditions,
+    hasPrivateDecorator,
+    isEjsEntryEnabled,
+    isEjsForceDisabledEntry,
+    isEjsGenerateBeforeEntry,
+    isEjsSpecialEntry,
+    matchLoreEntryKeywords,
     type CoreManifestResult,
     type TailRadar,
 } from '@/core/lore';
@@ -34,6 +45,13 @@ import type {
 } from '@/core/types';
 import { canonicalClone, stripJsonSchemaMeta } from '@/core/utils';
 import { prerenderPromptBlocks, renderPromptBlockSync } from './prompt-block-renderer';
+import {
+    LocalPromptInjectionSession,
+    applyOutletsToCanonicalMessages,
+    computeInjectionDigest,
+    extractReferencedInjectKeys,
+    extractReferencedOutletKeys,
+} from './prompt-injection-session';
 import { TrajectoryStore } from './trajectory-store';
 import { estimateRequestTokens, groupLayer1Turns } from './watermark-compactor';
 
@@ -70,6 +88,12 @@ export interface AssembledContext {
     consumedSideBriefPaths: string[];
     /** Side-clue radar scan result when `TailRadar.scanSideClues` ran or was provided. */
     sideHintResult?: SideClueRadarScanResult;
+    /** Pre-rendered PromptBlocks produced during `assembleWithHost()` for reuse on in-flight tool rounds. */
+    preRenderedBlocks?: ReadonlyMap<string, CanonicalMessage[]>;
+    /** Pre-rendered Category ① `system_rule` strings produced during `assembleWithHost()`. */
+    preRenderedSystemRules?: readonly string[];
+    /** Effective macro overrides (including turn-scoped `outlet:*` entries) produced during `assembleWithHost()`. */
+    effectiveMacroOverrides?: Record<string, string>;
 }
 
 export interface SideClueProvider {
@@ -95,6 +119,12 @@ export interface ContextAssembleInput {
     forceRecompilePrefix?: boolean;
     /** Optional pre-rendered prompt blocks (keyed by `PromptBlock.id`) from async EJS / custom JSON rendering. */
     preRenderedBlocks?: ReadonlyMap<string, CanonicalMessage[]>;
+    /** Optional pre-rendered Category ① `system_rule` strings (with EJS + outlets evaluated). */
+    preRenderedSystemRules?: readonly string[];
+    /** Optional pre-rendered Layer 2 dynamic lore reminder lines (with `@@if` + EJS + outlets evaluated). */
+    preRenderedDynamicReminders?: readonly string[];
+    /** Optional Layer 0 dynamic dependency fingerprint for `prefix` `getPromptsInjected` / `{{outlet::...}}`. */
+    prefixFingerprint?: string;
 
     // Layer 1 inputs
     trajectoryStore?: TrajectoryStore;
@@ -139,6 +169,8 @@ export interface AssembleWithHostInput extends Omit<ContextAssembleInput, 'hostB
     target?: MessageTarget;
     /** Whether to automatically run `TailRadar` when `tailRadar` is provided and hints are omitted (default `true`). */
     runTailRadar?: boolean;
+    /** Optional isolated `PromptInjectionSession` shared with `before_turn` triggers. */
+    injectionSession?: PromptInjectionSession;
 }
 
 export interface FinalizeTurnInput {
@@ -381,6 +413,99 @@ export function formatSideBriefXml(clues: readonly SideClueDoc[]): string {
  * Whether `placement: 'tail'` PromptBlocks should float after `inFlightMessages` alongside
  * `floating_tail` (matching Workbench/SideGen behavior) instead of staying inside Layer 2.
  */
+const PRECOLLECT_EXCLUDED_DECORATORS = new Set([
+    '@@system',
+    '@@trigger',
+    '@@tool',
+    '@@script',
+    '@@group',
+    '@@agent',
+    '@@skill',
+    '@@json_schema',
+    '@@zod_schema',
+    '@@preset',
+    '@@batch_order',
+    '@@replace',
+    '@@replace_before',
+    '@@replace_diff',
+    '@@replace_diff_before',
+    '@@replace_search',
+    '@@replace_search_before',
+    '@@variables_json',
+    '@@variables_json_before',
+    '@@variables_yaml',
+    '@@variables_yaml_before',
+    '@@variables_jsonpatch',
+    '@@variables_jsonpatch_before',
+    '@@evaluate_ejs',
+    '@@evaluate_ejs_before',
+    '@@replace_ejs',
+    '@@replace_ejs_before',
+    '@@append_output',
+    '@@append_output_before',
+    '@@append_output_ejs',
+    '@@append_output_ejs_before',
+    '@@replace_output',
+    '@@replace_output_before',
+    '@@replace_output_ejs',
+    '@@replace_output_ejs_before',
+]);
+
+function extractMetadataVarsFallback(hostBridge?: HostBridge): Record<string, unknown> {
+    const raw = hostBridge?.getMetadata()?.variables;
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        return { ...(raw as Record<string, unknown>) };
+    }
+    return {};
+}
+
+function resolvePrefixDynamicDeps(blocks: readonly PromptBlock[]): {
+    hasAnyDynamicDeps: boolean;
+    injectKeys: string[];
+    hasDynamicInjectKey: boolean;
+    outletKeys: string[];
+} {
+    const injectKeys = new Set<string>();
+    const outletKeys = new Set<string>();
+    let hasDynamicInjectKey = false;
+
+    for (const block of blocks) {
+        const extracted = extractReferencedInjectKeys(block.content);
+        for (const k of extracted.keys) {
+            injectKeys.add(k);
+        }
+        if (extracted.hasDynamicKey) {
+            hasDynamicInjectKey = true;
+        }
+        for (const oKey of extractReferencedOutletKeys(block.content)) {
+            outletKeys.add(oKey);
+        }
+    }
+
+    return {
+        hasAnyDynamicDeps: injectKeys.size > 0 || hasDynamicInjectKey || outletKeys.size > 0,
+        injectKeys: Array.from(injectKeys).sort(compareCodeUnits),
+        hasDynamicInjectKey,
+        outletKeys: Array.from(outletKeys).sort(compareCodeUnits),
+    };
+}
+
+function computePrefixDynamicFingerprint(
+    deps: ReturnType<typeof resolvePrefixDynamicDeps>,
+    session: PromptInjectionSession,
+    outletOverrides: Record<string, string>,
+): string | undefined {
+    if (!deps.hasAnyDynamicDeps) {
+        return undefined;
+    }
+    const injectDigest =
+        deps.injectKeys.length > 0 || deps.hasDynamicInjectKey
+            ? computeInjectionDigest(session, deps.hasDynamicInjectKey ? 'all' : deps.injectKeys)
+            : '';
+    const outletParts = deps.outletKeys.map((k) => `${k}:${outletOverrides[`outlet:${k}`] ?? ''}`);
+    return `${injectDigest}|${outletParts.join('\x02')}`;
+}
+
 export function shouldFloatTailPromptBlocks(
     context?: PromptTriggerContext,
 ): boolean {
@@ -417,6 +542,8 @@ export class ContextAssembler {
         systemBasePrompt?: string;
         promptTriggerContext?: PromptTriggerContext;
         preRenderedBlocks?: ReadonlyMap<string, CanonicalMessage[]>;
+        preRenderedSystemRules?: readonly string[];
+        macroOverrides?: Record<string, string>;
         hostBridge?: HostBridge;
     }): StaticPrefixResult {
         const canonicalTools = canonicalizeTools(input.tools);
@@ -426,7 +553,11 @@ export class ContextAssembler {
         // 1. Decoupled System Base (multi-character / world-simulator safe)
         const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
         if (input.systemBasePrompt !== undefined) {
-            const resolvedBase = substituteText(input.systemBasePrompt, input.hostBridge).trim();
+            const resolvedBase = substituteText(
+                input.systemBasePrompt,
+                input.hostBridge,
+                input.macroOverrides,
+            ).trim();
             if (resolvedBase) {
                 const baseRole =
                     systemBaseBlock?.role && systemBaseBlock.role !== 'custom'
@@ -449,13 +580,18 @@ export class ContextAssembler {
                 } else {
                     const rendered = renderPromptBlockSync(systemBaseBlock, {
                         hostBridge: input.hostBridge,
+                        macroOverrides: input.macroOverrides,
                         precedingMessages: layer0Messages,
                     });
                     layer0Messages.push(...rendered);
                 }
             }
         } else {
-            const resolvedBase = substituteText(this.defaultSystemBase, input.hostBridge).trim();
+            const resolvedBase = substituteText(
+                this.defaultSystemBase,
+                input.hostBridge,
+                input.macroOverrides,
+            ).trim();
             if (resolvedBase) {
                 layer0Messages.push({
                     role: 'system',
@@ -466,24 +602,37 @@ export class ContextAssembler {
 
         // 2. Category ① `system_rule` compiled block
         const classified = input.classifiedLore ?? [];
-        const systemRules = classified
-            .filter((item) => item.category === 'system_rule' && !item.entry.disable)
-            .sort(
-                (a, b) =>
-                    b.entry.order - a.entry.order
-                    || a.entry.depth - b.entry.depth
-                    || compareCodeUnits(a.entry.world, b.entry.world)
-                    || a.entry.uid - b.entry.uid,
-            );
-
         const renderedRules: string[] = [];
-        for (const item of systemRules) {
-            const text = substituteText(item.cleanContent, input.hostBridge).trim();
-            if (!text) {
-                continue;
+        if (input.preRenderedSystemRules !== undefined) {
+            for (const ruleText of input.preRenderedSystemRules) {
+                const trimmed = ruleText.trim();
+                if (trimmed) {
+                    renderedRules.push(trimmed);
+                }
             }
-            const title = item.entry.comment?.trim();
-            renderedRules.push(title ? `### ${title}\n${text}` : text);
+        } else {
+            const systemRules = classified
+                .filter((item) => item.category === 'system_rule' && !item.entry.disable)
+                .sort(
+                    (a, b) =>
+                        b.entry.order - a.entry.order
+                        || a.entry.depth - b.entry.depth
+                        || compareCodeUnits(a.entry.world, b.entry.world)
+                        || a.entry.uid - b.entry.uid,
+                );
+
+            for (const item of systemRules) {
+                const text = substituteText(
+                    item.cleanContent,
+                    input.hostBridge,
+                    input.macroOverrides,
+                ).trim();
+                if (!text) {
+                    continue;
+                }
+                const title = item.entry.comment?.trim();
+                renderedRules.push(title ? `### ${title}\n${text}` : text);
+            }
         }
 
         if (renderedRules.length > 0) {
@@ -539,6 +688,7 @@ export class ContextAssembler {
             } else {
                 const rendered = renderPromptBlockSync(block, {
                     hostBridge: input.hostBridge,
+                    macroOverrides: input.macroOverrides,
                     precedingMessages: layer0Messages,
                 });
                 layer0Messages.push(...rendered);
@@ -611,6 +761,8 @@ export class ContextAssembler {
                 systemBasePrompt: input.systemBasePrompt,
                 promptTriggerContext: input.promptTriggerContext,
                 preRenderedBlocks: input.preRenderedBlocks,
+                preRenderedSystemRules: input.preRenderedSystemRules,
+                macroOverrides: input.macroOverrides,
                 hostBridge,
             });
             tools = prefix.tools;
@@ -625,6 +777,9 @@ export class ContextAssembler {
                         tools,
                         messages: layer0Messages,
                         layer0EndIndex,
+                        ...(input.prefixFingerprint !== undefined
+                            ? { prefixFingerprint: input.prefixFingerprint }
+                            : {}),
                     },
                     input.agent.id,
                 );
@@ -742,6 +897,11 @@ export class ContextAssembler {
             systemRuleCount,
             consumedSideBriefPaths,
             ...(sideHintResult !== undefined ? { sideHintResult } : {}),
+            ...(input.preRenderedBlocks ? { preRenderedBlocks: input.preRenderedBlocks } : {}),
+            ...(input.preRenderedSystemRules !== undefined
+                ? { preRenderedSystemRules: input.preRenderedSystemRules }
+                : {}),
+            ...(input.macroOverrides ? { effectiveMacroOverrides: input.macroOverrides } : {}),
             stats: {
                 layer0MessageCount: layer0Messages.length,
                 layer1MessageCount: layer1Messages.length,
@@ -761,7 +921,15 @@ export class ContextAssembler {
      * entries via `TailRadar` against `TrajectoryStore`'s `Read-Set`.
      */
     async assembleWithHost(input: AssembleWithHostInput): Promise<AssembledContext> {
-        const { hostBridge, tailRadar, vfs, target, runTailRadar = true, ...rest } = input;
+        const {
+            hostBridge,
+            tailRadar,
+            vfs,
+            target,
+            runTailRadar = true,
+            injectionSession,
+            ...rest
+        } = input;
 
         let loreEntries = rest.loreEntries;
         if (!loreEntries) {
@@ -790,6 +958,110 @@ export class ContextAssembler {
                 : [],
         );
 
+        const session: PromptInjectionSession =
+            injectionSession
+            ?? hostBridge.createPromptInjectionSession?.().session
+            ?? new LocalPromptInjectionSession();
+
+        const effectiveVars: Record<string, unknown> = {
+            ...extractMetadataVarsFallback(hostBridge),
+            ...(rest.vars ?? {}),
+        };
+        const invertEnabled = Boolean(hostBridge.getEjsFeatures?.()?.invertEnabled);
+        const classified = classifyAllEntries(loreEntries, rest.wiRouterOverrides);
+        const keywordHaystack = userText
+            ? (recentTextHistory.length > 0 ? `${recentTextHistory.join('\n')}\n${userText}` : userText)
+            : recentTextHistory.join('\n');
+
+        // Step A: World Info `injectPrompt` pre-collection pass (e.g. @@generate_before / [GENERATE:BEFORE] / pure scripts)
+        if (rest.inFlightMessages === undefined && loreEntries.length > 0) {
+            const preCollectCandidates: Array<{
+                entry: RawLoreEntry;
+                decorators: ReturnType<typeof DecoratorParser.parseEntry>['decorators'];
+                cleanContent: string;
+            }> = [];
+
+            for (const rawItem of loreEntries) {
+                const entry = isClassifiedLoreEntry(rawItem) ? rawItem.entry : rawItem;
+                const parsed = DecoratorParser.parseEntry(entry);
+                if (parsed.decorators.some((d) => PRECOLLECT_EXCLUDED_DECORATORS.has(d.name))) {
+                    continue;
+                }
+                if (isEjsForceDisabledEntry(parsed.decorators)) {
+                    continue;
+                }
+
+                const isGenBefore = isEjsGenerateBeforeEntry(entry, parsed.decorators, parsed.cleanContent);
+                const enabled = isEjsEntryEnabled(entry, parsed.decorators, { invertEnabled });
+                if (!enabled) {
+                    continue;
+                }
+
+                const isSpecial = isEjsSpecialEntry(entry, parsed.decorators);
+                if (isSpecial && !isGenBefore) {
+                    continue;
+                }
+
+                const isPreCollect =
+                    isGenBefore
+                    || (parsed.cleanContent.includes('<%') && parsed.cleanContent.includes('injectPrompt('))
+                    || (classifyEntry(entry, { overrides: rest.wiRouterOverrides }).reason === 'pure_script');
+                if (!isPreCollect) {
+                    continue;
+                }
+
+                if (!entry.constant) {
+                    if (!keywordHaystack || !Array.isArray(entry.keys) || entry.keys.length === 0) {
+                        continue;
+                    }
+                    const matched = matchLoreEntryKeywords(entry, keywordHaystack, {
+                        substituteMacros: (t, ov) => hostBridge.substituteMacros(t, ov),
+                        macroOverrides: buildLayer2MacroOverrides(effectiveVars, rest.macroOverrides),
+                    });
+                    if (!matched) {
+                        continue;
+                    }
+                }
+
+                preCollectCandidates.push({
+                    entry,
+                    decorators: parsed.decorators,
+                    cleanContent: parsed.cleanContent,
+                });
+            }
+
+            preCollectCandidates.sort(
+                (a, b) =>
+                    b.entry.order - a.entry.order
+                    || a.entry.depth - b.entry.depth
+                    || compareCodeUnits(a.entry.world, b.entry.world)
+                    || a.entry.uid - b.entry.uid,
+            );
+
+            const preCollectMacroOverrides = buildLayer2MacroOverrides(effectiveVars, rest.macroOverrides);
+            for (const item of preCollectCandidates) {
+                const ifConds = extractIfConditions(item.decorators);
+                const passed = await evaluateIfConditions(ifConds, hostBridge, effectiveVars, {
+                    injectionSession: session,
+                });
+                if (!passed) {
+                    continue;
+                }
+                const substituted = hostBridge.substituteMacros(item.cleanContent, preCollectMacroOverrides);
+                if (hostBridge.evaluateOptionalEjs && substituted.includes('<%')) {
+                    try {
+                        await hostBridge.evaluateOptionalEjs(substituted, effectiveVars, {
+                            injectionSession: session,
+                            ...(hasPrivateDecorator(item.decorators) ? { isPrivate: true } : {}),
+                        });
+                    } catch {
+                        // Non-fatal in pre-collection pass
+                    }
+                }
+            }
+        }
+
+        // Step B: TailRadar scan (passing shared injectionSession so @@if & EJS inside Category ③ see pre-collected injections)
         let loreHint = rest.loreHint;
         const shouldScanLoreRadar =
             runTailRadar
@@ -798,7 +1070,6 @@ export class ContextAssembler {
             && tailRadar !== undefined;
 
         if (shouldScanLoreRadar && tailRadar && userText) {
-            const classified = classifyAllEntries(loreEntries, rest.wiRouterOverrides);
             loreHint = await tailRadar.scan(classified, {
                 input: userText,
                 recentMessages: recentTextHistory,
@@ -806,6 +1077,7 @@ export class ContextAssembler {
                 target,
                 vars: rest.vars,
                 macroOverrides: rest.macroOverrides,
+                injectionSession: session,
             });
         }
 
@@ -827,9 +1099,6 @@ export class ContextAssembler {
             });
         }
 
-        // Pre-render PromptBlocks asynchronously (EJS + custom JSON):
-        // - `prefix` blocks ONLY when Layer 0 is not frozen (or forceRecompilePrefix) to preserve KV cache invariance
-        // - `tail` blocks on every new turn (Layer 2 dynamic tail)
         const preRenderedBlocks = new Map<string, CanonicalMessage[]>(
             rest.preRenderedBlocks ? Array.from(rest.preRenderedBlocks.entries()) : [],
         );
@@ -843,100 +1112,324 @@ export class ContextAssembler {
             && rest.promptTriggerContext !== undefined
             && rest.promptTriggerContext.kind !== 'main'
             && hasTriggerScopedBlocks;
-        const willUseFrozenPrefix =
+        const existingFrozen =
             isPersistent
             && !rest.forceRecompilePrefix
             && !isNonMainTriggerRun
-            && Boolean(rest.trajectoryStore?.getFrozenPrefix(rest.agent.id));
+                ? rest.trajectoryStore?.getFrozenPrefix(rest.agent.id) ?? null
+                : null;
 
-        if (!willUseFrozenPrefix) {
-            const prefixBlocksToRender: PromptBlock[] = [];
-            const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
-            if (
-                rest.systemBasePrompt === undefined
-                && systemBaseBlock
-                && systemBaseBlock.enabled
-                && systemBaseBlock.content.trim().length > 0
-                && matchesPromptTriggers(systemBaseBlock.triggers, rest.promptTriggerContext)
-                && !preRenderedBlocks.has(systemBaseBlock.id)
-            ) {
-                prefixBlocksToRender.push(systemBaseBlock);
-            }
-            for (const block of promptBlocks) {
-                if (
-                    block.enabled
-                    && block.placement === 'prefix'
-                    && block.id !== 'system_base'
-                    && block.content.trim().length > 0
-                    && matchesPromptTriggers(block.triggers, rest.promptTriggerContext)
-                    && !preRenderedBlocks.has(block.id)
-                ) {
-                    prefixBlocksToRender.push(block);
+        // Step C: Build ST native `{{outlet::key}}` table for this turn (using forceOutlet=true so nested getPromptsInjected supports forward refs)
+        const outletMacroOverrides: Record<string, string> = {
+            __has_outlet_table__: '1',
+        };
+        const outletEntries = classified
+            .filter(
+                (item) =>
+                    !item.entry.disable
+                    && item.entry.position === WORLD_INFO_POSITION.outlet
+                    && Boolean(item.entry.outletName?.trim())
+                    && !isEjsForceDisabledEntry(item.decorators),
+            )
+            .sort(
+                (a, b) =>
+                    b.entry.order - a.entry.order
+                    || a.entry.depth - b.entry.depth
+                    || compareCodeUnits(a.entry.world, b.entry.world)
+                    || a.entry.uid - b.entry.uid,
+            );
+
+        if (outletEntries.length > 0) {
+            const outletBuckets = new Map<string, string[]>();
+            const outletEvaluator = new LoreReadEvaluator(hostBridge);
+            const baseMacroOverrides = buildLayer2MacroOverrides(effectiveVars, rest.macroOverrides);
+
+            session.setForceOutlet(true);
+            try {
+                for (const item of outletEntries) {
+                    const outletName = item.entry.outletName?.trim();
+                    if (!outletName) {
+                        continue;
+                    }
+                    if (!item.entry.constant) {
+                        if (!keywordHaystack || !Array.isArray(item.entry.keys) || item.entry.keys.length === 0) {
+                            continue;
+                        }
+                        const matched = matchLoreEntryKeywords(item.entry, keywordHaystack, {
+                            substituteMacros: (t, ov) => hostBridge.substituteMacros(t, ov),
+                            macroOverrides: baseMacroOverrides,
+                        });
+                        if (!matched) {
+                            continue;
+                        }
+                    }
+
+                    const evaluated = await outletEvaluator.evaluate(item, {
+                        target,
+                        vars: effectiveVars,
+                        macroOverrides: baseMacroOverrides,
+                        injectionSession: session,
+                    });
+                    if (evaluated.conditionSkipped || !evaluated.text.trim()) {
+                        continue;
+                    }
+                    const list = outletBuckets.get(outletName) ?? [];
+                    list.push(evaluated.text.trim());
+                    outletBuckets.set(outletName, list);
                 }
+            } finally {
+                session.setForceOutlet(false);
             }
-            if (prefixBlocksToRender.length > 0) {
-                const renderedPrefix = await prerenderPromptBlocks(prefixBlocksToRender, {
-                    hostBridge,
-                    vars: rest.vars,
-                });
-                for (const [blockId, messages] of renderedPrefix.entries()) {
-                    preRenderedBlocks.set(blockId, messages);
-                }
+
+            for (const [key, parts] of outletBuckets.entries()) {
+                outletMacroOverrides[`outlet:${key}`] = parts.join('\n');
             }
         }
 
-        const floatTailBlocks = shouldFloatTailPromptBlocks(rest.promptTriggerContext);
+        const combinedMacroOverrides: Record<string, string> = {
+            ...(rest.macroOverrides ?? {}),
+            ...outletMacroOverrides,
+        };
 
-        if (!floatTailBlocks && rest.inFlightMessages === undefined) {
-            const tailBlocksToRender = promptBlocks.filter(
+        // Determine matching prefix blocks and check Layer 0 dynamic dirty fingerprint
+        const matchingPrefixBlocks: PromptBlock[] = [];
+        const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
+        if (
+            rest.systemBasePrompt === undefined
+            && systemBaseBlock
+            && systemBaseBlock.enabled
+            && systemBaseBlock.content.trim().length > 0
+            && matchesPromptTriggers(systemBaseBlock.triggers, rest.promptTriggerContext)
+        ) {
+            matchingPrefixBlocks.push(systemBaseBlock);
+        }
+        for (const block of promptBlocks) {
+            if (
+                block.enabled
+                && block.placement === 'prefix'
+                && block.id !== 'system_base'
+                && block.content.trim().length > 0
+                && matchesPromptTriggers(block.triggers, rest.promptTriggerContext)
+            ) {
+                matchingPrefixBlocks.push(block);
+            }
+        }
+
+        const prefixDeps = resolvePrefixDynamicDeps(matchingPrefixBlocks);
+        const initialPrefixFingerprint = computePrefixDynamicFingerprint(
+            prefixDeps,
+            session,
+            outletMacroOverrides,
+        );
+        const dynamicPrefixChanged =
+            Boolean(existingFrozen)
+            && prefixDeps.hasAnyDynamicDeps
+            && existingFrozen?.prefixFingerprint !== initialPrefixFingerprint;
+
+        const effectiveForceRecompilePrefix = Boolean(rest.forceRecompilePrefix) || dynamicPrefixChanged;
+        const willUseFrozenPrefix = Boolean(existingFrozen) && !effectiveForceRecompilePrefix;
+
+        // Step D: Phase 1 — Render blocks & inline lore with forceOutlet=true
+        const newlyRenderedPrefixIds: string[] = [];
+        const newlyRenderedTailIds: string[] = [];
+        const newlyRenderedFloatingIds: string[] = [];
+        let preRenderedSystemRules: string[] | undefined = rest.preRenderedSystemRules
+            ? [...rest.preRenderedSystemRules]
+            : undefined;
+        let preRenderedDynamicReminders: string[] | undefined = rest.preRenderedDynamicReminders
+            ? [...rest.preRenderedDynamicReminders]
+            : undefined;
+
+        session.setForceOutlet(true);
+        try {
+            if (!willUseFrozenPrefix) {
+                const prefixBlocksToRender = matchingPrefixBlocks.filter(
+                    (block) => !preRenderedBlocks.has(block.id),
+                );
+                if (prefixBlocksToRender.length > 0) {
+                    const renderedPrefix = await prerenderPromptBlocks(prefixBlocksToRender, {
+                        hostBridge,
+                        macroOverrides: combinedMacroOverrides,
+                        vars: rest.vars,
+                        injectionSession: session,
+                    });
+                    for (const [blockId, messages] of renderedPrefix.entries()) {
+                        preRenderedBlocks.set(blockId, messages);
+                        newlyRenderedPrefixIds.push(blockId);
+                    }
+                }
+
+                if (preRenderedSystemRules === undefined) {
+                    const systemRuleEntries = classified
+                        .filter((item) => item.category === 'system_rule' && !item.entry.disable)
+                        .sort(
+                            (a, b) =>
+                                b.entry.order - a.entry.order
+                                || a.entry.depth - b.entry.depth
+                                || compareCodeUnits(a.entry.world, b.entry.world)
+                                || a.entry.uid - b.entry.uid,
+                        );
+                    const renderedRulesList: string[] = [];
+                    for (const item of systemRuleEntries) {
+                        const ifConds = extractIfConditions(item.decorators);
+                        const passed = await evaluateIfConditions(ifConds, hostBridge, effectiveVars, {
+                            injectionSession: session,
+                        });
+                        if (!passed) {
+                            continue;
+                        }
+                        let text = substituteText(item.cleanContent, hostBridge, combinedMacroOverrides);
+                        if (hostBridge.evaluateOptionalEjs && text.includes('<%')) {
+                            try {
+                                text = await hostBridge.evaluateOptionalEjs(text, effectiveVars, {
+                                    injectionSession: session,
+                                    ...(hasPrivateDecorator(item.decorators) ? { isPrivate: true } : {}),
+                                });
+                            } catch {
+                                // Keep macro-substituted fallback text
+                            }
+                        }
+                        const trimmed = text.trim();
+                        if (!trimmed) {
+                            continue;
+                        }
+                        const title = item.entry.comment?.trim();
+                        renderedRulesList.push(title ? `### ${title}\n${trimmed}` : trimmed);
+                    }
+                    preRenderedSystemRules = renderedRulesList;
+                }
+            }
+
+            const floatTailBlocks = shouldFloatTailPromptBlocks(rest.promptTriggerContext);
+            const layer2MacroOverrides = buildLayer2MacroOverrides(rest.vars, combinedMacroOverrides);
+
+            if (rest.inFlightMessages === undefined && rest.includeCategory4DynamicEntries !== false && preRenderedDynamicReminders === undefined) {
+                const dynamicEntries = classified
+                    .filter(
+                        (item) =>
+                            item.category === 'dynamic_or_trigger'
+                            && !item.entry.disable
+                            && (item.reason === 'dynamic_at_depth' || item.reason === 'conditional_dynamic'),
+                    )
+                    .sort(
+                        (a, b) =>
+                            b.entry.order - a.entry.order
+                            || a.entry.depth - b.entry.depth
+                            || compareCodeUnits(a.entry.world, b.entry.world)
+                            || a.entry.uid - b.entry.uid,
+                    );
+                const renderedReminders: string[] = [];
+                for (const item of dynamicEntries) {
+                    const ifConds = extractIfConditions(item.decorators);
+                    const passed = await evaluateIfConditions(ifConds, hostBridge, effectiveVars, {
+                        injectionSession: session,
+                    });
+                    if (!passed) {
+                        continue;
+                    }
+                    let text = substituteText(item.cleanContent, hostBridge, layer2MacroOverrides);
+                    if (hostBridge.evaluateOptionalEjs && text.includes('<%')) {
+                        try {
+                            text = await hostBridge.evaluateOptionalEjs(text, effectiveVars, {
+                                injectionSession: session,
+                                ...(hasPrivateDecorator(item.decorators) ? { isPrivate: true } : {}),
+                            });
+                        } catch {
+                            // Keep macro-substituted fallback text
+                        }
+                    }
+                    const trimmed = text.trim();
+                    if (trimmed) {
+                        renderedReminders.push(trimmed);
+                    }
+                }
+                preRenderedDynamicReminders = renderedReminders;
+            }
+
+            if (!floatTailBlocks && rest.inFlightMessages === undefined) {
+                const tailBlocksToRender = promptBlocks.filter(
+                    (b: PromptBlock) =>
+                        b.enabled
+                        && b.placement === 'tail'
+                        && b.content.trim().length > 0
+                        && matchesPromptTriggers(b.triggers, rest.promptTriggerContext)
+                        && !preRenderedBlocks.has(b.id),
+                );
+                if (tailBlocksToRender.length > 0) {
+                    const renderedTail = await prerenderPromptBlocks(tailBlocksToRender, {
+                        hostBridge,
+                        macroOverrides: layer2MacroOverrides,
+                        vars: rest.vars,
+                        injectionSession: session,
+                    });
+                    for (const [blockId, messages] of renderedTail.entries()) {
+                        preRenderedBlocks.set(blockId, messages);
+                        newlyRenderedTailIds.push(blockId);
+                    }
+                }
+            }
+
+            const floatingBlocksToRender = promptBlocks.filter(
                 (b: PromptBlock) =>
                     b.enabled
-                    && b.placement === 'tail'
+                    && (b.placement === 'floating_tail' || (floatTailBlocks && b.placement === 'tail'))
                     && b.content.trim().length > 0
                     && matchesPromptTriggers(b.triggers, rest.promptTriggerContext)
                     && !preRenderedBlocks.has(b.id),
             );
-            if (tailBlocksToRender.length > 0) {
-                const tailMacroOverrides = buildLayer2MacroOverrides(rest.vars, rest.macroOverrides);
-                const renderedTail = await prerenderPromptBlocks(tailBlocksToRender, {
+            if (floatingBlocksToRender.length > 0) {
+                const renderedFloating = await prerenderPromptBlocks(floatingBlocksToRender, {
                     hostBridge,
-                    macroOverrides: tailMacroOverrides,
+                    macroOverrides: layer2MacroOverrides,
                     vars: rest.vars,
+                    injectionSession: session,
                 });
-                for (const [blockId, messages] of renderedTail.entries()) {
+                for (const [blockId, messages] of renderedFloating.entries()) {
                     preRenderedBlocks.set(blockId, messages);
+                    newlyRenderedFloatingIds.push(blockId);
                 }
             }
+        } finally {
+            session.setForceOutlet(false);
         }
 
-        const floatingBlocksToRender = promptBlocks.filter(
-            (b: PromptBlock) =>
-                b.enabled
-                && (b.placement === 'floating_tail' || (floatTailBlocks && b.placement === 'tail'))
-                && b.content.trim().length > 0
-                && matchesPromptTriggers(b.triggers, rest.promptTriggerContext)
-                && !preRenderedBlocks.has(b.id),
-        );
-        if (floatingBlocksToRender.length > 0) {
-            const floatingMacroOverrides = buildLayer2MacroOverrides(rest.vars, rest.macroOverrides);
-            const renderedFloating = await prerenderPromptBlocks(floatingBlocksToRender, {
-                hostBridge,
-                macroOverrides: floatingMacroOverrides,
-                vars: rest.vars,
-            });
-            for (const [blockId, messages] of renderedFloating.entries()) {
-                preRenderedBlocks.set(blockId, messages);
+        // Step E: Phase 2 — Expand delayed {{outletPromptsInjected:...}} placeholders across all rendered parts
+        for (const blockId of [...newlyRenderedPrefixIds, ...newlyRenderedTailIds, ...newlyRenderedFloatingIds]) {
+            const msgs = preRenderedBlocks.get(blockId);
+            if (msgs) {
+                preRenderedBlocks.set(blockId, applyOutletsToCanonicalMessages(msgs, session));
             }
         }
+        if (preRenderedSystemRules) {
+            preRenderedSystemRules = preRenderedSystemRules
+                .map((rule) => session.applyOutlets(rule).trim())
+                .filter(Boolean);
+        }
+        if (preRenderedDynamicReminders) {
+            preRenderedDynamicReminders = preRenderedDynamicReminders
+                .map((line) => session.applyOutlets(line).trim())
+                .filter(Boolean);
+        }
+
+        const finalPrefixFingerprint = computePrefixDynamicFingerprint(
+            prefixDeps,
+            session,
+            outletMacroOverrides,
+        );
 
         return this.assemble({
             ...rest,
+            forceRecompilePrefix: effectiveForceRecompilePrefix,
             loreEntries,
             loreHint,
             sideClues,
             sideHint,
             tailRadar: runTailRadar ? tailRadar : undefined,
             preRenderedBlocks,
+            ...(preRenderedSystemRules !== undefined ? { preRenderedSystemRules } : {}),
+            ...(preRenderedDynamicReminders !== undefined ? { preRenderedDynamicReminders } : {}),
+            ...(finalPrefixFingerprint !== undefined ? { prefixFingerprint: finalPrefixFingerprint } : {}),
+            macroOverrides: combinedMacroOverrides,
             hostBridge,
         });
     }
@@ -967,27 +1460,36 @@ export class ContextAssembler {
         const layer2Messages: CanonicalMessage[] = [];
         const macroOverrides = buildLayer2MacroOverrides(input.vars, input.macroOverrides);
 
-        // 1. Dynamic reminders: Category ④ `dynamic_at_depth` + explicit `dynamicReminders`
+        // 1. Dynamic reminders: Category ④ `dynamic_at_depth` + `conditional_dynamic` + explicit `dynamicReminders`
         const reminderLines: string[] = [];
         if (input.includeCategory4DynamicEntries !== false) {
-            const dynamicEntries = classified
-                .filter(
-                    (item) =>
-                        item.category === 'dynamic_or_trigger'
-                        && !item.entry.disable
-                        && item.reason === 'dynamic_at_depth',
-                )
-                .sort(
-                    (a, b) =>
-                        b.entry.order - a.entry.order
-                        || a.entry.depth - b.entry.depth
-                        || compareCodeUnits(a.entry.world, b.entry.world)
-                        || a.entry.uid - b.entry.uid,
-                );
-            for (const item of dynamicEntries) {
-                const rendered = substituteText(item.cleanContent, input.hostBridge, macroOverrides).trim();
-                if (rendered) {
-                    reminderLines.push(rendered);
+            if (input.preRenderedDynamicReminders !== undefined) {
+                for (const line of input.preRenderedDynamicReminders) {
+                    const trimmed = line.trim();
+                    if (trimmed) {
+                        reminderLines.push(trimmed);
+                    }
+                }
+            } else {
+                const dynamicEntries = classified
+                    .filter(
+                        (item) =>
+                            item.category === 'dynamic_or_trigger'
+                            && !item.entry.disable
+                            && (item.reason === 'dynamic_at_depth' || item.reason === 'conditional_dynamic'),
+                    )
+                    .sort(
+                        (a, b) =>
+                            b.entry.order - a.entry.order
+                            || a.entry.depth - b.entry.depth
+                            || compareCodeUnits(a.entry.world, b.entry.world)
+                            || a.entry.uid - b.entry.uid,
+                    );
+                for (const item of dynamicEntries) {
+                    const rendered = substituteText(item.cleanContent, input.hostBridge, macroOverrides).trim();
+                    if (rendered) {
+                        reminderLines.push(rendered);
+                    }
                 }
             }
         }

@@ -5,6 +5,7 @@ import type {
     LLMStreamChunk,
     LLMToolChoice,
     LLMTransport,
+    PromptInjectionSession,
     ToolExecutionContext,
     ToolSideGenApi,
 } from '@/core/bridge';
@@ -16,6 +17,7 @@ import {
     resolveConnection,
 } from '@/core/config';
 import {
+    applyOutletsToCanonicalMessages,
     buildLayer2MacroOverrides,
     buildMainSurfaceMacroOverrides,
     buildWorkspaceNotices,
@@ -88,6 +90,7 @@ import type {
     Settings,
     TokenUsage,
     ToolStepLog,
+    WICategory,
 } from '@/core/types';
 import { canonicalClone, canonicalStringify, normalizeVfsPath } from '@/core/utils';
 import { OUTPUT_FILE_PATH, VirtualFileSystem } from '@/core/vfs';
@@ -99,6 +102,7 @@ import {
 
 export const FINISH_TURN_TOOL_NAME = 'finish_turn';
 const FINISH_TURN_DESCRIPTION = 'Complete the current turn and submit the final result.';
+let agentRunSandboxSeq = 0;
 
 export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
     'list_dir',
@@ -280,6 +284,8 @@ export interface AgentRunInput {
     resumeMessages?: readonly CanonicalMessage[];
     /** Prior `Read-Set` snapshot restored on resume without scanning `TrajectoryStore`. */
     initialReadSet?: ReadonlyMap<string, string> | Record<string, string>;
+    /** Isolated per-turn `injectPrompt` / `getPromptsInjected` session shared across phases. */
+    injectionSession?: PromptInjectionSession;
     /** Internal recursion guard for nested `@@agent` delegation. */
     delegationDepth?: number;
     onTextDelta?: (delta: string) => void;
@@ -986,10 +992,22 @@ export class AgentRunner {
 
     /** Execute a full single-agent or multi-round tool-calling turn. */
     async run(input: AgentRunInput): Promise<AgentRunResult> {
-        return await this.runInternal(input);
+        const runSandboxIds: string[] = [];
+        try {
+            return await this.runInternal(input, runSandboxIds);
+        } finally {
+            if (this.sandbox?.dispose) {
+                for (const sbId of runSandboxIds) {
+                    this.sandbox.dispose(sbId);
+                }
+            }
+        }
     }
 
-    private async runInternal(input: AgentRunInput): Promise<AgentRunResult> {
+    private async runInternal(
+        input: AgentRunInput,
+        runSandboxIds: string[],
+    ): Promise<AgentRunResult> {
         const target = assertValidTarget(input.target);
         const signal = input.signal ?? new AbortController().signal;
         throwIfAborted(signal);
@@ -1083,6 +1101,8 @@ export class AgentRunner {
             input.vars ?? (await this.vfs.readVariables({ target, staged }).catch(() => ({})));
         throwIfAborted(signal);
 
+        const runSandboxScope = `${runId}_s${++agentRunSandboxSeq}`;
+
         // Compile tool registry for this run (built-ins + preset customTools + @@tool + @@agent + extraTools)
         const { registry, autoAttachedToolNames } = await this.buildRunRegistry({
             agent,
@@ -1102,6 +1122,8 @@ export class AgentRunner {
             target,
             connection,
             presetFiles: preset.files,
+            sandboxScope: runSandboxScope,
+            createdSandboxIds: runSandboxIds,
             signal,
         });
 
@@ -1442,6 +1464,7 @@ export class AgentRunner {
             );
             const isNonMainTriggerRun =
                 isPersistent
+                && promptTriggerContext !== undefined
                 && promptTriggerContext.kind !== 'main'
                 && hasTriggerScopedBlocks;
             const willUseFrozenPrefix =
@@ -1451,65 +1474,107 @@ export class AgentRunner {
                 && Boolean(this.trajectoryStore.getFrozenPrefix(effectiveAgent.id));
 
             let preRenderedBlocks: Map<string, CanonicalMessage[]> | undefined;
-            if (!willUseFrozenPrefix) {
-                const prefixBlocksToRender: PromptBlock[] = [];
-                const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
-                if (
-                    input.systemBasePrompt === undefined
-                    && systemBaseBlock
-                    && systemBaseBlock.enabled
-                    && systemBaseBlock.content.trim().length > 0
-                    && matchesPromptTriggers(systemBaseBlock.triggers, promptTriggerContext)
-                ) {
-                    prefixBlocksToRender.push(systemBaseBlock);
+            if (input.resumeMessages !== undefined) {
+                if (input.injectionSession) {
+                    input.injectionSession.setForceOutlet(true);
                 }
-                for (const block of promptBlocks) {
-                    if (
-                        block.enabled
-                        && block.placement === 'prefix'
-                        && block.id !== 'system_base'
-                        && block.content.trim().length > 0
-                        && matchesPromptTriggers(block.triggers, promptTriggerContext)
-                    ) {
-                        prefixBlocksToRender.push(block);
+                try {
+                    if (!willUseFrozenPrefix) {
+                        const prefixBlocksToRender: PromptBlock[] = [];
+                        const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
+                        if (
+                            input.systemBasePrompt === undefined
+                            && systemBaseBlock
+                            && systemBaseBlock.enabled
+                            && systemBaseBlock.content.trim().length > 0
+                            && matchesPromptTriggers(systemBaseBlock.triggers, promptTriggerContext)
+                        ) {
+                            prefixBlocksToRender.push(systemBaseBlock);
+                        }
+                        for (const block of promptBlocks) {
+                            if (
+                                block.enabled
+                                && block.placement === 'prefix'
+                                && block.id !== 'system_base'
+                                && block.content.trim().length > 0
+                                && matchesPromptTriggers(block.triggers, promptTriggerContext)
+                            ) {
+                                prefixBlocksToRender.push(block);
+                            }
+                        }
+                        if (prefixBlocksToRender.length > 0) {
+                            preRenderedBlocks = await prerenderPromptBlocks(prefixBlocksToRender, {
+                                hostBridge: this.bridge,
+                                macroOverrides: preRenderMacroOverrides,
+                                vars: workingVars,
+                                injectionSession: input.injectionSession,
+                            });
+                            throwIfAborted(signal);
+                        }
+                    }
+
+                    const floatTailBlocks = shouldFloatTailPromptBlocks(promptTriggerContext);
+                    const floatingTailBlocksToRender = promptBlocks.filter(
+                        (block) =>
+                            block.enabled
+                            && (block.placement === 'floating_tail'
+                                || (floatTailBlocks && block.placement === 'tail'))
+                            && block.content.trim().length > 0
+                            && matchesPromptTriggers(block.triggers, promptTriggerContext),
+                    );
+                    if (floatingTailBlocksToRender.length > 0) {
+                        const renderedFloating = await prerenderPromptBlocks(floatingTailBlocksToRender, {
+                            hostBridge: this.bridge,
+                            macroOverrides: preRenderMacroOverrides,
+                            vars: workingVars,
+                            injectionSession: input.injectionSession,
+                        });
+                        throwIfAborted(signal);
+                        if (!preRenderedBlocks) {
+                            preRenderedBlocks = renderedFloating;
+                        } else {
+                            for (const [blockId, messages] of renderedFloating.entries()) {
+                                preRenderedBlocks.set(blockId, messages);
+                            }
+                        }
+                    }
+                } finally {
+                    if (input.injectionSession) {
+                        input.injectionSession.setForceOutlet(false);
                     }
                 }
-                if (prefixBlocksToRender.length > 0) {
-                    preRenderedBlocks = await prerenderPromptBlocks(prefixBlocksToRender, {
-                        hostBridge: this.bridge,
-                        macroOverrides: preRenderMacroOverrides,
-                        vars: workingVars,
-                    });
-                    throwIfAborted(signal);
+
+                if (preRenderedBlocks && input.injectionSession) {
+                    for (const [blockId, msgs] of preRenderedBlocks.entries()) {
+                        preRenderedBlocks.set(
+                            blockId,
+                            applyOutletsToCanonicalMessages(msgs, input.injectionSession),
+                        );
+                    }
                 }
             }
 
-            const floatTailBlocks = shouldFloatTailPromptBlocks(promptTriggerContext);
-            const floatingTailBlocksToRender = promptBlocks.filter(
-                (block) =>
-                    block.enabled
-                    && (block.placement === 'floating_tail'
-                        || (floatTailBlocks && block.placement === 'tail'))
-                    && block.content.trim().length > 0
-                    && matchesPromptTriggers(block.triggers, promptTriggerContext),
-            );
-            if (floatingTailBlocksToRender.length > 0) {
-                const renderedFloating = await prerenderPromptBlocks(floatingTailBlocksToRender, {
-                    hostBridge: this.bridge,
-                    macroOverrides: preRenderMacroOverrides,
-                    vars: workingVars,
-                });
-                throwIfAborted(signal);
-                if (!preRenderedBlocks) {
-                    preRenderedBlocks = renderedFloating;
-                } else {
-                    for (const [blockId, messages] of renderedFloating.entries()) {
-                        preRenderedBlocks.set(blockId, messages);
-                    }
-                }
-            }
-
-            const baseAssembleInput = {
+            const baseAssembleInput: {
+                agent: AgentProfile;
+                connectionId: string;
+                tools: CanonicalToolSchema[];
+                characterFields: Record<string, string>;
+                personaDescription: string;
+                loreEntries: readonly (RawLoreEntry | ClassifiedLoreEntry)[];
+                wiRouterOverrides: Record<string, WICategory>;
+                presetFiles: Record<string, string>;
+                systemBasePrompt?: string;
+                promptTriggerContext: PromptTriggerContext;
+                preRenderedBlocks?: ReadonlyMap<string, CanonicalMessage[]>;
+                preRenderedSystemRules?: readonly string[];
+                trajectoryStore?: TrajectoryStore;
+                recentChatMessages?: readonly (CanonicalMessage | ChatMessageSnapshot)[];
+                hostBridge: HostBridge;
+                regex?: RegexSource;
+                vars: Record<string, unknown>;
+                macroOverrides?: Record<string, string>;
+                signal: AbortSignal;
+            } = {
                 agent: effectiveAgent,
                 connectionId: connection.id,
                 tools: canonicalTools,
@@ -1568,9 +1633,20 @@ export class AgentRunner {
                     runTailRadar: input.runTailRadar ?? (input.phase === 'main_turn'),
                     target,
                     tailRadar: this.tailRadar,
+                    ...(input.injectionSession ? { injectionSession: input.injectionSession } : {}),
                     ...(workspaceNotices.noticeXml ? { workspaceNotice: workspaceNotices.noticeXml } : {}),
                     ...(isMainTurnRoot ? { vfs: this.vfs } : {}),
                 });
+
+            if (currentAssembled.preRenderedBlocks) {
+                baseAssembleInput.preRenderedBlocks = currentAssembled.preRenderedBlocks;
+            }
+            if (currentAssembled.preRenderedSystemRules !== undefined) {
+                baseAssembleInput.preRenderedSystemRules = currentAssembled.preRenderedSystemRules;
+            }
+            if (currentAssembled.effectiveMacroOverrides) {
+                baseAssembleInput.macroOverrides = currentAssembled.effectiveMacroOverrides;
+            }
 
             const consumedSideBriefPaths =
                 input.resumeMessages === undefined && isMainTurnRoot
@@ -2830,12 +2906,15 @@ export class AgentRunner {
         target: MessageTarget;
         connection: ApiConnection;
         presetFiles: Record<string, string>;
+        sandboxScope: string;
+        createdSandboxIds: string[];
         signal: AbortSignal;
     }): Promise<{ registry: ToolRegistry; autoAttachedToolNames: string[] }> {
         const registry = this.baseToolRegistry.clone();
         const autoAttachedToolNames: string[] = [];
 
         // 1. Register preset customTools allowed for this agent
+        let customIdx = 0;
         for (const custom of params.preset.customTools ?? []) {
             if (!custom.enabled) {
                 continue;
@@ -2850,7 +2929,13 @@ export class AgentRunner {
                 continue;
             }
             try {
+                let sandboxId: string | undefined;
+                if (custom.kind === 'js') {
+                    sandboxId = `${params.sandboxScope}:custom:${customIdx++}:${custom.id?.trim() || custom.name?.trim() || 'tool'}`;
+                    params.createdSandboxIds.push(sandboxId);
+                }
                 const compiled = await compileCustomToolConfig(custom, this.sandbox, {
+                    ...(sandboxId ? { sandboxId } : {}),
                     signal: params.signal,
                 });
                 for (const tool of compiled) {
@@ -2864,6 +2949,7 @@ export class AgentRunner {
         // 2. Register @@tool World Info entries when ScriptSandbox is available
         const rawLore = unwrapRawLoreEntries(params.loreEntries);
         if (this.sandbox) {
+            let loreIdx = 0;
             for (const entry of rawLore) {
                 if (entry.disable) {
                     continue;
@@ -2873,7 +2959,10 @@ export class AgentRunner {
                     continue;
                 }
                 try {
+                    const sandboxId = `${params.sandboxScope}:lore:${loreIdx++}:${entry.world}:${entry.uid}`;
+                    params.createdSandboxIds.push(sandboxId);
                     const compiled = await compileLoreToolEntry(entry, this.sandbox, {
+                        sandboxId,
                         signal: params.signal,
                     });
                     for (const tool of compiled) {
@@ -3084,7 +3173,7 @@ export class AgentRunner {
             };
 
         try {
-            const childResult = await this.runInternal({
+            const childResult = await this.run({
                 agent: childProfile,
                 preset: parentParams.preset,
                 target: parentParams.target,

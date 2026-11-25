@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { createDefaultConnection, createDefaultMainAgent } from '@/core/config';
-import { ContextAssembler, TrajectoryStore } from '@/core/context';
+import {
+    ContextAssembler,
+    LocalPromptInjectionSession,
+    TrajectoryStore,
+} from '@/core/context';
 import { PayloadCompiler } from '@/core/llm';
 import { TailRadar, WIClassifier } from '@/core/lore';
 import { RegexPipeline } from '@/core/regex';
@@ -378,5 +382,206 @@ describe('ContextAssembler', () => {
             userInput: '再次提起银莲花',
         });
         expect(second.layer2Messages[0].content).not.toContain('<lore-hint>');
+    });
+
+    it('supports two-phase injectPrompt/getPromptsInjected (forward refs + postprocess + WI pre-collection), ST native {{outlet::key}}, and Category 1/4 EJS + @@if', async () => {
+        const bridge = new MemoryHostBridge({
+            ejsFeatures: { invertEnabled: true },
+            ejsEvaluator: async (text, vars, opts) => {
+                const session = opts?.injectionSession;
+                if (text.includes('!!(')) {
+                    if (text.includes('vars.neverShowOutlet')) {
+                        return vars.neverShowOutlet ? 'true' : 'false';
+                    }
+                    if (text.includes('vars.showRule')) {
+                        return vars.showRule ? 'true' : 'false';
+                    }
+                    if (text.includes('vars.showOutlet')) {
+                        return vars.showOutlet ? 'true' : 'false';
+                    }
+                    return 'true';
+                }
+                if (text.includes('__PRE_INJECT__')) {
+                    session?.injectPrompt('from_wi', 'WI-PreCollected', 10, 0, 'wi1');
+                    return '';
+                }
+                if (text.includes('__TAIL_INJECT__')) {
+                    session?.injectPrompt('forward_key', 'Tail-Part-2', 20, 0, 't2');
+                    session?.injectPrompt('forward_key', 'Tail-Part-1', 10, 0, 't1');
+                    return 'tail_done';
+                }
+                if (text.includes('__READ_FORWARD__')) {
+                    const rendered = `FWD:[${session?.getPromptsInjected('forward_key', [{ search: /Tail-/g, replace: 'X-' }]) ?? ''}]|WI:[${session?.getPromptsInjected('from_wi') ?? ''}]`;
+                    return text.replace('<% __READ_FORWARD__ %>', rendered);
+                }
+                if (text.includes('vars.dynVal')) {
+                    return `DYN=${String(vars.dynVal ?? '')}`;
+                }
+                if (text.includes('vars.sysTag')) {
+                    return `SYS=${String(vars.sysTag ?? '')}`;
+                }
+                if (text.includes('vars.outletTag')) {
+                    return `OUTLET=${String(vars.outletTag ?? '')}`;
+                }
+                return text;
+            },
+        });
+
+        const loreEntries: RawLoreEntry[] = [
+            // [GENERATE:BEFORE] disabled in UI, enabled when invertEnabled: true
+            {
+                world: 'W',
+                uid: 1,
+                comment: '[GENERATE:BEFORE] PreInjector',
+                content: '<% __PRE_INJECT__ %>',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: true,
+                position: 0,
+                depth: 4,
+                order: 100,
+                role: 0,
+            },
+            // ST native outlet (position=7) with @@if and EJS
+            {
+                world: 'W',
+                uid: 2,
+                comment: 'Active Outlet',
+                content: '@@if vars.showOutlet\n<%- vars.outletTag %>',
+                keys: ['触发出口'],
+                keysecondary: [],
+                constant: false,
+                selective: false,
+                disable: false,
+                position: 7,
+                outletName: 'status_outlet',
+                depth: 4,
+                order: 100,
+                role: 0,
+            },
+            // Hidden outlet gated by @@if false
+            {
+                world: 'W',
+                uid: 3,
+                comment: 'Filtered Outlet',
+                content: '@@if vars.neverShowOutlet\nSHOULD_NOT_APPEAR',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 7,
+                outletName: 'status_outlet',
+                depth: 4,
+                order: 50,
+                role: 0,
+            },
+            // Category ① system_rule with inline EJS
+            {
+                world: 'W',
+                uid: 4,
+                comment: 'SysRule',
+                content: '@@system\n<%- vars.sysTag %>',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 0,
+                order: 10,
+                role: 0,
+            },
+            // Constant entry with @@if -> conditional_dynamic in Layer 2
+            {
+                world: 'W',
+                uid: 5,
+                comment: 'DynRule',
+                content: '@@if vars.showRule\n<%- vars.dynVal %>',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 4,
+                order: 10,
+                role: 0,
+            },
+        ];
+
+        const agent = createDefaultMainAgent({
+            sessionMode: 'persistent',
+            promptBlocks: [
+                {
+                    id: 'system_base',
+                    name: 'Base',
+                    role: 'system',
+                    placement: 'prefix',
+                    content: '<% __READ_FORWARD__ %> | {{outlet::status_outlet}}',
+                    enabled: true,
+                },
+                {
+                    id: 'tail_injector',
+                    name: 'Tail Injector',
+                    role: 'system',
+                    placement: 'tail',
+                    content: '<% __TAIL_INJECT__ %>',
+                    enabled: true,
+                },
+            ],
+        });
+
+        const assembler = new ContextAssembler();
+        const store = new TrajectoryStore();
+        const session = new LocalPromptInjectionSession();
+
+        const turn1 = await assembler.assembleWithHost({
+            agent,
+            hostBridge: bridge,
+            trajectoryStore: store,
+            loreEntries,
+            injectionSession: session,
+            userInput: '触发出口',
+            vars: {
+                showOutlet: true,
+                showRule: false,
+                outletTag: 'V1',
+                sysTag: 'CORE',
+                dynVal: 'HIDDEN',
+            },
+        });
+
+        expect(turn1.layer0Messages[0].content).toBe(
+            'FWD:[X-Part-1\nX-Part-2]|WI:[WI-PreCollected] | OUTLET=V1',
+        );
+        expect(turn1.layer0Messages[1].content).toContain('SYS=CORE');
+        expect(turn1.layer2Messages[0].content).not.toContain('DYN=');
+        expect(turn1.layer2Messages[1].content).toBe('tail_done');
+
+        // Turn 2: outlet value changes -> Layer 0 automatically detects dirty fingerprint and recompiles
+        const session2 = new LocalPromptInjectionSession();
+        const turn2 = await assembler.assembleWithHost({
+            agent,
+            hostBridge: bridge,
+            trajectoryStore: store,
+            loreEntries,
+            injectionSession: session2,
+            userInput: '触发出口',
+            vars: {
+                showOutlet: true,
+                showRule: true,
+                outletTag: 'V2',
+                sysTag: 'CORE',
+                dynVal: 'VISIBLE',
+            },
+        });
+
+        expect(turn2.layer0Messages[0].content).toBe(
+            'FWD:[X-Part-1\nX-Part-2]|WI:[WI-PreCollected] | OUTLET=V2',
+        );
+        expect(turn2.layer2Messages[0].content).toContain('DYN=VISIBLE');
     });
 });

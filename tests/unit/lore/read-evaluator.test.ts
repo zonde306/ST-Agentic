@@ -198,4 +198,48 @@ describe('LoreReadEvaluator', () => {
         expect(emptyOverride.overridden).toBe(true);
         expect(emptyOverride.text).toBe('');
     });
+
+    it('honors @@if conditions and @@private decorator during LoreReadEvaluator evaluation', async () => {
+        let sawPrivateWrapper = false;
+        const bridge = new MemoryHostBridge({
+            ejsEvaluator: async (text, vars) => {
+                let working = text;
+                if (working.includes('await (async () => {')) {
+                    sawPrivateWrapper = true;
+                    working = working
+                        .replace('<% await (async () => { %>', '')
+                        .replace('<% })(); %>', '');
+                }
+                if (working.includes('!!(vars.unlocked)')) {
+                    return vars.unlocked ? 'true' : 'false';
+                }
+                return working.replace(/<%-\s*vars\.secret\s*%>/g, String(vars.secret ?? ''));
+            },
+        });
+        const entry: RawLoreEntry = {
+            world: 'TestBook',
+            uid: 88,
+            comment: '机密卷宗',
+            content: '@@if vars.unlocked\n@@private\n机密：<%- vars.secret %>',
+            keys: ['卷宗'],
+            keysecondary: [],
+            constant: false,
+            selective: false,
+            disable: false,
+            position: 1,
+            depth: 4,
+            order: 50,
+            role: 0,
+        };
+
+        const evaluator = new LoreReadEvaluator(bridge);
+        const locked = await evaluator.evaluate(entry, { vars: { unlocked: false, secret: 'X' } });
+        expect(locked.conditionSkipped).toBe(true);
+        expect(locked.text).toBe('');
+
+        const unlocked = await evaluator.evaluate(entry, { vars: { unlocked: true, secret: '灰港密钥' } });
+        expect(unlocked.conditionSkipped).toBeUndefined();
+        expect(sawPrivateWrapper).toBe(true);
+        expect(unlocked.text).toBe('机密：灰港密钥');
+    });
 });

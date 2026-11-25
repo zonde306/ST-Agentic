@@ -1,3 +1,4 @@
+import type { EjsEvaluateOptions, HostBridge } from '@/core/bridge';
 import type { ParsedDecorator, RawLoreEntry } from '@/core/types';
 
 /** Legacy ST-CustomGeneration `@@` decorators supported for lossless migration and parsing. */
@@ -40,6 +41,25 @@ export const ST_NATIVE_DECORATORS = [
     '@@dont_activate',
 ] as const;
 
+/** ST-Prompt-Template World Info decorators (16 total including @@activate / @@dont_activate). */
+export const EJS_TEMPLATE_DECORATORS = [
+    '@@if',
+    '@@private',
+    '@@preload',
+    '@@only_preload',
+    '@@dont_preload',
+    '@@initial_variables',
+    '@@always_enabled',
+    '@@generate_before',
+    '@@generate_after',
+    '@@render_before',
+    '@@render_after',
+    '@@message_formatting',
+    '@@iframe',
+    '@@preprocessing',
+    '@@dont_deactivate',
+] as const;
+
 /** New ST-Agentic structured decorators. */
 export const AGENTIC_DECORATORS = [
     '@@trigger',
@@ -53,11 +73,29 @@ export const AGENTIC_DECORATORS = [
 export const KNOWN_DECORATORS: ReadonlySet<string> = new Set([
     ...LEGACY_DECORATORS,
     ...ST_NATIVE_DECORATORS,
+    ...EJS_TEMPLATE_DECORATORS,
     ...AGENTIC_DECORATORS,
 ]);
 
 /** Decorators whose argument payload should be kept verbatim without quote-stripping. */
-const VERBATIM_ARG_DECORATORS = new Set(['@@json_schema', '@@zod_schema']);
+const VERBATIM_ARG_DECORATORS = new Set(['@@json_schema', '@@zod_schema', '@@if', '@@iframe']);
+
+const EJS_SPECIAL_DECORATORS = new Set([
+    '@@initial_variables',
+    '@@only_preload',
+    '@@generate_before',
+    '@@generate_after',
+    '@@render_before',
+    '@@render_after',
+]);
+
+const EJS_FORCE_DISABLED_DECORATORS = new Set([
+    '@@dont_activate',
+    '@@dont_deactivate',
+]);
+
+const COMMENT_SPECIAL_PATTERN = /\[(?:initialvariables|generate:[^\]]*|render:[^\]]*)\]|@INJECT\b/i;
+const GENERATE_BEFORE_PATTERN = /\[generate:before\]/i;
 
 const PARAM_KEY_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_.-]*$/;
 
@@ -354,4 +392,143 @@ export class DecoratorParser {
     public rawArgs(name: string): string | undefined {
         return this.get(name)?.rawArgs;
     }
+}
+
+function resolveParsedDecorators(
+    entry: Pick<RawLoreEntry, 'content' | 'decorators'>,
+    decorators?: readonly ParsedDecorator[],
+): readonly ParsedDecorator[] {
+    return decorators ?? DecoratorParser.parseEntry(entry).decorators;
+}
+
+/**
+ * Check whether an entry is an `ST-Prompt-Template` special entry that must be
+ * excluded from normal context/VFS exposure (`@@render_*`, `@@generate_*`,
+ * `@@only_preload`, `@@initial_variables`, `[InitialVariables]`, `[GENERATE:*]`,
+ * `[RENDER:*]`, `@INJECT`).
+ */
+export function isEjsSpecialEntry(
+    entry: Pick<RawLoreEntry, 'comment' | 'content' | 'decorators'>,
+    decorators?: readonly ParsedDecorator[],
+): boolean {
+    const resolved = resolveParsedDecorators(entry, decorators);
+    if (resolved.some((d) => EJS_SPECIAL_DECORATORS.has(d.name))) {
+        return true;
+    }
+    if (COMMENT_SPECIAL_PATTERN.test(entry.comment ?? '')) {
+        return true;
+    }
+    return false;
+}
+
+/** Check whether decorators force-disable this entry (`@@dont_activate` / `@@dont_deactivate`). */
+export function isEjsForceDisabledEntry(decorators: readonly ParsedDecorator[]): boolean {
+    return decorators.some((d) => EJS_FORCE_DISABLED_DECORATORS.has(d.name));
+}
+
+/** Check whether an entry is a `@@generate_before` / `[GENERATE:BEFORE]` entry. */
+export function isEjsGenerateBeforeEntry(
+    entry: Pick<RawLoreEntry, 'comment' | 'content' | 'decorators'>,
+    decorators?: readonly ParsedDecorator[],
+    cleanContent?: string,
+): boolean {
+    const resolved = resolveParsedDecorators(entry, decorators);
+    if (resolved.some((d) => d.name === '@@generate_before')) {
+        return true;
+    }
+    if (GENERATE_BEFORE_PATTERN.test(entry.comment ?? '')) {
+        return true;
+    }
+    const body = cleanContent ?? DecoratorParser.parseEntry(entry).cleanContent;
+    return GENERATE_BEFORE_PATTERN.test(body);
+}
+
+/**
+ * Evaluate whether an entry is enabled under `ST-Prompt-Template` semantics,
+ * honoring `@@always_enabled` and `invert_enabled` on special entries.
+ */
+export function isEjsEntryEnabled(
+    entry: Pick<RawLoreEntry, 'disable' | 'comment' | 'content' | 'decorators'>,
+    decorators?: readonly ParsedDecorator[],
+    options?: { invertEnabled?: boolean },
+): boolean {
+    const resolved = resolveParsedDecorators(entry, decorators);
+    if (isEjsForceDisabledEntry(resolved)) {
+        return false;
+    }
+    if (resolved.some((d) => d.name === '@@always_enabled')) {
+        return true;
+    }
+    if (options?.invertEnabled && isEjsSpecialEntry(entry, resolved)) {
+        return Boolean(entry.disable);
+    }
+    return !entry.disable;
+}
+
+/** Extract all `@@if <expr>` condition expressions in declaration order. */
+export function extractIfConditions(decorators: readonly ParsedDecorator[]): string[] {
+    const conditions: string[] = [];
+    for (const dec of decorators) {
+        if (dec.name === '@@if') {
+            const expr = dec.rawArgs.trim();
+            if (expr) {
+                conditions.push(expr);
+            }
+        }
+    }
+    return conditions;
+}
+
+/** Check whether `@@private` is declared on the entry. */
+export function hasPrivateDecorator(decorators: readonly ParsedDecorator[]): boolean {
+    return decorators.some((d) => d.name === '@@private');
+}
+
+/**
+ * Evaluate `@@if <expr>` conditions using `HostBridge.evaluateOptionalEjs`.
+ * Degrades gracefully by returning `true` (and emitting a deduplicated warning) when
+ * `ST-Prompt-Template` is unavailable or when an expression fails to evaluate.
+ */
+export async function evaluateIfConditions(
+    conditions: readonly string[],
+    hostBridge: Pick<HostBridge, 'evaluateOptionalEjs' | 'reportCompatWarning'> | undefined,
+    vars: Record<string, unknown>,
+    options?: EjsEvaluateOptions,
+): Promise<boolean> {
+    if (!conditions || conditions.length === 0) {
+        return true;
+    }
+
+    if (!hostBridge?.evaluateOptionalEjs) {
+        hostBridge?.reportCompatWarning?.(
+            'ejs_missing_for_if',
+            '检测到世界书包含 @@if 条件装饰器，但未安装或未启用 ST-Prompt-Template；条件将按兼容降级模式默认放行。',
+        );
+        return true;
+    }
+
+    for (const expr of conditions) {
+        const trimmedExpr = expr.trim();
+        if (!trimmedExpr) {
+            continue;
+        }
+        try {
+            const evaluated = await hostBridge.evaluateOptionalEjs(
+                `<%- !!(${trimmedExpr}) %>`,
+                vars,
+                options,
+            );
+            if (evaluated.trim() === 'false') {
+                return false;
+            }
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            hostBridge.reportCompatWarning?.(
+                `ejs_if_eval_error:${trimmedExpr}`,
+                `@@if 条件表达式 (${trimmedExpr}) 求值出错，已降级放行：${msg}`,
+            );
+        }
+    }
+
+    return true;
 }

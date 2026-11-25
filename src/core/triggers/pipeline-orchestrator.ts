@@ -5,7 +5,14 @@ import {
     type SubAgentDescriptor,
     TurnInterruptedError,
 } from '@/core/agents';
-import type { HostBridge, LLMTransport, ToolExecutionContext, ToolSideGenApi } from '@/core/bridge';
+import type {
+    HostBridge,
+    LLMTransport,
+    PromptInjectionSession,
+    SerializedPromptInjected,
+    ToolExecutionContext,
+    ToolSideGenApi,
+} from '@/core/bridge';
 import {
     createDefaultMainAgent,
     createDefaultSettings,
@@ -14,6 +21,7 @@ import {
 } from '@/core/config';
 import {
     ContextAssembler,
+    LocalPromptInjectionSession,
     TrajectoryStore,
     WatermarkCompactor,
     type ChunkSummarizer,
@@ -23,12 +31,18 @@ import {
 import { TraceLogger } from '@/core/logger';
 import {
     LoreReadEvaluator,
+    evaluateIfConditions,
     parseLoreRegex,
     TailRadar,
     WIClassifier,
 } from '@/core/lore';
 import { applyRegexRules, compileRegexPattern, RegexPipeline } from '@/core/regex';
-import { ChatDataStore, DATA_NAMESPACES, worldInfoKey } from '@/core/store';
+import {
+    ChatDataStore,
+    DATA_NAMESPACES,
+    EJS_INJECTIONS_DOC_KEY,
+    worldInfoKey,
+} from '@/core/store';
 import {
     compileJsonSchema,
     compileVariableSchemaEntries,
@@ -64,6 +78,7 @@ import {
 import {
     DecoratorCompiler,
     groupTriggersForExecution,
+    mergeDerivedAgentProfiles,
     type TriggerExecutionUnit,
 } from './decorator-compiler';
 
@@ -393,23 +408,31 @@ export class PipelineOrchestrator {
             // 3. Load lorebooks & compile @@ decorators once per turn
             const env = await this.compileTurnEnvironment(preset, turnSignal);
 
+            // Create turn-isolated PromptInjectionSession seeded with parent floor's sticky state
+            const parentStickySnapshot = this.loadParentStickyInjections(target);
+            const injectionSession =
+                this.bridge.createPromptInjectionSession?.(parentStickySnapshot)?.session
+                ?? new LocalPromptInjectionSession(parentStickySnapshot);
+
             // 4. [Phase 1: before_turn] (skipped on `'continue'`)
             const beforeTurnResults: TriggerExecutionResult[] = [];
             if (input.action !== 'continue') {
-                const beforeUnits = groupTriggersForExecution(
-                    env.allTriggers.filter((t) => t.phase === 'before_turn'),
+                const beforeRules = env.allTriggers.filter(
+                    (t) => t.phase === 'before_turn' && t.enabled,
                 );
-                await this.executeOrderedSyncUnits(beforeUnits, {
+                await this.executeOrderedSyncUnits(beforeRules, {
                     target,
                     turnNumber,
                     userText: rawUserText,
                     assistantText: '',
                     preset,
                     effectiveAgents: env.effectiveAgents,
+                    derivedAgentsByRuleId: env.derivedAgentsByRuleId,
                     loreEntries: env.loreEntries,
                     subAgents: env.subAgents,
                     globalVarSchema: env.globalVarSchema,
                     staged: true,
+                    injectionSession,
                     signal: turnSignal,
                     resultsOut: beforeTurnResults,
                 });
@@ -450,6 +473,7 @@ export class PipelineOrchestrator {
                 subAgents: env.subAgents,
                 getVariableSchema: env.globalVarSchema ? () => env.globalVarSchema : undefined,
                 staged: true,
+                injectionSession,
                 stream: input.stream,
                 signal: turnSignal,
                 onTextDelta: input.onTextDelta,
@@ -480,6 +504,8 @@ export class PipelineOrchestrator {
                 mainRun,
                 preset,
                 env,
+                injectionSession,
+                hadParentSticky: parentStickySnapshot !== undefined,
                 signal: turnSignal,
             });
         } catch (error) {
@@ -641,12 +667,38 @@ export class PipelineOrchestrator {
         }
     }
 
+    private loadParentStickyInjections(target: MessageTarget): SerializedPromptInjected | undefined {
+        if (target.messageId <= 0) {
+            return undefined;
+        }
+        const chat = this.bridge.getChat();
+        const parentId = target.messageId - 1;
+        const parentSwipeId = chat[parentId]?.swipeId ?? 0;
+        const entry = this.store.get(DATA_NAMESPACES.EJS_INJECTIONS, EJS_INJECTIONS_DOC_KEY, {
+            target: { messageId: parentId, swipeId: parentSwipeId },
+        });
+        if (!entry || entry.deleted || !entry.content.trim()) {
+            return undefined;
+        }
+        try {
+            const parsed = JSON.parse(entry.content) as unknown;
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                return undefined;
+            }
+            const record = parsed as SerializedPromptInjected;
+            return Object.keys(record).length > 0 ? record : undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
     private async compileTurnEnvironment(
         preset: Preset,
         signal: AbortSignal,
     ): Promise<{
         loreEntries: RawLoreEntry[];
         effectiveAgents: Record<string, AgentProfile>;
+        derivedAgentsByRuleId: Record<string, AgentProfile>;
         allTriggers: TriggerRule[];
         subAgents: SubAgentDescriptor[];
         globalVarSchema: z.ZodTypeAny | undefined;
@@ -669,6 +721,7 @@ export class PipelineOrchestrator {
         return {
             loreEntries,
             effectiveAgents,
+            derivedAgentsByRuleId: compiled.derivedAgentsByRuleId,
             allTriggers,
             subAgents: compiled.subAgents,
             globalVarSchema,
@@ -704,12 +757,29 @@ export class PipelineOrchestrator {
         env: {
             loreEntries: RawLoreEntry[];
             effectiveAgents: Record<string, AgentProfile>;
+            derivedAgentsByRuleId: Record<string, AgentProfile>;
             allTriggers: TriggerRule[];
             subAgents: SubAgentDescriptor[];
             globalVarSchema: z.ZodTypeAny | undefined;
         };
+        injectionSession?: PromptInjectionSession;
+        hadParentSticky?: boolean;
         signal: AbortSignal;
     }): Promise<RunTurnResult> {
+        if (params.injectionSession) {
+            params.injectionSession.tickSticky(1);
+            const nextSticky = params.injectionSession.exportSnapshot();
+            if (Object.keys(nextSticky).length > 0 || params.hadParentSticky) {
+                this.store.set(
+                    DATA_NAMESPACES.EJS_INJECTIONS,
+                    EJS_INJECTIONS_DOC_KEY,
+                    'ejs-injections',
+                    JSON.stringify(nextSticky),
+                    { target: params.target, staged: true },
+                );
+            }
+        }
+
         // Commit before_turn + main_turn staged writes atomically to target (messageId, swipeId)
         this.store.commitStagedData(params.target);
         this.trajectoryStore.saveToHost(this.bridge);
@@ -722,10 +792,12 @@ export class PipelineOrchestrator {
             assistantText: params.combinedContent,
             preset: params.preset,
             effectiveAgents: params.env.effectiveAgents,
+            derivedAgentsByRuleId: params.env.derivedAgentsByRuleId,
             allTriggers: params.env.allTriggers,
             loreEntries: params.env.loreEntries,
             subAgents: params.env.subAgents,
             globalVarSchema: params.env.globalVarSchema,
+            injectionSession: params.injectionSession,
             signal: params.signal,
         });
 
@@ -780,22 +852,28 @@ export class PipelineOrchestrator {
         const preset = resolveActivePreset(settings);
         const turnNumber = this.resolveTurnNumber(target.messageId, input.turnNumber);
         const env = await this.compileTurnEnvironment(preset, turnSignal);
-        const beforeUnits = groupTriggersForExecution(
-            env.allTriggers.filter((t) => t.phase === 'before_turn'),
+        const beforeRules = env.allTriggers.filter(
+            (t) => t.phase === 'before_turn' && t.enabled,
         );
+        const parentSticky = this.loadParentStickyInjections(target);
+        const injectionSession =
+            this.bridge.createPromptInjectionSession?.(parentSticky)?.session
+            ?? new LocalPromptInjectionSession(parentSticky);
 
         const results: TriggerExecutionResult[] = [];
-        await this.executeOrderedSyncUnits(beforeUnits, {
+        await this.executeOrderedSyncUnits(beforeRules, {
             target,
             turnNumber,
             userText: input.userText,
             assistantText: '',
             preset,
             effectiveAgents: env.effectiveAgents,
+            derivedAgentsByRuleId: env.derivedAgentsByRuleId,
             loreEntries: env.loreEntries,
             subAgents: env.subAgents,
             globalVarSchema: env.globalVarSchema,
             staged: true,
+            injectionSession,
             signal: turnSignal,
             resultsOut: results,
         });
@@ -847,6 +925,7 @@ export class PipelineOrchestrator {
             assistantText,
             preset,
             effectiveAgents,
+            derivedAgentsByRuleId: compiled.derivedAgentsByRuleId,
             allTriggers,
             loreEntries,
             subAgents: compiled.subAgents,
@@ -873,6 +952,8 @@ export class PipelineOrchestrator {
             turnNumber: number;
             scanText: string;
             signal: AbortSignal;
+            staged?: boolean;
+            injectionSession?: PromptInjectionSession;
         },
     ): Promise<{ matched: boolean; matchOverrides?: Record<string, string> }> {
         throwIfAborted(context.signal);
@@ -964,11 +1045,24 @@ export class PipelineOrchestrator {
             };
         }
 
+        if (rule.ifConditions && rule.ifConditions.length > 0) {
+            const vars = await this.vfs
+                .readVariables({ target: context.target, staged: context.staged ?? true })
+                .catch(() => ({}));
+            throwIfAborted(context.signal);
+            const ifMatched = await evaluateIfConditions(rule.ifConditions, this.bridge, vars, {
+                injectionSession: context.injectionSession,
+            });
+            if (!ifMatched) {
+                return { matched: false };
+            }
+        }
+
         return { matched: true, matchOverrides };
     }
 
     private async executeOrderedSyncUnits(
-        units: readonly TriggerExecutionUnit[],
+        rules: readonly TriggerRule[],
         ctx: {
             target: MessageTarget;
             turnNumber: number;
@@ -976,26 +1070,67 @@ export class PipelineOrchestrator {
             assistantText: string;
             preset: Preset;
             effectiveAgents: Record<string, AgentProfile>;
+            derivedAgentsByRuleId: Record<string, AgentProfile>;
             loreEntries: readonly RawLoreEntry[];
             subAgents: readonly SubAgentDescriptor[];
             globalVarSchema?: z.ZodTypeAny;
             staged: boolean;
+            injectionSession?: PromptInjectionSession;
             signal: AbortSignal;
             resultsOut: TriggerExecutionResult[];
         },
     ): Promise<void> {
-        if (units.length === 0) {
+        if (rules.length === 0) {
             return;
         }
 
-        const batches = groupUnitsByOrder(units);
-        for (const batch of batches) {
+        const ruleBatches = groupRulesByOrder(rules);
+        for (const ruleBatch of ruleBatches) {
             throwIfAborted(ctx.signal);
+            const matchedRules: TriggerRule[] = [];
+            const matchOverridesByRuleId = new Map<string, Record<string, string>>();
+
+            for (const rule of ruleBatch) {
+                if (!rule.enabled) {
+                    continue;
+                }
+                const evalRes = await this.evaluateCondition(rule, {
+                    target: ctx.target,
+                    turnNumber: ctx.turnNumber,
+                    scanText: ctx.userText,
+                    signal: ctx.signal,
+                    staged: ctx.staged,
+                    injectionSession: ctx.injectionSession,
+                });
+                if (evalRes.matched) {
+                    matchedRules.push(rule);
+                    if (evalRes.matchOverrides) {
+                        matchOverridesByRuleId.set(rule.id, evalRes.matchOverrides);
+                    }
+                }
+            }
+
+            if (matchedRules.length === 0) {
+                continue;
+            }
+
+            const units = groupTriggersForExecution(matchedRules);
             const batchResults = await Promise.all(
-                batch.map((unit) =>
-                    this.executeSingleUnit(unit, {
-                        ...ctx,
-                        scanText: ctx.userText,
+                units.map((unit) =>
+                    this.executePreparedUnit(unit, {
+                        target: ctx.target,
+                        userText: ctx.userText,
+                        assistantText: ctx.assistantText,
+                        preset: ctx.preset,
+                        effectiveAgents: ctx.effectiveAgents,
+                        derivedAgentsByRuleId: ctx.derivedAgentsByRuleId,
+                        loreEntries: ctx.loreEntries,
+                        subAgents: ctx.subAgents,
+                        globalVarSchema: ctx.globalVarSchema,
+                        staged: ctx.staged,
+                        injectionSession: ctx.injectionSession,
+                        matchOverrides: mergeUnitMatchOverrides(unit.triggers, matchOverridesByRuleId),
+                        signal: ctx.signal,
                     }),
                 ),
             );
@@ -1014,108 +1149,218 @@ export class PipelineOrchestrator {
         assistantText: string;
         preset: Preset;
         effectiveAgents: Record<string, AgentProfile>;
+        derivedAgentsByRuleId: Record<string, AgentProfile>;
         allTriggers: readonly TriggerRule[];
         loreEntries: readonly RawLoreEntry[];
         subAgents: readonly SubAgentDescriptor[];
         globalVarSchema?: z.ZodTypeAny;
+        injectionSession?: PromptInjectionSession;
         signal?: AbortSignal;
     }): Promise<DispatchedTaskHandle<TriggerExecutionResult>[]> {
-        const afterUnits = groupTriggersForExecution(
-            params.allTriggers.filter((t) => t.phase === 'after_turn'),
-        );
-        if (afterUnits.length === 0) {
+        const afterRules = params.allTriggers.filter((t) => t.phase === 'after_turn' && t.enabled);
+        if (afterRules.length === 0) {
             return [];
         }
 
         const scanText = params.assistantText || params.userText;
-        const matchedUnits: Array<{
-            unit: TriggerExecutionUnit;
-            activeTriggers: TriggerRule[];
-            matchOverrides?: Record<string, string>;
-        }> = [];
-
-        for (const unit of afterUnits) {
-            const evaluated = await this.filterMatchingTriggers(unit, {
-                target: params.target,
-                turnNumber: params.turnNumber,
-                scanText,
-                signal: params.signal ?? new AbortController().signal,
-            });
-            if (evaluated.activeTriggers.length > 0) {
-                matchedUnits.push({
-                    unit: { ...unit, triggers: evaluated.activeTriggers },
-                    activeTriggers: evaluated.activeTriggers,
-                    matchOverrides: evaluated.matchOverrides,
-                });
-            }
-        }
-
-        if (matchedUnits.length === 0) {
-            return [];
-        }
-
+        const orderBatches = groupRulesByOrder(afterRules);
         const handles: DispatchedTaskHandle<TriggerExecutionResult>[] = [];
         let prevTurnOrderPromise: Promise<unknown> | undefined;
-        let currentTurnOrder: number | undefined;
-        let currentOrderGroupPromises: Promise<unknown>[] = [];
+        let prevAnyOrderPromise: Promise<unknown> | undefined;
 
-        for (const item of matchedUnits) {
-            const { unit, matchOverrides } = item;
+        for (let batchIdx = 0; batchIdx < orderBatches.length; batchIdx += 1) {
+            const ruleBatch = orderBatches[batchIdx];
+            const batchHasIf = ruleBatch.some((r) => (r.ifConditions?.length ?? 0) > 0);
+            const waitBeforeBatch = prevTurnOrderPromise ?? (batchHasIf ? prevAnyOrderPromise : undefined);
 
-            if (unit.barrier === 'turn') {
-                if (currentTurnOrder !== undefined && unit.order !== currentTurnOrder) {
-                    prevTurnOrderPromise =
-                        currentOrderGroupPromises.length > 0
-                            ? Promise.allSettled(currentOrderGroupPromises)
-                            : prevTurnOrderPromise;
-                    currentOrderGroupPromises = [];
+            if (batchIdx === 0 || !waitBeforeBatch) {
+                const matchedRules: TriggerRule[] = [];
+                const matchOverridesByRuleId = new Map<string, Record<string, string>>();
+                for (const rule of ruleBatch) {
+                    const evaluated = await this.evaluateCondition(rule, {
+                        target: params.target,
+                        turnNumber: params.turnNumber,
+                        scanText,
+                        signal: params.signal ?? new AbortController().signal,
+                        staged: false,
+                        injectionSession: params.injectionSession,
+                    });
+                    if (evaluated.matched) {
+                        matchedRules.push(rule);
+                        if (evaluated.matchOverrides) {
+                            matchOverridesByRuleId.set(rule.id, evaluated.matchOverrides);
+                        }
+                    }
                 }
-                currentTurnOrder = unit.order;
+                if (matchedRules.length === 0) {
+                    continue;
+                }
+
+                const units = groupTriggersForExecution(matchedRules);
+                const batchTurnPromises: Promise<unknown>[] = [];
+                const batchAllPromises: Promise<unknown>[] = [];
+
+                for (const unit of units) {
+                    const unitOverrides = mergeUnitMatchOverrides(
+                        unit.triggers,
+                        matchOverridesByRuleId,
+                    );
+                    const handle = this.barrierCoordinator.dispatch<TriggerExecutionResult>(
+                        {
+                            target: params.target,
+                            phase: 'after_turn',
+                            barrier: unit.barrier,
+                            agentProfileId: unit.agentProfileId,
+                            label: unit.label,
+                            ...(unit.targetPath ? { targetPath: unit.targetPath } : {}),
+                        },
+                        async (taskCtx) => {
+                            taskCtx.setCurrentStep(
+                                unit.kind === 'script'
+                                    ? `Running script (${unit.label})`
+                                    : `Running ${unit.agentProfileId}`,
+                            );
+
+                            const result = await this.executePreparedUnit(unit, {
+                                target: taskCtx.target,
+                                userText: params.userText,
+                                assistantText: params.assistantText,
+                                preset: params.preset,
+                                effectiveAgents: params.effectiveAgents,
+                                derivedAgentsByRuleId: params.derivedAgentsByRuleId,
+                                loreEntries: params.loreEntries,
+                                subAgents: params.subAgents,
+                                globalVarSchema: params.globalVarSchema,
+                                staged: true,
+                                injectionSession: params.injectionSession,
+                                matchOverrides: unitOverrides,
+                                signal: taskCtx.signal,
+                            });
+
+                            throwIfAborted(taskCtx.signal);
+                            this.store.commitStagedData(taskCtx.target);
+                            return result;
+                        },
+                    );
+                    batchAllPromises.push(handle.promise);
+                    if (unit.barrier === 'turn') {
+                        batchTurnPromises.push(handle.promise);
+                    }
+                    handles.push(handle);
+                }
+
+                if (batchAllPromises.length > 0) {
+                    prevAnyOrderPromise = Promise.allSettled(batchAllPromises);
+                }
+                if (batchTurnPromises.length > 0) {
+                    prevTurnOrderPromise = Promise.allSettled(batchTurnPromises);
+                }
+                continue;
             }
 
-            const waitBeforeRun = unit.barrier === 'turn' ? prevTurnOrderPromise : undefined;
-
+            // Subsequent order batch after a prior `turn` barrier: defer filtering & merging until
+            // the prior batch commits its variables/files so `@@if` sees the updated state.
+            const strictestBarrier = resolveStrictestBarrier(ruleBatch);
+            const batchOrder = ruleBatch[0]?.order ?? 1;
             const handle = this.barrierCoordinator.dispatch<TriggerExecutionResult>(
                 {
                     target: params.target,
                     phase: 'after_turn',
-                    barrier: unit.barrier,
-                    agentProfileId: unit.agentProfileId,
-                    label: unit.label,
-                    ...(unit.targetPath ? { targetPath: unit.targetPath } : {}),
+                    barrier: strictestBarrier,
+                    agentProfileId: 'after_turn_batch',
+                    label: `after_turn batch (order=${batchOrder})`,
                 },
                 async (taskCtx) => {
-                    if (waitBeforeRun) {
-                        await waitBeforeRun;
-                        throwIfAborted(taskCtx.signal);
+                    await waitBeforeBatch;
+                    throwIfAborted(taskCtx.signal);
+
+                    const matchedRules: TriggerRule[] = [];
+                    const matchOverridesByRuleId = new Map<string, Record<string, string>>();
+                    for (const rule of ruleBatch) {
+                        const evaluated = await this.evaluateCondition(rule, {
+                            target: taskCtx.target,
+                            turnNumber: params.turnNumber,
+                            scanText,
+                            signal: taskCtx.signal,
+                            staged: false,
+                            injectionSession: params.injectionSession,
+                        });
+                        if (evaluated.matched) {
+                            matchedRules.push(rule);
+                            if (evaluated.matchOverrides) {
+                                matchOverridesByRuleId.set(rule.id, evaluated.matchOverrides);
+                            }
+                        }
                     }
 
+                    if (matchedRules.length === 0) {
+                        return {
+                            unitId: `batch:after:${batchOrder}`,
+                            phase: 'after_turn',
+                            target: taskCtx.target,
+                            kind: 'script',
+                            triggerIds: [],
+                            agentProfileId: 'after_turn_batch',
+                            output: '',
+                            skipped: true,
+                        };
+                    }
+
+                    const units = groupTriggersForExecution(matchedRules);
                     taskCtx.setCurrentStep(
-                        unit.kind === 'script' ? `Running script (${unit.label})` : `Running ${unit.agentProfileId}`,
+                        units.length === 1
+                            ? `Running ${units[0].label}`
+                            : `Running ${units.length} after_turn units`,
                     );
 
-                    const result = await this.executePreparedUnit(unit, {
-                        target: taskCtx.target,
-                        userText: params.userText,
-                        assistantText: params.assistantText,
-                        preset: params.preset,
-                        effectiveAgents: params.effectiveAgents,
-                        loreEntries: params.loreEntries,
-                        subAgents: params.subAgents,
-                        globalVarSchema: params.globalVarSchema,
-                        staged: true,
-                        matchOverrides,
-                        signal: taskCtx.signal,
-                    });
+                    const unitResults = await Promise.all(
+                        units.map((unit) =>
+                            this.executePreparedUnit(unit, {
+                                target: taskCtx.target,
+                                userText: params.userText,
+                                assistantText: params.assistantText,
+                                preset: params.preset,
+                                effectiveAgents: params.effectiveAgents,
+                                derivedAgentsByRuleId: params.derivedAgentsByRuleId,
+                                loreEntries: params.loreEntries,
+                                subAgents: params.subAgents,
+                                globalVarSchema: params.globalVarSchema,
+                                staged: true,
+                                injectionSession: params.injectionSession,
+                                matchOverrides: mergeUnitMatchOverrides(
+                                    unit.triggers,
+                                    matchOverridesByRuleId,
+                                ),
+                                signal: taskCtx.signal,
+                            }),
+                        ),
+                    );
 
                     throwIfAborted(taskCtx.signal);
                     this.store.commitStagedData(taskCtx.target);
-                    return result;
+
+                    const combinedOutput = unitResults
+                        .map((r) => r.output.trim())
+                        .filter(Boolean)
+                        .join('\n\n');
+                    const last = unitResults[unitResults.length - 1];
+                    return {
+                        unitId: `batch:after:${batchOrder}`,
+                        phase: 'after_turn',
+                        target: taskCtx.target,
+                        kind: last?.kind ?? 'agent',
+                        triggerIds: unitResults.flatMap((r) => r.triggerIds),
+                        agentProfileId: last?.agentProfileId ?? 'after_turn_batch',
+                        output: combinedOutput,
+                        ...(last?.agentResult ? { agentResult: last.agentResult } : {}),
+                    };
                 },
             );
 
-            if (unit.barrier === 'turn') {
-                currentOrderGroupPromises.push(handle.promise);
+            const handlePromise = Promise.allSettled([handle.promise]);
+            prevAnyOrderPromise = handlePromise;
+            if (strictestBarrier === 'turn') {
+                prevTurnOrderPromise = handlePromise;
             }
             handles.push(handle);
         }
@@ -1183,82 +1428,6 @@ export class PipelineOrchestrator {
         return handles;
     }
 
-    private async executeSingleUnit(
-        unit: TriggerExecutionUnit,
-        ctx: {
-            target: MessageTarget;
-            turnNumber: number;
-            scanText: string;
-            userText: string;
-            assistantText: string;
-            preset: Preset;
-            effectiveAgents: Record<string, AgentProfile>;
-            loreEntries: readonly RawLoreEntry[];
-            subAgents: readonly SubAgentDescriptor[];
-            globalVarSchema?: z.ZodTypeAny;
-            staged: boolean;
-            signal: AbortSignal;
-        },
-    ): Promise<TriggerExecutionResult | null> {
-        const evaluated = await this.filterMatchingTriggers(unit, {
-            target: ctx.target,
-            turnNumber: ctx.turnNumber,
-            scanText: ctx.scanText,
-            signal: ctx.signal,
-        });
-
-        if (evaluated.activeTriggers.length === 0) {
-            return null;
-        }
-
-        const activeUnit: TriggerExecutionUnit = {
-            ...unit,
-            triggers: evaluated.activeTriggers,
-        };
-
-        return await this.executePreparedUnit(activeUnit, {
-            target: ctx.target,
-            userText: ctx.userText,
-            assistantText: ctx.assistantText,
-            preset: ctx.preset,
-            effectiveAgents: ctx.effectiveAgents,
-            loreEntries: ctx.loreEntries,
-            subAgents: ctx.subAgents,
-            globalVarSchema: ctx.globalVarSchema,
-            staged: ctx.staged,
-            matchOverrides: evaluated.matchOverrides,
-            signal: ctx.signal,
-        });
-    }
-
-    private async filterMatchingTriggers(
-        unit: TriggerExecutionUnit,
-        ctx: {
-            target: MessageTarget;
-            turnNumber: number;
-            scanText: string;
-            signal: AbortSignal;
-        },
-    ): Promise<{ activeTriggers: TriggerRule[]; matchOverrides?: Record<string, string> }> {
-        const activeTriggers: TriggerRule[] = [];
-        let mergedOverrides: Record<string, string> | undefined;
-
-        for (const rule of unit.triggers) {
-            const evalRes = await this.evaluateCondition(rule, ctx);
-            if (evalRes.matched) {
-                activeTriggers.push(rule);
-                if (evalRes.matchOverrides) {
-                    mergedOverrides = {
-                        ...(mergedOverrides ?? {}),
-                        ...evalRes.matchOverrides,
-                    };
-                }
-            }
-        }
-
-        return { activeTriggers, matchOverrides: mergedOverrides };
-    }
-
     private async executePreparedUnit(
         unit: TriggerExecutionUnit,
         ctx: {
@@ -1267,10 +1436,12 @@ export class PipelineOrchestrator {
             assistantText: string;
             preset: Preset;
             effectiveAgents: Record<string, AgentProfile>;
+            derivedAgentsByRuleId?: Record<string, AgentProfile>;
             loreEntries: readonly RawLoreEntry[];
             subAgents: readonly SubAgentDescriptor[];
             globalVarSchema?: z.ZodTypeAny;
             staged: boolean;
+            injectionSession?: PromptInjectionSession;
             matchOverrides?: Record<string, string>;
             signal: AbortSignal;
         },
@@ -1281,17 +1452,15 @@ export class PipelineOrchestrator {
             return await this.executeScriptUnit(unit, ctx);
         }
 
-        const profile =
-            ctx.effectiveAgents[unit.agentProfileId]
-            ?? createDefaultMainAgent({
-                id: unit.agentProfileId,
-                name: unit.label,
-                sessionMode: 'ephemeral',
-                ephemeralWindowSize: 4,
-            });
+        const profile = resolveEffectiveUnitAgentProfile(
+            unit,
+            ctx.preset,
+            ctx.derivedAgentsByRuleId,
+            ctx.effectiveAgents,
+        );
 
         const unitSchema = await this.compileUnitVariableSchema(unit, ctx.globalVarSchema);
-        const promptInput = this.buildTriggerAgentPrompt(unit, ctx);
+        const promptInput = await this.buildTriggerAgentPrompt(unit, ctx);
         const permissions = mergeUnitPermissions(profile.permissions, unit.triggers);
         const triggerTools = resolveUnitTools(profile.enabledTools, unit.triggers);
 
@@ -1328,6 +1497,7 @@ export class PipelineOrchestrator {
             triggerId: triggerIds.join(','),
             triggerLabel: unit.label,
             staged: ctx.staged,
+            ...(ctx.injectionSession ? { injectionSession: ctx.injectionSession } : {}),
             stream: false,
             signal: ctx.signal,
             macroOverrides: ctx.matchOverrides,
@@ -1354,6 +1524,7 @@ export class PipelineOrchestrator {
             preset: Preset;
             globalVarSchema?: z.ZodTypeAny;
             staged: boolean;
+            injectionSession?: PromptInjectionSession;
             matchOverrides?: Record<string, string>;
             signal: AbortSignal;
         },
@@ -1404,7 +1575,11 @@ export class PipelineOrchestrator {
                         output: ctx.assistantText,
                         target: ctx.target,
                     };
-                    const evaluated = await this.bridge.evaluateOptionalEjs(code, ejsVars);
+                    const evaluated = await this.bridge.evaluateOptionalEjs(
+                        code,
+                        ejsVars,
+                        ctx.injectionSession ? { injectionSession: ctx.injectionSession } : undefined,
+                    );
                     throwIfAborted(ctx.signal);
 
                     if (rule.decorator?.startsWith('@@replace_ejs') && rule.targetPath) {
@@ -1489,15 +1664,17 @@ export class PipelineOrchestrator {
         };
     }
 
-    private buildTriggerAgentPrompt(
+    private async buildTriggerAgentPrompt(
         unit: TriggerExecutionUnit,
         ctx: {
             target: MessageTarget;
             userText: string;
             assistantText: string;
+            staged?: boolean;
+            injectionSession?: PromptInjectionSession;
             matchOverrides?: Record<string, string>;
         },
-    ): string {
+    ): Promise<string> {
         const macroOverrides: Record<string, string> = {
             ...(ctx.matchOverrides ?? {}),
             input: ctx.userText,
@@ -1505,13 +1682,39 @@ export class PipelineOrchestrator {
             lastMessage: ctx.assistantText || ctx.userText,
         };
 
+        const hasEjsTemplates = unit.triggers.some((r) => r.instructionTemplate.includes('<%'));
+        let ejsVars: Record<string, unknown> | undefined;
+        if (hasEjsTemplates && this.bridge.evaluateOptionalEjs) {
+            const baseVars = await this.vfs
+                .readVariables({ target: ctx.target, staged: ctx.staged ?? true })
+                .catch(() => ({}));
+            ejsVars = {
+                ...baseVars,
+                ...macroOverrides,
+                target: ctx.target,
+            };
+        }
+
+        const renderRuleTemplate = async (template: string): Promise<string> => {
+            let text = this.bridge.substituteMacros(template, macroOverrides);
+            if (ejsVars && this.bridge.evaluateOptionalEjs && text.includes('<%')) {
+                try {
+                    text = await this.bridge.evaluateOptionalEjs(
+                        text,
+                        ejsVars,
+                        ctx.injectionSession ? { injectionSession: ctx.injectionSession } : undefined,
+                    );
+                } catch {
+                    // Keep macro-substituted fallback text on EJS runtime error
+                }
+            }
+            return text.trim();
+        };
+
         const sections: string[] = [];
         if (unit.triggers.length === 1) {
             const rule = unit.triggers[0];
-            const rendered = this.bridge.substituteMacros(
-                rule.instructionTemplate,
-                macroOverrides,
-            ).trim();
+            const rendered = await renderRuleTemplate(rule.instructionTemplate);
             if (rule.targetPath) {
                 sections.push(`Target VFS Path: ${rule.targetPath}`);
             }
@@ -1526,18 +1729,16 @@ export class PipelineOrchestrator {
                     '- Persist each task\'s changes strictly through the granted tools for its Target VFS Path, and ignore legacy plain-text output-only format directives inside individual task bodies.',
                 ].join('\n'),
             );
-            unit.triggers.forEach((rule, index) => {
-                const rendered = this.bridge.substituteMacros(
-                    rule.instructionTemplate,
-                    macroOverrides,
-                ).trim();
+            for (let index = 0; index < unit.triggers.length; index += 1) {
+                const rule = unit.triggers[index];
+                const rendered = await renderRuleTemplate(rule.instructionTemplate);
                 sections.push(
                     `### Task ${index + 1}: ${rule.label}${rule.targetPath ? ` (Target: ${rule.targetPath})` : ''}${rule.decorator ? ` [${rule.decorator}]` : ''}`,
                 );
                 if (rendered) {
                     sections.push(rendered);
                 }
-            });
+            }
         }
 
         if (ctx.userText) {
@@ -1672,28 +1873,97 @@ export class PipelineOrchestrator {
     }
 }
 
-function groupUnitsByOrder(units: readonly TriggerExecutionUnit[]): TriggerExecutionUnit[][] {
-    const sorted = [...units].sort((a, b) => a.order - b.order);
-    const batches: TriggerExecutionUnit[][] = [];
+function groupRulesByOrder(rules: readonly TriggerRule[]): TriggerRule[][] {
+    const sorted = rules
+        .map((rule, idx) => ({ rule, idx }))
+        .sort((a, b) => a.rule.order - b.rule.order || a.idx - b.idx);
+    const batches: TriggerRule[][] = [];
     let currentOrder: number | undefined;
-    let currentBatch: TriggerExecutionUnit[] = [];
+    let currentBatch: TriggerRule[] = [];
 
-    for (const unit of sorted) {
-        if (currentOrder === undefined || unit.order !== currentOrder) {
+    for (const { rule } of sorted) {
+        if (currentOrder === undefined || rule.order !== currentOrder) {
             if (currentBatch.length > 0) {
                 batches.push(currentBatch);
             }
-            currentOrder = unit.order;
-            currentBatch = [unit];
+            currentOrder = rule.order;
+            currentBatch = [rule];
         } else {
-            currentBatch.push(unit);
+            currentBatch.push(rule);
         }
     }
     if (currentBatch.length > 0) {
         batches.push(currentBatch);
     }
-
     return batches;
+}
+
+function resolveStrictestBarrier(rules: readonly TriggerRule[]): BarrierPolicy {
+    let strictest: BarrierPolicy = 'none';
+    for (const rule of rules) {
+        if (rule.barrier === 'turn') {
+            return 'turn';
+        }
+        if (rule.barrier === 'self') {
+            strictest = 'self';
+        }
+    }
+    return strictest;
+}
+
+function mergeUnitMatchOverrides(
+    triggers: readonly TriggerRule[],
+    overridesByRuleId: ReadonlyMap<string, Record<string, string>>,
+): Record<string, string> | undefined {
+    let merged: Record<string, string> | undefined;
+    for (const rule of triggers) {
+        const ov = overridesByRuleId.get(rule.id);
+        if (ov) {
+            merged = { ...(merged ?? {}), ...ov };
+        }
+    }
+    return merged;
+}
+
+function resolveEffectiveUnitAgentProfile(
+    unit: TriggerExecutionUnit,
+    preset: Preset,
+    derivedAgentsByRuleId: Record<string, AgentProfile> | undefined,
+    effectiveAgents: Record<string, AgentProfile>,
+): AgentProfile {
+    if (preset.agents[unit.agentProfileId]) {
+        return preset.agents[unit.agentProfileId];
+    }
+
+    if (derivedAgentsByRuleId) {
+        const survivingDerived: AgentProfile[] = [];
+        for (const rule of unit.triggers) {
+            const derived = derivedAgentsByRuleId[rule.id];
+            if (derived) {
+                survivingDerived.push(derived);
+            }
+        }
+        if (survivingDerived.length === 1) {
+            return survivingDerived[0];
+        }
+        if (survivingDerived.length > 1) {
+            let acc = survivingDerived[0];
+            for (let i = 1; i < survivingDerived.length; i += 1) {
+                acc = mergeDerivedAgentProfiles(acc, survivingDerived[i], unit.groupName);
+            }
+            return acc;
+        }
+    }
+
+    return (
+        effectiveAgents[unit.agentProfileId]
+        ?? createDefaultMainAgent({
+            id: unit.agentProfileId,
+            name: unit.label,
+            sessionMode: 'ephemeral',
+            ephemeralWindowSize: 4,
+        })
+    );
 }
 
 function matchConditionKeyword(rawKey: string, scanText: string): boolean {

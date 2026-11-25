@@ -5,3 +5,4 @@ export * from './watermark-compactor';
 export * from './context-budget';
 export * from './workspace-notices';
 export * from './surface-macros';
+export * from './prompt-injection-session';

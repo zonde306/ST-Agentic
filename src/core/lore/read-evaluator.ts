@@ -1,13 +1,19 @@
-import type { HostBridge } from '@/core/bridge';
+import type { HostBridge, PromptInjectionSession } from '@/core/bridge';
 import type {
     ClassifiedLoreEntry,
     LoreReadContext,
     LoreReadHook,
     MessageTarget,
+    ParsedDecorator,
     RawLoreEntry,
 } from '@/core/types';
 import { buildLoreOverrideKey, buildLoreVfsPath } from './classifier';
-import { DecoratorParser } from './decorators';
+import {
+    DecoratorParser,
+    evaluateIfConditions,
+    extractIfConditions,
+    hasPrivateDecorator,
+} from './decorators';
 
 const EJS_DETECT_PATTERN = /<%[\s\S]*?%>/;
 
@@ -42,6 +48,7 @@ export interface LoreEvaluateOptions {
     overrides?: LoreOverrideSource;
     vars?: Record<string, unknown>;
     macroOverrides?: Record<string, string>;
+    injectionSession?: PromptInjectionSession;
     applyLoreReadRegex?: LoreReadRegexCallback;
     onEjsError?: 'fallback' | 'throw';
 }
@@ -55,6 +62,7 @@ export interface LoreReadResult {
     charCount: number;
     overridden: boolean;
     ejsEvaluated: boolean;
+    conditionSkipped?: boolean;
     ejsError?: string;
 }
 
@@ -141,16 +149,19 @@ export class LoreReadEvaluator {
         let rawEntry: RawLoreEntry;
         let baseClean: string;
         let vfsPath: string;
+        let decorators: readonly ParsedDecorator[];
 
         if (isClassifiedEntry(input)) {
             rawEntry = input.entry;
             baseClean = input.cleanContent;
             vfsPath = input.vfsPath;
+            decorators = input.decorators;
         } else {
             rawEntry = input;
             const parsed = DecoratorParser.parseEntry(rawEntry);
             baseClean = parsed.cleanContent;
             vfsPath = buildLoreVfsPath(rawEntry, parsed.decorators);
+            decorators = parsed.decorators;
         }
 
         const resolvedOverride = await this.resolveOverride(
@@ -166,6 +177,7 @@ export class LoreReadEvaluator {
             uid: rawEntry.uid,
             path: vfsPath,
             initialText,
+            decorators,
             overridden: resolvedOverride !== null,
             callOptions,
         });
@@ -176,15 +188,17 @@ export class LoreReadEvaluator {
         callOptions?: Omit<LoreEvaluateOptions, 'overrideContent' | 'target'>,
     ): Promise<LoreReadResult> {
         const hasOverride = context.overriddenContent !== undefined;
+        const parsedRaw = DecoratorParser.parse(context.rawContent ?? '');
         const initialText = hasOverride
             ? context.overriddenContent!
-            : DecoratorParser.parse(context.rawContent ?? '').cleanContent;
+            : parsedRaw.cleanContent;
 
         return this.runPipeline({
             world: context.world,
             uid: context.uid,
             path: context.path,
             initialText,
+            decorators: parsedRaw.decorators,
             overridden: hasOverride,
             callOptions: {
                 ...callOptions,
@@ -248,16 +262,41 @@ export class LoreReadEvaluator {
         uid: number;
         path: string;
         initialText: string;
+        decorators: readonly ParsedDecorator[];
         overridden: boolean;
         callOptions?: LoreEvaluateOptions;
     }): Promise<LoreReadResult> {
-        const { world, uid, path, initialText, overridden, callOptions } = params;
+        const { world, uid, path, initialText, decorators, overridden, callOptions } = params;
 
         const metadataVars = extractMetadataVariables(this.hostBridge.getMetadata());
         const effectiveVars: Record<string, unknown> = {
             ...metadataVars,
             ...(callOptions?.vars ?? {}),
         };
+
+        const ifConditions = extractIfConditions(decorators);
+        if (ifConditions.length > 0) {
+            const conditionPassed = await evaluateIfConditions(
+                ifConditions,
+                this.hostBridge,
+                effectiveVars,
+                { injectionSession: callOptions?.injectionSession },
+            );
+            if (!conditionPassed) {
+                const emptyHash = await this.hostBridge.hashText('');
+                return {
+                    path,
+                    world,
+                    uid,
+                    text: '',
+                    contentHash: emptyHash,
+                    charCount: 0,
+                    overridden,
+                    ejsEvaluated: false,
+                    conditionSkipped: true,
+                };
+            }
+        }
 
         const macroOverrides: Record<string, string> = {};
         if (callOptions?.vars) {
@@ -280,8 +319,18 @@ export class LoreReadEvaluator {
 
         if (this.hostBridge.evaluateOptionalEjs && EJS_DETECT_PATTERN.test(workingText)) {
             const errorPolicy = callOptions?.onEjsError ?? this.options.onEjsError ?? 'fallback';
+            const isPrivate = hasPrivateDecorator(decorators);
             try {
-                workingText = await this.hostBridge.evaluateOptionalEjs(workingText, effectiveVars);
+                workingText = await this.hostBridge.evaluateOptionalEjs(
+                    workingText,
+                    effectiveVars,
+                    {
+                        ...(callOptions?.injectionSession
+                            ? { injectionSession: callOptions.injectionSession }
+                            : {}),
+                        ...(isPrivate ? { isPrivate: true } : {}),
+                    },
+                );
                 ejsEvaluated = true;
             } catch (error) {
                 if (errorPolicy === 'throw') {

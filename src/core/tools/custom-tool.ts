@@ -4,7 +4,22 @@ import type { ToolDefinition, ToolRegistry } from './registry';
 import { type ScriptSandbox, throwIfAborted } from './script-sandbox';
 import { compileSlashBridgeTool } from './slash-tool';
 
+const MAX_CUSTOM_TOOL_TIMEOUT_MS = 600_000;
+
+function parseDecoratorTimeoutMs(params: Record<string, string>): number | undefined {
+    const raw = params.timeoutMs ?? params.timeout;
+    if (raw === undefined) {
+        return undefined;
+    }
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        return undefined;
+    }
+    return Math.min(Math.max(1, Math.floor(parsed)), MAX_CUSTOM_TOOL_TIMEOUT_MS);
+}
+
 export interface CompileCustomToolOptions {
+    sandboxId?: string;
     signal?: AbortSignal;
     timeoutMs?: number;
 }
@@ -43,7 +58,7 @@ export async function compileCustomToolConfig(
         throw new Error(`Custom JS tool "${config.name || config.id}" has empty source code.`);
     }
 
-    const sandboxId = config.id?.trim() || config.name?.trim() || 'custom_js_tool';
+    const sandboxId = options.sandboxId?.trim() || config.id?.trim() || config.name?.trim() || 'custom_js_tool';
     const compiledList = await sandbox.compileCustomTools(code, {
         id: sandboxId,
         allowNetwork: config.allowNetwork ?? true,
@@ -87,6 +102,7 @@ export async function compileLoreToolEntry(
         allowNetworkParam === undefined
             ? true
             : allowNetworkParam.toLowerCase() !== 'false';
+    const decoratorTimeoutMs = parseDecoratorTimeoutMs(toolDec.params);
 
     const config: CustomToolConfig = {
         id: `lore:${entry.world}:${entry.uid}`,
@@ -98,7 +114,12 @@ export async function compileLoreToolEntry(
         allowNetwork,
     };
 
-    return await compileCustomToolConfig(config, sandbox, options);
+    return await compileCustomToolConfig(config, sandbox, {
+        ...options,
+        ...(options.timeoutMs === undefined && decoratorTimeoutMs !== undefined
+            ? { timeoutMs: decoratorTimeoutMs }
+            : {}),
+    });
 }
 
 /**

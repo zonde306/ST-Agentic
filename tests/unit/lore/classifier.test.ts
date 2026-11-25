@@ -175,4 +175,86 @@ describe('WIClassifier & Hollow Character Card detection', () => {
         expect(classifier.classifyEntries([disabledEntry]).all).toHaveLength(0);
         expect(classifier.classifyEntries([disabledEntry], { includeDisabled: true }).all).toHaveLength(1);
     });
+
+    it('excludes ST-Prompt-Template special entries, separates wi_outlet, and moves constant @@if entries to dynamic_or_trigger', () => {
+        const base: RawLoreEntry = {
+            world: 'CompatBook',
+            uid: 300,
+            comment: 'Base',
+            content: '内容',
+            keys: [],
+            keysecondary: [],
+            constant: true,
+            selective: false,
+            disable: false,
+            position: 4,
+            depth: 1,
+            order: 10,
+            role: 0,
+        };
+
+        const statusBar = classifyEntry({
+            ...base,
+            uid: 301,
+            comment: 'Status Bar',
+            content: '@@render_after\n@@iframe 状态栏\n@@if !is_user\n<div><%- vars.hp %></div>',
+        });
+        expect(statusBar.category).toBe('dynamic_or_trigger');
+        expect(statusBar.reason).toBe('decorator:@@render_after');
+
+        const initialVars = classifyEntry({
+            ...base,
+            uid: 302,
+            comment: 'Init',
+            content: '@@initial_variables\n{"hp": 100}',
+        });
+        expect(initialVars.category).toBe('dynamic_or_trigger');
+
+        const onlyPreload = classifyEntry({
+            ...base,
+            uid: 303,
+            comment: 'Helpers',
+            content: '@@only_preload\n<% define("fmt", () => "ok"); %>',
+        });
+        expect(onlyPreload.category).toBe('dynamic_or_trigger');
+
+        const commentInject = classifyEntry({
+            ...base,
+            uid: 304,
+            comment: '@INJECT pos=1,role=system',
+            content: '注入段落',
+        });
+        expect(commentInject.category).toBe('dynamic_or_trigger');
+        expect(commentInject.reason).toBe('ejs_special');
+
+        const renderHeader = classifyEntry({
+            ...base,
+            uid: 305,
+            comment: '[RENDER:AFTER] Card',
+            content: '<p>HUD</p>',
+        });
+        expect(renderHeader.category).toBe('dynamic_or_trigger');
+        expect(renderHeader.reason).toBe('ejs_special');
+
+        const outletEntry = classifyEntry({
+            ...base,
+            uid: 306,
+            comment: 'Achievement Outlet',
+            position: 7,
+            outletName: 'achievements',
+            content: '已解锁：灰港潜行者',
+        });
+        expect(outletEntry.category).toBe('dynamic_or_trigger');
+        expect(outletEntry.reason).toBe('wi_outlet');
+
+        const conditionalConstant = classifyEntry({
+            ...base,
+            uid: 307,
+            comment: 'Conditional Lore',
+            position: 0,
+            content: '@@if vars.phase === 2\n第二阶段世界观揭示。',
+        });
+        expect(conditionalConstant.category).toBe('dynamic_or_trigger');
+        expect(conditionalConstant.reason).toBe('conditional_dynamic');
+    });
 });

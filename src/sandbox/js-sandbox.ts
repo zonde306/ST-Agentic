@@ -219,6 +219,15 @@ function combineAbortSignals(
     };
 }
 
+const MAX_CUSTOM_TOOL_TIMEOUT_MS = 600_000;
+
+function resolveToolTimeoutMs(candidate: number | undefined, fallback: number): number {
+    if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0) {
+        return Math.min(Math.max(1, Math.floor(candidate)), MAX_CUSTOM_TOOL_TIMEOUT_MS);
+    }
+    return fallback;
+}
+
 function raceWithSignalAndTimeout<T>(
     promise: Promise<T>,
     signal?: AbortSignal,
@@ -830,6 +839,7 @@ export class IframeJsSandbox implements ScriptSandbox {
                 description: def.description,
                 parameters: def.parameters,
                 ...(def.strict !== undefined ? { strict: def.strict } : {}),
+                ...(def.timeoutMs !== undefined ? { timeoutMs: def.timeoutMs } : {}),
                 execute: async (args: Record<string, unknown>, ctx: ToolExecutionContext) => {
                     if (realm.handle.isDisposed()) {
                         throw new SandboxExecutionError(`Sandbox "${id}" has been disposed.`);
@@ -861,11 +871,15 @@ export class IframeJsSandbox implements ScriptSandbox {
                     };
 
                     try {
+                        const executionTimeoutMs = resolveToolTimeoutMs(
+                            def.timeoutMs ?? options.timeoutMs,
+                            this.defaultTimeoutMs,
+                        );
                         const runPromise = Promise.resolve(def.execute(args, scopedCtx));
                         return await raceWithSignalAndTimeout(
                             runPromise,
                             combined.signal,
-                            options.timeoutMs ?? this.defaultTimeoutMs,
+                            executionTimeoutMs,
                             `Custom tool "${def.name}"`,
                         );
                     } finally {

@@ -1,4 +1,4 @@
-import type { HostBridge } from '@/core/bridge';
+import type { HostBridge, PromptInjectionSession } from '@/core/bridge';
 import type {
     CanonicalContentPart,
     CanonicalMessage,
@@ -21,6 +21,8 @@ export interface PromptBlockRenderOptions extends PromptBlockRenderSyncOptions {
     hostBridge?: Pick<HostBridge, 'substituteMacros' | 'evaluateOptionalEjs'>;
     /** Variables exposed to `hostBridge.evaluateOptionalEjs(text, vars)`. */
     vars?: Record<string, unknown>;
+    /** Isolated per-turn `injectPrompt` / `getPromptsInjected` session. */
+    injectionSession?: PromptInjectionSession;
 }
 
 export type CustomPromptBlockMode = 'json' | 'ejs_template' | 'empty' | 'invalid';
@@ -170,7 +172,13 @@ async function evaluateStringLeafAsync(
     let text = applyMacros(raw, options.hostBridge, options.macroOverrides);
     if (evalEjs && options.hostBridge?.evaluateOptionalEjs && text.includes('<%')) {
         try {
-            text = await options.hostBridge.evaluateOptionalEjs(text, ejsEnv);
+            text = await options.hostBridge.evaluateOptionalEjs(
+                text,
+                ejsEnv,
+                options.injectionSession
+                    ? { injectionSession: options.injectionSession }
+                    : undefined,
+            );
         } catch (err) {
             options.onError?.(err instanceof Error ? err : new Error(String(err)), block);
         }
@@ -859,7 +867,13 @@ export async function renderPromptBlock(
         let text = applyMacros(block.content, options.hostBridge, options.macroOverrides);
         if (options.hostBridge?.evaluateOptionalEjs && text.includes('<%')) {
             try {
-                text = await options.hostBridge.evaluateOptionalEjs(text, ejsEnv);
+                text = await options.hostBridge.evaluateOptionalEjs(
+                    text,
+                    ejsEnv,
+                    options.injectionSession
+                        ? { injectionSession: options.injectionSession }
+                        : undefined,
+                );
             } catch (err) {
                 options.onError?.(err instanceof Error ? err : new Error(String(err)), block);
             }
@@ -893,7 +907,13 @@ export async function renderPromptBlock(
     if (trimmed.includes('<%') && options.hostBridge?.evaluateOptionalEjs) {
         let evaluated: string;
         try {
-            evaluated = await options.hostBridge.evaluateOptionalEjs(trimmed, ejsEnv);
+            evaluated = await options.hostBridge.evaluateOptionalEjs(
+                trimmed,
+                ejsEnv,
+                options.injectionSession
+                    ? { injectionSession: options.injectionSession }
+                    : undefined,
+            );
         } catch (err) {
             options.onError?.(err instanceof Error ? err : new Error(String(err)), block);
             return [];

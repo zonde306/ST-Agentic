@@ -1,5 +1,12 @@
 import yaml from 'yaml';
 import type { HostBridge, ToolEditResult } from '@/core/bridge';
+import {
+    DecoratorParser,
+    KNOWN_DECORATORS,
+    isEjsEntryEnabled,
+    isEjsForceDisabledEntry,
+    isEjsSpecialEntry,
+} from '@/core/lore/decorators';
 import { ChatDataStore, DATA_NAMESPACES, worldInfoKey } from '@/core/store';
 import type { LoreReadHook, RawLoreEntry, VfsEntryStat } from '@/core/types';
 import {
@@ -52,7 +59,8 @@ const NON_LORE_MOUNT_DECORATORS = new Set([
     '@@replace_ejs_before',
 ]);
 
-const KNOWN_LORE_DECORATORS = new Set([
+const KNOWN_LORE_DECORATORS = new Set<string>([
+    ...KNOWN_DECORATORS,
     ...NON_LORE_MOUNT_DECORATORS,
     '@@replace',
     '@@replace_before',
@@ -197,23 +205,31 @@ function getDecoratorBase(decoratorLine: string): string {
     return spaceIdx !== -1 ? trimmed.slice(0, spaceIdx) : trimmed;
 }
 
-export function isInitVarEntry(entry: RawLoreEntry): boolean {
-    if (entry.disable) {
+export function isInitVarEntry(
+    entry: RawLoreEntry,
+    options?: { invertEnabled?: boolean },
+): boolean {
+    const parsed = DecoratorParser.parseEntry(entry);
+    const hasInitialVarDecorator = parsed.decorators.some((d) => d.name === '@@initial_variables');
+    const hasInitVarComment = /\[(?:initvar|initialvariables)\]/i.test(entry.comment ?? '');
+    const hasInitVarBody = /^\s*\[(?:initvar|initialvariables)\]/i.test(parsed.cleanContent);
+
+    if (!hasInitialVarDecorator && !hasInitVarComment && !hasInitVarBody) {
         return false;
     }
-    if (/\[initvar\]/i.test(entry.comment ?? '')) {
-        return true;
-    }
-    const { cleanContent } = stripLeadingDecorators(entry.content ?? '', entry.decorators);
-    return /^\s*\[initvar\]/i.test(cleanContent);
+
+    return isEjsEntryEnabled(entry, parsed.decorators, options);
 }
 
-/** Parse and merge all enabled `[InitVar]` lorebook entries in ascending `order`. */
-export function parseInitVarEntries(books: Map<string, RawLoreEntry[]>): Record<string, unknown> {
+/** Parse and merge all enabled `[InitVar]` / `[InitialVariables]` / `@@initial_variables` lorebook entries in ascending `order`. */
+export function parseInitVarEntries(
+    books: Map<string, RawLoreEntry[]>,
+    options?: { invertEnabled?: boolean },
+): Record<string, unknown> {
     const candidates: RawLoreEntry[] = [];
     for (const entries of books.values()) {
         for (const entry of entries) {
-            if (isInitVarEntry(entry)) {
+            if (isInitVarEntry(entry, options)) {
                 candidates.push(entry);
             }
         }
@@ -238,7 +254,7 @@ export function parseInitVarEntries(books: Map<string, RawLoreEntry[]>): Record<
 }
 
 function stripInitVarFence(text: string): string {
-    let body = text.replace(/^\s*\[initvar\]\s*/i, '').trim();
+    let body = text.replace(/^\s*\[(?:initvar|initialvariables)\]\s*/i, '').trim();
     const fenceMatch = /^```(?:json|yaml|yml)?\s*\r?\n([\s\S]*?)\r?\n```\s*$/i.exec(body);
     if (fenceMatch) {
         body = fenceMatch[1].trim();
@@ -301,6 +317,10 @@ export function isLorebookMountableEntry(entry: RawLoreEntry): boolean {
         return false;
     }
     if (isInitVarEntry(entry)) {
+        return false;
+    }
+    const parsed = DecoratorParser.parseEntry(entry);
+    if (isEjsForceDisabledEntry(parsed.decorators) || isEjsSpecialEntry(entry, parsed.decorators)) {
         return false;
     }
     const decorators = getEntryDecorators(entry);

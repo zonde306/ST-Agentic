@@ -7,6 +7,11 @@ import type {
     ReloadDisplayedMessagesResult,
     SwipeDataSnapshot,
 } from '../types';
+import type {
+    PromptInjectionSession,
+    SerializedPromptInjected,
+} from '../context/prompt-injection-session';
+export type { PromptInjectionSession, SerializedPromptInjected };
 import type { HostAdminBridge, HostAuthorBridge } from './host-admin-bridge';
 
 export interface HostIdentity {
@@ -58,6 +63,15 @@ export interface DeletedChatMessageSnapshot {
     messageId: number;
     snapshot: ChatMessageSnapshot;
     rawMessage?: Record<string, unknown>;
+}
+
+export interface EjsEvaluateOptions {
+    injectionSession?: PromptInjectionSession;
+    isPrivate?: boolean;
+}
+
+export interface EjsFeaturesSnapshot {
+    invertEnabled?: boolean;
 }
 
 /**
@@ -122,7 +136,17 @@ export interface HostBridge {
 
     // 3. Macro & optional template rendering
     substituteMacros(text: string, overrides?: Record<string, string>): string;
-    evaluateOptionalEjs?(text: string, vars: Record<string, unknown>): Promise<string>;
+    evaluateOptionalEjs?(
+        text: string,
+        vars: Record<string, unknown>,
+        options?: EjsEvaluateOptions,
+    ): Promise<string>;
+    createPromptInjectionSession?(initialSnapshot?: SerializedPromptInjected): {
+        session: PromptInjectionSession;
+        mode: 'native' | 'fallback';
+    };
+    getEjsFeatures?(): EjsFeaturesSnapshot | null;
+    reportCompatWarning?(code: string, message: string): void;
 
     // 4. External extension integration & slash commands
     executeSlashCommand?(command: string, signal?: AbortSignal): Promise<string>;

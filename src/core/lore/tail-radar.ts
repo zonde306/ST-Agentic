@@ -1,4 +1,4 @@
-import type { HostBridge } from '@/core/bridge';
+import type { HostBridge, PromptInjectionSession } from '@/core/bridge';
 import type {
     ClassifiedLoreEntry,
     MessageTarget,
@@ -48,6 +48,8 @@ export interface RadarScanInput {
     vars?: Record<string, unknown>;
     /** Macro overrides for keyword and entry evaluation. */
     macroOverrides?: Record<string, string>;
+    /** Isolated prompt injection session shared across the turn. */
+    injectionSession?: PromptInjectionSession;
     /** Per-scan override content resolver. */
     getOverride?: LoreOverrideResolver;
     /** Per-scan override map/record. */
@@ -365,6 +367,7 @@ export class TailRadar {
             target: scanOptions.target,
             vars: scanOptions.vars,
             macroOverrides: scanOptions.macroOverrides,
+            injectionSession: scanOptions.injectionSession,
             getOverride: scanOptions.getOverride,
             overrides: scanOptions.overrides,
             applyLoreReadRegex: scanOptions.applyLoreReadRegex,
@@ -405,6 +408,9 @@ export class TailRadar {
             }
 
             const evaluated = await this.evaluator.evaluate(classified, evaluateOpts);
+            if (evaluated.conditionSkipped) {
+                continue;
+            }
             const previousHash = scanOptions.readSet?.get(classified.vfsPath);
 
             if (previousHash !== undefined && previousHash === evaluated.contentHash) {
@@ -634,94 +640,122 @@ export class TailRadar {
         defaultMatchWholeWords: boolean,
         macroOverrides?: Record<string, string>,
     ): EntryMatchResult | null {
-        const primaryMatches: KeywordMatchDetail[] = [];
+        return matchLoreEntryKeywords(entry, haystack, {
+            defaultCaseSensitive,
+            defaultMatchWholeWords,
+            substituteMacros: (text, overrides) =>
+                this.evaluator.hostBridge.substituteMacros(text, overrides),
+            macroOverrides,
+        });
+    }
+}
 
-        for (const rawKey of entry.keys) {
-            const substituted = this.evaluator.hostBridge
-                .substituteMacros(rawKey, macroOverrides)
-                .trim();
-            if (!substituted) {
-                continue;
-            }
+export interface MatchLoreKeywordsOptions {
+    defaultCaseSensitive?: boolean;
+    defaultMatchWholeWords?: boolean;
+    substituteMacros?: (text: string, overrides?: Record<string, string>) => string;
+    macroOverrides?: Record<string, string>;
+}
 
+/**
+ * Match a World Info entry's primary/secondary keywords against a haystack string,
+ * honoring `caseSensitive`, `matchWholeWords`, regex `/.../flags`, and `selectiveLogic`.
+ */
+export function matchLoreEntryKeywords(
+    entry: RawLoreEntry,
+    haystack: string,
+    options: MatchLoreKeywordsOptions = {},
+): EntryMatchResult | null {
+    const defaultCaseSensitive = options.defaultCaseSensitive ?? false;
+    const defaultMatchWholeWords = options.defaultMatchWholeWords ?? false;
+    const sub = options.substituteMacros ?? ((text: string) => text);
+    const macroOverrides = options.macroOverrides;
+
+    const primaryMatches: KeywordMatchDetail[] = [];
+
+    for (const rawKey of entry.keys) {
+        const substituted = sub(rawKey, macroOverrides).trim();
+        if (!substituted) {
+            continue;
+        }
+
+        const matched = matchSingleKeyword(
+            haystack,
+            substituted,
+            entry,
+            defaultCaseSensitive,
+            defaultMatchWholeWords,
+        );
+        if (matched) {
+            primaryMatches.push(matched);
+        }
+    }
+
+    if (primaryMatches.length === 0) {
+        return null;
+    }
+
+    const activeSecondary = (entry.keysecondary ?? [])
+        .map((key) => sub(key, macroOverrides).trim())
+        .filter(Boolean);
+
+    const hasSecondary = Boolean(entry.selective && activeSecondary.length > 0);
+    const positiveSecondaryMatches: KeywordMatchDetail[] = [];
+
+    if (hasSecondary) {
+        const logic = entry.selectiveLogic ?? WORLD_INFO_LOGIC.AND_ANY;
+        let matchedCount = 0;
+
+        for (const secKey of activeSecondary) {
             const matched = matchSingleKeyword(
                 haystack,
-                substituted,
+                secKey,
                 entry,
                 defaultCaseSensitive,
                 defaultMatchWholeWords,
             );
             if (matched) {
-                primaryMatches.push(matched);
+                matchedCount += 1;
+                positiveSecondaryMatches.push(matched);
             }
         }
 
-        if (primaryMatches.length === 0) {
+        const passed = evaluateSelectiveLogic(logic, matchedCount, activeSecondary.length);
+        if (!passed) {
             return null;
         }
-
-        const activeSecondary = (entry.keysecondary ?? [])
-            .map((key) => this.evaluator.hostBridge.substituteMacros(key, macroOverrides).trim())
-            .filter(Boolean);
-
-        const hasSecondary = Boolean(entry.selective && activeSecondary.length > 0);
-        const positiveSecondaryMatches: KeywordMatchDetail[] = [];
-
-        if (hasSecondary) {
-            const logic = entry.selectiveLogic ?? WORLD_INFO_LOGIC.AND_ANY;
-            let matchedCount = 0;
-
-            for (const secKey of activeSecondary) {
-                const matched = matchSingleKeyword(
-                    haystack,
-                    secKey,
-                    entry,
-                    defaultCaseSensitive,
-                    defaultMatchWholeWords,
-                );
-                if (matched) {
-                    matchedCount += 1;
-                    positiveSecondaryMatches.push(matched);
-                }
-            }
-
-            const passed = evaluateSelectiveLogic(logic, matchedCount, activeSecondary.length);
-            if (!passed) {
-                return null;
-            }
-        }
-
-        const isPositiveSecondary =
-            hasSecondary
-            && (entry.selectiveLogic === undefined
-                || entry.selectiveLogic === WORLD_INFO_LOGIC.AND_ANY
-                || entry.selectiveLogic === WORLD_INFO_LOGIC.AND_ALL);
-
-        const allMatches = isPositiveSecondary
-            ? [...primaryMatches, ...positiveSecondaryMatches]
-            : primaryMatches;
-
-        const seenKeywords = new Set<string>();
-        const matchedKeywords: string[] = [];
-        let specificity = 0;
-
-        for (const item of allMatches) {
-            if (!seenKeywords.has(item.keyword)) {
-                seenKeywords.add(item.keyword);
-                matchedKeywords.push(item.keyword);
-                specificity += item.matchedLength;
-            }
-        }
-
-        if (matchedKeywords.length > 1) {
-            specificity += matchedKeywords.length;
-        }
-
-        return {
-            matchedKeywords,
-            specificity,
-        };
     }
+
+    const isPositiveSecondary =
+        hasSecondary
+        && (entry.selectiveLogic === undefined
+            || entry.selectiveLogic === WORLD_INFO_LOGIC.AND_ANY
+            || entry.selectiveLogic === WORLD_INFO_LOGIC.AND_ALL);
+
+    const allMatches = isPositiveSecondary
+        ? [...primaryMatches, ...positiveSecondaryMatches]
+        : primaryMatches;
+
+    const seenKeywords = new Set<string>();
+    const matchedKeywords: string[] = [];
+    let specificity = 0;
+
+    for (const item of allMatches) {
+        if (!seenKeywords.has(item.keyword)) {
+            seenKeywords.add(item.keyword);
+            matchedKeywords.push(item.keyword);
+            specificity += item.matchedLength;
+        }
+    }
+
+    if (matchedKeywords.length > 1) {
+        specificity += matchedKeywords.length;
+    }
+
+    return {
+        matchedKeywords,
+        specificity,
+    };
 }
 
 function evaluateSelectiveLogic(
