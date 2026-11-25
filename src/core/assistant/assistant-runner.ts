@@ -1058,6 +1058,69 @@ export function createAssistantUndoExecutor(deps: {
                 await bridge.admin.replaceTavernHelperScripts(scope, prevScripts);
                 return;
             }
+            if (action === 'tavern_helper_script_single') {
+                if (!bridge.admin.readTavernHelperScripts || !bridge.admin.replaceTavernHelperScripts) {
+                    throw new Error(
+                        'HostAdminBridge.readTavernHelperScripts and replaceTavernHelperScripts are required to undo TavernHelper script edit.',
+                    );
+                }
+                const scope = String(snap.scope ?? 'global') as TavernHelperScriptScope;
+                const targetId = typeof snap.scriptId === 'string' ? snap.scriptId : '';
+                const folderId = typeof snap.folderId === 'string' ? snap.folderId : undefined;
+                const existed = Boolean(snap.existed);
+                const previousScript =
+                    snap.previousScript
+                    && typeof snap.previousScript === 'object'
+                    && !Array.isArray(snap.previousScript)
+                        ? canonicalClone(snap.previousScript as Record<string, unknown>)
+                        : undefined;
+
+                const current = await bridge.admin.readTavernHelperScripts(scope);
+                const nextTrees: Record<string, unknown>[] = [];
+                let restored = false;
+
+                for (const item of current.scripts) {
+                    if (item.id === targetId) {
+                        if (existed && previousScript) {
+                            nextTrees.push(previousScript);
+                            restored = true;
+                        }
+                        continue;
+                    }
+                    if (item.type === 'folder' && Array.isArray(item.scripts)) {
+                        const nextChildren: Record<string, unknown>[] = [];
+                        for (const child of item.scripts) {
+                            if (
+                                child
+                                && typeof child === 'object'
+                                && !Array.isArray(child)
+                                && (child as Record<string, unknown>).id === targetId
+                            ) {
+                                if (existed && previousScript) {
+                                    nextChildren.push(previousScript);
+                                    restored = true;
+                                }
+                                continue;
+                            }
+                            nextChildren.push(child as Record<string, unknown>);
+                        }
+                        if (!restored && existed && previousScript && folderId && item.id === folderId) {
+                            nextChildren.push(previousScript);
+                            restored = true;
+                        }
+                        nextTrees.push({ ...item, scripts: nextChildren });
+                        continue;
+                    }
+                    nextTrees.push(item);
+                }
+
+                if (!restored && existed && previousScript) {
+                    nextTrees.push(previousScript);
+                }
+
+                await bridge.admin.replaceTavernHelperScripts(scope, nextTrees);
+                return;
+            }
             if (action === 'settings_patch') {
                 const scope = String(snap.scope ?? 'all') as HostSettingsScope;
                 const prevValues = (snap.previousValues ?? {}) as Record<string, unknown>;

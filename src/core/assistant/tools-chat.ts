@@ -372,6 +372,48 @@ export async function executeAssistantTool(
     }
 }
 
+const DATA_URI_BASE64_RE =
+    /(data:[a-zA-Z0-9.+_-]+\/[a-zA-Z0-9.+_-]+(?:;[a-zA-Z0-9_=.-]+)*;base64,)([A-Za-z0-9+/=]{512,})/g;
+const QUOTED_LARGE_BASE64_RE = /(['"`])([A-Za-z0-9+/=]{4096,})\1/g;
+
+/**
+ * Fold oversized inline Base64 data URIs or bare quoted blobs without changing `\n`
+ * line counts, keeping 1-based line numbers aligned with raw source text.
+ */
+export function foldInlineBase64(text: string): {
+    text: string;
+    count: number;
+    bytes: number;
+} {
+    if (!text) {
+        return { text: '', count: 0, bytes: 0 };
+    }
+    let count = 0;
+    let bytes = 0;
+    let out = text.replace(DATA_URI_BASE64_RE, (_full, prefix: string, payload: string) => {
+        count += 1;
+        bytes += utf8ByteLength(payload);
+        return `${prefix}[BASE64_OMITTED:${payload.length}chars]`;
+    });
+    out = out.replace(QUOTED_LARGE_BASE64_RE, (_full, quote: string, payload: string) => {
+        count += 1;
+        bytes += utf8ByteLength(payload);
+        return `${quote}[BASE64_OMITTED:${payload.length}chars]${quote}`;
+    });
+    return { text: out, count, bytes };
+}
+
+/**
+ * Replace `formatFileReadResult`'s default `read_file` footer hint with a
+ * tool-specific continuation instruction.
+ */
+export function rewriteReadFooterHint(formattedText: string, customInstruction: string): string {
+    return formattedText.replace(
+        /\[\.\.\. (\d+) more line\(s\) omitted\. Use read_file\([^\]]*\]$/,
+        (_match, countStr: string) => `[... ${countStr} more line(s) omitted. ${customInstruction}]`,
+    );
+}
+
 function normalizeDirectoryInput(rawPath: string | undefined): string {
     const trimmed = (rawPath ?? '/').trim();
     if (!trimmed || trimmed === '.') {

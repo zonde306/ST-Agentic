@@ -1,5 +1,10 @@
 import { z } from 'zod';
-import type { HostAdminBridge, HostBridge, ReadHostSettingsOptions } from '@/core/bridge';
+import type {
+    HostAdminBridge,
+    HostBridge,
+    ReadHostSettingsOptions,
+    ToolEditOperation,
+} from '@/core/bridge';
 import { utf8ByteLength } from '@/core/context';
 import type {
     HostCharacterCreatePayload,
@@ -11,6 +16,13 @@ import type {
     TavernHelperScriptScope,
 } from '@/core/types';
 import { canonicalClone } from '@/core/utils';
+import {
+    applyTextEdits,
+    countLines,
+    formatByteSize,
+    formatFileReadResult,
+    grepLinesInText,
+} from '@/core/vfs';
 import { computeDiffLines } from './approval';
 import { redactWithReport } from './redact';
 import {
@@ -26,6 +38,8 @@ import {
     finalizeMutationToolResult,
     finalizeReadToolResult,
     finalizeToolError,
+    foldInlineBase64,
+    rewriteReadFooterHint,
     throwIfAssistantAborted,
     truncateSummary,
     type AssistantToolContext,
@@ -462,6 +476,68 @@ const TAVERN_HELPER_SCRIPTS_READ_SCHEMA = z.object({
         .optional()
         .default('global')
         .describe('JS-Slash-Runner (TavernHelper) script scope: "global", "character", or "preset".'),
+    scriptId: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Target script/folder ID (or exact name) to inspect with numbered paginated source.'),
+    name: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Optional target script/folder name (alternative to scriptId).'),
+    query: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Search text or regex across scripts in this scope (returns 1-based line numbers & context; folds huge Base64).'),
+    regex: z.boolean().optional().default(false).describe('Treat query as RegExp.'),
+    case_sensitive: z.boolean().optional().default(false),
+    context_lines: z.number().int().min(0).max(10).optional().default(2),
+    max_matches: z.number().int().min(1).max(100).optional().default(30),
+    summaryOnly: z
+        .boolean()
+        .optional()
+        .describe('Return lightweight script catalog only; auto-enabled above 16 KB when scriptId/name/query are omitted.'),
+    includeData: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe('When reading a single script, include full script.data JSON instead of compact dataSummary.'),
+    stripBase64: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe('Fold oversized inline Base64 blobs without changing 1-based line numbers.'),
+    start_line: z.number().int().min(1).optional(),
+    end_line: z.number().int().min(1).optional(),
+    line_numbers: z.boolean().optional().default(true),
+    char_offset: z.number().int().min(0).optional(),
+    char_limit: z.number().int().min(200).max(20000).optional(),
+});
+
+const TAVERN_HELPER_CONTENT_EDIT_SCHEMA = z.object({
+    search: z
+        .string()
+        .min(1)
+        .describe('Exact verbatim source text to replace (without "N| " line-number prefixes).'),
+    replace: z.string().describe('Replacement text.'),
+    start_line: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe('Optional 1-based start line to constrain matching.'),
+    end_line: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe('Optional 1-based end line to constrain matching.'),
+    replace_all: z
+        .boolean()
+        .optional()
+        .describe('Replace all matches within range (defaults to false).'),
 });
 
 const TAVERN_HELPER_SCRIPTS_UPSERT_SCHEMA = z.object({
@@ -469,19 +545,24 @@ const TAVERN_HELPER_SCRIPTS_UPSERT_SCHEMA = z.object({
         .enum(['global', 'character', 'preset'])
         .describe('JS-Slash-Runner (TavernHelper) script scope: "global", "character", or "preset".'),
     mode: z
-        .enum(['upsert', 'delete', 'replace_all'])
+        .enum(['upsert', 'edit_content', 'delete', 'replace_all'])
         .optional()
         .default('upsert')
-        .describe('"upsert" adds/updates one script or folder; "delete" removes by scriptId; "replace_all" replaces the entire scripts array.'),
+        .describe('"upsert" adds/updates one script or folder; "edit_content" patches an existing script in-place via contentEdits (preserving Base64/data); "delete" removes by scriptId; "replace_all" replaces the entire scripts array.'),
     script: z
         .record(z.string(), z.unknown())
         .optional()
-        .describe('Script or folder object for mode="upsert" (merged over existing matching id/name).'),
+        .describe('Script or folder object for mode="upsert" (or optional metadata updates alongside contentEdits).'),
     scriptId: z
         .string()
         .min(1)
         .optional()
-        .describe('Target script/folder id (or exact name) for mode="delete".'),
+        .describe('Target script/folder id (or exact name) for mode="edit_content" or mode="delete".'),
+    contentEdits: z
+        .array(TAVERN_HELPER_CONTENT_EDIT_SCHEMA)
+        .min(1)
+        .optional()
+        .describe('Surgical search/replace operations against an existing script.content (preserves untouched lines, Base64 blobs, and script.data).'),
     scripts: z
         .array(z.record(z.string(), z.unknown()))
         .optional()
@@ -743,34 +824,171 @@ function buildDefaultTavernHelperScript(
     };
 }
 
-function findScriptContentInTrees(
+function summarizeTavernHelperTree(item: Record<string, unknown>): Record<string, unknown> {
+    const id = typeof item.id === 'string' ? item.id : '';
+    const name = typeof item.name === 'string' ? item.name : id;
+    const enabled = item.enabled !== undefined ? Boolean(item.enabled) : true;
+    if (item.type === 'folder' || Array.isArray(item.scripts)) {
+        const rawChildren = Array.isArray(item.scripts) ? item.scripts.filter(isPlainRecord) : [];
+        return {
+            type: 'folder',
+            id,
+            name,
+            enabled,
+            scriptCount: rawChildren.length,
+            scripts: rawChildren.map(summarizeTavernHelperTree),
+        };
+    }
+
+    const content = typeof item.content === 'string' ? item.content : '';
+    const info = typeof item.info === 'string' ? item.info : '';
+    const dataRecord = isPlainRecord(item.data) ? item.data : {};
+    const dataBytes = utf8ByteLength(JSON.stringify(dataRecord));
+    const buttonObj = isPlainRecord(item.button) ? item.button : undefined;
+    const buttonCount = Array.isArray(buttonObj?.buttons) ? buttonObj.buttons.length : 0;
+
+    return {
+        type: 'script',
+        id,
+        name,
+        enabled,
+        contentBytes: utf8ByteLength(content),
+        contentLines: countLines(content),
+        dataBytes,
+        dataKeys: Object.keys(dataRecord).slice(0, 20),
+        buttonCount,
+        ...(info.trim() ? { infoPreview: formatBoundedPreview(info, 100) } : {}),
+    };
+}
+
+interface LocatedTavernHelperItem {
+    item: Record<string, unknown>;
+    topIndex: number;
+    childIndex?: number;
+    folderId?: string;
+    folderName?: string;
+}
+
+function locateTavernHelperItem(
     trees: readonly Record<string, unknown>[],
-    targetId: string,
-    targetName?: string,
-): Record<string, unknown> | undefined {
-    for (const item of trees) {
-        if (
-            (targetId && item.id === targetId)
-            || (!targetId && targetName && item.name === targetName)
-        ) {
-            return item;
+    rawId?: string,
+    rawName?: string,
+): LocatedTavernHelperItem | undefined {
+    const targetId = rawId?.trim() ?? '';
+    const targetName = rawName?.trim() ?? '';
+    const entries: LocatedTavernHelperItem[] = [];
+
+    for (let i = 0; i < trees.length; i += 1) {
+        const item = trees[i];
+        if (!isPlainRecord(item)) {
+            continue;
         }
+        entries.push({ item, topIndex: i });
+        if (item.type === 'folder' && Array.isArray(item.scripts)) {
+            const folderId = typeof item.id === 'string' ? item.id : undefined;
+            const folderName = typeof item.name === 'string' ? item.name : undefined;
+            for (let j = 0; j < item.scripts.length; j += 1) {
+                const child = item.scripts[j];
+                if (isPlainRecord(child)) {
+                    entries.push({
+                        item: child,
+                        topIndex: i,
+                        childIndex: j,
+                        folderId,
+                        folderName,
+                    });
+                }
+            }
+        }
+    }
+
+    if (targetId) {
+        const byId = entries.find((entry) => entry.item.id === targetId);
+        if (byId) {
+            return byId;
+        }
+    }
+
+    const nameCandidates = [targetName, targetId].filter(Boolean);
+    for (const candidate of nameCandidates) {
+        const exact = entries.find((entry) => entry.item.name === candidate);
+        if (exact) {
+            return exact;
+        }
+    }
+
+    for (const candidate of nameCandidates) {
+        const lower = candidate.toLowerCase();
+        const ciMatches = entries.filter(
+            (entry) =>
+                typeof entry.item.name === 'string' && entry.item.name.toLowerCase() === lower,
+        );
+        if (ciMatches.length === 1) {
+            return ciMatches[0];
+        }
+    }
+
+    return undefined;
+}
+
+function collectTavernHelperLabels(trees: readonly Record<string, unknown>[]): string[] {
+    const labels: string[] = [];
+    for (const item of trees) {
+        if (!isPlainRecord(item)) {
+            continue;
+        }
+        const id = typeof item.id === 'string' ? item.id : '';
+        const name = typeof item.name === 'string' ? item.name : '';
+        labels.push(name && id && name !== id ? `${name} (id=${id})` : name || id || '(unnamed)');
         if (item.type === 'folder' && Array.isArray(item.scripts)) {
             for (const child of item.scripts) {
                 if (!isPlainRecord(child)) {
                     continue;
                 }
-                if (
-                    (targetId && child.id === targetId)
-                    || (!targetId && targetName && child.name === targetName)
-                ) {
-                    return child;
-                }
+                const cId = typeof child.id === 'string' ? child.id : '';
+                const cName = typeof child.name === 'string' ? child.name : '';
+                labels.push(
+                    cName && cId && cName !== cId ? `${cName} (id=${cId})` : cName || cId || '(unnamed)',
+                );
             }
         }
     }
-    return undefined;
+    return labels;
 }
+
+function flattenTavernHelperLeafScripts(
+    trees: readonly Record<string, unknown>[],
+): Array<{ item: Record<string, unknown>; folderId?: string; folderName?: string }> {
+    const leaves: Array<{ item: Record<string, unknown>; folderId?: string; folderName?: string }> =
+        [];
+    for (const item of trees) {
+        if (!isPlainRecord(item)) {
+            continue;
+        }
+        if (item.type === 'folder' && Array.isArray(item.scripts)) {
+            const folderId = typeof item.id === 'string' ? item.id : undefined;
+            const folderName = typeof item.name === 'string' ? item.name : undefined;
+            for (const child of item.scripts) {
+                if (isPlainRecord(child) && child.type !== 'folder') {
+                    leaves.push({ item: child, folderId, folderName });
+                }
+            }
+            continue;
+        }
+        leaves.push({ item });
+    }
+    return leaves;
+}
+
+type TavernHelperUndoTarget =
+    | { kind: 'all' }
+    | {
+        kind: 'single';
+        scriptId: string;
+        folderId?: string;
+        existed: boolean;
+        previousScript?: Record<string, unknown>;
+    };
 
 function computeNextTavernHelperTrees(
     existingTrees: readonly Record<string, unknown>[],
@@ -782,22 +1000,35 @@ function computeNextTavernHelperTrees(
     targetLabel: string;
     title: string;
     summary: string;
+    undoTarget: TavernHelperUndoTarget;
+    updatedSummary?: Record<string, unknown>;
+    editResult?: {
+        replacements?: number;
+        matchLines?: number[];
+        changedRanges?: unknown;
+        totalLines?: number;
+        bytes?: number;
+    };
 } {
     const cloned = canonicalClone([...existingTrees]);
-    const mode = args.mode ?? 'upsert';
+    const hasEdits = Array.isArray(args.contentEdits) && args.contentEdits.length > 0;
+    const mode = args.mode === 'upsert' && hasEdits ? 'edit_content' : (args.mode ?? 'upsert');
 
     if (mode === 'replace_all') {
         if (!Array.isArray(args.scripts)) {
             throw new Error('tavern_helper_scripts_upsert with mode="replace_all" requires "scripts" array.');
         }
         const nextTrees = args.scripts.map((entry) => buildDefaultTavernHelperScript(entry));
+        const beforeFolded = foldInlineBase64(JSON.stringify(cloned.map(summarizeTavernHelperTree), null, 2)).text;
+        const afterFolded = foldInlineBase64(JSON.stringify(nextTrees.map(summarizeTavernHelperTree), null, 2)).text;
         return {
             nextTrees,
-            beforeText: JSON.stringify(cloned, null, 2),
-            afterText: JSON.stringify(nextTrees, null, 2),
+            beforeText: beforeFolded,
+            afterText: afterFolded,
             targetLabel: `TavernHelper (${args.scope}): replace_all`,
             title: `Replace all TavernHelper (${args.scope}) scripts`,
             summary: `Replace ${cloned.length} tree(s) with ${nextTrees.length} tree(s) in scope "${args.scope}".`,
+            undoTarget: { kind: 'all' },
         };
     }
 
@@ -806,44 +1037,143 @@ function computeNextTavernHelperTrees(
         if (!delKey) {
             throw new Error('tavern_helper_scripts_upsert with mode="delete" requires "scriptId".');
         }
-        let removed: Record<string, unknown> | undefined;
-        const nextTrees: Record<string, unknown>[] = [];
-        for (const item of cloned) {
-            if (item.id === delKey || item.name === delKey) {
-                removed = item;
-                continue;
-            }
-            if (item.type === 'folder' && Array.isArray(item.scripts)) {
-                const nextChildren: Record<string, unknown>[] = [];
-                for (const child of item.scripts) {
-                    if (!isPlainRecord(child)) {
-                        continue;
-                    }
-                    if (!removed && (child.id === delKey || child.name === delKey)) {
-                        removed = child;
-                        continue;
-                    }
-                    nextChildren.push(child);
-                }
-                nextTrees.push({ ...item, scripts: nextChildren });
-                continue;
-            }
-            nextTrees.push(item);
-        }
-        if (!removed) {
+        const located = locateTavernHelperItem(cloned, delKey, delKey);
+        if (!located) {
             throw new Error(`TavernHelper script "${delKey}" not found in scope "${args.scope}".`);
         }
-        const beforeText =
+        const removed = located.item;
+        const nextTrees: Record<string, unknown>[] = [];
+        for (let i = 0; i < cloned.length; i += 1) {
+            const top = cloned[i]!;
+            if (located.childIndex === undefined) {
+                if (i === located.topIndex) {
+                    continue;
+                }
+                nextTrees.push(top);
+                continue;
+            }
+            if (i === located.topIndex && Array.isArray(top.scripts)) {
+                const nextChildren = (top.scripts as Record<string, unknown>[]).filter(
+                    (_child, idx) => idx !== located.childIndex,
+                );
+                nextTrees.push({ ...top, scripts: nextChildren });
+                continue;
+            }
+            nextTrees.push(top);
+        }
+        const beforeRaw =
             typeof removed.content === 'string'
                 ? removed.content
                 : JSON.stringify(removed, null, 2);
+        const removedId = typeof removed.id === 'string' && removed.id ? removed.id : delKey;
         return {
             nextTrees,
-            beforeText,
+            beforeText: foldInlineBase64(beforeRaw).text,
             afterText: '',
             targetLabel: `TavernHelper (${args.scope}): ${String(removed.name || delKey)}`,
             title: `Delete TavernHelper (${args.scope}) script "${String(removed.name || delKey)}"`,
             summary: `Delete script "${String(removed.name || delKey)}" from scope "${args.scope}".`,
+            undoTarget: {
+                kind: 'single',
+                scriptId: removedId,
+                ...(located.folderId ? { folderId: located.folderId } : {}),
+                existed: true,
+                previousScript: canonicalClone(removed),
+            },
+        };
+    }
+
+    if (mode === 'edit_content') {
+        if (!hasEdits) {
+            throw new Error(
+                'tavern_helper_scripts_upsert with mode="edit_content" requires non-empty "contentEdits".',
+            );
+        }
+        const scriptPatch = isPlainRecord(args.script) ? args.script : undefined;
+        const targetId =
+            args.scriptId?.trim()
+            || (typeof scriptPatch?.id === 'string' ? scriptPatch.id.trim() : '');
+        const targetName = typeof scriptPatch?.name === 'string' ? scriptPatch.name.trim() : '';
+        if (!targetId && !targetName) {
+            throw new Error(
+                'tavern_helper_scripts_upsert with mode="edit_content" requires "scriptId" (or "script.id"/"script.name").',
+            );
+        }
+
+        const located = locateTavernHelperItem(cloned, targetId, targetName);
+        if (!located) {
+            const available = collectTavernHelperLabels(cloned);
+            throw new Error(
+                `TavernHelper script "${targetId || targetName}" not found in scope "${args.scope}". Available: ${available.slice(0, 20).join(', ') || 'none'}`,
+            );
+        }
+        if (located.item.type === 'folder' || Array.isArray(located.item.scripts)) {
+            throw new Error(
+                `Target "${String(located.item.name || located.item.id)}" is a folder; mode="edit_content" requires a leaf script.`,
+            );
+        }
+
+        const existingItem = located.item;
+        const rawBeforeContent =
+            typeof existingItem.content === 'string' ? existingItem.content : '';
+        const editOps: ToolEditOperation[] = args.contentEdits!.map((op) => ({
+            search: op.search,
+            replace: op.replace,
+            ...(op.start_line !== undefined ? { startLine: op.start_line } : {}),
+            ...(op.end_line !== undefined ? { endLine: op.end_line } : {}),
+            ...(op.replace_all !== undefined ? { replaceAll: op.replace_all } : {}),
+        }));
+        const labelPath = `tavern_helper:${args.scope}:${String(existingItem.name || existingItem.id)}`;
+        const applied = applyTextEdits({
+            path: labelPath,
+            content: rawBeforeContent,
+            edits: editOps,
+        });
+        if (!applied.ok || applied.updatedContent === undefined) {
+            throw new Error(applied.message);
+        }
+
+        const metaPatch: Record<string, unknown> = scriptPatch ? canonicalClone(scriptPatch) : {};
+        delete metaPatch.content;
+        delete metaPatch.id;
+        delete metaPatch.type;
+
+        const updated = buildDefaultTavernHelperScript(
+            { ...metaPatch, content: applied.updatedContent },
+            existingItem,
+        );
+        if (located.childIndex !== undefined) {
+            const folder = cloned[located.topIndex]!;
+            const children = [...(folder.scripts as Record<string, unknown>[])];
+            children[located.childIndex] = updated;
+            cloned[located.topIndex] = { ...folder, scripts: children };
+        } else {
+            cloned[located.topIndex] = updated;
+        }
+
+        const updatedId = typeof updated.id === 'string' ? updated.id : targetId;
+        return {
+            nextTrees: cloned,
+            beforeText: foldInlineBase64(rawBeforeContent).text,
+            afterText: foldInlineBase64(applied.updatedContent).text,
+            targetLabel: `TavernHelper (${args.scope}): ${String(updated.name || updatedId)}`,
+            title: `Edit TavernHelper (${args.scope}) script "${String(updated.name || updatedId)}"`,
+            summary: `Apply ${applied.replacements ?? editOps.length} content edit(s) to "${String(updated.name || updatedId)}" in scope "${args.scope}".`,
+            undoTarget: {
+                kind: 'single',
+                scriptId: updatedId,
+                ...(located.folderId ? { folderId: located.folderId } : {}),
+                existed: true,
+                previousScript: canonicalClone(existingItem),
+            },
+            updatedSummary: summarizeTavernHelperTree(updated),
+            editResult: {
+                replacements: applied.replacements,
+                matchLines: applied.matchLines,
+                changedRanges: applied.changedRanges,
+                totalLines: applied.totalLines,
+                bytes: applied.bytes,
+            },
         };
     }
 
@@ -851,92 +1181,75 @@ function computeNextTavernHelperTrees(
     if (!isPlainRecord(args.script)) {
         throw new Error('tavern_helper_scripts_upsert with mode="upsert" requires "script" object.');
     }
-    const rawId = typeof args.script.id === 'string' ? args.script.id.trim() : '';
+    const rawId =
+        args.scriptId?.trim()
+        || (typeof args.script.id === 'string' ? args.script.id.trim() : '');
     const rawName = typeof args.script.name === 'string' ? args.script.name.trim() : '';
     if (!rawId && !rawName) {
         throw new Error('TavernHelper script upsert requires at least "script.name" or "script.id".');
     }
 
-    const existingTopIdx = cloned.findIndex(
-        (item) => (rawId && item.id === rawId) || (!rawId && rawName && item.name === rawName),
-    );
-    if (existingTopIdx >= 0) {
-        const existingItem = cloned[existingTopIdx]!;
+    const located = locateTavernHelperItem(cloned, rawId, rawName);
+    if (located) {
+        const existingItem = located.item;
         const updated = buildDefaultTavernHelperScript(args.script, existingItem);
-        cloned[existingTopIdx] = updated;
-        const beforeText =
+        if (located.childIndex !== undefined) {
+            const folder = cloned[located.topIndex]!;
+            const children = [...(folder.scripts as Record<string, unknown>[])];
+            children[located.childIndex] = updated;
+            cloned[located.topIndex] = { ...folder, scripts: children };
+        } else {
+            cloned[located.topIndex] = updated;
+        }
+        const beforeRaw =
             typeof existingItem.content === 'string'
                 ? existingItem.content
                 : JSON.stringify(existingItem, null, 2);
-        const afterText =
+        const afterRaw =
             typeof updated.content === 'string'
                 ? updated.content
                 : JSON.stringify(updated, null, 2);
+        const updatedId = typeof updated.id === 'string' ? updated.id : rawId;
         return {
             nextTrees: cloned,
-            beforeText,
-            afterText,
-            targetLabel: `TavernHelper (${args.scope}): ${String(updated.name || updated.id)}`,
-            title: `Update TavernHelper (${args.scope}) script "${String(updated.name || updated.id)}"`,
-            summary: `Update script "${String(updated.name || updated.id)}" in scope "${args.scope}".`,
+            beforeText: foldInlineBase64(beforeRaw).text,
+            afterText: foldInlineBase64(afterRaw).text,
+            targetLabel: `TavernHelper (${args.scope}): ${String(updated.name || updatedId)}`,
+            title: `Update TavernHelper (${args.scope}) script "${String(updated.name || updatedId)}"`,
+            summary: `Update ${located.childIndex !== undefined ? 'folder script' : 'script'} "${String(updated.name || updatedId)}" in scope "${args.scope}".`,
+            undoTarget: {
+                kind: 'single',
+                scriptId: updatedId,
+                ...(located.folderId ? { folderId: located.folderId } : {}),
+                existed: true,
+                previousScript: canonicalClone(existingItem),
+            },
+            updatedSummary: summarizeTavernHelperTree(updated),
         };
     }
 
-    // Check inside folders by id (or by exact name if no top-level match)
-    let matchedFolderIdx = -1;
-    let matchedChildIdx = -1;
-    for (let f = 0; f < cloned.length; f += 1) {
-        const folder = cloned[f];
-        if (folder?.type === 'folder' && Array.isArray(folder.scripts)) {
-            const cIdx = folder.scripts.findIndex(
-                (child) =>
-                    isPlainRecord(child)
-                    && ((rawId && child.id === rawId) || (!rawId && rawName && child.name === rawName)),
-            );
-            if (cIdx >= 0) {
-                matchedFolderIdx = f;
-                matchedChildIdx = cIdx;
-                break;
-            }
-        }
-    }
-
-    if (matchedFolderIdx >= 0 && matchedChildIdx >= 0) {
-        const folder = cloned[matchedFolderIdx]!;
-        const children = [...(folder.scripts as Record<string, unknown>[])];
-        const existingChild = children[matchedChildIdx]!;
-        const updated = buildDefaultTavernHelperScript(args.script, existingChild);
-        children[matchedChildIdx] = updated;
-        cloned[matchedFolderIdx] = { ...folder, scripts: children };
-        return {
-            nextTrees: cloned,
-            beforeText:
-                typeof existingChild.content === 'string'
-                    ? existingChild.content
-                    : JSON.stringify(existingChild, null, 2),
-            afterText:
-                typeof updated.content === 'string'
-                    ? updated.content
-                    : JSON.stringify(updated, null, 2),
-            targetLabel: `TavernHelper (${args.scope}): ${String(updated.name || updated.id)}`,
-            title: `Update TavernHelper (${args.scope}) script "${String(updated.name || updated.id)}"`,
-            summary: `Update folder script "${String(updated.name || updated.id)}" in scope "${args.scope}".`,
-        };
-    }
-
-    const existingAny = findScriptContentInTrees(cloned, rawId, rawName);
-    const created = buildDefaultTavernHelperScript(args.script, existingAny);
+    const created = buildDefaultTavernHelperScript(
+        rawId ? { ...args.script, id: rawId } : args.script,
+    );
     cloned.push(created);
+    const createdId = String(created.id ?? '');
+    const createdRaw =
+        typeof created.content === 'string'
+            ? created.content
+            : JSON.stringify(created, null, 2);
     return {
         nextTrees: cloned,
         beforeText: '',
-        afterText:
-            typeof created.content === 'string'
-                ? created.content
-                : JSON.stringify(created, null, 2),
-        targetLabel: `TavernHelper (${args.scope}): ${String(created.name || created.id)}`,
-        title: `Create TavernHelper (${args.scope}) script "${String(created.name || created.id)}"`,
-        summary: `Add script "${String(created.name || created.id)}" to scope "${args.scope}".`,
+        afterText: foldInlineBase64(createdRaw).text,
+        targetLabel: `TavernHelper (${args.scope}): ${String(created.name || createdId)}`,
+        title: `Create TavernHelper (${args.scope}) script "${String(created.name || createdId)}"`,
+        summary: `Add script "${String(created.name || createdId)}" to scope "${args.scope}".`,
+        undoTarget: {
+            kind: 'single',
+            scriptId: createdId,
+            existed: false,
+        },
+        updatedSummary: summarizeTavernHelperTree(created),
     };
 }
 
@@ -2135,7 +2448,7 @@ export function createStAdminTools(): AssistantToolDefinition[] {
     > = {
         name: 'tavern_helper_scripts_read',
         description:
-            'Read JS-Slash-Runner (TavernHelper) scripts from live store or host storage for scope "global", "character", or "preset". Read-only.',
+            'Inspect, search, or read JS-Slash-Runner (TavernHelper) scripts in scope "global", "character", or "preset". Large scopes (>16 KB) auto-summarize to a lightweight catalog; pass scriptId/name (with start_line/end_line) for numbered source or query to grep across scripts with Base64 folded. Read-only.',
         parameters: TAVERN_HELPER_SCRIPTS_READ_SCHEMA,
         tier: 'admin',
         readOnly: true,
@@ -2147,6 +2460,17 @@ export function createStAdminTools(): AssistantToolDefinition[] {
                     ctx.signal,
                 );
             }
+            if (
+                args.start_line !== undefined
+                && args.end_line !== undefined
+                && args.start_line > args.end_line
+            ) {
+                return finalizeToolError(
+                    `Invalid line range: start_line (${args.start_line}) must be <= end_line (${args.end_line}).`,
+                    ctx.signal,
+                );
+            }
+
             const admin = requireAdminBridge(ctx);
             if (!admin.readTavernHelperScripts) {
                 return finalizeToolError(
@@ -2154,9 +2478,183 @@ export function createStAdminTools(): AssistantToolDefinition[] {
                     ctx.signal,
                 );
             }
+
             const res = await admin.readTavernHelperScripts(args.scope as TavernHelperScriptScope);
+            const stripBase64 = args.stripBase64 !== false;
+
+            // Mode 1: Search across scope or single target
+            if (args.query) {
+                let searchItems: Array<{
+                    item: Record<string, unknown>;
+                    folderId?: string;
+                    folderName?: string;
+                }>;
+                if (args.scriptId || args.name) {
+                    const located = locateTavernHelperItem(res.scripts, args.scriptId, args.name);
+                    if (!located) {
+                        return finalizeToolError(
+                            `TavernHelper script "${args.scriptId ?? args.name}" not found in scope "${res.scope}".`,
+                            ctx.signal,
+                        );
+                    }
+                    searchItems =
+                        located.item.type === 'folder' && Array.isArray(located.item.scripts)
+                            ? flattenTavernHelperLeafScripts([located.item])
+                            : [located];
+                } else {
+                    searchItems = flattenTavernHelperLeafScripts(res.scripts);
+                }
+
+                const maxMatches = args.max_matches ?? 30;
+                const matches: Array<Record<string, unknown>> = [];
+                for (const entry of searchItems) {
+                    if (matches.length >= maxMatches) {
+                        break;
+                    }
+                    const sId = typeof entry.item.id === 'string' ? entry.item.id : '';
+                    const sName = typeof entry.item.name === 'string' ? entry.item.name : sId;
+                    const rawText = typeof entry.item.content === 'string' ? entry.item.content : '';
+                    const searchText = stripBase64 ? foldInlineBase64(rawText).text : rawText;
+                    const hits = grepLinesInText({
+                        path: `tavern_helper:${res.scope}:${sName}`,
+                        title: sName,
+                        content: searchText,
+                        query: args.query,
+                        caseSensitive: args.case_sensitive ?? false,
+                        regex: args.regex ?? false,
+                        contextLines: args.context_lines ?? 2,
+                        maxMatches: maxMatches - matches.length,
+                    });
+                    for (const hit of hits) {
+                        matches.push({
+                            scriptId: sId,
+                            name: sName,
+                            ...(entry.folderName ? { folder: entry.folderName } : {}),
+                            line: hit.line,
+                            totalLines: hit.totalLines,
+                            snippet: hit.snippet,
+                            ...(hit.context ? { context: hit.context } : {}),
+                        });
+                    }
+                }
+
+                return finalizeReadToolResult({
+                    ok: true,
+                    mode: 'search',
+                    scope: res.scope,
+                    query: args.query,
+                    liveApiAvailable: res.liveApiAvailable,
+                    totalScripts: searchItems.length,
+                    matchCount: matches.length,
+                    truncated: matches.length >= maxMatches,
+                    matches,
+                    hint: 'Use tavern_helper_scripts_read({ scope, scriptId, start_line, end_line }) to inspect full source around any hit line.',
+                });
+            }
+
+            // Mode 2: Targeted single script / folder read
+            if (args.scriptId || args.name) {
+                const located = locateTavernHelperItem(res.scripts, args.scriptId, args.name);
+                if (!located) {
+                    const available = collectTavernHelperLabels(res.scripts);
+                    return finalizeToolError(
+                        `TavernHelper script "${args.scriptId ?? args.name}" not found in scope "${res.scope}". Available: ${available.slice(0, 20).join(', ') || 'none'}`,
+                        ctx.signal,
+                    );
+                }
+                const target = located.item;
+                if (target.type === 'folder' || Array.isArray(target.scripts)) {
+                    return finalizeReadToolResult({
+                        ok: true,
+                        mode: 'folder',
+                        scope: res.scope,
+                        liveApiAvailable: res.liveApiAvailable,
+                        folder: summarizeTavernHelperTree(target),
+                    });
+                }
+
+                const sId = typeof target.id === 'string' ? target.id : '';
+                const sName = typeof target.name === 'string' ? target.name : sId;
+                const rawContent = typeof target.content === 'string' ? target.content : '';
+                const rawBytes = utf8ByteLength(rawContent);
+                const folded = stripBase64
+                    ? foldInlineBase64(rawContent)
+                    : { text: rawContent, count: 0, bytes: 0 };
+                const formatted = formatFileReadResult({
+                    path: `tavern_helper:${res.scope}/${sName}`,
+                    rawContent: folded.text,
+                    startLine: args.start_line,
+                    endLine: args.end_line,
+                    lineNumbers: args.line_numbers ?? true,
+                    charOffset: args.char_offset,
+                    charLimit: args.char_limit,
+                });
+                const nextEnd = Math.min(formatted.totalLines, formatted.shownEndLine + 200);
+                const renderedContent = rewriteReadFooterHint(
+                    formatted.text,
+                    `Use tavern_helper_scripts_read({ scope: ${JSON.stringify(res.scope)}, scriptId: ${JSON.stringify(sId || sName)}, start_line: ${formatted.shownEndLine + 1}, end_line: ${nextEnd} }) to continue.`,
+                );
+                const dataRecord = isPlainRecord(target.data) ? target.data : {};
+                const dataBytes = utf8ByteLength(JSON.stringify(dataRecord));
+
+                return finalizeReadToolResult({
+                    ok: true,
+                    mode: 'script',
+                    scope: res.scope,
+                    liveApiAvailable: res.liveApiAvailable,
+                    script: {
+                        type: 'script',
+                        id: sId,
+                        name: sName,
+                        enabled: target.enabled !== undefined ? Boolean(target.enabled) : true,
+                        ...(typeof target.info === 'string' && target.info ? { info: target.info } : {}),
+                        ...(located.folderId
+                            ? { folderId: located.folderId, folderName: located.folderName }
+                            : {}),
+                        ...(isPlainRecord(target.button) ? { button: target.button } : {}),
+                        ...(isPlainRecord(target.export_with) ? { export_with: target.export_with } : {}),
+                        dataSummary: {
+                            bytes: dataBytes,
+                            size: formatByteSize(dataBytes),
+                            keys: Object.keys(dataRecord).slice(0, 30),
+                        },
+                        ...(args.includeData ? { data: dataRecord } : {}),
+                        rawBytes,
+                        rawSize: formatByteSize(rawBytes),
+                        foldedBase64Count: folded.count,
+                        totalLines: formatted.totalLines,
+                        shownStartLine: formatted.shownStartLine,
+                        shownEndLine: formatted.shownEndLine,
+                        hasMore: formatted.hasMore,
+                        content: renderedContent,
+                    },
+                });
+            }
+
+            // Mode 3: Unfiltered list vs auto-catalog manifest
+            const totalBytes = utf8ByteLength(JSON.stringify(res.scripts));
+            const shouldSummarize =
+                args.summaryOnly === true
+                || (args.summaryOnly !== false && totalBytes > SETTINGS_READ_MANIFEST_THRESHOLD_BYTES);
+
+            if (shouldSummarize) {
+                return finalizeReadToolResult({
+                    ok: true,
+                    mode: 'catalog',
+                    summaryOnly: true,
+                    scope: res.scope,
+                    liveApiAvailable: res.liveApiAvailable,
+                    total: res.scripts.length,
+                    totalBytes,
+                    totalSize: formatByteSize(totalBytes),
+                    hint: 'Scripts exceeded 16 KB; returned lightweight catalog so oversized sibling scripts/Base64 assets do not truncate target code. Pass scriptId (with optional start_line/end_line) to read source, or query to grep.',
+                    scripts: res.scripts.map(summarizeTavernHelperTree),
+                });
+            }
+
             return finalizeReadToolResult({
                 ok: true,
+                mode: 'list',
                 scope: res.scope,
                 liveApiAvailable: res.liveApiAvailable,
                 total: res.scripts.length,
@@ -2170,7 +2668,7 @@ export function createStAdminTools(): AssistantToolDefinition[] {
     > = {
         name: 'tavern_helper_scripts_upsert',
         description:
-            'Create, update, delete, or replace JS-Slash-Runner (TavernHelper) scripts in scope "global", "character", or "preset" with live zero-refresh sync via TavernHelper.replaceScriptTrees. High-risk mandatoryConfirm operation.',
+            'Create, update, patch in-place (mode="edit_content" + contentEdits), delete, or replace JS-Slash-Runner (TavernHelper) scripts in scope "global", "character", or "preset" with live zero-refresh sync via TavernHelper.replaceScriptTrees. High-risk mandatoryConfirm operation.',
         parameters: TAVERN_HELPER_SCRIPTS_UPSERT_SCHEMA,
         tier: 'admin',
         readOnly: false,
@@ -2215,7 +2713,7 @@ export function createStAdminTools(): AssistantToolDefinition[] {
             }
             const scope = args.scope as TavernHelperScriptScope;
             const current = await admin.readTavernHelperScripts(scope);
-            const previousScripts = canonicalClone(current.scripts);
+            const previousScripts = current.scripts;
             const computed = computeNextTavernHelperTrees(previousScripts, args);
             const writeRes = await admin.replaceTavernHelperScripts(scope, computed.nextTrees);
 
@@ -2227,6 +2725,26 @@ export function createStAdminTools(): AssistantToolDefinition[] {
                 reloadedMessageIds = reloadRes.reloadedIds;
             }
 
+            const undoSnapshot: Record<string, unknown> =
+                computed.undoTarget.kind === 'single'
+                    ? {
+                        action: 'tavern_helper_script_single',
+                        scope,
+                        scriptId: computed.undoTarget.scriptId,
+                        ...(computed.undoTarget.folderId
+                            ? { folderId: computed.undoTarget.folderId }
+                            : {}),
+                        existed: computed.undoTarget.existed,
+                        ...(computed.undoTarget.previousScript
+                            ? { previousScript: computed.undoTarget.previousScript }
+                            : {}),
+                    }
+                    : {
+                        action: 'tavern_helper_scripts',
+                        scope,
+                        previousScripts: canonicalClone(previousScripts),
+                    };
+
             const undoId =
                 ctx.captureUndo === false
                     ? undefined
@@ -2237,13 +2755,15 @@ export function createStAdminTools(): AssistantToolDefinition[] {
                         kind: 'st_setting',
                         label: computed.title,
                         scope: `tavern_helper:${scope}`,
-                        beforeSummary: `${previousScripts.length} script tree(s)`,
-                        afterSummary: `${writeRes.count} script tree(s)`,
-                        snapshot: {
-                            action: 'tavern_helper_scripts',
-                            scope,
-                            previousScripts,
-                        },
+                        beforeSummary:
+                            computed.undoTarget.kind === 'single'
+                                ? `${computed.undoTarget.existed ? 'Script' : '(new)'} ${computed.undoTarget.scriptId}`
+                                : `${previousScripts.length} script tree(s)`,
+                        afterSummary:
+                            computed.undoTarget.kind === 'single'
+                                ? computed.summary
+                                : `${writeRes.count} script tree(s)`,
+                        snapshot: undoSnapshot,
                         target: ctx.target,
                     }).id;
 
@@ -2253,7 +2773,9 @@ export function createStAdminTools(): AssistantToolDefinition[] {
                     syncedLive: writeRes.syncedLive,
                     requiresReload: writeRes.requiresReload,
                     count: writeRes.count,
-                    scripts: writeRes.scripts,
+                    ...(computed.updatedSummary ? { updatedScript: computed.updatedSummary } : {}),
+                    ...(computed.editResult ? { editResult: computed.editResult } : {}),
+                    scripts: writeRes.scripts.map(summarizeTavernHelperTree),
                     detail: writeRes.detail,
                     ...(reloadedMessageIds ? { reloadedMessageIds } : {}),
                 },

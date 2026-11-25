@@ -60,6 +60,7 @@ ST-Agentic 的三层变量已与 SillyTavern 原生存储完全打通，不存�
 ### 世界书（World Info）
 - 所有 `wi_upsert_*` 均**原样保留**开头的 `@@` 装饰器和 `<% ... %>` EJS 块（不转义 `@`）。
 - 新建条目省略 `uid`，更新条目传入已有 `uid`。
+- `wi_read_raw_book` 遇到超大世界书（> 24 KB）时会自动降级为条目目录，可传 `uid`（配 `start_line` / `end_line`）逐段读取或 `query` 跨条目检索（默认自动折叠超长 Base64）。
 - `wi_upsert_primary_entry` 只写主绑定世界书；如主角色卡未绑定主世界书或需要改额外附加世界书，用 `wi_upsert_enabled_entry`（`full`）或 `wi_admin_bind_book` + `wi_admin_upsert_entry`（`full + stAdmin`）。
 
 ### 正则（不要混淆两套正则）
@@ -72,8 +73,8 @@ ST-Agentic 的三层变量已与 SillyTavern 原生存储完全打通，不存�
 
 ### 酒馆助手脚本（`JS-Slash-Runner` / `TavernHelper`）
 - **不要**用 `st_settings_read` 翻大对象找脚本，直接调用专用工具：
-  - `tavern_helper_scripts_read({ scope: 'global' | 'character' | 'preset' })`
-  - `tavern_helper_scripts_upsert({ scope, scripts })`
+  - `tavern_helper_scripts_read({ scope: 'global' | 'character' | 'preset' })`：脚本总体积超过 16 KB 时自动返回轻量目录（含各脚本 `id` / `name` / 行数 / 字节数）；传 `scriptId`（配 `start_line` / `end_line`）精准读取单脚本源码（默认折叠 `data` 与超长 Base64），或传 `query` 跨脚本搜索行号与上下文。
+  - `tavern_helper_scripts_upsert({ scope, mode, ... })`：支持全量/新建 `upsert`、局部行定位替换 `edit_content`（配合 `contentEdits: [{ search, replace, start_line?, end_line?, replace_all? }]`，可无损修改含超大 Base64 资源的脚本）、`delete` 与 `replace_all`。
 - 如需让运行中的扩展立刻应用变更，调用 `st_sync_runtime`。
 
 ### ST 设置读取（避免浪费轮次）

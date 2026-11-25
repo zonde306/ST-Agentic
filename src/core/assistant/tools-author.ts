@@ -9,12 +9,21 @@ import type {
     WorldInfoEntryUpsert,
 } from '@/core/types';
 import { canonicalClone } from '@/core/utils';
+import {
+    countLines,
+    formatByteSize,
+    formatFileReadResult,
+    grepLinesInText,
+    utf8ByteLength,
+} from '@/core/vfs';
 import { computeDiffLines } from './approval';
 import { redactWithReport } from './redact';
 import {
     finalizeMutationToolResult,
     finalizeReadToolResult,
     finalizeToolError,
+    foldInlineBase64,
+    rewriteReadFooterHint,
     throwIfAssistantAborted,
     truncateSummary,
     type AssistantToolContext,
@@ -291,6 +300,35 @@ const WI_READ_RAW_BOOK_SCHEMA = z.object({
         .string()
         .optional()
         .describe('World Info book name; defaults to the active character primary World Info book.'),
+    uid: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('Optional entry UID to read in full with 1-based line numbers and pagination.'),
+    query: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Optional text/regex search query across entries in this book (returns line numbers and context).'),
+    regex: z.boolean().optional().default(false).describe('Treat query as RegExp.'),
+    case_sensitive: z.boolean().optional().default(false),
+    context_lines: z.number().int().min(0).max(10).optional().default(2),
+    max_matches: z.number().int().min(1).max(100).optional().default(30),
+    summaryOnly: z
+        .boolean()
+        .optional()
+        .describe('When true, return only entry metadata catalog; auto-enabled above 24 KB if uid/query are omitted.'),
+    stripBase64: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe('Fold oversized inline Base64 blobs when reading/searching entry content.'),
+    start_line: z.number().int().min(1).optional(),
+    end_line: z.number().int().min(1).optional(),
+    line_numbers: z.boolean().optional().default(true),
+    char_offset: z.number().int().min(0).optional(),
+    char_limit: z.number().int().min(200).max(20000).optional(),
 });
 
 const WI_UPSERT_PRIMARY_ENTRY_SCHEMA = z.object({
@@ -465,7 +503,7 @@ export function createAuthorTools(): AssistantToolDefinition[] {
     const wiReadRawBookTool: AssistantToolDefinition<typeof WI_READ_RAW_BOOK_SCHEMA> = {
         name: 'wi_read_raw_book',
         description:
-            'Read raw entries (including raw @@ decorators and <% ... %> EJS code) from the active character primary World Info book. Read-only.',
+            'Read or search raw entries (including raw @@ decorators and <% ... %> EJS code) from the active character primary World Info book. Large books auto-summarize to a catalog; pass uid (with optional start_line/end_line) or query to drill down without hitting output limits. Read-only.',
         parameters: WI_READ_RAW_BOOK_SCHEMA,
         tier: 'author',
         readOnly: true,
@@ -480,6 +518,156 @@ export function createAuthorTools(): AssistantToolDefinition[] {
                     ctx.signal,
                 );
             }
+
+            if (
+                args.start_line !== undefined
+                && args.end_line !== undefined
+                && args.start_line > args.end_line
+            ) {
+                return finalizeToolError(
+                    `Invalid line range: start_line (${args.start_line}) must be <= end_line (${args.end_line}).`,
+                    ctx.signal,
+                );
+            }
+
+            const stripBase64 = args.stripBase64 !== false;
+
+            if (args.query) {
+                const targetEntries =
+                    args.uid !== undefined
+                        ? snapshot.entries.filter((e) => e.uid === args.uid)
+                        : snapshot.entries;
+                const maxMatches = args.max_matches ?? 30;
+                const matches: Array<Record<string, unknown>> = [];
+                for (const entry of targetEntries) {
+                    if (matches.length >= maxMatches) {
+                        break;
+                    }
+                    const rawText = entry.content ?? '';
+                    const searchText = stripBase64 ? foldInlineBase64(rawText).text : rawText;
+                    const hits = grepLinesInText({
+                        path: `wi:${snapshot.name}#${entry.uid}`,
+                        title: entry.comment,
+                        content: searchText,
+                        query: args.query,
+                        caseSensitive: args.case_sensitive ?? false,
+                        regex: args.regex ?? false,
+                        contextLines: args.context_lines ?? 2,
+                        maxMatches: maxMatches - matches.length,
+                    });
+                    for (const hit of hits) {
+                        matches.push({
+                            uid: entry.uid,
+                            comment: entry.comment,
+                            line: hit.line,
+                            totalLines: hit.totalLines,
+                            snippet: hit.snippet,
+                            ...(hit.context ? { context: hit.context } : {}),
+                        });
+                    }
+                }
+                return finalizeReadToolResult({
+                    ok: true,
+                    mode: 'search',
+                    bookName: snapshot.name,
+                    query: args.query,
+                    entryCount: snapshot.entries.length,
+                    matchCount: matches.length,
+                    truncated: matches.length >= maxMatches,
+                    matches,
+                });
+            }
+
+            if (args.uid !== undefined) {
+                const entry = snapshot.entries.find((e) => e.uid === args.uid);
+                if (!entry) {
+                    return finalizeToolError(
+                        `World Info entry uid=${args.uid} was not found in "${snapshot.name}". Available UIDs: ${snapshot.entries.map((e) => e.uid).slice(0, 30).join(', ')}`,
+                        ctx.signal,
+                    );
+                }
+                const rawContent = entry.content ?? '';
+                const rawBytes = utf8ByteLength(rawContent);
+                const folded = stripBase64
+                    ? foldInlineBase64(rawContent)
+                    : { text: rawContent, count: 0, bytes: 0 };
+                const formatted = formatFileReadResult({
+                    path: `wi:${snapshot.name}#${entry.uid} (${entry.comment || 'untitled'})`,
+                    rawContent: folded.text,
+                    startLine: args.start_line,
+                    endLine: args.end_line,
+                    lineNumbers: args.line_numbers ?? true,
+                    charOffset: args.char_offset,
+                    charLimit: args.char_limit,
+                });
+                const bookArg = args.bookName ? `, bookName: ${JSON.stringify(args.bookName)}` : '';
+                const nextEnd = Math.min(formatted.totalLines, formatted.shownEndLine + 200);
+                const renderedContent = rewriteReadFooterHint(
+                    formatted.text,
+                    `Use wi_read_raw_book({ uid: ${entry.uid}${bookArg}, start_line: ${formatted.shownEndLine + 1}, end_line: ${nextEnd} }) to continue.`,
+                );
+                return finalizeReadToolResult({
+                    ok: true,
+                    mode: 'entry',
+                    bookName: snapshot.name,
+                    uid: entry.uid,
+                    comment: entry.comment,
+                    keys: entry.keys,
+                    disable: entry.disable,
+                    constant: entry.constant,
+                    position: entry.position,
+                    depth: entry.depth,
+                    order: entry.order,
+                    rawBytes,
+                    foldedBase64Count: folded.count,
+                    totalLines: formatted.totalLines,
+                    shownStartLine: formatted.shownStartLine,
+                    shownEndLine: formatted.shownEndLine,
+                    hasMore: formatted.hasMore,
+                    content: renderedContent,
+                });
+            }
+
+            const totalBytes = utf8ByteLength(JSON.stringify(snapshot.entries));
+            const shouldSummarize =
+                args.summaryOnly === true || (args.summaryOnly !== false && totalBytes > 24 * 1024);
+
+            if (shouldSummarize) {
+                const catalog = snapshot.entries.map((entry) => {
+                    const text = entry.content ?? '';
+                    const cleanPreview = foldInlineBase64(text)
+                        .text.replace(/\s+/g, ' ')
+                        .trim();
+                    const preview =
+                        cleanPreview.length <= 100
+                            ? cleanPreview
+                            : `${cleanPreview.slice(0, 97).trimEnd()}...`;
+                    return {
+                        uid: entry.uid,
+                        comment: entry.comment,
+                        keys: entry.keys,
+                        disable: entry.disable,
+                        constant: entry.constant,
+                        position: entry.position,
+                        order: entry.order,
+                        contentBytes: utf8ByteLength(text),
+                        contentLines: countLines(text),
+                        preview,
+                    };
+                });
+                return finalizeReadToolResult({
+                    ok: true,
+                    mode: 'catalog',
+                    summaryOnly: true,
+                    bookName: snapshot.name,
+                    entryCount: snapshot.entries.length,
+                    totalBytes,
+                    totalSize: formatByteSize(totalBytes),
+                    hint: 'Book exceeded 24 KB; returned entry catalog. Call wi_read_raw_book({ uid, start_line?, end_line? }) to read raw content, or pass query to search.',
+                    entries: catalog,
+                });
+            }
+
             return finalizeReadToolResult({
                 ok: true,
                 bookName: snapshot.name,
