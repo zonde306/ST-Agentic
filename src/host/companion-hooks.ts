@@ -495,9 +495,18 @@ async function runCompanionBeforeTurnUnits(
         if (signal.aborted) {
             return;
         }
+        const ruleMetaOverrides: Record<string, string> = {
+            triggerLabel: rule.label,
+            triggerId: rule.id,
+            triggerPhase: rule.phase,
+            triggerTargetPath: rule.targetPath ?? '',
+        };
         const substitutedPrompt = bridge.substituteMacros(
             rule.instructionTemplate,
-            matchOverrides,
+            {
+                ...(matchOverrides ?? {}),
+                ...ruleMetaOverrides,
+            },
         );
         if (!substitutedPrompt.trim()) {
             return;
@@ -515,12 +524,19 @@ async function runCompanionBeforeTurnUnits(
                 userInput: substitutedPrompt,
                 target,
                 phase: 'before_turn',
+                triggerId: rule.id,
+                triggerLabel: rule.label,
                 promptTriggerContext: {
                     kind: 'trigger',
                     phase: 'before_turn',
                     triggerIds: [rule.id],
                     ...(rule.decorator ? { decorators: [rule.decorator] } : {}),
                     ...(rule.targetPath ? { targetPaths: [rule.targetPath] } : {}),
+                },
+                macroOverrides: {
+                    ...(matchOverrides ?? {}),
+                    ...ruleMetaOverrides,
+                    triggerPrompt: substitutedPrompt.trim(),
                 },
                 preset,
                 signal,

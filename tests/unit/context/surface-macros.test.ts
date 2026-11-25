@@ -12,12 +12,14 @@ import {
     buildMainSurfaceMacroOverrides,
     buildModelAndBudgetMacros,
     buildSideGenMacroOverrides,
+    EMPTY_TRIGGER_MACRO_DEFAULTS,
     readHostChatMacroSnapshot,
     resolveEffectiveContextBudget,
     TrajectoryStore,
 } from '@/core/context';
 import { SideGenService } from '@/core/sidegen';
-import type { PromptBlock } from '@/core/types';
+import { PipelineOrchestrator } from '@/core/triggers';
+import type { PromptBlock, RawLoreEntry } from '@/core/types';
 import { MemoryHostBridge, ScriptedLLMTransport } from '../../mocks';
 
 function createMacroAuditTemplate(extraFields?: Record<string, string>): string {
@@ -119,6 +121,11 @@ describe('surface-scoped macro helpers & end-to-end integration', () => {
         expect(emptyAssistant.agenticSurface).toBe('assistant');
         expect(emptyAssistant.assistantMode).toBe('chat');
         expect(emptyAssistant['var:gold']).toBe('42');
+        expect(emptyAssistant.triggerPrompt).toBe('');
+        expect(emptyAssistant.triggerLabel).toBe('');
+        expect(emptyAssistant.triggerId).toBe('');
+        expect(emptyAssistant.triggerPhase).toBe('');
+        expect(emptyAssistant.triggerTargetPath).toBe('');
 
         // Populated assistant session excluding pending empty assistant bubble + empty resume prompt
         const populatedAssistant = buildAssistantMacroOverrides({
@@ -172,8 +179,9 @@ describe('surface-scoped macro helpers & end-to-end integration', () => {
         expect(sideOverrides.allChatRange).toBe('0-2');
         expect(sideOverrides.agenticSurface).toBe('sidegen');
         expect(sideOverrides.lastGenerationType).toBe('normal');
+        expect(sideOverrides.triggerPrompt).toBe('');
 
-        // Main chat preserves callerOverrides precedence
+        // Main chat preserves callerOverrides precedence and defaults trigger macros to ''
         const mainOverrides = buildMainSurfaceMacroOverrides({
             bridge,
             userInput: 'Main fresh input',
@@ -185,6 +193,7 @@ describe('surface-scoped macro helpers & end-to-end integration', () => {
         expect(mainOverrides.lastInput).toBe('Caller Override Input');
         expect(mainOverrides.stLastUserMessage).toBe('ST user 3');
         expect(mainOverrides.lastUserMessage).toBeUndefined();
+        expect(mainOverrides).toMatchObject(EMPTY_TRIGGER_MACRO_DEFAULTS);
     });
 
     it('scopes macros to Workbench across Turn 1, Turn 2, regenerate, and checkpoint continue while preventing cascading expansion', async () => {
@@ -541,5 +550,287 @@ describe('surface-scoped macro helpers & end-to-end integration', () => {
         expect(req2Tail.lastInput).toBe('CUSTOM_OVERRIDE_INPUT');
         expect(req2Tail.lastUser).toBe('CALLER_USER_MSG');
         expect(req2Tail.surface).toBe('main');
+    });
+
+    it('defaults {{triggerPrompt}} and trigger metadata macros to empty string in non-trigger runs', async () => {
+        const bridge = new MemoryHostBridge({
+            identity: { userName: 'Player', charName: 'Companion' },
+            chat: [{ id: 0, name: 'Player', isUser: true, mes: 'Hi', swipeId: 0 }],
+        });
+
+        const agent = createDefaultMainAgent({
+            strictToolLoop: 'off',
+            promptBlocks: [
+                {
+                    id: 'non_trigger_block',
+                    name: 'Non-Trigger Block',
+                    role: 'system',
+                    placement: 'floating_tail',
+                    enabled: true,
+                    content:
+                        'macros={{triggerPrompt}}|{{triggerLabel}}|{{triggerId}}|{{triggerPhase}}|{{triggerTargetPath}}',
+                },
+            ],
+        });
+        const connection = createDefaultConnection({
+            id: 'conn_nontrig',
+            strictToolLoop: false,
+            roundMaxRetries: 0,
+        });
+        const preset = createDefaultPreset({ agents: { main: agent } });
+        const settings = createDefaultSettings({
+            currentConnectionId: connection.id,
+            connections: { [connection.id]: connection },
+            presets: { [preset.id]: preset },
+            currentPresetId: preset.id,
+        });
+
+        const transport = new ScriptedLLMTransport([{ content: 'Main done' }]);
+        const runner = new AgentRunner({
+            bridge,
+            transport,
+            settings,
+            trajectoryStore: new TrajectoryStore(),
+        });
+
+        await runner.run({
+            agent,
+            preset,
+            connection,
+            target: { messageId: 0, swipeId: 0 },
+            phase: 'main_turn',
+            userInput: 'Hi',
+            runTailRadar: false,
+            includeCategory4DynamicEntries: false,
+        });
+
+        const tailContent = String(
+            transport.requests[0].messages[transport.requests[0].messages.length - 1].content,
+        );
+        expect(tailContent).toBe('macros=||||');
+    });
+
+    it('populates {{triggerPrompt}} and metadata macros from WI trigger entries in single and grouped PipelineOrchestrator runs', async () => {
+        const singleWiEntry: RawLoreEntry = {
+            world: 'StateBook',
+            uid: 101,
+            comment: 'HP Tracker',
+            content: '@@variables_json\n@@group isolate\nUpdate {{char}} HP based on the latest scene.',
+            keys: [],
+            keysecondary: [],
+            constant: true,
+            selective: false,
+            disable: false,
+            position: 0,
+            depth: 0,
+            order: 1,
+            role: 0,
+        };
+        const groupedEntryA: RawLoreEntry = {
+            world: 'ComboBook',
+            uid: 201,
+            comment: 'Task Alpha',
+            content: '@@trigger phase=after_turn group=combo\nInspect mood of {{char}}.',
+            keys: [],
+            keysecondary: [],
+            constant: true,
+            selective: false,
+            disable: false,
+            position: 0,
+            depth: 0,
+            order: 2,
+            role: 0,
+        };
+        const groupedEntryB: RawLoreEntry = {
+            world: 'ComboBook',
+            uid: 202,
+            comment: 'Task Beta',
+            content: '@@trigger phase=after_turn group=combo\nInspect inventory of {{user}}.',
+            keys: [],
+            keysecondary: [],
+            constant: true,
+            selective: false,
+            disable: false,
+            position: 0,
+            depth: 0,
+            order: 2,
+            role: 0,
+        };
+
+        const bridge = new MemoryHostBridge({
+            identity: { userName: 'Traveler', charName: 'Aria' },
+            chat: [
+                { id: 0, name: 'Traveler', isUser: true, mes: 'I check the potion.', swipeId: 0 },
+                { id: 1, name: 'Aria', isUser: false, mes: 'Aria takes the potion.', swipeId: 0 },
+            ],
+            lorebooks: {
+                StateBook: [singleWiEntry],
+                ComboBook: [groupedEntryA, groupedEntryB],
+            },
+        });
+
+        const connection = createDefaultConnection({
+            id: 'conn_trig',
+            strictToolLoop: false,
+            roundMaxRetries: 0,
+        });
+        const mainAgent = createDefaultMainAgent({
+            promptBlocks: [
+                {
+                    id: 'trigger_tail_audit',
+                    name: 'Trigger Tail Audit',
+                    role: 'system',
+                    placement: 'floating_tail',
+                    enabled: true,
+                    triggers: ['trigger'],
+                    content: [
+                        'LABEL={{triggerLabel}}',
+                        'ID={{triggerId}}',
+                        'PHASE={{triggerPhase}}',
+                        'TARGET={{triggerTargetPath}}',
+                        'PROMPT_START',
+                        '{{triggerPrompt}}',
+                        'PROMPT_END',
+                    ].join('\n'),
+                },
+            ],
+        });
+        const preset = createDefaultPreset({
+            agents: { main: mainAgent },
+        });
+        const settings = createDefaultSettings({
+            currentConnectionId: connection.id,
+            connections: { [connection.id]: connection },
+            presets: { [preset.id]: preset },
+            currentPresetId: preset.id,
+        });
+
+        const transport = new ScriptedLLMTransport([
+            { content: 'Single trigger done' },
+            { content: 'Grouped trigger done' },
+        ]);
+        const orchestrator = new PipelineOrchestrator({
+            bridge,
+            transport,
+            settings: () => settings,
+        });
+
+        const handles = await orchestrator.rerunAfterTurn({ messageId: 1, swipeId: 0 });
+        await Promise.all(handles.map((h) => h.promise));
+
+        expect(transport.requests).toHaveLength(2);
+
+        const singleTail = String(
+            transport.requests.find((r) => String(r.messages[r.messages.length - 1].content).includes('LABEL=HP Tracker'))
+                ?.messages.slice(-1)[0].content ?? '',
+        );
+        expect(singleTail).toContain('LABEL=HP Tracker');
+        expect(singleTail).toContain('ID=wi_StateBook_101');
+        expect(singleTail).toContain('PHASE=after_turn');
+        expect(singleTail).toContain('TARGET=/state/variables.json');
+        expect(singleTail).toContain('PROMPT_START\nUpdate Aria HP based on the latest scene.\nPROMPT_END');
+        expect(singleTail).not.toContain('Target VFS Path:');
+        expect(singleTail).not.toContain('Latest User Input:');
+        expect(singleTail).not.toContain('Latest Assistant Output:');
+
+        const groupedTail = String(
+            transport.requests.find((r) => String(r.messages[r.messages.length - 1].content).includes('ID=wi_ComboBook_201,wi_ComboBook_202'))
+                ?.messages.slice(-1)[0].content ?? '',
+        );
+        expect(groupedTail).toContain('PHASE=after_turn');
+        expect(groupedTail).toContain('Inspect mood of Aria.');
+        expect(groupedTail).toContain('Inspect inventory of Traveler.');
+        expect(groupedTail).not.toContain('Latest User Input:');
+    });
+
+    it('populates {{triggerPrompt}} and {{triggerLabel}} from @@agent WI entry instructions during subagent delegation', async () => {
+        const archivistEntry: RawLoreEntry = {
+            world: 'Lore',
+            uid: 50,
+            comment: 'Archivist Agent',
+            content: '@@agent archivist\nInspect /lorebooks/ and return only verified facts.',
+            keys: [],
+            keysecondary: [],
+            constant: false,
+            selective: false,
+            disable: false,
+            position: 0,
+            depth: 0,
+            order: 1,
+            role: 0,
+        };
+        const bridge = new MemoryHostBridge({
+            identity: { userName: 'Traveler', charName: 'Guide' },
+            chat: [{ id: 0, name: 'Traveler', isUser: true, mes: 'Check lore', swipeId: 0 }],
+            lorebooks: { Lore: [archivistEntry] },
+        });
+        const agent = createDefaultMainAgent({
+            strictToolLoop: 'off',
+            promptBlocks: [
+                {
+                    id: 'subagent_prompt_audit',
+                    name: 'Subagent Prompt Audit',
+                    role: 'system',
+                    placement: 'floating_tail',
+                    enabled: true,
+                    triggers: ['subagent'],
+                    content:
+                        'SUB_LABEL={{triggerLabel}}|SUB_ID={{triggerId}}|SUB_PROMPT={{triggerPrompt}}',
+                },
+            ],
+        });
+        const connection = createDefaultConnection({
+            id: 'conn_sub',
+            strictToolLoop: false,
+            roundMaxRetries: 0,
+        });
+        const preset = createDefaultPreset({ agents: { main: agent } });
+        const settings = createDefaultSettings({
+            currentConnectionId: connection.id,
+            connections: { [connection.id]: connection },
+            presets: { [preset.id]: preset },
+            currentPresetId: preset.id,
+        });
+
+        const transport = new ScriptedLLMTransport([
+            {
+                toolCalls: [
+                    {
+                        id: 'call_sub_1',
+                        name: 'delegate_agent_archivist',
+                        arguments: JSON.stringify({ task: 'Find archive facts' }),
+                    },
+                ],
+            },
+            { content: 'Verified child fact.' },
+            { content: 'Parent finished.' },
+        ]);
+        const runner = new AgentRunner({
+            bridge,
+            transport,
+            settings,
+            trajectoryStore: new TrajectoryStore(),
+        });
+
+        const res = await runner.run({
+            agent,
+            preset,
+            connection,
+            target: { messageId: 0, swipeId: 0 },
+            phase: 'main_turn',
+            userInput: 'Check lore',
+            requireOutputFile: false,
+            runTailRadar: false,
+            includeCategory4DynamicEntries: false,
+        });
+
+        expect(res.content).toBe('Parent finished.');
+        // transport.requests[1] is the delegated child @@agent request
+        const childTail = String(
+            transport.requests[1].messages[transport.requests[1].messages.length - 1].content,
+        );
+        expect(childTail).toBe(
+            'SUB_LABEL=archivist|SUB_ID=subagent_archivist|SUB_PROMPT=Inspect /lorebooks/ and return only verified facts.',
+        );
     });
 });

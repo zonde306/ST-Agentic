@@ -1451,12 +1451,29 @@ export class AgentRunner {
                 connection,
                 agent.watermark ? { configuredWatermark: agent.watermark } : undefined,
             );
+            const fallbackTriggerOverrides: Record<string, string> | undefined =
+                promptTriggerContext.kind === 'trigger'
+                    ? {
+                          triggerLabel: input.triggerLabel ?? '',
+                          triggerId:
+                              input.triggerId
+                              ?? (promptTriggerContext.triggerIds?.join(',') ?? ''),
+                          triggerPhase: promptTriggerContext.phase,
+                          triggerTargetPath: promptTriggerContext.targetPaths?.join(',') ?? '',
+                      }
+                    : undefined;
             const effectiveMacroOverrides = buildMainSurfaceMacroOverrides({
                 bridge: this.bridge,
                 userInput: input.userInput,
                 connection,
                 budget: contextBudget,
-                callerOverrides: input.macroOverrides,
+                callerOverrides:
+                    fallbackTriggerOverrides || input.macroOverrides
+                        ? {
+                              ...(fallbackTriggerOverrides ?? {}),
+                              ...(input.macroOverrides ?? {}),
+                          }
+                        : undefined,
             });
             const preRenderMacroOverrides = buildLayer2MacroOverrides(
                 workingVars,
@@ -3195,6 +3212,13 @@ export class AgentRunner {
                 includeSubAgentTools: false,
                 allowSubAgentDelegation: false,
                 delegationDepth: parentParams.delegationDepth + 1,
+                macroOverrides: {
+                    triggerPrompt: desc.instructions.trim(),
+                    triggerLabel: desc.name,
+                    triggerId: childProfile.id,
+                    triggerPhase: parentParams.parentPhase,
+                    triggerTargetPath: '',
+                },
                 ...(sourceWorld
                     ? { triggerSource: 'worldinfo' as const, lorebookNames: [sourceWorld] }
                     : {}),

@@ -1460,7 +1460,7 @@ export class PipelineOrchestrator {
         );
 
         const unitSchema = await this.compileUnitVariableSchema(unit, ctx.globalVarSchema);
-        const promptInput = await this.buildTriggerAgentPrompt(unit, ctx);
+        const { promptInput, triggerPrompt } = await this.buildTriggerAgentPrompt(unit, ctx);
         const permissions = mergeUnitPermissions(profile.permissions, unit.triggers);
         const triggerTools = resolveUnitTools(profile.enabledTools, unit.triggers);
 
@@ -1473,6 +1473,15 @@ export class PipelineOrchestrator {
         const targetPaths = unit.triggers
             .map((t) => t.targetPath)
             .filter((p): p is string => Boolean(p));
+
+        const triggerMacroOverrides: Record<string, string> = {
+            ...(ctx.matchOverrides ?? {}),
+            triggerPrompt,
+            triggerLabel: unit.label,
+            triggerId: triggerIds.join(','),
+            triggerPhase: unit.phase,
+            triggerTargetPath: unit.targetPath ?? targetPaths.join(','),
+        };
 
         const agentResult = await this.agentRunner.run({
             agent: {
@@ -1504,7 +1513,7 @@ export class PipelineOrchestrator {
             ...(ctx.injectionSession ? { injectionSession: ctx.injectionSession } : {}),
             stream: false,
             signal: ctx.signal,
-            macroOverrides: ctx.matchOverrides,
+            macroOverrides: triggerMacroOverrides,
         });
 
         return {
@@ -1575,6 +1584,11 @@ export class PipelineOrchestrator {
                     const ejsVars: Record<string, unknown> = {
                         ...vars,
                         ...(ctx.matchOverrides ?? {}),
+                        triggerPrompt: code,
+                        triggerLabel: rule.label,
+                        triggerId: rule.id,
+                        triggerPhase: unit.phase,
+                        triggerTargetPath: rule.targetPath ?? '',
                         input: ctx.userText,
                         output: ctx.assistantText,
                         target: ctx.target,
@@ -1682,7 +1696,7 @@ export class PipelineOrchestrator {
             injectionSession?: PromptInjectionSession;
             matchOverrides?: Record<string, string>;
         },
-    ): Promise<string> {
+    ): Promise<{ promptInput: string; triggerPrompt: string }> {
         const macroOverrides: Record<string, string> = {
             ...(ctx.matchOverrides ?? {}),
             input: ctx.userText,
@@ -1691,21 +1705,28 @@ export class PipelineOrchestrator {
         };
 
         const hasEjsTemplates = unit.triggers.some((r) => r.instructionTemplate.includes('<%'));
-        let ejsVars: Record<string, unknown> | undefined;
+        let baseVars: Record<string, unknown> | undefined;
         if (hasEjsTemplates && this.bridge.evaluateOptionalEjs) {
-            const baseVars = await this.vfs
+            baseVars = await this.vfs
                 .readVariables({ target: ctx.target, staged: ctx.staged ?? true })
                 .catch(() => ({}));
-            ejsVars = {
-                ...baseVars,
-                ...macroOverrides,
-                target: ctx.target,
-            };
         }
 
-        const renderRuleTemplate = async (template: string): Promise<string> => {
-            let text = this.bridge.substituteMacros(template, macroOverrides);
-            if (ejsVars && this.bridge.evaluateOptionalEjs && text.includes('<%')) {
+        const renderRuleTemplate = async (rule: TriggerRule): Promise<string> => {
+            const ruleOverrides: Record<string, string> = {
+                ...macroOverrides,
+                triggerLabel: rule.label,
+                triggerId: rule.id,
+                triggerPhase: unit.phase,
+                triggerTargetPath: rule.targetPath ?? '',
+            };
+            let text = this.bridge.substituteMacros(rule.instructionTemplate, ruleOverrides);
+            if (baseVars && this.bridge.evaluateOptionalEjs && text.includes('<%')) {
+                const ejsVars: Record<string, unknown> = {
+                    ...baseVars,
+                    ...ruleOverrides,
+                    target: ctx.target,
+                };
                 try {
                     text = await this.bridge.evaluateOptionalEjs(
                         text,
@@ -1720,9 +1741,11 @@ export class PipelineOrchestrator {
         };
 
         const sections: string[] = [];
+        let triggerPrompt = '';
         if (unit.triggers.length === 1) {
             const rule = unit.triggers[0];
-            const rendered = await renderRuleTemplate(rule.instructionTemplate);
+            const rendered = await renderRuleTemplate(rule);
+            triggerPrompt = rendered;
             if (rule.targetPath) {
                 sections.push(`Target VFS Path: ${rule.targetPath}`);
             }
@@ -1737,16 +1760,18 @@ export class PipelineOrchestrator {
                     '- Persist each task\'s changes strictly through the granted tools for its Target VFS Path, and ignore legacy plain-text output-only format directives inside individual task bodies.',
                 ].join('\n'),
             );
+            const taskSections: string[] = [];
             for (let index = 0; index < unit.triggers.length; index += 1) {
                 const rule = unit.triggers[index];
-                const rendered = await renderRuleTemplate(rule.instructionTemplate);
-                sections.push(
-                    `### Task ${index + 1}: ${rule.label}${rule.targetPath ? ` (Target: ${rule.targetPath})` : ''}${rule.decorator ? ` [${rule.decorator}]` : ''}`,
-                );
+                const header = `### Task ${index + 1}: ${rule.label}${rule.targetPath ? ` (Target: ${rule.targetPath})` : ''}${rule.decorator ? ` [${rule.decorator}]` : ''}`;
+                const rendered = await renderRuleTemplate(rule);
+                taskSections.push(rendered ? `${header}\n\n${rendered}` : header);
+                sections.push(header);
                 if (rendered) {
                     sections.push(rendered);
                 }
             }
+            triggerPrompt = taskSections.join('\n\n');
         }
 
         if (ctx.userText) {
@@ -1756,7 +1781,10 @@ export class PipelineOrchestrator {
             sections.push(`Latest Assistant Output:\n${ctx.assistantText}`);
         }
 
-        return sections.join('\n\n');
+        return {
+            promptInput: sections.join('\n\n'),
+            triggerPrompt,
+        };
     }
 
     private async compileGlobalVariableSchema(

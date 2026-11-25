@@ -59,6 +59,8 @@ ST-Agentic 通过 `evaluateOptionalEjs()` 集成可选插件 **`ST-Prompt-Templa
 | `{{lastUserMessage}}` / `{{lastCharMessage}}` / `{{lastMessage}}` | 当前表面会话的最近一条用户/角色/任意消息（助手工作台与 SideGen 中隔离为各自会话） | 全表面 |
 | `{{stLastUserMessage}}` / `{{stLastCharMessage}}` / `{{stLastMessage}}` / `{{stLastMessageId}}` | **始终指向 SillyTavern 主聊天**的最近消息与楼层 ID | 助手工作台 / SideGen / 主流程 |
 | `{{agenticSurface}}` | `'main'` \| `'assistant'` \| `'sidegen'` | 全表面 |
+| `{{triggerPrompt}}` | 当前触发器 / `@@agent` 子智能体对应的世界书条目指令正文（已渲染宏与 EJS，不含 `Target VFS Path` / `Latest User Input` 等外围包装；非触发场景为空字符串） | 触发器 / `@@agent` 子智能体 |
+| `{{triggerLabel}}` / `{{triggerId}}` / `{{triggerPhase}}` / `{{triggerTargetPath}}` | 当前触发器标题、规则 ID、阶段（`before_turn`/`after_turn`/`maintenance`）与目标 VFS 路径 | 触发器 / `@@agent` 子智能体 |
 
 ---
 

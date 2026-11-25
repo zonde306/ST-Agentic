@@ -222,6 +222,14 @@ export function buildModelAndBudgetMacros(
     return out;
 }
 
+export const EMPTY_TRIGGER_MACRO_DEFAULTS = {
+    triggerPrompt: '',
+    triggerLabel: '',
+    triggerId: '',
+    triggerPhase: '',
+    triggerTargetPath: '',
+} as const;
+
 /**
  * Build session-scoped macro overrides for the Assistant Workbench (`AssistantRunner`),
  * overriding ST chat-history macros with Workbench conversation state while preserving
@@ -252,6 +260,7 @@ export function buildAssistantMacroOverrides(
 
     const stSnapshot = readHostChatMacroSnapshot(input.bridge);
     const overrides: Record<string, string> = {
+        ...EMPTY_TRIGGER_MACRO_DEFAULTS,
         ...buildScopedConversationMacros(items, input.currentUserInput),
         ...buildModelAndBudgetMacros(input.connection, input.budget),
         stLastMessage: stSnapshot.stLastMessage,
@@ -292,6 +301,7 @@ export function buildSideGenMacroOverrides(
 
     const stSnapshot = readHostChatMacroSnapshot(input.bridge);
     const overrides: Record<string, string> = {
+        ...EMPTY_TRIGGER_MACRO_DEFAULTS,
         ...buildScopedConversationMacros(items, input.currentPrompt),
         ...buildModelAndBudgetMacros(input.connection, input.budget),
         stLastMessage: stSnapshot.stLastMessage,
@@ -317,6 +327,7 @@ export function buildMainSurfaceMacroOverrides(
     const stSnapshot = readHostChatMacroSnapshot(input.bridge);
     const plainUserInput = extractCanonicalPlainText(input.userInput);
     return {
+        ...EMPTY_TRIGGER_MACRO_DEFAULTS,
         stLastMessage: stSnapshot.stLastMessage,
         stLastMessageId: stSnapshot.stLastMessageId,
         stLastUserMessage: stSnapshot.stLastUserMessage,
