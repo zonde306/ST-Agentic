@@ -1397,10 +1397,19 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
 
     return {
         async listFilesAndOverrides(target?: MessageTarget) {
+            const visibleFiles = files.filter(
+                (f) =>
+                    !(
+                        f.category === 'worldinfo'
+                        && (!f.overridden
+                            || (f.baseContent !== undefined
+                                && f.content.replace(/\r\n/g, '\n') === f.baseContent.replace(/\r\n/g, '\n')))
+                    ),
+            );
             if (!target) {
-                return files.map((f) => ({ ...f }));
+                return visibleFiles.map((f) => ({ ...f }));
             }
-            return files
+            return visibleFiles
                 .filter((f) => f.target.messageId <= target.messageId)
                 .map((f) => ({ ...f }));
         },

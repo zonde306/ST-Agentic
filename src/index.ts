@@ -96,6 +96,7 @@ import {
     isChatBaseWorkspacePath,
     isInstructionDocPath,
     isInstructionIndexPath,
+    unescapeAt,
 } from '@/core/vfs';
 import type { AgenticAssistantPublicApi, AgenticPublicApi } from '@/globals';
 import { type CompanionHooksHandle, setupCompanionHooks } from '@/host/companion-hooks';
@@ -490,6 +491,16 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
         summaryMode,
     });
 
+    const normalizeLineEndings = (text: string): string => text.replace(/\r\n/g, '\n');
+
+    const isSameAsWorldInfoBase = (overrideContent: string, baseContent: string): boolean => {
+        const normBase = normalizeLineEndings(baseContent);
+        return (
+            normalizeLineEndings(overrideContent) === normBase
+            || normalizeLineEndings(unescapeAt(overrideContent)) === normBase
+        );
+    };
+
     const listFilesAndOverrides = async (targetInput?: MessageTarget): Promise<FileOverrideItem[]> => {
         const target = resolveTarget(targetInput);
         const settings = getSettings();
@@ -666,66 +677,76 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             }
         }
 
-        // 3. World Info entries & branch overrides
-        const lorebooks = await bridge.listEnabledLorebooks();
+        // 3. World Info branch overrides (omit unmodified entries and overrides identical to base)
         const wiRows = store.lookup(DATA_NAMESPACES.WORLDINFO, {
             target,
             includeStaged: true,
         });
-        const wiRowMap = new Map(wiRows.map((row) => [row.key, row]));
-        const seenWiKeys = new Set<string>();
+        if (wiRows.length > 0) {
+            const lorebooks = await bridge.listEnabledLorebooks();
+            const wiRowMap = new Map(wiRows.map((row) => [row.key, row]));
+            const seenWiKeys = new Set<string>();
 
-        for (const [worldName, entries] of lorebooks.entries()) {
-            for (const entry of entries) {
-                const rawEntry = entry.world ? entry : { ...entry, world: worldName };
-                const wiKey = worldInfoKey(rawEntry.world, rawEntry.uid);
-                seenWiKeys.add(wiKey);
-                const wiPath = buildLoreVfsPath(rawEntry);
-                const overrideRow = wiRowMap.get(wiKey);
-                const baseContent = rawEntry.content ?? '';
+            for (const [worldName, entries] of lorebooks.entries()) {
+                for (const entry of entries) {
+                    const rawEntry = entry.world ? entry : { ...entry, world: worldName };
+                    const wiKey = worldInfoKey(rawEntry.world, rawEntry.uid);
+                    const overrideRow = wiRowMap.get(wiKey);
+                    if (!overrideRow) {
+                        continue;
+                    }
+                    seenWiKeys.add(wiKey);
+                    const baseContent = rawEntry.content ?? '';
+                    if (isSameAsWorldInfoBase(overrideRow.entry.content, baseContent)) {
+                        continue;
+                    }
+                    const wiPath = buildLoreVfsPath(rawEntry);
 
+                    items.push({
+                        id: `worldinfo:${wiKey}`,
+                        category: 'worldinfo',
+                        namespace: DATA_NAMESPACES.WORLDINFO,
+                        path: wiPath,
+                        key: wiKey,
+                        target:
+                            overrideRow.messageId >= 0
+                                ? { messageId: overrideRow.messageId, swipeId: overrideRow.swipeId }
+                                : target,
+                        layerLabel: formatLayerLabel(
+                            overrideRow.messageId,
+                            overrideRow.swipeId,
+                            overrideRow.messageId < 0,
+                        ),
+                        source: overrideRow.entry.source ?? 'lorebook',
+                        content: overrideRow.entry.content,
+                        baseContent,
+                        overridden: true,
+                        writable: true,
+                    });
+                }
+            }
+
+            for (const [wiKey, row] of wiRowMap.entries()) {
+                if (seenWiKeys.has(wiKey)) {
+                    continue;
+                }
                 items.push({
                     id: `worldinfo:${wiKey}`,
                     category: 'worldinfo',
                     namespace: DATA_NAMESPACES.WORLDINFO,
-                    path: wiPath,
+                    path: `/lorebooks/${wiKey}`,
                     key: wiKey,
                     target:
-                        overrideRow && overrideRow.messageId >= 0
-                            ? { messageId: overrideRow.messageId, swipeId: overrideRow.swipeId }
+                        row.messageId >= 0
+                            ? { messageId: row.messageId, swipeId: row.swipeId }
                             : target,
-                    layerLabel: overrideRow
-                        ? formatLayerLabel(overrideRow.messageId, overrideRow.swipeId, overrideRow.messageId < 0)
-                        : `原书 (${rawEntry.world})`,
-                    source: overrideRow?.entry.source ?? 'lorebook',
-                    content: overrideRow ? overrideRow.entry.content : baseContent,
-                    baseContent,
-                    overridden: Boolean(overrideRow),
+                    layerLabel: formatLayerLabel(row.messageId, row.swipeId, row.messageId < 0),
+                    source: row.entry.source,
+                    content: row.entry.content,
+                    overridden: true,
                     writable: true,
                 });
             }
-        }
-
-        for (const [wiKey, row] of wiRowMap.entries()) {
-            if (seenWiKeys.has(wiKey)) {
-                continue;
-            }
-            items.push({
-                id: `worldinfo:${wiKey}`,
-                category: 'worldinfo',
-                namespace: DATA_NAMESPACES.WORLDINFO,
-                path: `/lorebooks/${wiKey}`,
-                key: wiKey,
-                target:
-                    row.messageId >= 0
-                        ? { messageId: row.messageId, swipeId: row.swipeId }
-                        : target,
-                layerLabel: formatLayerLabel(row.messageId, row.swipeId, row.messageId < 0),
-                source: row.entry.source,
-                content: row.entry.content,
-                overridden: true,
-                writable: true,
-            });
         }
 
         // 4. Message outputs (/output.md mapped directly to host chat messages)
@@ -1023,6 +1044,24 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             if (matched) {
                 return matched;
             }
+            let wiBaseContent: string | undefined;
+            let wiMatchesBase = false;
+            if (input.namespace === DATA_NAMESPACES.WORLDINFO) {
+                const lorebooks = await bridge.listEnabledLorebooks();
+                for (const [worldName, entries] of lorebooks.entries()) {
+                    for (const entry of entries) {
+                        const rawEntry = entry.world ? entry : { ...entry, world: worldName };
+                        if (worldInfoKey(rawEntry.world, rawEntry.uid) === cleanKey) {
+                            wiBaseContent = rawEntry.content ?? '';
+                            wiMatchesBase = isSameAsWorldInfoBase(input.content, wiBaseContent);
+                            break;
+                        }
+                    }
+                    if (wiBaseContent !== undefined) {
+                        break;
+                    }
+                }
+            }
             const isSpec = isInstructionIndexPath(`/${cleanKey}`) || isInstructionDocPath(`/${cleanKey}`);
             return {
                 id: `${input.namespace}:${cleanKey}`,
@@ -1044,7 +1083,8 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                     : formatLayerLabel(target.messageId, target.swipeId),
                 source: 'ui-edit',
                 content: input.content,
-                overridden: !isBaseScope,
+                ...(wiBaseContent !== undefined ? { baseContent: wiBaseContent } : {}),
+                overridden: input.namespace === DATA_NAMESPACES.WORLDINFO ? !wiMatchesBase : !isBaseScope,
                 writable: true,
             };
         },

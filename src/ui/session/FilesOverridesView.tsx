@@ -247,6 +247,19 @@ function matchDeepLinkItem(item: FileOverrideItem, filePath: string): boolean {
     return item.path === filePath || item.id === filePath || item.key === filePath;
 }
 
+export function isUnmodifiedWorldInfoItem(item: FileOverrideItem): boolean {
+    if (item.category !== 'worldinfo') {
+        return false;
+    }
+    if (!item.overridden) {
+        return true;
+    }
+    if (item.baseContent !== undefined) {
+        return item.content.replace(/\r\n/g, '\n') === item.baseContent.replace(/\r\n/g, '\n');
+    }
+    return false;
+}
+
 export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
     const deepLink = useStoreSlice(store, (s) => s.deepLink);
     const activeTarget = useStoreSlice(store, (s) => s.activeTarget);
@@ -295,7 +308,9 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
             setLoading(true);
             setErrorText(null);
             try {
-                const fetched = await store.services.listFilesAndOverrides(targetArg);
+                const fetched = (await store.services.listFilesAndOverrides(targetArg)).filter(
+                    (item) => !isUnmodifiedWorldInfoItem(item),
+                );
                 setItems(fetched);
                 setSelectedId((prev) => {
                     if (prev && fetched.some((item) => item.id === prev)) {
@@ -393,6 +408,9 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
     const filteredItems = useMemo(() => {
         const query = searchQuery.trim().toLowerCase();
         return items.filter((item) => {
+            if (isUnmodifiedWorldInfoItem(item)) {
+                return false;
+            }
             if (categoryFilter !== 'all' && item.category !== categoryFilter) {
                 return false;
             }
@@ -449,6 +467,14 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                 target: selectedItem.target,
                 storageScope: selectedItem.storageScope,
             });
+            if (isUnmodifiedWorldInfoItem(saved)) {
+                const nextItems = items.filter((item) => item.id !== selectedItem.id);
+                setItems(nextItems);
+                setDetailOpen(false);
+                setSelectedId((prev) => (prev === selectedItem.id ? (nextItems[0]?.id ?? null) : prev));
+                store.pushToast(`内容与原书一致，已移出覆写列表：${saved.path}`, 'primary');
+                return;
+            }
             setItems((prev) =>
                 prev.map((item) => (item.id === selectedItem.id ? { ...item, ...saved } : item)),
             );
