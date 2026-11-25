@@ -8,9 +8,14 @@ import {
 
 export type ComposerPopoverKind = 'mode' | 'model' | null;
 
+export type AssistantSessionConfig = Pick<
+    AssistantSession,
+    'mode' | 'stAdminEnabled' | 'autoApproveAuthor' | 'autoApproveChatDelete' | 'connectionId'
+>;
+
 export interface ModeModelPopoverProps {
     kind: ComposerPopoverKind;
-    session: AssistantSession;
+    session: AssistantSessionConfig;
     connections: Record<string, ApiConnection>;
     currentConnectionId: string;
     onSelectMode: (mode: AssistantMode) => void;

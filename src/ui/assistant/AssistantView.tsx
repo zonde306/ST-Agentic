@@ -14,6 +14,7 @@ import { Button, IconCheck, IconClose, IconEdit, ShadowModal } from '@/ui/compon
 import type { ConsoleViewProps } from '@/ui/store';
 import { MessageBubble } from './MessageBubble';
 import {
+    type AssistantSessionConfig,
     type ComposerPopoverKind,
     ModeModelPopover,
     StAdminConfirmModal,
@@ -33,6 +34,22 @@ import {
 } from './assistant-helpers';
 
 type ActivePopover = ComposerPopoverKind | 'sessions';
+
+interface DraftAssistantSessionConfig {
+    mode: AssistantMode;
+    stAdminEnabled: boolean;
+    autoApproveAuthor: boolean;
+    autoApproveChatDelete: boolean;
+    connectionId: string | null;
+}
+
+const DEFAULT_DRAFT_SESSION_CONFIG: DraftAssistantSessionConfig = {
+    mode: 'chat',
+    stAdminEnabled: false,
+    autoApproveAuthor: false,
+    autoApproveChatDelete: false,
+    connectionId: null,
+};
 
 interface FilePreviewState {
     path: string;
@@ -115,6 +132,9 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     const [compactFocusDraft, setCompactFocusDraft] = useState<string>('');
     const [compactError, setCompactError] = useState<string | null>(null);
     const [compactSummaryPreviewOpen, setCompactSummaryPreviewOpen] = useState<boolean>(false);
+    const [draftSessionConfig, setDraftSessionConfig] = useState<DraftAssistantSessionConfig>(
+        DEFAULT_DRAFT_SESSION_CONFIG,
+    );
 
     const abortControllerRef = useRef<AbortController | null>(null);
     const tokenFetchSeqRef = useRef<number>(0);
@@ -126,6 +146,17 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     const dragDepthRef = useRef<number>(0);
     const pendingAttachmentsRef = useRef<AssistantAttachment[]>(pendingAttachments);
     pendingAttachmentsRef.current = pendingAttachments;
+    const draftSessionConfigRef = useRef<DraftAssistantSessionConfig>(draftSessionConfig);
+    draftSessionConfigRef.current = draftSessionConfig;
+
+    const updateDraftSessionConfig = useCallback(
+        (updater: (prev: DraftAssistantSessionConfig) => DraftAssistantSessionConfig) => {
+            const next = updater(draftSessionConfigRef.current);
+            draftSessionConfigRef.current = next;
+            setDraftSessionConfig(next);
+        },
+        [],
+    );
 
     // Hydrate from AssistantRuntimeBridge on mount.
     useEffect(() => {
@@ -173,6 +204,33 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
         }
         return assistantSessions.length > 0 ? assistantSessions[0] : null;
     }, [assistantSessions, selectedSessionId]);
+
+    const effectiveSessionConfig = useMemo<AssistantSessionConfig>(() => {
+        if (activeSession) {
+            return {
+                mode: activeSession.mode,
+                stAdminEnabled: activeSession.stAdminEnabled,
+                autoApproveAuthor: activeSession.autoApproveAuthor,
+                autoApproveChatDelete: Boolean(activeSession.autoApproveChatDelete),
+                connectionId: activeSession.connectionId || 'inherit',
+            };
+        }
+        return {
+            mode: draftSessionConfig.mode,
+            stAdminEnabled:
+                draftSessionConfig.mode === 'full' ? draftSessionConfig.stAdminEnabled : false,
+            autoApproveAuthor: draftSessionConfig.autoApproveAuthor,
+            autoApproveChatDelete: draftSessionConfig.autoApproveChatDelete,
+            connectionId:
+                draftSessionConfig.connectionId
+                ?? settings.offMainline?.defaultAssistantConnectionId
+                ?? 'inherit',
+        };
+    }, [
+        activeSession,
+        draftSessionConfig,
+        settings.offMainline?.defaultAssistantConnectionId,
+    ]);
 
     const isStreamingCurrent = Boolean(
         activeSession && streamingSessionId === activeSession.id,
@@ -295,12 +353,21 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
 
     const handleCreateSession = useCallback(async (): Promise<AssistantSession | null> => {
         const current = activeSession;
-        const defaultMode: AssistantMode = current?.mode ?? 'chat';
+        const draftCfg = draftSessionConfigRef.current;
+        const defaultMode: AssistantMode = current?.mode ?? draftCfg.mode;
         const defaultConnId =
             current?.connectionId
+            ?? draftCfg.connectionId
             ?? settings.offMainline?.defaultAssistantConnectionId
             ?? 'inherit';
-        const defaultStAdmin = defaultMode === 'full' ? Boolean(current?.stAdminEnabled) : false;
+        const defaultStAdmin =
+            defaultMode === 'full'
+                ? Boolean(current ? current.stAdminEnabled : draftCfg.stAdminEnabled)
+                : false;
+        const defaultAutoApproveAuthor = current ? false : Boolean(draftCfg.autoApproveAuthor);
+        const defaultAutoApproveChatDelete = current
+            ? false
+            : Boolean(draftCfg.autoApproveChatDelete);
 
         setOpenPopover(null);
         const runtime = store.assistantRuntime;
@@ -311,9 +378,12 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                     mode: defaultMode,
                     connectionId: defaultConnId,
                     stAdminEnabled: defaultStAdmin,
-                    autoApproveAuthor: false,
-                    autoApproveChatDelete: false,
+                    autoApproveAuthor: defaultAutoApproveAuthor,
+                    autoApproveChatDelete: defaultAutoApproveChatDelete,
                 });
+                if (!current) {
+                    updateDraftSessionConfig(() => DEFAULT_DRAFT_SESSION_CONFIG);
+                }
                 upsertSessionInStore(created);
                 store.openAssistantSession(created.id);
                 await store.refreshAssistantState();
@@ -329,12 +399,15 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 title: `新助手对话 (${modeMeta.label})`,
                 mode: defaultMode,
                 stAdminEnabled: defaultStAdmin,
-                autoApproveAuthor: false,
-                autoApproveChatDelete: false,
+                autoApproveAuthor: defaultAutoApproveAuthor,
+                autoApproveChatDelete: defaultAutoApproveChatDelete,
                 connectionId: defaultConnId,
                 updatedAt: now,
                 messages: [],
             };
+            if (!current) {
+                updateDraftSessionConfig(() => DEFAULT_DRAFT_SESSION_CONFIG);
+            }
             store.setAssistantSessions([created, ...store.getSnapshot().assistantSessions]);
             store.openAssistantSession(created.id);
             store.pushToast('已新建助手会话', 'success');
@@ -343,7 +416,13 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             store.pushToast(`新建助手会话失败：${formatErrorMessage(err)}`, 'error');
             return null;
         }
-    }, [activeSession, settings.offMainline?.defaultAssistantConnectionId, store, upsertSessionInStore]);
+    }, [
+        activeSession,
+        settings.offMainline?.defaultAssistantConnectionId,
+        store,
+        updateDraftSessionConfig,
+        upsertSessionInStore,
+    ]);
 
     const handleSelectSession = useCallback(
         (sessionId: string) => {
@@ -514,6 +593,31 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             >,
         ) => {
             if (!activeSession) {
+                updateDraftSessionConfig((prev) => {
+                    const nextMode = patch.mode ?? prev.mode;
+                    const nextStAdmin =
+                        nextMode !== 'full'
+                            ? false
+                            : patch.stAdminEnabled !== undefined
+                                ? Boolean(patch.stAdminEnabled)
+                                : prev.stAdminEnabled;
+                    return {
+                        mode: nextMode,
+                        stAdminEnabled: nextStAdmin,
+                        autoApproveAuthor:
+                            patch.autoApproveAuthor !== undefined
+                                ? Boolean(patch.autoApproveAuthor)
+                                : prev.autoApproveAuthor,
+                        autoApproveChatDelete:
+                            patch.autoApproveChatDelete !== undefined
+                                ? Boolean(patch.autoApproveChatDelete)
+                                : prev.autoApproveChatDelete,
+                        connectionId:
+                            patch.connectionId !== undefined
+                                ? patch.connectionId
+                                : prev.connectionId,
+                    };
+                });
                 return;
             }
             const optimistic: AssistantSession = {
@@ -537,14 +641,11 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 }
             }
         },
-        [activeSession, store, upsertSessionInStore],
+        [activeSession, store, updateDraftSessionConfig, upsertSessionInStore],
     );
 
     const handleSelectMode = useCallback(
         (mode: AssistantMode) => {
-            if (!activeSession) {
-                return;
-            }
             const patch: Partial<Pick<AssistantSession, 'mode' | 'stAdminEnabled'>> =
                 mode !== 'full' ? { mode, stAdminEnabled: false } : { mode };
             void patchActiveSessionConfig(patch);
@@ -556,7 +657,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 setOpenPopover(null);
             }
         },
-        [activeSession, patchActiveSessionConfig, store],
+        [patchActiveSessionConfig, store],
     );
 
     const handleToggleAutoApproveAuthor = useCallback(
@@ -586,17 +687,14 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     );
 
     const handleRequestToggleStAdmin = useCallback(() => {
-        if (!activeSession) {
-            return;
-        }
-        if (activeSession.stAdminEnabled) {
+        if (effectiveSessionConfig.stAdminEnabled) {
             void patchActiveSessionConfig({ stAdminEnabled: false });
             store.pushToast('已关闭「ST 全权管家」，权限收口为仅已开启世界书', 'primary');
             return;
         }
         setOpenPopover(null);
         setStAdminConfirmOpen(true);
-    }, [activeSession, patchActiveSessionConfig, store]);
+    }, [effectiveSessionConfig.stAdminEnabled, patchActiveSessionConfig, store]);
 
     const handleConfirmStAdmin = useCallback(() => {
         setStAdminConfirmOpen(false);
@@ -1549,14 +1647,16 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
         );
     }
 
-    const activeMode: AssistantMode = activeSession?.mode ?? 'chat';
+    const activeMode: AssistantMode = effectiveSessionConfig.mode;
     const modeMeta = ASSISTANT_MODE_META[activeMode];
-    const isAdminMode = Boolean(activeSession?.mode === 'full' && activeSession?.stAdminEnabled);
+    const isAdminMode = Boolean(
+        effectiveSessionConfig.mode === 'full' && effectiveSessionConfig.stAdminEnabled,
+    );
     const modeButtonLabel = isAdminMode ? '⚡ 管家' : `${modeMeta.icon} ${modeMeta.label}`;
     const modeButtonPillClass = isAdminMode ? 'ag-pill-error' : modeMeta.pillClass;
 
     const connDisplay = resolveConnectionDisplay(
-        activeSession?.connectionId ?? 'inherit',
+        effectiveSessionConfig.connectionId,
         settings.connections,
         settings.currentConnectionId,
     );
@@ -1938,10 +2038,10 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
 
             {/* 3. Unified Minimal Bottom Composer (NO shortcut bar, NO attach context chips) */}
             <div class="ag-ast-composer-wrap" data-assistant-composer="true">
-                {activeSession && (openPopover === 'mode' || openPopover === 'model') ? (
+                {openPopover === 'mode' || openPopover === 'model' ? (
                     <ModeModelPopover
                         kind={openPopover}
-                        session={activeSession}
+                        session={effectiveSessionConfig}
                         connections={settings.connections}
                         currentConnectionId={settings.currentConnectionId}
                         onSelectMode={handleSelectMode}
@@ -2047,7 +2147,6 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                 data-assistant-mode-btn="true"
                                 aria-expanded={openPopover === 'mode'}
                                 title="切换助手权限模式"
-                                disabled={!activeSession}
                                 class={`ag-ast-mode-btn ${modeButtonPillClass}`}
                                 onClick={() =>
                                     setOpenPopover((prev) => (prev === 'mode' ? null : 'mode'))
@@ -2062,7 +2161,6 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                 data-assistant-model-btn="true"
                                 aria-expanded={openPopover === 'model'}
                                 title={`切换助手模型连接：${connDisplay.fullLabel}`}
-                                disabled={!activeSession}
                                 class={
                                     openPopover === 'model'
                                         ? 'ag-ast-model-btn ag-pill-primary'

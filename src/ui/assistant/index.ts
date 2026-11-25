@@ -6,6 +6,7 @@ export { SessionListPanel, type SessionListPanelProps } from './SessionListPanel
 export {
     ModeModelPopover,
     StAdminConfirmModal,
+    type AssistantSessionConfig,
     type ComposerPopoverKind,
     type ModeModelPopoverProps,
     type StAdminConfirmModalProps,

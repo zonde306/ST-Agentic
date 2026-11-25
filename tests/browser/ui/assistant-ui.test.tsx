@@ -2503,4 +2503,236 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
         assertNoHorizontalOverflow(mobile.dialog, mobile.shadowRoot, 'mobile:file-refs');
         assertTouchTargetsAndTypography(mobile.shadowRoot, 'mobile:file-refs');
     });
+
+    it('allows switching mode, safety toggles, and model connection before any session exists and carries them into session creation', async () => {
+        await page.viewport(1280, 800);
+
+        // Part A: configure mode + safety flags + model in empty state, then send prompt to auto-create session.
+        const runtimeA = createMockAssistantRuntime({
+            sessions: [],
+            approvals: [],
+            undoRecords: [],
+        });
+        activeHarness = mountAssistantHarness({
+            runtime: runtimeA,
+            initialSessionId: null,
+        });
+        await settleLayout(5);
+
+        const shellA = getShellElements();
+        const emptyTitleA = shellA.shadowRoot.querySelector('.ag-empty-title');
+        expect(emptyTitleA?.textContent).toContain('独立线外助手工作台');
+
+        const modeBtnA = shellA.shadowRoot.querySelector(
+            '[data-assistant-mode-btn="true"]',
+        ) as HTMLButtonElement;
+        const modelBtnA = shellA.shadowRoot.querySelector(
+            '[data-assistant-model-btn="true"]',
+        ) as HTMLButtonElement;
+        expect(modeBtnA).toBeTruthy();
+        expect(modelBtnA).toBeTruthy();
+        expect(modeBtnA.disabled).toBe(false);
+        expect(modelBtnA.disabled).toBe(false);
+        expect(modeBtnA.textContent).toContain('交流');
+        expect(modelBtnA.textContent).toContain('跟随主连接');
+
+        // Open mode popover without an active session
+        modeBtnA.click();
+        await settleLayout(3);
+        expect(shellA.shadowRoot.querySelector('[data-assistant-popover="mode"]')).toBeTruthy();
+
+        // Switch to adjust and toggle autoApproveChatDelete
+        (
+            shellA.shadowRoot.querySelector(
+                '[data-assistant-mode-option="adjust"]',
+            ) as HTMLButtonElement
+        ).click();
+        await settleLayout(3);
+        const chatDeleteCheckboxA = shellA.shadowRoot.querySelector(
+            'input[data-assistant-auto-approve-chat-delete-checkbox="true"]',
+        ) as HTMLInputElement;
+        expect(chatDeleteCheckboxA).toBeTruthy();
+        chatDeleteCheckboxA.click();
+        await settleLayout(3);
+        expect(chatDeleteCheckboxA.checked).toBe(true);
+
+        // Switch to author and toggle autoApproveAuthor
+        (
+            shellA.shadowRoot.querySelector(
+                '[data-assistant-mode-option="author"]',
+            ) as HTMLButtonElement
+        ).click();
+        await settleLayout(3);
+        const autoApproveCheckboxA = shellA.shadowRoot.querySelector(
+            'input[data-assistant-auto-approve-checkbox="true"]',
+        ) as HTMLInputElement;
+        expect(autoApproveCheckboxA).toBeTruthy();
+        autoApproveCheckboxA.click();
+        await settleLayout(3);
+        expect(autoApproveCheckboxA.checked).toBe(true);
+
+        // Switch to full and confirm ST 全权管家
+        (
+            shellA.shadowRoot.querySelector(
+                '[data-assistant-mode-option="full"]',
+            ) as HTMLButtonElement
+        ).click();
+        await settleLayout(3);
+        (
+            shellA.shadowRoot.querySelector(
+                '[data-assistant-st-admin-toggle="true"]',
+            ) as HTMLButtonElement
+        ).click();
+        await settleLayout(3);
+        expect(
+            shellA.shadowRoot.querySelector('[data-assistant-st-admin-modal="true"]'),
+        ).toBeTruthy();
+        (
+            shellA.shadowRoot.querySelector(
+                '[data-assistant-st-admin-confirm="true"]',
+            ) as HTMLButtonElement
+        ).click();
+        await settleLayout(4);
+
+        expect(modeBtnA.textContent).toContain('⚡ 管家');
+        expect(runtimeA.sessions.length).toBe(0);
+
+        // Open model popover without an active session and select conn_flash
+        modelBtnA.click();
+        await settleLayout(3);
+        const modelPopoverA = shellA.shadowRoot.querySelector(
+            '[data-assistant-popover="model"]',
+        ) as HTMLDivElement;
+        expect(modelPopoverA).toBeTruthy();
+        (
+            modelPopoverA.querySelector(
+                '[data-assistant-model-option="conn_flash"]',
+            ) as HTMLButtonElement
+        ).click();
+        await settleLayout(3);
+
+        expect(modelBtnA.textContent).toContain('Gemini Flash');
+        expect(runtimeA.sessions.length).toBe(0);
+
+        // Send prompt -> auto-creates session carrying pre-selected draft config
+        const draftInputA = shellA.shadowRoot.querySelector(
+            'textarea[data-assistant-draft-input="true"]',
+        ) as HTMLTextAreaElement;
+        const sendBtnA = shellA.shadowRoot.querySelector(
+            '[data-assistant-send-btn="true"]',
+        ) as HTMLButtonElement;
+        setInputValue(draftInputA, '先核查当前角色卡状态');
+        await settleLayout(2);
+        sendBtnA.click();
+        await settleLayout(6);
+
+        expect(runtimeA.sessions.length).toBe(1);
+        const createdA = runtimeA.sessions[0];
+        expect(createdA.mode).toBe('full');
+        expect(createdA.stAdminEnabled).toBe(true);
+        expect(createdA.autoApproveAuthor).toBe(true);
+        expect(createdA.autoApproveChatDelete).toBe(true);
+        expect(createdA.connectionId).toBe('conn_flash');
+        expect(runtimeA.sendPromptSpy).toHaveBeenCalledTimes(1);
+        expect(runtimeA.sendPromptSpy).toHaveBeenCalledWith(
+            createdA.id,
+            '先核查当前角色卡状态',
+            expect.any(Object),
+        );
+
+        activeHarness.cleanup();
+        activeHarness = null;
+
+        // Part B: configure in empty state, click empty-state create button, then delete session and verify reset.
+        const runtimeB = createMockAssistantRuntime({
+            sessions: [],
+            approvals: [],
+            undoRecords: [],
+        });
+        activeHarness = mountAssistantHarness({
+            runtime: runtimeB,
+            initialSessionId: null,
+        });
+        await settleLayout(5);
+
+        const shellB = getShellElements();
+        const modeBtnB = shellB.shadowRoot.querySelector(
+            '[data-assistant-mode-btn="true"]',
+        ) as HTMLButtonElement;
+        const modelBtnB = shellB.shadowRoot.querySelector(
+            '[data-assistant-model-btn="true"]',
+        ) as HTMLButtonElement;
+
+        modeBtnB.click();
+        await settleLayout(3);
+        (
+            shellB.shadowRoot.querySelector(
+                '[data-assistant-mode-option="adjust"]',
+            ) as HTMLButtonElement
+        ).click();
+        await settleLayout(3);
+        (
+            shellB.shadowRoot.querySelector(
+                'input[data-assistant-auto-approve-chat-delete-checkbox="true"]',
+            ) as HTMLInputElement
+        ).click();
+        await settleLayout(3);
+
+        modelBtnB.click();
+        await settleLayout(3);
+        (
+            shellB.shadowRoot.querySelector(
+                '[data-assistant-model-option="conn_flash"]',
+            ) as HTMLButtonElement
+        ).click();
+        await settleLayout(3);
+
+        const emptyCreateBtnB = shellB.shadowRoot.querySelector(
+            '.ag-empty button',
+        ) as HTMLButtonElement;
+        expect(emptyCreateBtnB).toBeTruthy();
+        emptyCreateBtnB.click();
+        await settleLayout(6);
+
+        expect(runtimeB.sessions.length).toBe(1);
+        const createdB = runtimeB.sessions[0];
+        expect(createdB.mode).toBe('adjust');
+        expect(createdB.stAdminEnabled).toBe(false);
+        expect(createdB.autoApproveAuthor).toBe(false);
+        expect(createdB.autoApproveChatDelete).toBe(true);
+        expect(createdB.connectionId).toBe('conn_flash');
+
+        // Delete the only session via drawer and verify composer resets to defaults (交流 / 跟随主连接)
+        (
+            shellB.shadowRoot.querySelector(
+                '[data-assistant-drawer-btn="true"]',
+            ) as HTMLButtonElement
+        ).click();
+        await settleLayout(3);
+        (
+            shellB.shadowRoot.querySelector(
+                `[data-assistant-session-delete="${createdB.id}"]`,
+            ) as HTMLButtonElement
+        ).click();
+        await settleLayout(6);
+
+        expect(runtimeB.sessions.length).toBe(0);
+        expect(shellB.shadowRoot.querySelector('.ag-empty-title')?.textContent).toContain(
+            '独立线外助手工作台',
+        );
+        expect(
+            (
+                shellB.shadowRoot.querySelector(
+                    '[data-assistant-mode-btn="true"]',
+                ) as HTMLButtonElement
+            ).textContent,
+        ).toContain('交流');
+        expect(
+            (
+                shellB.shadowRoot.querySelector(
+                    '[data-assistant-model-btn="true"]',
+                ) as HTMLButtonElement
+            ).textContent,
+        ).toContain('跟随主连接');
+    });
 });
