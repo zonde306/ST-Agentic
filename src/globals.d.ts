@@ -11,6 +11,7 @@ import type {
     UndoRevertResult,
 } from '@/core/assistant';
 import type { ToolSideGenApi } from '@/core/bridge';
+import type { AgenticDocsPublicApi, ExternalDocRegistration } from '@/core/docs';
 import type { TraceLogger } from '@/core/logger';
 import type { ChatDataStore } from '@/core/store';
 import type { PipelineOrchestrator, RunTurnInput, RunTurnResult } from '@/core/triggers';
@@ -72,6 +73,7 @@ export interface AgenticPublicApi {
     rerunAfterTurn(target?: MessageTarget): Promise<void>;
     readonly sideGen: ToolSideGenApi;
     readonly assistant: AgenticAssistantPublicApi;
+    readonly docs: AgenticDocsPublicApi;
     readonly vfs: VirtualFileSystem;
     readonly store: ChatDataStore;
     readonly traces: TraceLogger;
@@ -88,6 +90,8 @@ declare global {
     var Agentic_interceptor: STGenerateInterceptor | undefined;
     // eslint-disable-next-line no-var
     var EjsTemplate: EjsTemplateGlobal | undefined;
+    // eslint-disable-next-line no-var
+    var __AGENTIC_PENDING_DOCS__: ExternalDocRegistration[] | undefined;
 }
 
 export {};

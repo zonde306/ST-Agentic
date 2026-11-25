@@ -26,6 +26,12 @@ import {
     TransientToolSpillStore,
     WatermarkCompactor,
 } from '@/core/context';
+import {
+    type AgenticDocsPublicApi,
+    defaultDocsRegistry,
+    type ExternalDocItem,
+    type ExternalDocRegistration,
+} from '@/core/docs';
 import { FetchLLMTransport } from '@/core/llm';
 import { TraceLogger } from '@/core/logger';
 import {
@@ -2650,6 +2656,26 @@ jQuery(async () => {
             abort: (sessionId) => assistantRunner.abort(sessionId),
         };
 
+        const docsApi: AgenticDocsPublicApi = {
+            register: (input) => defaultDocsRegistry.register(input),
+            unregister: (namespace, relPath) => defaultDocsRegistry.unregister(namespace, relPath),
+            unregisterNamespace: (namespace) => defaultDocsRegistry.unregisterNamespace(namespace),
+            list: (namespace) => defaultDocsRegistry.list(namespace),
+            get: (pathOrFileName) => defaultDocsRegistry.get(pathOrFileName),
+        };
+
+        const pendingDocs = globalThis.__AGENTIC_PENDING_DOCS__;
+        if (Array.isArray(pendingDocs) && pendingDocs.length > 0) {
+            for (const item of pendingDocs) {
+                try {
+                    docsApi.register(item);
+                } catch (err) {
+                    console.warn('[Agentic] Failed to register queued external doc:', err);
+                }
+            }
+            pendingDocs.length = 0;
+        }
+
         const publicApi: AgenticPublicApi = {
             version: AGENTIC_VERSION,
             getSettings: () => canonicalClone(currentSettings),
@@ -2665,6 +2691,7 @@ jQuery(async () => {
             },
             sideGen: sideGenApi,
             assistant: publicAssistantApi,
+            docs: docsApi,
             vfs,
             store,
             traces: traceLogger,
@@ -2675,6 +2702,13 @@ jQuery(async () => {
         };
 
         globalThis.Agentic = publicApi;
+        if (typeof CustomEvent === 'function' && typeof globalThis.dispatchEvent === 'function') {
+            try {
+                globalThis.dispatchEvent(new CustomEvent('agentic:ready', { detail: publicApi }));
+            } catch {
+                // Ignore event dispatch failures in restricted environments.
+            }
+        }
         resolveBootReady?.();
     } catch (error) {
         bootFailed = true;
@@ -2683,7 +2717,13 @@ jQuery(async () => {
     }
 });
 
-export type { AgenticAssistantPublicApi, AgenticPublicApi };
+export type {
+    AgenticAssistantPublicApi,
+    AgenticDocsPublicApi,
+    AgenticPublicApi,
+    ExternalDocItem,
+    ExternalDocRegistration,
+};
 export default {
     version: AGENTIC_VERSION,
     getApi: (): AgenticPublicApi | undefined => globalThis.Agentic,

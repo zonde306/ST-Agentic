@@ -27,6 +27,11 @@ import {
     type SurfaceGenerationType,
 } from '@/core/context';
 import {
+    type BuiltinDocEntry,
+    defaultDocsRegistry,
+    type DocsRegistry,
+} from '@/core/docs';
+import {
     computeRoundRetryDelayMs,
     delayWithAbort,
     isAbortError,
@@ -135,6 +140,7 @@ export interface AssistantRunnerOptions {
     transport: LLMTransport;
     store?: ChatDataStore;
     vfs?: VirtualFileSystem;
+    docsRegistry?: DocsRegistry;
     trajectoryStore?: TrajectoryStore;
     sessionStore?: AssistantSessionStore;
     approvalGate?: ApprovalGate;
@@ -547,6 +553,7 @@ function buildAssistantSystemPrompt(
     mode: AssistantMode,
     stAdminEnabled: boolean,
     capabilities?: HostExtensionCapabilities,
+    externalDocs: readonly BuiltinDocEntry[] = [],
 ): string {
     const hasEjs = Boolean(capabilities?.ejsTemplate);
     const hasThScripts = Boolean(capabilities?.tavernHelperScripts);
@@ -593,6 +600,47 @@ function buildAssistantSystemPrompt(
         lines.push(
             'Workspace Progressive-Disclosure Convention: Keep persistent user rules/directives under /workspace/AGENTS.md (thin index + core rules, saved chat-wide across swipes; modifying AGENTS.md ALWAYS requires explicit user confirmation). Put lengthy or topic-specific guidelines under /workspace/docs/<topic>.md (saved chat-wide across swipes, directly editable with UndoRecord) and link them from /workspace/AGENTS.md with a brief "when to read" trigger. Use /workspace/shared/<name>.md for cross-agent collaboration/handoff notes.',
         );
+    }
+    lines.push(
+        'Built-in Reference Docs (/docs/, read-only): Before authoring triggers/scripts/tools or routing SillyTavern native assets, read the relevant guide directly with read_file instead of guessing:',
+        `- /docs/st-native.md — SillyTavern native asset tools (cards, World Info, regex, ${hasThScripts ? 'TavernHelper scripts, ' : ''}settings/presets, chat messages, slash), mode gates, VFS overlay vs permanent writes, and unified 3-scope variables`,
+        '- /docs/triggers.md — TriggerRule phases/barriers/conditions, @@trigger, and all @@ decorators',
+        '- /docs/scripts.md — @@script deterministic JS scripts and sandbox APIs',
+        '- /docs/js-tools.md — defineTool / @@tool / ctx.* full API and slash_bridge',
+        `- /docs/ejs-macros.md — PromptBlock, macros, VFS mounts${hasEjs ? ', and EJS (<% ... %>, @@*_ejs)' : ''}`,
+    );
+    if (hasEjs) {
+        lines.push(
+            '- /docs/ejs-reference.md — ST-Prompt-Template full functions/constants/16 decorators/[GENERATE]/[RENDER]/@INJECT reference',
+        );
+    }
+    if (hasThScripts || hasEjs) {
+        const uiParts: string[] = [];
+        if (hasThScripts) {
+            uiParts.push('JS-Slash-Runner');
+        }
+        if (hasEjs) {
+            uiParts.push('@@render_after');
+        }
+        lines.push(
+            `- /docs/status-ui.md — ${uiParts.join(' & ')} status bar / custom HTML UI rendering and iframe variable APIs`,
+        );
+    }
+    lines.push(
+        '- /docs/agentic-config.md — agentic_config_read / agentic_settings_patch / agentic_preset_component_* / agentic_connection_upsert',
+    );
+    if (externalDocs.length > 0) {
+        const MAX_INDEXED_EXTERNAL_DOCS = 24;
+        lines.push('External Extension Docs (/docs/extensions/, read-only):');
+        for (const doc of externalDocs.slice(0, MAX_INDEXED_EXTERNAL_DOCS)) {
+            const desc = doc.summary || doc.title;
+            lines.push(`- ${doc.path} — ${desc}`);
+        }
+        if (externalDocs.length > MAX_INDEXED_EXTERNAL_DOCS) {
+            lines.push(
+                `- ... (${externalDocs.length - MAX_INDEXED_EXTERNAL_DOCS} more; call list_dir('/docs/extensions') to view all)`,
+            );
+        }
     }
     return lines.join('\n');
 }
@@ -1071,6 +1119,7 @@ export class AssistantRunner {
     public readonly traceLogger?: TraceLogger;
 
     private readonly toolsByName = new Map<string, AssistantToolDefinition>();
+    private readonly docsRegistry: DocsRegistry;
     private readonly undoExecutor: UndoExecutor;
     private readonly settingsProvider: () => Settings;
     private readonly settingsUpdater?: (
@@ -1098,12 +1147,14 @@ export class AssistantRunner {
     constructor(options: AssistantRunnerOptions) {
         this.bridge = options.bridge;
         this.transport = options.transport;
+        this.docsRegistry = options.docsRegistry ?? defaultDocsRegistry;
         this.store = options.store ?? options.vfs?.store ?? new ChatDataStore(options.bridge);
         this.vfs =
             options.vfs
             ?? new VirtualFileSystem({
                 bridge: this.bridge,
                 store: this.store,
+                docsRegistry: this.docsRegistry,
             });
         this.trajectoryStore =
             options.trajectoryStore
@@ -1981,6 +2032,7 @@ export class AssistantRunner {
                 currentSession.mode,
                 currentSession.stAdminEnabled,
                 capabilities,
+                this.docsRegistry.listExternalIndexEntries(),
             );
             const allowedToolDefs = this.getAllowedToolDefinitions(
                 currentSession.mode,
@@ -3087,6 +3139,7 @@ export class AssistantRunner {
             session.mode,
             session.stAdminEnabled,
             capabilities,
+            this.docsRegistry.listExternalIndexEntries(),
         );
         const allowedToolDefs = this.getAllowedToolDefinitions(
             session.mode,
@@ -3580,6 +3633,7 @@ export class AssistantRunner {
             session.mode,
             session.stAdminEnabled,
             capabilities,
+            this.docsRegistry.listExternalIndexEntries(),
         );
         const allowedToolDefs = this.getAllowedToolDefinitions(
             session.mode,

@@ -1,5 +1,6 @@
 import MiniSearch from 'minisearch';
 import type { HostBridge, ToolEditResult } from '@/core/bridge';
+import type { DocsRegistry } from '@/core/docs';
 import { ChatDataStore } from '@/core/store';
 import type {
     LoreReadHook,
@@ -56,6 +57,7 @@ import {
     SideMount,
     type SideClueListOptions,
 } from './fs-side';
+import { BuiltinDocsMount, DOCS_MOUNT } from './fs-docs';
 import { ScopedToolGuard } from './fs-scopes';
 
 export interface VirtualFileSystemOptions {
@@ -63,6 +65,7 @@ export interface VirtualFileSystemOptions {
     store?: ChatDataStore;
     loreReadHook?: LoreReadHook;
     getPresetFiles?: () => Record<string, string>;
+    docsRegistry?: DocsRegistry;
     defaultTarget?: MessageTarget;
     defaultStaged?: boolean;
 }
@@ -246,6 +249,7 @@ function buildSnippet(content: string, matchedTerms: string[], rawQuery: string 
  * - `/global/*` (`rw`, `HostBridge` global extension storage)
  * - `/history/*` (`ro` for agents, internal write API for compaction)
  * - `/side/*` (`rw`, `side-files` branch-safe off-mainline clues: `comms/*`, `rumors/*`, `notes/*`)
+ * - `/docs/*` (`ro`, built-in ST-Agentic & SillyTavern reference docs)
  */
 export class VirtualFileSystem {
     public readonly bridge: HostBridge;
@@ -262,6 +266,7 @@ export class VirtualFileSystem {
     private readonly globalMount: GlobalMount;
     private readonly historyMount: HistoryMount;
     private readonly sideMount: SideMount;
+    private readonly docsMount: BuiltinDocsMount;
     private readonly namedMounts: Map<string, VfsMount>;
 
     private readonly defaultTarget?: MessageTarget;
@@ -296,6 +301,7 @@ export class VirtualFileSystem {
         this.globalMount = new GlobalMount(this.bridge);
         this.historyMount = new HistoryMount(this.bridge);
         this.sideMount = new SideMount(this.store);
+        this.docsMount = new BuiltinDocsMount(options.docsRegistry);
 
         this.namedMounts = new Map<string, VfsMount>([
             [CHARACTER_MOUNT, this.characterMount],
@@ -306,6 +312,7 @@ export class VirtualFileSystem {
             [GLOBAL_MOUNT, this.globalMount],
             [HISTORY_MOUNT, this.historyMount],
             [SIDE_MOUNT, this.sideMount],
+            [DOCS_MOUNT, this.docsMount],
         ]);
     }
 
@@ -720,6 +727,7 @@ export class VirtualFileSystem {
             this.globalMount,
             this.historyMount,
             this.sideMount,
+            this.docsMount,
         ];
     }
 
@@ -745,7 +753,8 @@ export class VirtualFileSystem {
 
     private selectMountsForPrefix(prefix: string): VfsMount[] {
         if (prefix === '/') {
-            return this.allMounts();
+            // Keep built-in /docs/* out of default root searches so mainline RP queries stay clean.
+            return this.allMounts().filter((m) => m !== this.docsMount);
         }
         if (prefix === OUTPUT_FILE_PATH) {
             return [this.outputMount];

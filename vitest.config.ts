@@ -1,11 +1,27 @@
 import { defineConfig } from 'vitest/config';
 import { playwright } from '@vitest/browser-playwright';
+import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { resolve } from 'path';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
+function rawMarkdownPlugin() {
+  return {
+    name: 'raw-markdown',
+    load(id: string) {
+      const cleanId = id.split('?', 1)[0];
+      if (!cleanId.endsWith('.md')) {
+        return null;
+      }
+      const raw = readFileSync(cleanId, 'utf8');
+      return `export default ${JSON.stringify(raw)};`;
+    },
+  };
+}
+
 export default defineConfig({
+  plugins: [rawMarkdownPlugin()],
   resolve: {
     alias: {
       '@': resolve(__dirname, './src'),

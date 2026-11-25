@@ -46,6 +46,10 @@ const serverConfig = {
                 ],
                 exclude: /node_modules/,
             },
+            {
+                test: /\.md$/,
+                type: 'asset/source',
+            },
         ],
     },
     experiments: {

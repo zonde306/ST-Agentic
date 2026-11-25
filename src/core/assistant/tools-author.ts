@@ -21,6 +21,26 @@ import {
     type AssistantToolDefinition,
 } from './tools-chat';
 
+/** Official `ST-Prompt-Template` leading `@@` decorators accepted by `lintWorldInfoContent` without warnings. */
+const ST_PROMPT_TEMPLATE_DECORATORS: ReadonlySet<string> = new Set([
+    '@@activate',
+    '@@dont_activate',
+    '@@message_formatting',
+    '@@generate_before',
+    '@@generate_after',
+    '@@render_before',
+    '@@render_after',
+    '@@dont_preload',
+    '@@preload',
+    '@@only_preload',
+    '@@initial_variables',
+    '@@always_enabled',
+    '@@private',
+    '@@if',
+    '@@iframe',
+    '@@preprocessing',
+]);
+
 /**
  * Lightweight, non-blocking syntax checker for raw World Info entries authored in
  * `author` / `full` modes. Flags unclosed `<%` EJS tags and unknown leading `@@`
@@ -45,7 +65,11 @@ export function lintWorldInfoContent(content: string): string[] {
             break;
         }
         const parsed = parseDecoratorLine(line);
-        if (parsed && !DecoratorParser.isKnownDecorator(parsed.name)) {
+        if (
+            parsed
+            && !DecoratorParser.isKnownDecorator(parsed.name)
+            && !ST_PROMPT_TEMPLATE_DECORATORS.has(parsed.name)
+        ) {
             warnings.push(
                 `Line ${i + 1}: unknown decorator "${parsed.name}" (non-blocking warning).`,
             );
