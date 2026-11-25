@@ -403,3 +403,23 @@ export function IconFiles(props: IconProps) {
         </SvgIcon>
     );
 }
+
+export function IconPanelLeftClose(props: IconProps) {
+    return (
+        <SvgIcon {...props}>
+            <rect x="3" y="3" width="18" height="18" rx="2" />
+            <path d="M9 3v18" />
+            <path d="m16 15-3-3 3-3" />
+        </SvgIcon>
+    );
+}
+
+export function IconPanelLeftOpen(props: IconProps) {
+    return (
+        <SvgIcon {...props}>
+            <rect x="3" y="3" width="18" height="18" rx="2" />
+            <path d="M9 3v18" />
+            <path d="m14 9 3 3-3 3" />
+        </SvgIcon>
+    );
+}

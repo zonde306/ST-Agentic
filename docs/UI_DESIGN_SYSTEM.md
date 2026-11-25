@@ -189,6 +189,11 @@ Dark 主题阴影以**内描边高光 + 深阴影**组合呈现（`inset 0 1px 0
 - 状态：默认 `--muted-foreground`；悬停 `--hover` 底 + `--foreground`；选中 `--active` 底 + `--foreground` + 图标染 `--primary` + 左侧 3px 主色指示条。
 - 分组标题：11px / 500 / `--subtle-foreground`，上间距 16px。
 - 计数徽标：胶囊、`--warning` 柔和底。
+- **折叠为图标栏**：侧栏底部固定一个「收起侧栏 / 展开侧栏」切换项（`.ag-sidebar-toggle`，`aria-expanded` + `aria-controls`），状态写入 `localStorage['st-agentic:sidebar-collapsed']`。
+  - 折叠态 `.ag-sidebar[data-collapsed="true"]` 宽 60px（10px 内边距 + 40×40 热区），宽度 180ms 过渡；标签淡出但保留在 DOM 中（可访问名称与 `title` 悬停提示不变）。
+  - 分组标题保持原高度、文字透明，非首组改绘 1px `--border` 细分隔线，避免折叠时纵向跳动。
+  - 计数徽标在折叠态替换为图标右上角 7px `--warning` 圆点（`.ag-nav-item-dot`）。
+  - 仅桌面端生效；< 768px 侧栏隐藏，改用顶部横向导航。
 
 ### 2.3 主画布 `.ag-main`
 

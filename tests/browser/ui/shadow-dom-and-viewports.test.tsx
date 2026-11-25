@@ -257,7 +257,7 @@ async function selectTab(
 ): Promise<void> {
     const index = ALL_CONSOLE_TABS.indexOf(tabId);
     expect(index).toBeGreaterThanOrEqual(0);
-    const selector = isMobile ? '.ag-mobile-nav .ag-mobile-tab' : '.ag-sidebar .ag-nav-item';
+    const selector = isMobile ? '.ag-mobile-nav .ag-mobile-tab' : '.ag-sidebar .ag-nav-item[data-tab-id]';
     const buttons = Array.from(shadowRoot.querySelectorAll(selector)) as HTMLButtonElement[];
     expect(buttons.length).toBe(ALL_CONSOLE_TABS.length);
     buttons[index].click();
@@ -551,6 +551,47 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
             const rect = btn.getBoundingClientRect();
             expect(rect.width).toBeGreaterThanOrEqual(40);
             expect(rect.height).toBeGreaterThanOrEqual(40);
+        }
+    });
+
+    it('collapses the desktop sidebar into a 60px icon rail with >=40x40px targets and persists the choice', async () => {
+        await page.viewport(1280, 800);
+        window.localStorage.removeItem('st-agentic:sidebar-collapsed');
+        activeHarness = createHarness({ initialTab: 'files', initialOpen: true });
+        await settleLayout(5);
+
+        const { shadowRoot } = getShellElements();
+        const sidebar = shadowRoot.querySelector('.ag-sidebar') as HTMLElement;
+        const toggle = shadowRoot.querySelector('.ag-sidebar-toggle') as HTMLButtonElement;
+        expect(sidebar.dataset.collapsed).toBe('false');
+        expect(toggle.getAttribute('aria-expanded')).toBe('true');
+
+        try {
+            toggle.click();
+            await new Promise((resolve) => setTimeout(resolve, 260));
+            await settleLayout(3);
+
+            expect(sidebar.dataset.collapsed).toBe('true');
+            expect(toggle.getAttribute('aria-expanded')).toBe('false');
+            expect(window.localStorage.getItem('st-agentic:sidebar-collapsed')).toBe('1');
+            expect(Math.round(sidebar.getBoundingClientRect().width)).toBe(60);
+            for (const btn of Array.from(sidebar.querySelectorAll('button')) as HTMLButtonElement[]) {
+                const rect = btn.getBoundingClientRect();
+                expect(rect.width).toBeGreaterThanOrEqual(40);
+                expect(rect.height).toBeGreaterThanOrEqual(40);
+            }
+
+            // Navigation still works from the rail.
+            (sidebar.querySelector('[data-tab-id="logs"]') as HTMLButtonElement).click();
+            await settleLayout(2);
+            expect(activeHarness.store.getSnapshot().activeTab).toBe('logs');
+
+            toggle.click();
+            await settleLayout(2);
+            expect(sidebar.dataset.collapsed).toBe('false');
+            expect(window.localStorage.getItem('st-agentic:sidebar-collapsed')).toBe('0');
+        } finally {
+            window.localStorage.removeItem('st-agentic:sidebar-collapsed');
         }
     });
 

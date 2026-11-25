@@ -568,11 +568,13 @@ textarea:focus-visible {
     width: 212px;
     flex-shrink: 0;
     background: var(--sidebar);
-    padding: 4px 10px 12px;
+    padding: 4px 10px 0;
+    overflow-x: hidden;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
     gap: 14px;
+    transition: width 180ms var(--ease);
 }
 
 .ag-nav-group {
@@ -582,12 +584,16 @@ textarea:focus-visible {
 }
 
 .ag-nav-group-label {
+    position: relative;
     padding: 6px 10px 4px;
     font-size: 11px;
     font-weight: 500;
     letter-spacing: 0.02em;
     color: var(--subtle-foreground);
+    white-space: nowrap;
+    overflow: hidden;
     user-select: none;
+    transition: color var(--dur-fast) var(--ease);
 }
 
 .ag-nav-item {
@@ -603,8 +609,9 @@ textarea:focus-visible {
     border: none;
     background: transparent;
     color: var(--muted-foreground);
+    white-space: nowrap;
     cursor: pointer;
-    transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+    transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), padding 180ms var(--ease);
 }
 
 .ag-nav-item:hover {
@@ -630,6 +637,7 @@ textarea:focus-visible {
 }
 
 .ag-nav-item-icon {
+    position: relative;
     flex-shrink: 0;
     display: inline-flex;
     color: inherit;
@@ -646,6 +654,7 @@ textarea:focus-visible {
     flex-direction: column;
     flex: 1 1 auto;
     min-width: 0;
+    transition: opacity var(--dur-fast) var(--ease);
 }
 
 .ag-nav-item-label-row {
@@ -689,6 +698,79 @@ textarea:focus-visible {
 
 .ag-nav-item-desc {
     display: none;
+}
+
+/* Collapsed-only attention dot (replaces the count badge in icon-rail mode) */
+.ag-nav-item-dot {
+    position: absolute;
+    top: -3px;
+    right: -4px;
+    width: 7px;
+    height: 7px;
+    border-radius: 9999px;
+    background: var(--warning);
+    box-shadow: 0 0 0 2px var(--sidebar);
+    opacity: 0;
+    transform: scale(0.4);
+    transition: opacity var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+    pointer-events: none;
+}
+
+/* Sidebar footer — collapse / expand toggle, pinned to the rail bottom */
+.ag-sidebar-footer {
+    position: sticky;
+    bottom: 0;
+    margin-top: auto;
+    padding: 6px 0 10px;
+    background: var(--sidebar);
+}
+
+.ag-sidebar-footer::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 10px;
+    right: 10px;
+    height: 1px;
+    background: var(--border);
+}
+
+.ag-sidebar-toggle {
+    color: var(--subtle-foreground);
+}
+
+/* Collapsed icon-rail mode: 60px = 10px padding + 40px target + 10px padding */
+.ag-sidebar[data-collapsed="true"] {
+    width: 60px;
+}
+
+.ag-sidebar[data-collapsed="true"] .ag-nav-item {
+    padding: 0 12px;
+}
+
+.ag-sidebar[data-collapsed="true"] .ag-nav-item-text {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.ag-sidebar[data-collapsed="true"] .ag-nav-item-dot {
+    opacity: 1;
+    transform: scale(1);
+}
+
+/* Group titles keep their height (no vertical jump) and turn into hairline dividers */
+.ag-sidebar[data-collapsed="true"] .ag-nav-group-label {
+    color: transparent;
+}
+
+.ag-sidebar[data-collapsed="true"] .ag-nav-group:not(:first-child) .ag-nav-group-label::after {
+    content: "";
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    top: 50%;
+    height: 1px;
+    background: var(--border);
 }
 
 /* Main Content Slot — inset canvas panel */

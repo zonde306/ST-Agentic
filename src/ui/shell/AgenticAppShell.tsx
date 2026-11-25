@@ -1,5 +1,5 @@
 import { Fragment, type TargetedKeyboardEvent, render } from 'preact';
-import { useEffect, useMemo, useRef } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { ConsoleTabId, RunMode, ThemeMode } from '@/core/types';
 import {
     Badge,
@@ -24,6 +24,8 @@ import {
     IconMinimize,
     IconMonitor,
     IconMoon,
+    IconPanelLeftClose,
+    IconPanelLeftOpen,
     IconPlug,
     IconSun,
     IconTerminal,
@@ -129,6 +131,37 @@ function TabIcon({ tabId }: { tabId: ConsoleTabId }) {
         case 'connections':
             return <IconPlug size={16} />;
     }
+}
+
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'st-agentic:sidebar-collapsed';
+
+function readSidebarCollapsed(): boolean {
+    try {
+        return globalThis.localStorage?.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1';
+    } catch {
+        return false;
+    }
+}
+
+function writeSidebarCollapsed(collapsed: boolean): void {
+    try {
+        globalThis.localStorage?.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, collapsed ? '1' : '0');
+    } catch {
+        // Storage may be unavailable (privacy mode / sandboxed iframe); keep in-memory state only.
+    }
+}
+
+/** Desktop sidebar icon-rail collapse state, persisted per browser profile. */
+function useSidebarCollapsed(): [boolean, () => void] {
+    const [collapsed, setCollapsed] = useState<boolean>(readSidebarCollapsed);
+    const toggle = useCallback(() => {
+        setCollapsed((prev) => {
+            const next = !prev;
+            writeSidebarCollapsed(next);
+            return next;
+        });
+    }, []);
+    return [collapsed, toggle];
 }
 
 function nextThemeMode(current: ThemeMode): ThemeMode {
@@ -282,6 +315,7 @@ function AgenticShellContent() {
     const isMaximized = useAppStore((s) => s.isMaximized);
     const settings = useAppStore((s) => s.settings);
     const toastQueue = useAppStore((s) => s.toastQueue);
+    const [sidebarCollapsed, toggleSidebarCollapsed] = useSidebarCollapsed();
 
     const RegisteredView = useConsoleView(activeTab);
     const activeTabMeta = getConsoleTabMeta(activeTab);
@@ -491,12 +525,20 @@ function AgenticShellContent() {
 
             {/* Body: Desktop Sidebar + Active View Slot */}
             <div class="ag-body">
-                <aside class="ag-sidebar ag-thin-scroll" aria-label="功能模块">
+                <aside
+                    id="ag-sidebar"
+                    class="ag-sidebar ag-thin-scroll"
+                    aria-label="功能模块"
+                    data-collapsed={sidebarCollapsed ? 'true' : 'false'}
+                >
                     {CONSOLE_TAB_GROUPS.map((group) => (
                         <div key={group.id} class="ag-nav-group">
-                            <div class="ag-nav-group-label">{group.label}</div>
+                            <div class="ag-nav-group-label" aria-hidden={sidebarCollapsed ? 'true' : undefined}>
+                                {group.label}
+                            </div>
                             {CONSOLE_TABS.filter((tab) => tab.group === group.id).map((tab) => {
                                 const isActive = activeTab === tab.id;
+                                const showBadge = tab.id === 'assistant' && pendingApprovalCount > 0;
                                 return (
                                     <button
                                         key={tab.id}
@@ -509,11 +551,14 @@ function AgenticShellContent() {
                                     >
                                         <span class="ag-nav-item-icon">
                                             <TabIcon tabId={tab.id} />
+                                            {showBadge ? (
+                                                <span class="ag-nav-item-dot" aria-hidden="true" />
+                                            ) : null}
                                         </span>
                                         <span class="ag-nav-item-text">
                                             <span class="ag-nav-item-label-row">
                                                 <span class="ag-nav-item-label">{tab.label}</span>
-                                                {tab.id === 'assistant' && pendingApprovalCount > 0 ? (
+                                                {showBadge ? (
                                                     <span
                                                         class={
                                                             isActive
@@ -531,6 +576,30 @@ function AgenticShellContent() {
                             })}
                         </div>
                     ))}
+
+                    <div class="ag-sidebar-footer">
+                        <button
+                            type="button"
+                            class="ag-nav-item ag-sidebar-toggle"
+                            aria-controls="ag-sidebar"
+                            aria-expanded={sidebarCollapsed ? 'false' : 'true'}
+                            title={sidebarCollapsed ? '展开侧栏' : '收起为图标栏'}
+                            onClick={toggleSidebarCollapsed}
+                        >
+                            <span class="ag-nav-item-icon">
+                                {sidebarCollapsed ? (
+                                    <IconPanelLeftOpen size={16} />
+                                ) : (
+                                    <IconPanelLeftClose size={16} />
+                                )}
+                            </span>
+                            <span class="ag-nav-item-text">
+                                <span class="ag-nav-item-label">
+                                    {sidebarCollapsed ? '展开侧栏' : '收起侧栏'}
+                                </span>
+                            </span>
+                        </button>
+                    </div>
                 </aside>
 
                 <main class="ag-main">
