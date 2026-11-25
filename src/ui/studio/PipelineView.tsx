@@ -101,8 +101,19 @@ function inferRuleFromLoreEntry(
         barrier = params.barrier;
     }
 
-    const orderNum = Number(params.order ?? batchOrderDec?.args[0] ?? item.entry.order ?? 1);
+    const orderNum = Number(params.order ?? batchOrderDec?.args[0] ?? 1);
     const order = Number.isFinite(orderNum) ? Math.trunc(orderNum) : 1;
+
+    const rawGroup = (params.group ?? groupDec?.args[0] ?? groupDec?.rawArgs ?? '').trim();
+    const forceIsolate = ['none', 'isolate', 'off', 'false'].includes(rawGroup.toLowerCase());
+    const tag = primary?.args[0]?.trim() ?? '';
+    const inferredGroupName = forceIsolate
+        ? undefined
+        : rawGroup
+            ? rawGroup
+            : decName.startsWith('@@variables')
+                ? (tag ? `variables:${tag}` : 'variables')
+                : undefined;
 
     const jsonSchemaDec = item.decorators.find((d) => d.name === '@@json_schema');
     const zodSchemaDec = item.decorators.find((d) => d.name === '@@zod_schema');
@@ -116,8 +127,8 @@ function inferRuleFromLoreEntry(
         barrier,
         agentProfileId: params.profile?.trim() || defaultAgentId,
         kind: decName === '@@script' || decName.startsWith('@@evaluate_ejs') ? 'script' : 'agent',
-        tag: primary?.args[0] ?? '',
-        groupName: params.group ?? groupDec?.args[0],
+        tag,
+        ...(inferredGroupName ? { groupName: inferredGroupName } : {}),
         condition: { type: 'always' },
         instructionTemplate: item.cleanContent,
         decorator: decName,

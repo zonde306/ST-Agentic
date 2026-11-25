@@ -372,4 +372,171 @@ describe('DecoratorCompiler & Trigger Grouping', () => {
         expect(replaceEjsBefore.targetPath).toBe('/output.md');
         expect(replaceEjsBefore.phase).toBe('before_turn');
     });
+
+    it('auto-merges legacy @@variables* across different WI entry.order and respects tag, @@batch_order, and @@group none/isolate', () => {
+        const compiler = new DecoratorCompiler();
+        const compiled = compiler.compile([
+            makeEntry({
+                uid: 101,
+                comment: 'HP与体力',
+                order: 100,
+                content: '@@variables_json\n根据剧情更新 hp。',
+            }),
+            makeEntry({
+                uid: 102,
+                comment: '背包与金币',
+                order: 105,
+                content: '@@variables_yaml\n更新 gold 与 inventory。',
+            }),
+            makeEntry({
+                uid: 103,
+                comment: '任务进度',
+                order: 110,
+                content: '@@variables_jsonpatch\n更新 quest。',
+            }),
+            // Different tag -> separate unit
+            makeEntry({
+                uid: 104,
+                comment: '好感度结算',
+                order: 120,
+                content: '@@variables_json affinity\n更新好感度。',
+            }),
+            // Different @@batch_order -> separate unit
+            makeEntry({
+                uid: 105,
+                comment: '二批变量',
+                order: 125,
+                content: '@@variables_json\n@@batch_order 2\n第二批结算。',
+            }),
+            // Explicit @@group none / @@group isolate -> isolated
+            makeEntry({
+                uid: 106,
+                comment: '强制隔离A',
+                order: 130,
+                content: '@@variables_json\n@@group none\n强制单独运行A。',
+            }),
+            makeEntry({
+                uid: 107,
+                comment: '强制隔离B',
+                order: 135,
+                content: '@@variables_json\n@@group isolate\n强制单独运行B。',
+            }),
+        ]);
+
+        const units = groupTriggersForExecution(compiled.triggers);
+        expect(units).toHaveLength(5);
+
+        const defaultVarsUnit = units.find((u) => u.groupName === 'variables');
+        expect(defaultVarsUnit).toBeDefined();
+        expect(defaultVarsUnit!.isGrouped).toBe(true);
+        expect(defaultVarsUnit!.order).toBe(1);
+        expect(defaultVarsUnit!.triggers.map((t) => t.label)).toEqual([
+            'HP与体力',
+            '背包与金币',
+            '任务进度',
+        ]);
+        expect(new Set(defaultVarsUnit!.triggers.map((t) => t.agentProfileId)).size).toBe(1);
+
+        const affinityUnit = units.find((u) => u.groupName === 'variables:affinity');
+        expect(affinityUnit).toBeDefined();
+        expect(affinityUnit!.isGrouped).toBe(false);
+
+        const batch2Unit = units.find((u) => u.order === 2);
+        expect(batch2Unit).toBeDefined();
+        expect(batch2Unit!.isGrouped).toBe(false);
+
+        const isolatedA = units.find((u) => u.label === '强制隔离A');
+        const isolatedB = units.find((u) => u.label === '强制隔离B');
+        expect(isolatedA?.isGrouped).toBe(false);
+        expect(isolatedA?.groupName).toBeUndefined();
+        expect(isolatedB?.isGrouped).toBe(false);
+        expect(isolatedB?.groupName).toBeUndefined();
+        expect(isolatedA?.agentProfileId).not.toBe(isolatedB?.agentProfileId);
+    });
+
+    it('keeps legacy @@replace* isolated by default, merges on explicit @@group, and supports cross-type explicit @@group', () => {
+        const compiler = new DecoratorCompiler();
+        const compiled = compiler.compile([
+            // Legacy @@replace* without @@group -> isolated
+            makeEntry({
+                uid: 201,
+                comment: '独立日志A',
+                order: 50,
+                content: '@@replace\n记录事件A。',
+            }),
+            makeEntry({
+                uid: 202,
+                comment: '独立日志B',
+                order: 50,
+                content: '@@replace\n记录事件B。',
+            }),
+            // Legacy @@replace* with matching @@group -> merged with unioned write permissions
+            makeEntry({
+                uid: 203,
+                comment: '同行角色甲',
+                order: 10,
+                content: '@@replace\n@@group party_cards\n更新角色甲状态。',
+            }),
+            makeEntry({
+                uid: 204,
+                comment: '同行角色乙',
+                order: 20,
+                content: '@@replace\n@@group party_cards\n更新角色乙状态。',
+            }),
+            // Cross-type explicit @@group: @@variables_json + @@replace sharing @@group sync_pack
+            makeEntry({
+                uid: 205,
+                comment: '同步变量',
+                order: 30,
+                content: '@@variables_json\n@@group sync_pack\n更新 hp 与状态。',
+            }),
+            makeEntry({
+                uid: 206,
+                comment: '同步档案',
+                order: 40,
+                content: '@@replace\n@@group sync_pack\n同步更新档案文本。',
+            }),
+        ]);
+
+        const units = groupTriggersForExecution(compiled.triggers);
+        expect(units).toHaveLength(4);
+
+        expect(units.find((u) => u.label === '独立日志A')?.isGrouped).toBe(false);
+        expect(units.find((u) => u.label === '独立日志B')?.isGrouped).toBe(false);
+
+        const partyUnit = units.find((u) => u.groupName === 'party_cards');
+        expect(partyUnit).toBeDefined();
+        expect(partyUnit!.isGrouped).toBe(true);
+        expect(partyUnit!.triggers.map((t) => t.label)).toEqual(['同行角色甲', '同行角色乙']);
+        const partyAgent = compiled.derivedAgents[partyUnit!.agentProfileId];
+        expect(partyAgent).toBeDefined();
+        expect(partyAgent.permissions.write).toEqual([
+            '/lorebooks/霜烬纪元/同行角色甲-203.md',
+            '/lorebooks/霜烬纪元/同行角色乙-204.md',
+        ]);
+        expect(partyAgent.promptBlocks[0].content).toContain('grouped batch of scoped trigger tasks');
+
+        const syncUnit = units.find((u) => u.groupName === 'sync_pack');
+        expect(syncUnit).toBeDefined();
+        expect(syncUnit!.isGrouped).toBe(true);
+        expect(syncUnit!.barrier).toBe('turn');
+        expect(syncUnit!.triggers.map((t) => t.label)).toEqual(['同步变量', '同步档案']);
+
+        const syncAgent = compiled.derivedAgents[syncUnit!.agentProfileId];
+        expect(syncAgent).toBeDefined();
+        expect(syncAgent.enabledTools).toEqual(
+            expect.arrayContaining([
+                'read_variables',
+                'patch_variables',
+                'read_file',
+                'edit_file',
+                'write_file',
+            ]),
+        );
+        expect(syncAgent.permissions.write).toEqual([
+            '/state/variables.json',
+            '/lorebooks/霜烬纪元/同步档案-206.md',
+        ]);
+        expect(syncAgent.promptBlocks[0].content).toContain('Complete EVERY task');
+    });
 });

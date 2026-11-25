@@ -439,6 +439,19 @@ async function runCompanionBeforeTurnUnits(
     signal: AbortSignal,
     pendingUserInput = '',
 ): Promise<string> {
+    const scanText = buildScanTail(8, pendingUserInput);
+    const turnNumber = target.messageId + 1;
+
+    if (typeof orchestrator.runBeforeTurn === 'function') {
+        const result = await orchestrator.runBeforeTurn({
+            target,
+            userText: scanText,
+            turnNumber,
+            signal,
+        });
+        return result.brief;
+    }
+
     const lorebooks = await bridge.listEnabledLorebooks();
     const preset = resolveActivePreset(settings);
     const compiled = orchestrator.decoratorCompiler.compile(lorebooks, { preset });
@@ -451,8 +464,6 @@ async function runCompanionBeforeTurnUnits(
     }
 
     const units: TriggerExecutionUnit[] = groupTriggersForExecution(beforeRules);
-    const scanText = buildScanTail(8, pendingUserInput);
-    const turnNumber = target.messageId + 1;
     const briefFragments: string[] = [];
 
     const executeRule = async (rule: TriggerRule): Promise<void> => {
@@ -478,7 +489,10 @@ async function runCompanionBeforeTurnUnits(
         }
 
         if (rule.kind === 'agent' && rule.agentProfileId) {
-            const agentProfile = preset?.agents?.[rule.agentProfileId] ?? rule.agentProfileId;
+            const agentProfile =
+                preset?.agents?.[rule.agentProfileId]
+                ?? compiled.derivedAgents?.[rule.agentProfileId]
+                ?? rule.agentProfileId;
             const result = await orchestrator.agentRunner.run({
                 agent: agentProfile,
                 userInput: substitutedPrompt,

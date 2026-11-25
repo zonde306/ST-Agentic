@@ -1448,4 +1448,272 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
             '1#0:B:end',
         ]);
     });
+
+    it('auto-merges legacy @@variables_json entries with merged Zod schemas in a single LLM call', async () => {
+        const loreEntries: RawLoreEntry[] = [
+            {
+                world: 'VarsBook',
+                uid: 1,
+                comment: '生命值更新',
+                content: [
+                    '@@variables_json',
+                    '@@zod_schema z.object({ hp: z.number().min(0).max(100) }).loose()',
+                    '只输出 JSON，更新 hp 数值。',
+                ].join('\n'),
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 0,
+                order: 100,
+                role: 0,
+            },
+            {
+                world: 'VarsBook',
+                uid: 2,
+                comment: '银币结算',
+                content: [
+                    '@@variables_json',
+                    '@@zod_schema z.object({ coins: z.number().int().min(0) }).loose()',
+                    '检测到银币关键词时更新 coins。',
+                ].join('\n'),
+                keys: ['银币'],
+                keysecondary: [],
+                constant: false,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 0,
+                order: 120,
+                role: 0,
+            },
+        ];
+
+        const { bridge, transport, orchestrator } = createPipelineFixture({
+            lorebooks: { VarsBook: loreEntries },
+        });
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '检查钱袋' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+
+        let sawMergedPrompt = false;
+        let sawSchemaValidationError = false;
+
+        transport.enqueue(
+            writeOutputTurn('林晚拾起地上的三枚银币，擦去伤口的血迹。', 'w_vars_main'),
+            { content: 'main done' },
+            // 1 single merged after_turn LLM run (first tries invalid hp=150 -> self-heals on merged Zod schema -> patches both hp & coins)
+            (req) => {
+                const userPrompt = String(req.messages[req.messages.length - 1].content);
+                expect(userPrompt).toContain('Grouped Trigger Batch (variables, 2 tasks)');
+                expect(userPrompt).toContain('Complete ALL 2 tasks below before finishing');
+                expect(userPrompt).toContain('只输出 JSON，更新 hp 数值。');
+                expect(userPrompt).toContain('检测到银币关键词时更新 coins。');
+                sawMergedPrompt = true;
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'bad_patch',
+                            name: 'patch_variables',
+                            arguments: JSON.stringify({ json_merge: { hp: 150, coins: 3 } }),
+                        },
+                    ],
+                };
+            },
+            (req) => {
+                const toolMsg = req.messages.filter((m) => m.role === 'tool').pop();
+                expect(String(toolMsg?.content)).toMatch(/validation|too_big|100/i);
+                sawSchemaValidationError = true;
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'good_patch',
+                            name: 'patch_variables',
+                            arguments: JSON.stringify({ json_merge: { hp: 85, coins: 3 } }),
+                        },
+                    ],
+                };
+            },
+            { content: 'vars batch done' },
+        );
+
+        await orchestrator.runTurn({
+            action: 'normal',
+            target: { messageId: 1, swipeId: 0 },
+            userInput: '检查钱袋',
+        });
+        await orchestrator.barrierCoordinator.awaitAllSettled();
+
+        expect(sawMergedPrompt).toBe(true);
+        expect(sawSchemaValidationError).toBe(true);
+        expect(transport.requests).toHaveLength(5);
+
+        const vars = await orchestrator.vfs.readVariables({ target: { messageId: 1, swipeId: 0 } });
+        expect(vars).toMatchObject({ hp: 85, coins: 3 });
+    });
+
+    it('runs cross-type explicit @@group (@@variables_json + @@replace) in 1 LLM call and merges before_turn in runBeforeTurn', async () => {
+        const loreEntries: RawLoreEntry[] = [
+            {
+                world: 'MixedBook',
+                uid: 10,
+                comment: '前置时间推进',
+                content: '@@variables_json_before\n推进时间段。',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 0,
+                order: 10,
+                role: 0,
+            },
+            {
+                world: 'MixedBook',
+                uid: 11,
+                comment: '前置天气推演',
+                content: '@@variables_json_before\n更新天气状态。',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 0,
+                order: 25,
+                role: 0,
+            },
+            {
+                world: 'MixedBook',
+                uid: 12,
+                comment: '后置变量结算',
+                content: '@@variables_json\n@@group sync_pack\n更新 alertLevel。',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 0,
+                order: 15,
+                role: 0,
+            },
+            {
+                world: 'MixedBook',
+                uid: 13,
+                comment: '灰港事件板',
+                content: '@@replace\n@@group sync_pack\n更新灰港事件板记录。',
+                keys: [],
+                keysecondary: [],
+                constant: true,
+                selective: false,
+                disable: false,
+                position: 0,
+                depth: 0,
+                order: 30,
+                role: 0,
+            },
+        ];
+
+        const { bridge, transport, orchestrator } = createPipelineFixture({
+            lorebooks: { MixedBook: loreEntries },
+        });
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '巡视码头' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+
+        // 1. Test orchestrator.runBeforeTurn merges the two @@variables_json_before entries into 1 LLM call
+        transport.enqueue(
+            (req) => {
+                const prompt = String(req.messages[req.messages.length - 1].content);
+                expect(prompt).toContain('Grouped Trigger Batch (variables, 2 tasks)');
+                expect(prompt).toContain('推进时间段。');
+                expect(prompt).toContain('更新天气状态。');
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'before_patch',
+                            name: 'patch_variables',
+                            arguments: JSON.stringify({ json_merge: { period: 'night', weather: 'fog' } }),
+                        },
+                    ],
+                };
+            },
+            { content: '当前为浓雾深夜' },
+        );
+
+        const beforeRes = await orchestrator.runBeforeTurn({
+            target: { messageId: 1, swipeId: 0 },
+            userText: '巡视码头',
+            turnNumber: 1,
+        });
+        expect(beforeRes.brief).toBe('当前为浓雾深夜');
+        expect(beforeRes.results).toHaveLength(1);
+        expect(beforeRes.results[0].triggerIds).toHaveLength(2);
+        expect(transport.requests).toHaveLength(2);
+
+        // 2. Test full runTurn: 1 before_turn batch + main_turn + 1 cross-type sync_pack batch
+        transport.enqueue(
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'before_patch_2',
+                        name: 'patch_variables',
+                        arguments: JSON.stringify({ json_merge: { period: 'night', weather: 'fog' } }),
+                    },
+                ],
+            },
+            { content: '浓雾笼罩码头' },
+            writeOutputTurn('雾中传来钟声。', 'w_mixed_main'),
+            { content: 'main done' },
+            (req) => {
+                const sys = String(req.messages[0].content);
+                const prompt = String(req.messages[req.messages.length - 1].content);
+                expect(sys).toContain('Complete EVERY task');
+                expect(prompt).toContain('Grouped Trigger Batch (sync_pack, 2 tasks)');
+                expect(prompt).toContain('Target: /state/variables.json');
+                expect(prompt).toContain('Target: /lorebooks/MixedBook/灰港事件板-13.md');
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'sync_vars',
+                            name: 'patch_variables',
+                            arguments: JSON.stringify({ json_merge: { alertLevel: 2 } }),
+                        },
+                        {
+                            id: 'sync_lore',
+                            name: 'write_file',
+                            arguments: JSON.stringify({
+                                path: '/lorebooks/MixedBook/灰港事件板-13.md',
+                                content: '浓雾夜响起警戒钟声。',
+                            }),
+                        },
+                    ],
+                };
+            },
+            { content: 'sync_pack done' },
+        );
+
+        await orchestrator.runTurn({
+            action: 'normal',
+            target: { messageId: 1, swipeId: 0 },
+            userInput: '巡视码头',
+            turnNumber: 1,
+        });
+        await orchestrator.barrierCoordinator.awaitAllSettled();
+
+        const target = { messageId: 1, swipeId: 0 };
+        const vars = await orchestrator.vfs.readVariables({ target });
+        expect(vars).toMatchObject({ period: 'night', weather: 'fog', alertLevel: 2 });
+        const loreContent = await orchestrator.vfs.readFile('/lorebooks/MixedBook/灰港事件板-13.md', {
+            target,
+        });
+        expect(loreContent).toContain('浓雾夜响起警戒钟声。');
+    });
 });

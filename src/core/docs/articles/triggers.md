@@ -19,9 +19,10 @@ ST-Agentic 的自动化逻辑可以放在**预设触发器规则（`TriggerRule`
 - `none`：**无阻塞**——后台异步触发，与主流程解耦。
 
 ### `order` 与 `groupName`（合并与隔离）
-- 同一 `phase` 内按 `order` 升序执行（可用 `@@trigger order=10`、`@@batch_order 10` 或世界书条目的 `order` 字段）。
-- **默认隔离（`1 Trigger = 1 Run`）**：不同触发器各自独立运行。
-- **同组打包**：只有当 `kind === 'agent'`、显式设置了相同的 `groupName`（或 `@@group <name>`），且 `phase`、`order`、`agentProfileId` 完全一致时，多条触发器才会合并为同一次 LLM 调用；合并后取最严格的 `barrier`。`@@script` 始终独立执行，不参与合并。
+- 同一 `phase` 内按 `order` 升序执行（由 `@@trigger order=10` 或 `@@batch_order 10` 指定；均未指定时默认 `1`，不随世界书条目的插入顺序 `entry.order` 打散）。
+- **默认隔离（`1 Trigger = 1 Run`）**：`@@trigger`、`@@replace*`、`@@append_output*`、`@@replace_output*` 默认各自独立运行。
+- **旧版变量触发器默认自动合并**：同一 `phase`、同 `@@batch_order` 且同 `<tag>` 的旧版 `@@variables*`（如 `@@variables_json` / `yaml` / `jsonpatch` 及其 `*_before`）条目默认自动合组为同一次 Agent 调用（合并各自规则与 `@@zod_schema` / `@@json_schema`）；如需强制单独执行，可显式写 `@@group none` 或 `@@group isolate`（或设置不同的 `<tag>` / `@@batch_order`）。
+- **显式同组打包（含跨类型合组）**：当 `kind === 'agent'`、显式设置了相同的 `groupName`（或 `@@group <name>`），且 `phase`、`order`、`agentProfileId` 一致时，多条触发器（包括旧版 `@@replace*`、`@@*_output*`、`@@variables*` 或混合类型）会合并为同一次 LLM 调用；合并后取最严格的 `barrier`，并自动合并工具与读写权限。`@@script` 与 `@@*_ejs*` 始终独立执行，不参与合并。
 
 ---
 

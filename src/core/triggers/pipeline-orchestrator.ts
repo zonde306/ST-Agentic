@@ -763,6 +763,54 @@ export class PipelineOrchestrator {
     }
 
     /**
+     * Execute `before_turn` triggers (used both internally and by Companion mode hooks)
+     * with full `groupTriggersForExecution` merging and ordered batch execution.
+     */
+    async runBeforeTurn(input: {
+        target: MessageTarget;
+        userText: string;
+        turnNumber?: number;
+        signal?: AbortSignal;
+    }): Promise<{ brief: string; results: TriggerExecutionResult[] }> {
+        const target = freezeTarget(input.target);
+        const turnSignal = input.signal ?? new AbortController().signal;
+        throwIfAborted(turnSignal);
+
+        const settings = this.settingsProvider();
+        const preset = resolveActivePreset(settings);
+        const turnNumber = this.resolveTurnNumber(target.messageId, input.turnNumber);
+        const env = await this.compileTurnEnvironment(preset, turnSignal);
+        const beforeUnits = groupTriggersForExecution(
+            env.allTriggers.filter((t) => t.phase === 'before_turn'),
+        );
+
+        const results: TriggerExecutionResult[] = [];
+        await this.executeOrderedSyncUnits(beforeUnits, {
+            target,
+            turnNumber,
+            userText: input.userText,
+            assistantText: '',
+            preset,
+            effectiveAgents: env.effectiveAgents,
+            loreEntries: env.loreEntries,
+            subAgents: env.subAgents,
+            globalVarSchema: env.globalVarSchema,
+            staged: true,
+            signal: turnSignal,
+            resultsOut: results,
+        });
+
+        const briefParts = results
+            .filter((r) => !r.skipped && r.output.trim().length > 0)
+            .map((r) => r.output.trim());
+
+        return {
+            brief: briefParts.join('\n\n'),
+            results,
+        };
+    }
+
+    /**
      * Manually re-run `after_turn` triggers for a specific `(messageId, swipeId)` target.
      */
     async rerunAfterTurn(
@@ -1466,7 +1514,11 @@ export class PipelineOrchestrator {
             }
         } else {
             sections.push(
-                `Grouped Trigger Batch (${unit.groupName ?? unit.label}, ${unit.triggers.length} tasks):`,
+                [
+                    `Grouped Trigger Batch (${unit.groupName ?? unit.label}, ${unit.triggers.length} tasks):`,
+                    `- Complete ALL ${unit.triggers.length} tasks below before finishing; do not stop after completing only the first task.`,
+                    '- Persist each task\'s changes strictly through the granted tools for its Target VFS Path, and ignore legacy plain-text output-only format directives inside individual task bodies.',
+                ].join('\n'),
             );
             unit.triggers.forEach((rule, index) => {
                 const rendered = this.bridge.substituteMacros(
@@ -1474,7 +1526,7 @@ export class PipelineOrchestrator {
                     macroOverrides,
                 ).trim();
                 sections.push(
-                    `### Task ${index + 1}: ${rule.label}${rule.targetPath ? ` (Target: ${rule.targetPath})` : ''}`,
+                    `### Task ${index + 1}: ${rule.label}${rule.targetPath ? ` (Target: ${rule.targetPath})` : ''}${rule.decorator ? ` [${rule.decorator}]` : ''}`,
                 );
                 if (rendered) {
                     sections.push(rendered);

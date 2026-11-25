@@ -159,10 +159,72 @@ function parseBarrierValue(raw: string | undefined, fallback: BarrierPolicy): Ba
     return fallback;
 }
 
+const ISOLATED_GROUP_VALUES = new Set(['none', 'isolate', 'off', 'false']);
+
+function parseExplicitGroupDirective(
+    raw: string | undefined,
+): { groupName?: string; forceIsolate: boolean } {
+    const trimmed = raw?.trim() ?? '';
+    if (!trimmed) {
+        return { forceIsolate: false };
+    }
+    if (ISOLATED_GROUP_VALUES.has(trimmed.toLowerCase())) {
+        return { forceIsolate: true };
+    }
+    return { groupName: trimmed, forceIsolate: false };
+}
+
+function uniqueStrings(items: readonly string[]): string[] {
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (const item of items) {
+        if (!seen.has(item)) {
+            seen.add(item);
+            result.push(item);
+        }
+    }
+    return result;
+}
+
+function mergeDerivedAgentProfiles(
+    existing: AgentProfile,
+    incoming: AgentProfile,
+    groupName?: string,
+): AgentProfile {
+    const mergedTools = uniqueStrings([...existing.enabledTools, ...incoming.enabledTools]);
+    const mergedRead = uniqueStrings([...existing.permissions.read, ...incoming.permissions.read]);
+    const mergedWrite = uniqueStrings([...existing.permissions.write, ...incoming.permissions.write]);
+
+    const existingBase = existing.promptBlocks.find((b) => b.id === 'system_base')?.content ?? '';
+    const incomingBase = incoming.promptBlocks.find((b) => b.id === 'system_base')?.content ?? '';
+    const unifiedInstruction = [
+        'You are executing a grouped batch of scoped trigger tasks in a single run.',
+        'Complete EVERY task listed in the prompt using each task\'s specified Target VFS Path and granted tools (read_variables / patch_variables for /state/variables.json; read_file / edit_file / write_file / append_file for file targets).',
+        'Ignore legacy plain-text-only output format instructions inside individual task rules and persist all changes strictly via tool calls before finishing.',
+    ].join('\n');
+
+    const systemContent = existingBase === incomingBase ? existingBase : unifiedInstruction;
+    const promptBlocks = existing.promptBlocks.map((block) =>
+        block.id === 'system_base'
+            ? { ...block, content: systemContent }
+            : { ...block },
+    );
+
+    return {
+        ...existing,
+        name: groupName ? `Grouped Trigger (${groupName})` : existing.name,
+        promptBlocks,
+        enabledTools: mergedTools,
+        permissions: {
+            read: mergedRead,
+            write: mergedWrite,
+        },
+    };
+}
+
 function parseOrderValue(
     explicitOrder: string | undefined,
     batchOrderDec: ParsedDecorator | undefined,
-    entryOrder: number | undefined,
 ): number {
     if (explicitOrder !== undefined) {
         const parsed = Number(explicitOrder);
@@ -177,7 +239,7 @@ function parseOrderValue(
             return Math.trunc(parsed);
         }
     }
-    return typeof entryOrder === 'number' && Number.isFinite(entryOrder) ? entryOrder : 1;
+    return 1;
 }
 
 function extractCondition(
@@ -332,7 +394,14 @@ export class DecoratorCompiler {
                 triggers.push(compiled.trigger);
             }
             if (compiled.derivedAgent) {
-                derivedAgents[compiled.derivedAgent.id] = compiled.derivedAgent;
+                const existingAgent = derivedAgents[compiled.derivedAgent.id];
+                derivedAgents[compiled.derivedAgent.id] = existingAgent
+                    ? mergeDerivedAgentProfiles(
+                        existingAgent,
+                        compiled.derivedAgent,
+                        compiled.trigger?.groupName,
+                    )
+                    : compiled.derivedAgent;
             }
             if (compiled.warnings.length > 0) {
                 warnings.push(...compiled.warnings);
@@ -409,17 +478,17 @@ export class DecoratorCompiler {
         const vfsPath = buildLoreVfsPath(entry, decorators);
         const ruleId = `wi_${sanitizeSegment(entry.world)}_${entry.uid}`;
         const label = entry.comment?.trim() || `${entry.world}#${entry.uid}`;
-        const groupName =
-            triggerDec?.params.group?.trim()
-            || scriptDec?.params.group?.trim()
-            || groupDec?.args[0]?.trim()
-            || groupDec?.rawArgs.trim()
-            || undefined;
+        const rawGroupValue =
+            triggerDec?.params.group
+            || scriptDec?.params.group
+            || groupDec?.args[0]
+            || groupDec?.rawArgs;
+        const groupDirective = parseExplicitGroupDirective(rawGroupValue);
+        const explicitGroupName = groupDirective.forceIsolate ? undefined : groupDirective.groupName;
 
         const baseOrder = parseOrderValue(
             triggerDec?.params.order ?? scriptDec?.params.order,
             batchOrderDec,
-            entry.order,
         );
 
         const presetAgents = options.preset?.agents ?? {};
@@ -451,7 +520,7 @@ export class DecoratorCompiler {
                     agentProfileId: params.profile?.trim() || params.agent?.trim() || 'script',
                     kind: 'script',
                     ...(tag ? { tag } : {}),
-                    ...(groupName ? { groupName } : {}),
+                    ...(explicitGroupName ? { groupName: explicitGroupName } : {}),
                     condition,
                     instructionTemplate: scriptCode,
                     ...(targetPath ? { targetPath } : {}),
@@ -467,7 +536,11 @@ export class DecoratorCompiler {
             const existingProfile = requestedProfileId ? presetAgents[requestedProfileId] : undefined;
             const agentProfileId = existingProfile
                 ? existingProfile.id
-                : (requestedProfileId || `wi_agent_${sanitizeSegment(entry.world)}_${entry.uid}`);
+                : requestedProfileId
+                    ? requestedProfileId
+                    : explicitGroupName
+                        ? `wi_group_${phase}_${sanitizeSegment(explicitGroupName)}`
+                        : `wi_agent_${sanitizeSegment(entry.world)}_${entry.uid}`;
 
             let derivedAgent: AgentProfile | undefined;
             if (!existingProfile) {
@@ -516,7 +589,7 @@ export class DecoratorCompiler {
                 agentProfileId,
                 kind: 'agent',
                 ...(tag ? { tag } : {}),
-                ...(groupName ? { groupName } : {}),
+                ...(explicitGroupName ? { groupName: explicitGroupName } : {}),
                 condition,
                 instructionTemplate: instructionText,
                 ...(targetPath ? { targetPath } : {}),
@@ -535,7 +608,9 @@ export class DecoratorCompiler {
                 : 'after_turn';
             const barrier: BarrierPolicy = phase === 'before_turn' ? 'turn' : 'self';
             const tag = replaceDec.args[0]?.trim() || undefined;
-            const agentProfileId = `wi_agent_${sanitizeSegment(entry.world)}_${entry.uid}`;
+            const agentProfileId = explicitGroupName
+                ? `wi_group_${phase}_${sanitizeSegment(explicitGroupName)}`
+                : `wi_agent_${sanitizeSegment(entry.world)}_${entry.uid}`;
 
             const derivedAgent = buildDerivedTriggerAgent({
                 id: agentProfileId,
@@ -561,7 +636,7 @@ export class DecoratorCompiler {
                 agentProfileId,
                 kind: 'agent',
                 ...(tag ? { tag } : {}),
-                ...(groupName ? { groupName } : {}),
+                ...(explicitGroupName ? { groupName: explicitGroupName } : {}),
                 condition: extractCondition(entry, {}),
                 instructionTemplate: parsed.cleanContent.trim(),
                 targetPath: vfsPath,
@@ -580,7 +655,14 @@ export class DecoratorCompiler {
             const barrier: BarrierPolicy = 'turn';
             const tag = varsDec.args[0]?.trim() || undefined;
             const { schemaSource, instructionText } = extractInlineSchema(decorators, parsed.cleanContent);
-            const agentProfileId = `wi_agent_${sanitizeSegment(entry.world)}_${entry.uid}`;
+            const resolvedGroupName = groupDirective.forceIsolate
+                ? undefined
+                : explicitGroupName ?? (tag ? `variables:${tag}` : 'variables');
+            const agentProfileId = groupDirective.forceIsolate
+                ? `wi_agent_${sanitizeSegment(entry.world)}_${entry.uid}`
+                : explicitGroupName
+                    ? `wi_group_${phase}_${sanitizeSegment(explicitGroupName)}`
+                    : `wi_vars_${phase}_${tag ? sanitizeSegment(tag) : 'default'}`;
 
             const derivedAgent = buildDerivedTriggerAgent({
                 id: agentProfileId,
@@ -588,6 +670,7 @@ export class DecoratorCompiler {
                 systemInstruction: [
                     'You maintain structured state variables at /state/variables.json.',
                     'Read current state with read_variables and apply incremental updates with patch_variables.',
+                    'Complete all variable update tasks listed in the prompt and ignore any legacy instructions asking to output raw JSON/YAML text instead of calling patch_variables.',
                     'If patch_variables reports a schema validation error, inspect the failing field paths and fix them in the same turn.',
                 ].join('\n'),
                 enabledTools: ['read_variables', 'patch_variables', 'read_file'],
@@ -607,7 +690,7 @@ export class DecoratorCompiler {
                 agentProfileId,
                 kind: 'agent',
                 ...(tag ? { tag } : {}),
-                ...(groupName ? { groupName } : {}),
+                ...(resolvedGroupName ? { groupName: resolvedGroupName } : {}),
                 condition: extractCondition(entry, {}),
                 instructionTemplate: instructionText,
                 targetPath: '/state/variables.json',
@@ -628,7 +711,9 @@ export class DecoratorCompiler {
                 : 'after_turn';
             const barrier: BarrierPolicy = phase === 'before_turn' ? 'turn' : 'self';
             const tag = activeDec.args[0]?.trim() || undefined;
-            const agentProfileId = `wi_agent_${sanitizeSegment(entry.world)}_${entry.uid}`;
+            const agentProfileId = explicitGroupName
+                ? `wi_group_${phase}_${sanitizeSegment(explicitGroupName)}`
+                : `wi_agent_${sanitizeSegment(entry.world)}_${entry.uid}`;
 
             const derivedAgent = buildDerivedTriggerAgent({
                 id: agentProfileId,
@@ -661,7 +746,7 @@ export class DecoratorCompiler {
                 agentProfileId,
                 kind: 'agent',
                 ...(tag ? { tag } : {}),
-                ...(groupName ? { groupName } : {}),
+                ...(explicitGroupName ? { groupName: explicitGroupName } : {}),
                 condition: extractCondition(entry, {}),
                 instructionTemplate: parsed.cleanContent.trim(),
                 targetPath: '/output.md',
@@ -695,7 +780,7 @@ export class DecoratorCompiler {
                 agentProfileId: 'ejs_script',
                 kind: 'script',
                 ...(tag ? { tag } : {}),
-                ...(groupName ? { groupName } : {}),
+                ...(explicitGroupName ? { groupName: explicitGroupName } : {}),
                 condition: extractCondition(entry, {}),
                 instructionTemplate: parsed.cleanContent,
                 ...(targetPath ? { targetPath } : {}),
