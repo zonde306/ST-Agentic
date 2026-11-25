@@ -1161,15 +1161,25 @@ textarea:focus-visible {
     display: inline-flex;
     align-items: center;
     gap: 4px;
+    min-width: 0;
+    max-width: 100%;
     height: 20px;
     padding: 0 7px;
     border-radius: var(--radius-sm);
     border: none;
+    overflow: hidden;
     font-size: 11px;
     font-weight: 500;
     line-height: 1;
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
+}
+
+.ag-badge-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .ag-badge-neutral {
@@ -1493,6 +1503,9 @@ textarea:focus-visible {
 
 .ag-list-item {
     width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
     text-align: left;
     display: flex;
     flex-direction: column;
@@ -1525,6 +1538,9 @@ textarea:focus-visible {
 }
 
 .ag-list-item-meta {
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
     font-size: 12px;
     color: var(--muted-foreground);
     display: flex;

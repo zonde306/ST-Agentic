@@ -120,11 +120,27 @@ export interface BadgeProps {
     children?: ComponentChildren;
 }
 
+function isPlainBadgeText(children: ComponentChildren): boolean {
+    if (typeof children === 'string' || typeof children === 'number') {
+        return true;
+    }
+    if (Array.isArray(children)) {
+        return children.every(
+            (child) =>
+                typeof child === 'string'
+                || typeof child === 'number'
+                || child == null
+                || typeof child === 'boolean',
+        );
+    }
+    return false;
+}
+
 export function Badge({ tone = 'neutral', className, title, children }: BadgeProps) {
     const classes = ['ag-badge', `ag-badge-${tone}`, className ?? ''].filter(Boolean).join(' ');
     return (
         <span class={classes} title={title}>
-            {children}
+            {isPlainBadgeText(children) ? <span class="ag-badge-text">{children}</span> : children}
         </span>
     );
 }

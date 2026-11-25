@@ -1406,11 +1406,29 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
                                 && f.content.replace(/\r\n/g, '\n') === f.baseContent.replace(/\r\n/g, '\n')))
                     ),
             );
-            if (!target) {
-                return visibleFiles.map((f) => ({ ...f }));
+            const scopedFiles = target
+                ? visibleFiles.filter((f) => f.target.messageId <= target.messageId)
+                : visibleFiles;
+            const messageFiles = scopedFiles.filter((f) => f.category === 'message');
+            if (messageFiles.length <= 1) {
+                return scopedFiles.map((f) => ({ ...f }));
             }
-            return visibleFiles
-                .filter((f) => f.target.messageId <= target.messageId)
+            const keptMessage =
+                (target
+                    ? messageFiles.find(
+                          (f) =>
+                              f.target.messageId === target.messageId
+                              && f.target.swipeId === target.swipeId,
+                      ) ?? messageFiles.find((f) => f.target.messageId === target.messageId)
+                    : undefined)
+                ?? messageFiles.reduce((latest, candidate) => {
+                    if (candidate.target.messageId !== latest.target.messageId) {
+                        return candidate.target.messageId > latest.target.messageId ? candidate : latest;
+                    }
+                    return candidate.target.swipeId > latest.target.swipeId ? candidate : latest;
+                });
+            return scopedFiles
+                .filter((f) => f.category !== 'message' || f === keptMessage)
                 .map((f) => ({ ...f }));
         },
 

@@ -260,6 +260,40 @@ export function isUnmodifiedWorldInfoItem(item: FileOverrideItem): boolean {
     return false;
 }
 
+export function filterVisibleFileOverrideItems(
+    items: readonly FileOverrideItem[],
+    scopedTarget?: MessageTarget,
+): FileOverrideItem[] {
+    const baseFiltered = items.filter((item) => !isUnmodifiedWorldInfoItem(item));
+    const messageItems = baseFiltered.filter((item) => item.category === 'message');
+    if (messageItems.length <= 1) {
+        return baseFiltered;
+    }
+
+    let keptMessageItem: FileOverrideItem | undefined;
+    if (scopedTarget) {
+        keptMessageItem =
+            messageItems.find(
+                (item) =>
+                    item.target.messageId === scopedTarget.messageId
+                    && item.target.swipeId === scopedTarget.swipeId,
+            )
+            ?? messageItems.find((item) => item.target.messageId === scopedTarget.messageId);
+    }
+    if (!keptMessageItem) {
+        keptMessageItem = messageItems.reduce((latest, candidate) => {
+            if (candidate.target.messageId !== latest.target.messageId) {
+                return candidate.target.messageId > latest.target.messageId ? candidate : latest;
+            }
+            return candidate.target.swipeId > latest.target.swipeId ? candidate : latest;
+        });
+    }
+
+    return baseFiltered.filter(
+        (item) => item.category !== 'message' || item === keptMessageItem,
+    );
+}
+
 export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
     const deepLink = useStoreSlice(store, (s) => s.deepLink);
     const activeTarget = useStoreSlice(store, (s) => s.activeTarget);
@@ -308,8 +342,9 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
             setLoading(true);
             setErrorText(null);
             try {
-                const fetched = (await store.services.listFilesAndOverrides(targetArg)).filter(
-                    (item) => !isUnmodifiedWorldInfoItem(item),
+                const fetched = filterVisibleFileOverrideItems(
+                    await store.services.listFilesAndOverrides(targetArg),
+                    targetArg,
                 );
                 setItems(fetched);
                 setSelectedId((prev) => {
@@ -927,10 +962,11 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                                 }
                                 onClick={() => handleSelectItem(item)}
                             >
-                                <div class="ag-row" style={{ justifyContent: 'space-between' }}>
+                                <div class="ag-row" style={{ justifyContent: 'space-between', minWidth: 0, width: '100%' }}>
                                     <span
                                         class="ag-list-item-title ag-mono"
                                         style={{
+                                            minWidth: 0,
                                             overflow: 'hidden',
                                             textOverflow: 'ellipsis',
                                             whiteSpace: 'nowrap',
@@ -939,28 +975,46 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                                     >
                                         {item.path}
                                     </span>
-                                    <Badge tone={getCategoryTone(item.category)}>
-                                        {getCategoryLabel(item.category)}
-                                    </Badge>
+                                    <span style={{ flexShrink: 0 }}>
+                                        <Badge tone={getCategoryTone(item.category)}>
+                                            {getCategoryLabel(item.category)}
+                                        </Badge>
+                                    </span>
                                 </div>
                                 <div class="ag-list-item-meta">
                                     <span
                                         style={{
+                                            minWidth: 0,
+                                            flexShrink: 0,
+                                            maxWidth: '42%',
                                             overflow: 'hidden',
                                             textOverflow: 'ellipsis',
                                             whiteSpace: 'nowrap',
                                         }}
+                                        title={item.source}
                                     >
                                         {item.source}
                                     </span>
-                                    <span class="ag-row" style={{ gap: '4px', flexShrink: 0 }}>
+                                    <span
+                                        class="ag-row"
+                                        style={{
+                                            gap: '4px',
+                                            minWidth: 0,
+                                            flex: '0 1 auto',
+                                            overflow: 'hidden',
+                                        }}
+                                    >
                                         {isInstructionIndexPath(item.path) ? (
-                                            <Badge tone="primary">索引</Badge>
+                                            <span style={{ flexShrink: 0 }}>
+                                                <Badge tone="primary">索引</Badge>
+                                            </span>
                                         ) : null}
                                         {isTargetMatch ? (
-                                            <Badge tone="primary">定位</Badge>
+                                            <span style={{ flexShrink: 0 }}>
+                                                <Badge tone="primary">定位</Badge>
+                                            </span>
                                         ) : null}
-                                        <Badge tone={item.overridden ? 'success' : 'neutral'}>
+                                        <Badge tone={item.overridden ? 'success' : 'neutral'} title={item.layerLabel}>
                                             {item.layerLabel}
                                         </Badge>
                                     </span>

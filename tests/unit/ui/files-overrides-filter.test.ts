@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { isUnmodifiedWorldInfoItem } from '@/ui/session/FilesOverridesView';
+import {
+    filterVisibleFileOverrideItems,
+    isUnmodifiedWorldInfoItem,
+} from '@/ui/session/FilesOverridesView';
 import type { FileOverrideItem } from '@/ui/store';
 import { createMockUIServices } from '@/ui/store/mock-services';
 
@@ -114,5 +117,65 @@ describe('FilesOverridesView worldinfo filtering', () => {
         });
         const afterRestore = await services.listFilesAndOverrides();
         expect(afterRestore.some((item) => item.id === wiItem!.id)).toBe(false);
+    });
+
+    it('keeps only the latest or scoped /output.md message entry while preserving other categories', () => {
+        const varsItem = makeItem({
+            id: 'variables:vars',
+            category: 'variables',
+            namespace: 'variables',
+            path: '/state/variables.json',
+            key: 'vars',
+            overridden: true,
+        });
+        const unmodifiedWi = makeItem({
+            id: 'worldinfo:Book/unmodified',
+            overridden: false,
+        });
+        const out0 = makeItem({
+            id: 'output:0#0',
+            category: 'message',
+            namespace: 'files',
+            path: '/output.md',
+            key: 'output.md',
+            target: { messageId: 0, swipeId: 0 },
+            layerLabel: 'L0#0',
+            overridden: false,
+        });
+        const out1 = makeItem({
+            id: 'output:1#0',
+            category: 'message',
+            namespace: 'files',
+            path: '/output.md',
+            key: 'output.md',
+            target: { messageId: 1, swipeId: 0 },
+            layerLabel: 'L1#0',
+            overridden: false,
+        });
+        const out2 = makeItem({
+            id: 'output:2#1',
+            category: 'message',
+            namespace: 'files',
+            path: '/output.md',
+            key: 'output.md',
+            target: { messageId: 2, swipeId: 1 },
+            layerLabel: 'L2#1',
+            overridden: false,
+        });
+
+        const unscoped = filterVisibleFileOverrideItems([varsItem, unmodifiedWi, out2, out1, out0]);
+        expect(unscoped.map((item) => item.id)).toEqual(['variables:vars', 'output:2#1']);
+
+        const scoped = filterVisibleFileOverrideItems(
+            [varsItem, unmodifiedWi, out2, out1, out0],
+            { messageId: 1, swipeId: 0 },
+        );
+        expect(scoped.map((item) => item.id)).toEqual(['variables:vars', 'output:1#0']);
+
+        const fallbackToLatest = filterVisibleFileOverrideItems(
+            [varsItem, out2, out1, out0],
+            { messageId: 99, swipeId: 0 },
+        );
+        expect(fallbackToLatest.map((item) => item.id)).toEqual(['variables:vars', 'output:2#1']);
     });
 });

@@ -190,13 +190,15 @@ const CAPSULE_STYLES = `
     flex-wrap: nowrap;
     gap: 2px;
     width: 100%;
+    max-width: 100%;
     min-width: 0;
     min-height: 40px;
     padding: 0 2px;
+    overflow: hidden;
 }
 
 .cap-open-btn {
-    flex: 1 1 auto;
+    flex: 1 1 0%;
     min-width: 0;
     min-height: 40px;
     padding: 0 8px;
@@ -283,7 +285,10 @@ const CAPSULE_STYLES = `
 }
 
 .cap-badges {
-    flex-shrink: 0;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 45%;
+    overflow: hidden;
     display: inline-flex;
     align-items: center;
 }
@@ -293,8 +298,9 @@ const CAPSULE_STYLES = `
 }
 
 .cap-badge-btn {
-    flex-shrink: 0;
+    flex: 0 1 auto;
     min-width: 40px;
+    max-width: 100%;
     min-height: 40px;
     padding: 0 2px;
     margin: 0;
@@ -306,21 +312,32 @@ const CAPSULE_STYLES = `
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    overflow: hidden;
     cursor: pointer;
 }
 
 .cap-badge-pill {
     display: inline-flex;
     align-items: center;
+    min-width: 0;
+    max-width: 160px;
     height: 20px;
     padding: 0 8px;
     border-radius: 9999px;
+    overflow: hidden;
     font-size: 11px;
     font-weight: 600;
     white-space: nowrap;
     background: color-mix(in srgb, var(--cap-primary) 12%, transparent);
     color: var(--cap-primary);
     transition: background-color 0.15s;
+}
+
+.cap-badge-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .cap-badge-pill[data-tone="success"] {
@@ -352,6 +369,7 @@ const CAPSULE_STYLES = `
     flex: 0 1 auto;
     min-width: 0;
     max-width: 50%;
+    overflow-x: clip;
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -380,6 +398,7 @@ const CAPSULE_STYLES = `
 }
 
 .cap-task-text {
+    flex: 0 1 auto;
     min-width: 0;
     white-space: nowrap;
     overflow: hidden;
@@ -444,6 +463,7 @@ const CAPSULE_STYLES = `
     font: inherit;
     display: inline-flex;
     align-items: center;
+    overflow: hidden;
     cursor: pointer;
 }
 
@@ -1606,7 +1626,10 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
             if (badge.tone) {
                 pill.setAttribute('data-tone', badge.tone);
             }
-            pill.textContent = badge.label;
+            const pillText = document.createElement('span');
+            pillText.className = 'cap-badge-text';
+            pillText.textContent = badge.label;
+            pill.appendChild(pillText);
             btn.appendChild(pill);
             btn.addEventListener('click', (event) => {
                 event.stopPropagation();

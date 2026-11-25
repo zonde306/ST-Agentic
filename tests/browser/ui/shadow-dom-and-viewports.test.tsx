@@ -1202,4 +1202,111 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
         expect(filteredItems).toHaveLength(1);
         expect(filteredItems[0].textContent).toContain(longBookName);
     });
+
+    it('clips long text in <agentic-capsule> badges/tasks and FilesOverridesView list-item badges without horizontal overflow across desktop and mobile', async () => {
+        for (const vp of [
+            { label: 'desktop', width: 1280, height: 800 },
+            { label: 'mobile', width: 390, height: 844 },
+        ]) {
+            activeHarness?.cleanup();
+            activeHarness = null;
+            await page.viewport(vp.width, vp.height);
+            const baseServices = createMockUIServices();
+            activeHarness = createHarness({
+                initialTab: 'files',
+                initialOpen: true,
+                services: {
+                    ...baseServices,
+                    async listFilesAndOverrides(target) {
+                        const base = await baseServices.listFilesAndOverrides(target);
+                        return [
+                            {
+                                id: 'variables:global_variables.json',
+                                category: 'variables',
+                                storageScope: 'global',
+                                namespace: 'variables',
+                                path: '/state/global_variables.json',
+                                key: 'global_variables.json',
+                                target: { messageId: 12, swipeId: 0 },
+                                layerLabel: '全局变量 (ST extension_settings.variables.global)',
+                                source: 'st-global',
+                                content: '{}',
+                                baseContent: '{}',
+                                overridden: false,
+                                writable: true,
+                            },
+                            ...base,
+                        ];
+                    },
+                },
+            });
+            await settleLayout(5);
+
+            // 1. Verify FilesOverridesView long layerLabel badge clips inside .ag-list-item bounds
+            const { dialog, shadowRoot } = getShellElements();
+            const globalVarsItem = Array.from(shadowRoot.querySelectorAll('.ag-list-item')).find(
+                (el) => el.textContent?.includes('/state/global_variables.json'),
+            ) as HTMLElement | undefined;
+            expect(globalVarsItem, `${vp.label}: expected /state/global_variables.json item`).toBeTruthy();
+
+            const itemRect = globalVarsItem!.getBoundingClientRect();
+            const badges = Array.from(globalVarsItem!.querySelectorAll('.ag-badge')) as HTMLElement[];
+            expect(badges.length).toBeGreaterThan(0);
+            for (const badge of badges) {
+                const badgeRect = badge.getBoundingClientRect();
+                expect(
+                    badgeRect.right,
+                    `${vp.label}: badge "${badge.textContent?.trim()}" overflows item right (${badgeRect.right} > ${itemRect.right})`,
+                ).toBeLessThanOrEqual(itemRect.right + 1);
+            }
+            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:files:badge_clip`);
+
+            // 2. Verify <agentic-capsule> clips long summary, badge labels, and background task labels
+            activeHarness.store.closeConsole();
+            await settleLayout(3);
+
+            activeHarness.capsule.setState({
+                status: 'background-running',
+                persistMode: 'keep',
+                summary:
+                    '超长胶囊摘要文本测试_ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789_用于验证溢出裁剪与省略号截断',
+                badges: [
+                    {
+                        label: '全局变量 (ST extension_settings.variables.global) 超长胶囊标签测试',
+                        tone: 'warning',
+                        tab: 'files',
+                    },
+                ],
+                backgroundTasks: [
+                    {
+                        taskId: 'bg_overflow_1',
+                        target: { messageId: 0, swipeId: 0 },
+                        phase: 'after_turn',
+                        barrier: 'none',
+                        agentProfileId: 'ag_test',
+                        label: '超长后台任务名称_ComfyUI生图工作流执行中_ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                        state: 'running',
+                        startedAt: Date.now() - 5000,
+                    },
+                ],
+            });
+            await settleLayout(4);
+
+            const capShadow = activeHarness.capsule.shadowRoot!;
+            const capShell = capShadow.querySelector('.cap-shell') as HTMLDivElement;
+            const shellRect = capShell.getBoundingClientRect();
+            expect(
+                capShell.scrollWidth,
+                `${vp.label}: capsule horizontal overflow (${capShell.scrollWidth} > ${capShell.clientWidth})`,
+            ).toBeLessThanOrEqual(capShell.clientWidth + 1);
+
+            const capPill = capShadow.querySelector('.cap-badge-pill') as HTMLElement | null;
+            expect(capPill).toBeTruthy();
+            expect(capPill!.getBoundingClientRect().right).toBeLessThanOrEqual(shellRect.right + 1);
+
+            const taskGroup = capShadow.querySelector('.cap-task-group') as HTMLElement | null;
+            expect(taskGroup).toBeTruthy();
+            expect(taskGroup!.getBoundingClientRect().right).toBeLessThanOrEqual(shellRect.right + 1);
+        }
+    });
 });

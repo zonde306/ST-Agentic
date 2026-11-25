@@ -749,33 +749,40 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             }
         }
 
-        // 4. Message outputs (/output.md mapped directly to host chat messages)
+        // 4. Message outputs (/output.md mapped directly to host chat messages; keep only latest/targeted)
         const chatMessages = bridge.getChat();
-        const messageIndices = new Set<number>();
-        const windowStart = Math.max(0, chatMessages.length - 50);
-        for (let i = chatMessages.length - 1; i >= windowStart; i -= 1) {
-            messageIndices.add(i);
-        }
-        if (target.messageId >= 0 && target.messageId < chatMessages.length) {
-            messageIndices.add(target.messageId);
-        }
-
-        const sortedMessageIndices = Array.from(messageIndices).sort((a, b) => b - a);
-        for (const i of sortedMessageIndices) {
-            const rawMsg = chatMessages[i];
-            if (!rawMsg || rawMsg.isSystem) {
-                continue;
+        let outputMsgIndex = -1;
+        if (
+            targetInput !== undefined
+            && target.messageId >= 0
+            && target.messageId < chatMessages.length
+        ) {
+            const targetedMsg = chatMessages[target.messageId];
+            if (targetedMsg && !targetedMsg.isSystem) {
+                outputMsgIndex = target.messageId;
             }
-            const sw = i === target.messageId ? target.swipeId : (rawMsg.swipeId ?? 0);
-            const msgTarget: MessageTarget = { messageId: i, swipeId: sw };
+        }
+        if (outputMsgIndex < 0) {
+            for (let i = chatMessages.length - 1; i >= 0; i -= 1) {
+                const rawMsg = chatMessages[i];
+                if (rawMsg && !rawMsg.isSystem) {
+                    outputMsgIndex = i;
+                    break;
+                }
+            }
+        }
+        if (outputMsgIndex >= 0) {
+            const rawMsg = chatMessages[outputMsgIndex];
+            const sw = outputMsgIndex === target.messageId ? target.swipeId : (rawMsg?.swipeId ?? 0);
+            const msgTarget: MessageTarget = { messageId: outputMsgIndex, swipeId: sw };
             items.push({
-                id: `output:${i}#${sw}`,
+                id: `output:${outputMsgIndex}#${sw}`,
                 category: 'message',
                 namespace: DATA_NAMESPACES.FILES,
                 path: OUTPUT_FILE_PATH,
                 key: 'output.md',
                 target: msgTarget,
-                layerLabel: formatLayerLabel(i, sw),
+                layerLabel: formatLayerLabel(outputMsgIndex, sw),
                 source: 'chat',
                 content: bridge.readChatMessage(msgTarget) ?? '',
                 overridden: false,
