@@ -1,5 +1,5 @@
 import type { TargetedEvent, TargetedKeyboardEvent, TargetedPointerEvent } from 'preact';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type {
     AssistantAttachment,
     AssistantMessage,
@@ -10,7 +10,19 @@ import type {
     PendingApproval,
     UndoRecord,
 } from '@/core/types';
-import { Button, IconCheck, IconClose, IconEdit, ShadowModal } from '@/ui/components';
+import {
+    Button,
+    IconArrowUp,
+    IconBolt,
+    IconCheck,
+    IconChevronDown,
+    IconClose,
+    IconEdit,
+    IconPaperclip,
+    IconPlug,
+    IconStop,
+    ShadowModal,
+} from '@/ui/components';
 import type { ConsoleViewProps } from '@/ui/store';
 import { MessageBubble } from './MessageBubble';
 import {
@@ -332,9 +344,36 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             return;
         }
         ta.style.height = 'auto';
-        const nextHeight = Math.min(160, Math.max(40, ta.scrollHeight));
+        const nextHeight = Math.min(160, Math.max(28, ta.scrollHeight));
         ta.style.height = `${nextHeight}px`;
     }, [draft]);
+
+    // Mode / model popovers anchor to the composer. On the centered landing
+    // screen there may not be enough room above it, so measure and flip.
+    const composerWrapRef = useRef<HTMLDivElement | null>(null);
+    const composerPopoverOpen = openPopover === 'mode' || openPopover === 'model';
+    const [composerPopoverPlacement, setComposerPopoverPlacement] = useState<{
+        dir: 'up' | 'down';
+        max: number;
+    } | null>(null);
+    useLayoutEffect(() => {
+        if (!composerPopoverOpen) {
+            setComposerPopoverPlacement(null);
+            return;
+        }
+        const wrap = composerWrapRef.current;
+        const root = wrap?.closest('.ag-ast-root');
+        if (!wrap || !root) {
+            return;
+        }
+        const wrapRect = wrap.getBoundingClientRect();
+        const rootRect = root.getBoundingClientRect();
+        const above = wrapRect.top - rootRect.top - 16;
+        const below = rootRect.bottom - wrapRect.bottom - 16;
+        const dir: 'up' | 'down' = above >= 320 || above >= below ? 'up' : 'down';
+        const max = Math.round(Math.max(160, Math.min(430, dir === 'up' ? above : below)));
+        setComposerPopoverPlacement({ dir, max });
+    }, [composerPopoverOpen, activeSession?.id]);
 
     const upsertSessionInStore = useCallback(
         (updated: AssistantSession) => {
@@ -1690,7 +1729,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
 
     return (
         <div
-            class="ag-ast-root"
+            class={activeSession ? 'ag-ast-root' : 'ag-ast-root ag-ast-root-landing'}
             data-view-id="assistant"
             data-assistant-mobile-view={isMobile ? 'detail' : 'desktop'}
             data-drag-over={isDragOver ? 'true' : 'false'}
@@ -1901,18 +1940,14 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                 }}
             >
                 {!activeSession ? (
-                    <div class="ag-empty" style={{ margin: 'auto' }}>
+                    <div class="ag-empty ag-ast-landing-hero" data-assistant-landing="true">
+                        <div class="ag-ast-landing-mark" aria-hidden="true">
+                            <IconBolt size={20} />
+                        </div>
                         <div class="ag-empty-title">独立线外助手工作台</div>
                         <div class="ag-empty-desc">
-                            不占用主线上下文与 KV Cache。新建会话后直接输入自然语言，助手将按当前权限自主调用只读或写卡工具。
+                            不占用主线上下文与 KV Cache。直接输入自然语言即可开始新会话，助手将按当前权限自主调用只读或写卡工具。
                         </div>
-                        <Button
-                            variant="primary"
-                            size="sm"
-                            onClick={() => void handleCreateSession()}
-                        >
-                            ＋ 新建助手会话
-                        </Button>
                     </div>
                 ) : renderedMessages.length === 0 && !showSyntheticStreamingBubble ? (
                     <div class="ag-ast-msg-row ag-ast-msg-row-assistant">
@@ -2037,7 +2072,17 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             ) : null}
 
             {/* 3. Unified Minimal Bottom Composer (NO shortcut bar, NO attach context chips) */}
-            <div class="ag-ast-composer-wrap" data-assistant-composer="true">
+            <div
+                ref={composerWrapRef}
+                class="ag-ast-composer-wrap"
+                data-assistant-composer="true"
+                data-popover-dir={composerPopoverPlacement?.dir ?? 'up'}
+                style={
+                    composerPopoverPlacement
+                        ? { '--ag-ast-popover-max': `${composerPopoverPlacement.max}px` }
+                        : undefined
+                }
+            >
                 {openPopover === 'mode' || openPopover === 'model' ? (
                     <ModeModelPopover
                         kind={openPopover}
@@ -2144,6 +2189,18 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                         <div class="ag-ast-composer-left">
                             <button
                                 type="button"
+                                data-assistant-upload-btn="true"
+                                aria-label="上传图片、音频、视频或文件"
+                                title="上传附件（图片 / 音频 / 视频 / 文件，或直接拖拽到此处）"
+                                disabled={isStreamingCurrent}
+                                class="ag-ast-upload-btn"
+                                onClick={() => fileInputRef.current?.click()}
+                            >
+                                <IconPaperclip size={17} />
+                            </button>
+
+                            <button
+                                type="button"
                                 data-assistant-mode-btn="true"
                                 aria-expanded={openPopover === 'mode'}
                                 title="切换助手权限模式"
@@ -2153,7 +2210,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                 }
                             >
                                 <span>{modeButtonLabel}</span>
-                                <span style={{ opacity: 0.7, fontSize: '10px' }}>▾</span>
+                                <IconChevronDown size={12} className="ag-ast-chip-caret" />
                             </button>
 
                             <button
@@ -2170,28 +2227,13 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                     setOpenPopover((prev) => (prev === 'model' ? null : 'model'))
                                 }
                             >
+                                <IconPlug size={13} className="ag-ast-chip-icon" />
                                 <span class="ag-ast-model-label">{connDisplay.shortLabel}</span>
-                                <span
-                                    style={{ opacity: 0.7, fontSize: '10px', flexShrink: 0 }}
-                                >
-                                    ▾
-                                </span>
+                                <IconChevronDown size={12} className="ag-ast-chip-caret" />
                             </button>
                         </div>
 
                         <div class="ag-ast-composer-right">
-                            <button
-                                type="button"
-                                data-assistant-upload-btn="true"
-                                aria-label="上传图片、音频、视频或文件"
-                                title="上传附件（图片 / 音频 / 视频 / 文件，或直接拖拽到此处）"
-                                disabled={isStreamingCurrent}
-                                class="ag-ast-upload-btn"
-                                onClick={() => fileInputRef.current?.click()}
-                            >
-                                <span aria-hidden="true">📎</span>
-                            </button>
-
                             {isStreamingCurrent ? (
                                 <button
                                     type="button"
@@ -2201,24 +2243,33 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                                     class="ag-ast-stop-btn"
                                     onClick={handleAbortStream}
                                 >
-                                    <span>■</span>
+                                    <IconStop size={16} />
                                 </button>
                             ) : (
                                 <button
                                     type="button"
                                     data-assistant-send-btn="true"
+                                    data-empty={
+                                        !draft.trim() && pendingAttachments.length === 0
+                                            ? 'true'
+                                            : 'false'
+                                    }
                                     title="发送 (Enter)"
                                     aria-label="发送"
                                     class="ag-ast-send-btn"
                                     onClick={() => void handleSendPrompt()}
                                 >
-                                    <span>▶</span>
+                                    <IconArrowUp size={17} />
                                 </button>
                             )}
                         </div>
                     </div>
                 </div>
             </div>
+
+            {!activeSession ? (
+                <div class="ag-ast-landing-spacer" aria-hidden="true" />
+            ) : null}
 
             {/* Desktop Slide-Out Sessions Drawer */}
             {!isMobile && openPopover === 'sessions' ? (

@@ -1704,22 +1704,26 @@ textarea:focus-visible {
     background: transparent;
 }
 
-/* Toasts Inside Shadow DOM */
+/* Toasts Inside Shadow DOM — top-centre, just below the header, so they never
+   cover the composer / send button or the bottom-right actions. */
 .ag-toast-container {
     position: absolute;
-    right: 16px;
-    bottom: 16px;
+    top: 64px;
+    left: 50%;
+    transform: translateX(-50%);
     z-index: 50;
     display: flex;
     flex-direction: column;
+    align-items: center;
     gap: 8px;
+    width: max-content;
     max-width: min(420px, calc(100% - 32px));
     pointer-events: none;
 }
 
 @keyframes ag-toast-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: translateY(0); }
 }
 
 .ag-toast {
@@ -1727,8 +1731,9 @@ textarea:focus-visible {
     display: flex;
     align-items: center;
     gap: 10px;
+    max-width: 100%;
     padding: 0 4px 0 14px;
-    min-height: 48px;
+    min-height: 44px;
     border-radius: var(--radius-lg);
     border: 1px solid var(--border);
     background: var(--card);
@@ -3990,24 +3995,25 @@ textarea:focus-visible {
 .ag-ast-composer-wrap {
     flex-shrink: 0;
     position: relative;
-    background: var(--sidebar);
-    border-top: 1px solid var(--border);
-    padding: 8px 12px;
+    background: var(--content);
+    padding: 4px 14px 14px;
 }
 
 .ag-ast-composer-box {
-    border-radius: var(--radius-xl);
+    border-radius: 22px;
     border: 1px solid var(--border);
-    background: var(--content);
-    padding: 8px 10px 6px;
+    background: var(--card);
+    padding: 8px 8px 4px;
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    transition: border-color var(--dur-fast) var(--ease);
+    gap: 2px;
+    box-shadow: var(--shadow-sm);
+    transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
 
 .ag-ast-composer-box:focus-within {
-    border-color: var(--primary);
+    border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
+    box-shadow: var(--shadow-sm), 0 0 0 3px color-mix(in srgb, var(--primary) 12%, transparent);
 }
 
 .ag-ast-composer-box-dragover {
@@ -4112,10 +4118,15 @@ textarea:focus-visible {
 .ag-ast-composer-right {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 2px;
     flex-shrink: 0;
 }
 
+/*
+ * Composer controls keep a 40x40 hit area (design-system red line) while the
+ * visible face is smaller: a transparent border + padding-box background clip
+ * shrinks the painted area without shrinking the clickable box.
+ */
 .ag-ast-upload-btn {
     width: 40px;
     height: 40px;
@@ -4123,41 +4134,44 @@ textarea:focus-visible {
     min-height: 40px;
     padding: 0;
     flex-shrink: 0;
-    border-radius: var(--radius-lg);
-    border: 1px solid var(--border);
-    background: var(--card);
-    color: var(--foreground);
-    font-size: 16px;
-    line-height: 1;
+    border: 4px solid transparent;
+    border-radius: 999px;
+    background-color: transparent;
+    background-clip: padding-box;
+    color: var(--muted-foreground);
     display: inline-flex;
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+    transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
 
 .ag-ast-upload-btn:hover:not(:disabled) {
-    background: var(--secondary);
-    border-color: var(--primary);
+    background-color: var(--hover);
+    color: var(--foreground);
 }
 
 .ag-ast-upload-btn:disabled {
-    opacity: 0.45;
+    opacity: 0.4;
     cursor: not-allowed;
 }
 
 .ag-ast-composer-input {
     width: 100%;
-    min-height: 40px;
+    min-height: 28px;
     max-height: 160px;
     border: none;
     background: transparent;
     color: var(--foreground);
     font-size: 16px;
-    line-height: 1.4;
+    line-height: 1.45;
     resize: none;
     outline: none;
-    padding: 4px 2px;
+    padding: 4px 8px 2px;
+}
+
+.ag-ast-composer-input::placeholder {
+    color: var(--subtle-foreground);
 }
 
 .ag-ast-composer-bar {
@@ -4171,44 +4185,65 @@ textarea:focus-visible {
 .ag-ast-composer-left {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 2px;
     min-width: 0;
     flex: 1 1 auto;
 }
 
+/* Compact chips: 40px tall hit area, 28px visible pill. */
 .ag-ast-mode-btn,
 .ag-ast-model-btn {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: 5px;
+    height: 40px;
     min-width: 40px;
     min-height: 40px;
     padding: 0 10px;
-    border-radius: var(--radius-lg);
-    border: 1px solid var(--border);
-    background: var(--card);
-    color: var(--foreground);
+    border-style: solid;
+    border-color: transparent;
+    border-width: 6px 0;
+    border-radius: 999px;
+    background-clip: padding-box;
     font-size: 12px;
-    font-weight: 600;
+    font-weight: 500;
+    line-height: 1;
     cursor: pointer;
     white-space: nowrap;
-    transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+    transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), filter var(--dur-fast) var(--ease);
 }
 
 .ag-ast-mode-btn {
     flex-shrink: 0;
+    font-weight: 600;
+}
+
+.ag-ast-mode-btn:hover {
+    filter: brightness(1.06);
 }
 
 .ag-ast-model-btn {
-    min-width: 40px;
     max-width: 100%;
     overflow: hidden;
-    font-weight: 500;
 }
 
-.ag-ast-model-btn:hover,
-.ag-ast-mode-btn:hover {
-    filter: brightness(1.06);
+.ag-ast-model-btn:not(.ag-pill-primary) {
+    background-color: transparent;
+    color: var(--muted-foreground);
+}
+
+.ag-ast-model-btn:not(.ag-pill-primary):hover {
+    background-color: var(--hover);
+    color: var(--foreground);
+}
+
+.ag-ast-chip-icon {
+    opacity: 0.85;
+}
+
+.ag-ast-chip-caret {
+    opacity: 0.6;
+    margin-left: -1px;
 }
 
 .ag-ast-model-label {
@@ -4218,6 +4253,7 @@ textarea:focus-visible {
     min-width: 0;
 }
 
+/* Send / stop: 40px hit area, 32px round face. */
 .ag-ast-send-btn,
 .ag-ast-stop-btn {
     width: 40px;
@@ -4226,37 +4262,101 @@ textarea:focus-visible {
     min-height: 40px;
     padding: 0;
     flex-shrink: 0;
-    border-radius: var(--radius-lg);
-    border: none;
+    border: 4px solid transparent;
+    border-radius: 999px;
+    background-clip: padding-box;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 14px;
-    font-weight: 700;
     line-height: 1;
     cursor: pointer;
-    box-shadow: var(--shadow-sm);
-    transition: opacity var(--dur-fast) var(--ease), filter var(--dur-fast) var(--ease);
+    transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), filter var(--dur-fast) var(--ease);
 }
 
 .ag-ast-send-btn {
-    background: var(--primary);
+    background-color: var(--primary);
     color: var(--primary-foreground);
 }
 
+.ag-ast-send-btn[data-empty="true"] {
+    background-color: var(--secondary);
+    color: var(--subtle-foreground);
+}
+
 .ag-ast-stop-btn {
-    background: var(--error);
-    color: var(--primary-foreground);
+    background-color: var(--foreground);
+    color: var(--card);
 }
 
 .ag-ast-send-btn:hover:not(:disabled),
 .ag-ast-stop-btn:hover:not(:disabled) {
-    filter: brightness(1.08);
+    filter: brightness(1.1);
 }
 
 .ag-ast-send-btn:disabled {
     opacity: 0.45;
     cursor: not-allowed;
+}
+
+/*
+ * Landing (no active session): hero + composer float around the vertical
+ * centre like ChatGPT / Claude / Gemini new-chat screens. The thread and a
+ * trailing spacer share the free space; the composer keeps its natural height.
+ */
+.ag-ast-root-landing .ag-ast-thread {
+    flex: 1 1 0;
+    padding-bottom: 20px;
+}
+
+.ag-ast-landing-hero {
+    margin: auto auto 0;
+    min-height: 0;
+    padding: 24px 16px 0;
+    gap: 10px;
+}
+
+.ag-ast-landing-mark {
+    width: 40px;
+    height: 40px;
+    border-radius: var(--radius-lg);
+    background: var(--primary-soft);
+    color: var(--primary);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 2px;
+}
+
+.ag-ast-landing-hero .ag-empty-title {
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+}
+
+.ag-ast-landing-hero .ag-empty-desc {
+    font-size: 13px;
+    max-width: 440px;
+}
+
+.ag-ast-root-landing .ag-ast-composer-wrap {
+    width: 100%;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 0 16px;
+    background: transparent;
+}
+
+.ag-ast-root-landing .ag-ast-composer-box {
+    padding: 10px 8px 4px;
+}
+
+.ag-ast-root-landing .ag-ast-composer-input {
+    min-height: 52px;
+}
+
+.ag-ast-landing-spacer {
+    flex: 1.35 1 0;
+    min-height: 16px;
 }
 
 .ag-ast-popover-backdrop {
@@ -4271,7 +4371,7 @@ textarea:focus-visible {
     bottom: calc(100% + 8px);
     left: 12px;
     width: min(340px, calc(100% - 24px));
-    max-height: min(430px, 65vh);
+    max-height: var(--ag-ast-popover-max, min(430px, 65vh));
     z-index: 30;
     background: var(--card);
     border: 1px solid var(--border);
@@ -4283,6 +4383,11 @@ textarea:focus-visible {
     gap: 10px;
     overflow-y: auto;
     font-size: 12px;
+}
+
+.ag-ast-composer-wrap[data-popover-dir="down"] .ag-ast-popover {
+    bottom: auto;
+    top: calc(100% + 8px);
 }
 
 .ag-ast-popover-header {
@@ -5112,7 +5217,20 @@ textarea:focus-visible {
     }
 
     .ag-ast-composer-wrap {
-        padding: 6px 8px;
+        padding: 2px 8px 8px;
+    }
+
+    .ag-ast-root-landing .ag-ast-composer-wrap {
+        padding: 0 10px;
+    }
+
+    .ag-ast-landing-hero .ag-empty-title {
+        font-size: 18px;
+    }
+
+    .ag-toast-container {
+        top: calc(env(safe-area-inset-top, 0px) + 56px);
+        max-width: calc(100% - 24px);
     }
 
     .ag-ast-popover {

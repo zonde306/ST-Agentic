@@ -744,7 +744,7 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
         expect(uploadBtn).toBeTruthy();
         expect(sendBtn).toBeTruthy();
         expect(draftInput).toBeTruthy();
-        expect(sendBtn.textContent?.trim()).toBe('▶');
+        expect(sendBtn.querySelector('svg')).toBeTruthy();
         const uploadRect = uploadBtn.getBoundingClientRect();
         expect(Math.round(uploadRect.width)).toBe(40);
         expect(Math.round(uploadRect.height)).toBe(40);
@@ -772,7 +772,7 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
 
         const stopBtn = composerWrap.querySelector('[data-assistant-stop-btn="true"]') as HTMLButtonElement;
         expect(stopBtn).toBeTruthy();
-        expect(stopBtn.textContent?.trim()).toBe('■');
+        expect(stopBtn.querySelector('svg')).toBeTruthy();
         const stopRect = stopBtn.getBoundingClientRect();
         expect(Math.round(stopRect.width)).toBe(40);
         expect(Math.round(stopRect.height)).toBe(40);
@@ -795,7 +795,7 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
         expect(composerWrap.querySelector('[data-assistant-stop-btn="true"]')).toBeNull();
         const restoredSendBtn = composerWrap.querySelector('[data-assistant-send-btn="true"]') as HTMLButtonElement;
         expect(restoredSendBtn).toBeTruthy();
-        expect(restoredSendBtn.textContent?.trim()).toBe('▶');
+        expect(restoredSendBtn.querySelector('svg')).toBeTruthy();
     });
 
     it('switches across all 4 modes, toggles autoApproveAuthor, and confirms ST 全权管家 inside Shadow DOM without window.confirm', async () => {
@@ -2687,8 +2687,10 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
         ).click();
         await settleLayout(3);
 
+        // Landing screen has no inline create button; use the topbar ＋ action.
+        expect(shellB.shadowRoot.querySelector('.ag-empty button')).toBeNull();
         const emptyCreateBtnB = shellB.shadowRoot.querySelector(
-            '.ag-empty button',
+            '[data-assistant-new-session-btn="true"]',
         ) as HTMLButtonElement;
         expect(emptyCreateBtnB).toBeTruthy();
         emptyCreateBtnB.click();
