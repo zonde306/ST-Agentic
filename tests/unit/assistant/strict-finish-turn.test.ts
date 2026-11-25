@@ -420,7 +420,7 @@ describe('AssistantRunner — A1.3 Async Custom/EJS Prompts, Transparent finish_
     });
 
     it('preserves ApprovalGate pause & resume on mixed [chat_delete_message, finish_turn] without bypassing approval or dropping tool_call_id pairing', async () => {
-        const { bridge, trajectoryStore, runner } = createStrictHarness(
+        const { bridge, transport, trajectoryStore, runner } = createStrictHarness(
             [
                 // Round 1: approval-gated write tool + premature finish_turn in same round
                 {
@@ -436,6 +436,19 @@ describe('AssistantRunner — A1.3 Async Custom/EJS Prompts, Transparent finish_
                             arguments: JSON.stringify({
                                 step_brief: '假装已删除',
                                 response: '已经帮你删掉了！（抢跑）',
+                            }),
+                        },
+                    ],
+                },
+                // Round 2 (after approve + continueLastMessage): receives paired tool results and finishes cleanly
+                {
+                    toolCalls: [
+                        {
+                            id: 'call_ft_after_approve',
+                            name: 'finish_turn',
+                            arguments: JSON.stringify({
+                                step_brief: '确认删除完成',
+                                response: '已删除第 1 条消息。',
                             }),
                         },
                     ],
@@ -464,10 +477,31 @@ describe('AssistantRunner — A1.3 Async Custom/EJS Prompts, Transparent finish_
         expect(pending.status).toBe('pending');
         expect(pending.toolName).toBe('chat_delete_message');
 
-        // User approves -> deletes message & commits paired tool results for BOTH chat_delete_message AND deferred finish_turn
+        // User approves -> deletes message & prepares resumable checkpoint with BOTH paired tool results
         const approved = await runner.decideApproval(approvalId, 'approve');
         expect(approved?.status).toBe('approved');
         expect(bridge.chat).toHaveLength(1);
+
+        const checkpointSession = runner.getSession(session.id)!;
+        expect(checkpointSession.interruptedCheckpoint).toBeDefined();
+        expect(checkpointSession.interruptedCheckpoint!.messageId).toBe(suspendedBubble.id);
+        const checkpointToolIds = checkpointSession.interruptedCheckpoint!.inFlightMessages
+            .filter((m) => m.role === 'tool')
+            .map((m) => m.toolCallId)
+            .sort();
+        expect(checkpointToolIds).toEqual(['call_del_1', 'call_ft_jump_approval']);
+
+        // Auto-continue resumes in the same bubble -> delivers paired tool outputs and commits real reply
+        const resumed = await runner.continueLastMessage(session.id);
+        expect(resumed.id).toBe(suspendedBubble.id);
+        expect(resumed.content).toBe('已删除第 1 条消息。');
+        expect(resumed.content).not.toContain('已执行：');
+
+        const round2ToolIds = transport.requests[1].messages
+            .filter((m) => m.role === 'tool')
+            .map((m) => m.toolCallId)
+            .sort();
+        expect(round2ToolIds).toEqual(['call_del_1', 'call_ft_jump_approval']);
 
         const committed = trajectoryStore.getMessages(toAssistantThreadId(session.id));
         const toolResults = committed.filter((m) => m.role === 'tool');
@@ -477,6 +511,11 @@ describe('AssistantRunner — A1.3 Async Custom/EJS Prompts, Transparent finish_
         ]);
         const deferredEntry = toolResults.find((m) => m.toolCallId === 'call_ft_jump_approval');
         expect(JSON.parse(String(deferredEntry!.content)).deferred).toBe(true);
+        expect(committed[committed.length - 1]).toEqual({
+            role: 'assistant',
+            content: '已删除第 1 条消息。',
+            reasoningContent: '确认删除完成',
+        });
     });
 
     it('rolls back and retries TOOL_CHOICE_VIOLATION and MALFORMED_TOOL_CALL honoring connection.roundMaxRetries', async () => {

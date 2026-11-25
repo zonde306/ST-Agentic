@@ -176,14 +176,22 @@ export interface AssistantSendOptions {
     stream?: boolean;
 }
 
-interface SuspendedApprovalContext {
-    approvalId: string;
+interface SuspendedApprovalRound {
     sessionId: string;
     messageId: string;
-    toolCall: CanonicalToolCall;
-    policy: ToolPolicyResult;
     target: MessageTarget;
+    /** Canonical messages up to and including this round's assistant(toolCalls) + already-executed sibling tool results. */
     inFlightMessages: CanonicalMessage[];
+    /** Bubble content prefix accumulated before this suspended round (earlier rounds' prefaces). */
+    bubbleBaseContent: string;
+    /** Total completed rounds so far in this turn (including this suspended round). */
+    roundsCompleted: number;
+    /** Approval IDs belonging to this suspended round, in tool-call order. */
+    approvalIds: string[];
+    /** Tool results collected for approved items in this round (approvalId -> tool CanonicalMessage). */
+    resolvedTools: Map<string, CanonicalMessage>;
+    /** Per-approval metadata needed by decideApproval / retryApproval. */
+    perApproval: Map<string, { toolCall: CanonicalToolCall; policy: ToolPolicyResult }>;
 }
 
 interface TurnLLMOutput {
@@ -1204,7 +1212,7 @@ export class AssistantRunner {
 
     private readonly listeners = new Set<() => void>();
     private readonly activeControllers = new Map<string, AbortController>();
-    private readonly suspendedApprovals = new Map<string, SuspendedApprovalContext>();
+    private readonly suspendedApprovals = new Map<string, SuspendedApprovalRound>();
     private readonly compactingSessions = new Set<string>();
     private seq = 0;
 
@@ -1942,6 +1950,32 @@ export class AssistantRunner {
 
         const resume = config.resumeState;
         if (!resume) {
+            const existingCp = this.sessionStore.getInterruptedCheckpoint(sessionId);
+            if (
+                config.appendUserMessage
+                && existingCp
+                && existingCp.inFlightMessages.length > 0
+                && existingCp.inFlightMessages[existingCp.inFlightMessages.length - 1]?.role === 'tool'
+            ) {
+                const cpMsg = session.messages.find((m) => m.id === existingCp.messageId);
+                const fallbackText = cpMsg?.content.trim() || '已完成批准的工具操作。';
+                this.sessionStore.appendTrajectoryTurn(sessionId, [
+                    ...existingCp.inFlightMessages,
+                    { role: 'assistant', content: fallbackText },
+                ]);
+                const budget = this.resolveSessionContextBudget(session);
+                this.sessionStore.compactIfNeeded(sessionId, {
+                    watermark: {
+                        high: budget.autoHighWatermark,
+                        low: budget.autoLowWatermark,
+                    },
+                });
+                for (const [apprId, round] of Array.from(this.suspendedApprovals.entries())) {
+                    if (round.messageId === existingCp.messageId) {
+                        this.suspendedApprovals.delete(apprId);
+                    }
+                }
+            }
             this.sessionStore.setInterruptedCheckpoint(sessionId, undefined);
         }
 
@@ -1966,6 +2000,11 @@ export class AssistantRunner {
         let assistantMessageId: string;
         if (resume) {
             assistantMessageId = resume.existingAssistantMessage.id;
+            for (const [apprId, round] of Array.from(this.suspendedApprovals.entries())) {
+                if (round.messageId === assistantMessageId) {
+                    this.suspendedApprovals.delete(apprId);
+                }
+            }
             const restoredBase = canonicalClone(resume.existingAssistantMessage);
             delete restoredBase.interrupted;
             delete restoredBase.errorCode;
@@ -2819,6 +2858,10 @@ export class AssistantRunner {
                 };
                 const roundExecutedTools: CanonicalMessage[] = [];
                 const roundPendingApprovalIds: string[] = [];
+                const roundPendingMeta = new Map<
+                    string,
+                    { toolCall: CanonicalToolCall; policy: ToolPolicyResult }
+                >();
 
                 const liveSession = this.sessionStore.getSession(sessionId) ?? currentSession;
                 let suspendedThisRound = false;
@@ -2964,18 +3007,9 @@ export class AssistantRunner {
 
                         approvalIds.push(pending.id);
                         roundPendingApprovalIds.push(pending.id);
-                        this.suspendedApprovals.set(pending.id, {
-                            approvalId: pending.id,
-                            sessionId,
-                            messageId: assistantMessageId,
+                        roundPendingMeta.set(pending.id, {
                             toolCall: canonicalClone(toolCall),
                             policy,
-                            target,
-                            inFlightMessages: canonicalClone([
-                                ...inFlightMessages,
-                                assistantToolMessage,
-                                ...roundExecutedTools,
-                            ]),
                         });
                         suspendedThisRound = true;
                         syncAssistantBubble();
@@ -3015,22 +3049,28 @@ export class AssistantRunner {
                     syncAssistantBubble();
                 }
 
-                // Ensure any suspended approvals captured in a mixed round also include all sibling
-                // tool responses from this round (e.g., deferred `finish_turn` responses) so
-                // `decideApproval` / `retryApproval` always preserve valid tool_call_id pairing.
+                // Store one shared SuspendedApprovalRound for all pending approvals in this round
+                // so sibling tool results (including deferred `finish_turn` responses) stay paired
+                // and resuming happens once every approval in the round is resolved.
                 if (roundPendingApprovalIds.length > 0) {
                     const fullSuspendedInFlight = canonicalClone([
                         ...inFlightMessages,
                         assistantToolMessage,
                         ...roundExecutedTools,
                     ]);
+                    const suspendedRound: SuspendedApprovalRound = {
+                        sessionId,
+                        messageId: assistantMessageId,
+                        target: canonicalClone(target),
+                        inFlightMessages: fullSuspendedInFlight,
+                        bubbleBaseContent: contentBuffer,
+                        roundsCompleted: priorRoundsCompleted + rounds,
+                        approvalIds: [...roundPendingApprovalIds],
+                        resolvedTools: new Map(),
+                        perApproval: roundPendingMeta,
+                    };
                     for (const pendingId of roundPendingApprovalIds) {
-                        const existingSuspended = this.suspendedApprovals.get(pendingId);
-                        if (existingSuspended) {
-                            existingSuspended.inFlightMessages = canonicalClone(
-                                fullSuspendedInFlight,
-                            );
-                        }
+                        this.suspendedApprovals.set(pendingId, suspendedRound);
                     }
                 }
 
@@ -3104,6 +3144,96 @@ export class AssistantRunner {
     // Inline Bubble Approval / Reject / Retry / Undo Lifecycle
     // ========================================================================
 
+    private buildResumedInFlightForRound(round: SuspendedApprovalRound): CanonicalMessage[] {
+        const resumed = canonicalClone(round.inFlightMessages);
+        for (const id of round.approvalIds) {
+            let toolMsg = round.resolvedTools.get(id);
+            if (!toolMsg) {
+                const item = this.approvalGate.get(id);
+                const meta = round.perApproval.get(id);
+                toolMsg = {
+                    role: 'tool',
+                    toolCallId: item?.toolCallId ?? meta?.toolCall.id ?? id,
+                    toolName: item?.toolName ?? meta?.toolCall.name ?? 'unknown_tool',
+                    content: JSON.stringify({
+                        ok: false,
+                        status: 'rejected_by_user',
+                        ...(item?.rejectionFeedback ? { feedback: item.rejectionFeedback } : {}),
+                    }),
+                };
+            }
+            const existingIdx = resumed.findIndex(
+                (m) => m.role === 'tool' && m.toolCallId === toolMsg!.toolCallId,
+            );
+            if (existingIdx >= 0) {
+                resumed[existingIdx] = canonicalClone(toolMsg);
+            } else {
+                resumed.push(canonicalClone(toolMsg));
+            }
+        }
+        return resumed;
+    }
+
+    private finalizeResolvedApprovalRound(
+        round: SuspendedApprovalRound,
+        session: AssistantSession,
+        fallbackTitle?: string,
+    ): void {
+        const hasPending = round.approvalIds.some(
+            (id) => this.approvalGate.get(id)?.status === 'pending',
+        );
+        if (hasPending) {
+            return;
+        }
+
+        const resumedInFlight = this.buildResumedInFlightForRound(round);
+        const isTrailingMessage = session.messages[session.messages.length - 1]?.id === round.messageId;
+
+        if (isTrailingMessage) {
+            this.sessionStore.setInterruptedCheckpoint(round.sessionId, {
+                messageId: round.messageId,
+                reason: 'user_stop',
+                inFlightMessages: resumedInFlight,
+                ...(round.bubbleBaseContent
+                    ? { bubbleBaseContent: round.bubbleBaseContent }
+                    : {}),
+                target: canonicalClone(round.target),
+                roundsCompleted: round.roundsCompleted,
+                createdAt: this.now(),
+            });
+            const hasRejected = round.approvalIds.some(
+                (id) => this.approvalGate.get(id)?.status === 'rejected',
+            );
+            if (!hasRejected) {
+                for (const id of round.approvalIds) {
+                    this.suspendedApprovals.delete(id);
+                }
+            }
+            return;
+        }
+
+        const fallbackAssistantText = fallbackTitle
+            ? `Approved and executed: ${fallbackTitle}`
+            : 'Approved and executed.';
+        this.sessionStore.appendTrajectoryTurn(round.sessionId, [
+            ...resumedInFlight,
+            {
+                role: 'assistant',
+                content: fallbackAssistantText,
+            },
+        ]);
+        const budget = this.resolveSessionContextBudget(session);
+        this.sessionStore.compactIfNeeded(round.sessionId, {
+            watermark: {
+                high: budget.autoHighWatermark,
+                low: budget.autoLowWatermark,
+            },
+        });
+        for (const id of round.approvalIds) {
+            this.suspendedApprovals.delete(id);
+        }
+    }
+
     public async decideApproval(
         approvalId: string,
         decision: 'approve' | 'reject',
@@ -3116,6 +3246,11 @@ export class AssistantRunner {
 
         if (decision === 'reject') {
             const rejected = this.approvalGate.reject(approvalId, feedback);
+            const suspended = this.suspendedApprovals.get(approvalId);
+            const session = this.sessionStore.getSession(existing.sessionId);
+            if (suspended && session && suspended.resolvedTools.size > 0) {
+                this.finalizeResolvedApprovalRound(suspended, session);
+            }
             this.notify();
             return rejected;
         }
@@ -3180,6 +3315,10 @@ export class AssistantRunner {
             ...(execResult.undoId ? { undoId: execResult.undoId } : {}),
         };
 
+        const isResumableTrailing = Boolean(
+            suspended && session.messages[session.messages.length - 1]?.id === existing.messageId,
+        );
+
         this.sessionStore.updateMessage(existing.sessionId, existing.messageId, (msg) => {
             const nextCalls = [...(msg.toolCalls ?? [])];
             const idx = nextCalls.findIndex((c) => c.id === toolRecord.id);
@@ -3192,38 +3331,28 @@ export class AssistantRunner {
                 !toolDef.readOnly && execResult.fileRefs?.length
                     ? Array.from(new Set([...(msg.fileRefs ?? []), ...execResult.fileRefs]))
                     : msg.fileRefs;
+            const nextContent = isResumableTrailing
+                ? msg.content
+                : msg.content.trim()
+                    ? msg.content
+                    : `已执行：${approved.title}`;
             return {
                 ...msg,
-                content: msg.content.trim() ? msg.content : `已执行：${approved.title}`,
+                content: nextContent,
                 toolCalls: nextCalls,
                 ...(nextFileRefs?.length ? { fileRefs: nextFileRefs } : {}),
             };
         });
 
-        // Commit the approved tool call + result into the session's TrajectoryStore thread.
         if (suspended) {
-            const committedTurn: CanonicalMessage[] = [
-                ...suspended.inFlightMessages,
-                {
-                    role: 'tool',
-                    toolCallId: existing.toolCallId,
-                    toolName: existing.toolName,
-                    content: execResult.output,
-                },
-                {
-                    role: 'assistant',
-                    content: `Approved and executed ${existing.toolName}: ${approved.title}`,
-                },
-            ];
-            this.sessionStore.appendTrajectoryTurn(existing.sessionId, committedTurn);
-            const budget = this.resolveSessionContextBudget(session);
-            this.sessionStore.compactIfNeeded(existing.sessionId, {
-                watermark: {
-                    high: budget.autoHighWatermark,
-                    low: budget.autoLowWatermark,
-                },
+            suspended.resolvedTools.set(approvalId, {
+                role: 'tool',
+                toolCallId: existing.toolCallId,
+                toolName: existing.toolName,
+                content: execResult.output,
             });
-            this.suspendedApprovals.delete(approvalId);
+            const latestSession = this.sessionStore.getSession(existing.sessionId) ?? session;
+            this.finalizeResolvedApprovalRound(suspended, latestSession, approved.title);
         }
 
         this.notify();
@@ -3281,21 +3410,57 @@ export class AssistantRunner {
             ? `User requested a revision for pending tool "${existing.toolName}" (revision #${existing.revision}) with feedback: ${feedbackText}. Call "${existing.toolName}" again with the revised arguments.`
             : `User requested an alternative revised proposal for pending tool "${existing.toolName}" (revision #${existing.revision}). Call "${existing.toolName}" again with revised arguments.`;
 
-        const baseInFlight: CanonicalMessage[] = suspended
-            ? canonicalClone(suspended.inFlightMessages)
-            : [
-                {
-                    role: 'assistant',
-                    content: existing.summary,
-                    toolCalls: [
-                        {
-                            id: existing.toolCallId,
-                            name: existing.toolName,
-                            arguments: JSON.stringify(existing.args),
-                        },
-                    ],
-                },
-            ];
+        if (this.sessionStore.getInterruptedCheckpoint(existing.sessionId)?.messageId === existing.messageId) {
+            this.sessionStore.setInterruptedCheckpoint(existing.sessionId, undefined);
+        }
+
+        const baseInFlight: CanonicalMessage[] = (() => {
+            if (!suspended) {
+                return [
+                    {
+                        role: 'assistant',
+                        content: existing.summary,
+                        toolCalls: [
+                            {
+                                id: existing.toolCallId,
+                                name: existing.toolName,
+                                arguments: JSON.stringify(existing.args),
+                            },
+                        ],
+                    },
+                ];
+            }
+            const cloned = canonicalClone(suspended.inFlightMessages);
+            for (const siblingId of suspended.approvalIds) {
+                if (siblingId === approvalId) {
+                    continue;
+                }
+                let siblingToolMsg = suspended.resolvedTools.get(siblingId);
+                if (!siblingToolMsg) {
+                    const sibling = this.approvalGate.get(siblingId);
+                    const siblingMeta = suspended.perApproval.get(siblingId);
+                    siblingToolMsg = {
+                        role: 'tool',
+                        toolCallId: sibling?.toolCallId ?? siblingMeta?.toolCall.id ?? siblingId,
+                        toolName: sibling?.toolName ?? siblingMeta?.toolCall.name ?? 'unknown_tool',
+                        content: JSON.stringify({
+                            ok: false,
+                            status:
+                                sibling?.status === 'rejected'
+                                    ? 'rejected_by_user'
+                                    : 'pending_user_decision',
+                        }),
+                    };
+                }
+                const alreadyPresent = cloned.some(
+                    (m) => m.role === 'tool' && m.toolCallId === siblingToolMsg!.toolCallId,
+                );
+                if (!alreadyPresent) {
+                    cloned.push(canonicalClone(siblingToolMsg));
+                }
+            }
+            return cloned;
+        })();
 
         const retryInFlight: CanonicalMessage[] = [
             ...baseInFlight,
@@ -3412,6 +3577,32 @@ export class AssistantRunner {
                         args: canonicalClone(finalArgs),
                     });
 
+                    if (existing.toolCallId !== revisedCall.id) {
+                        this.sessionStore.updateMessage(
+                            existing.sessionId,
+                            existing.messageId,
+                            (msg) => {
+                                if (!msg.activity?.length) {
+                                    return msg;
+                                }
+                                let changed = false;
+                                const nextActivity = msg.activity.map((step) => {
+                                    if (!step.toolCallIds.includes(existing.toolCallId)) {
+                                        return step;
+                                    }
+                                    changed = true;
+                                    return {
+                                        ...step,
+                                        toolCallIds: step.toolCallIds.map((id) =>
+                                            id === existing.toolCallId ? revisedCall.id : id,
+                                        ),
+                                    };
+                                });
+                                return changed ? { ...msg, activity: nextActivity } : msg;
+                            },
+                        );
+                    }
+
                     const nextSuspendedInFlight: CanonicalMessage[] = [
                         ...retryInFlight,
                         {
@@ -3424,15 +3615,52 @@ export class AssistantRunner {
                         },
                     ];
 
-                    this.suspendedApprovals.set(approvalId, {
-                        approvalId,
-                        sessionId: existing.sessionId,
-                        messageId: existing.messageId,
-                        toolCall: canonicalClone(revisedCall),
-                        policy,
-                        target,
-                        inFlightMessages: nextSuspendedInFlight,
-                    });
+                    if (suspended) {
+                        const remainingSiblingIds: string[] = [];
+                        for (const id of suspended.approvalIds) {
+                            if (id === approvalId) {
+                                continue;
+                            }
+                            const status = this.approvalGate.get(id)?.status;
+                            if (status === 'pending' || status === 'rejected') {
+                                remainingSiblingIds.push(id);
+                            } else {
+                                this.suspendedApprovals.delete(id);
+                                suspended.perApproval.delete(id);
+                            }
+                        }
+                        suspended.inFlightMessages = nextSuspendedInFlight;
+                        suspended.approvalIds = [...remainingSiblingIds, approvalId];
+                        suspended.resolvedTools.clear();
+                        suspended.perApproval.set(approvalId, {
+                            toolCall: canonicalClone(revisedCall),
+                            policy,
+                        });
+                        for (const id of suspended.approvalIds) {
+                            this.suspendedApprovals.set(id, suspended);
+                        }
+                    } else {
+                        const newRound: SuspendedApprovalRound = {
+                            sessionId: existing.sessionId,
+                            messageId: existing.messageId,
+                            target,
+                            inFlightMessages: nextSuspendedInFlight,
+                            bubbleBaseContent: '',
+                            roundsCompleted: 1,
+                            approvalIds: [approvalId],
+                            resolvedTools: new Map(),
+                            perApproval: new Map([
+                                [
+                                    approvalId,
+                                    {
+                                        toolCall: canonicalClone(revisedCall),
+                                        policy,
+                                    },
+                                ],
+                            ]),
+                        };
+                        this.suspendedApprovals.set(approvalId, newRound);
+                    }
 
                     this.notify();
                     return retried;
@@ -3698,6 +3926,12 @@ export class AssistantRunner {
         }
         for (const apprId of targetApprovalIds) {
             this.approvalGate.remove(apprId);
+            const round = this.suspendedApprovals.get(apprId);
+            if (round) {
+                round.approvalIds = round.approvalIds.filter((id) => id !== apprId);
+                round.resolvedTools.delete(apprId);
+                round.perApproval.delete(apprId);
+            }
             this.suspendedApprovals.delete(apprId);
         }
     }

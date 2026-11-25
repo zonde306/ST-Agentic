@@ -2737,4 +2737,177 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
             ).textContent,
         ).toContain('跟随主连接');
     });
+
+    it('automatically invokes continueLastMessage only after the final pending approval on a trailing bubble is approved', async () => {
+        await page.viewport(1280, 800);
+
+        const singleApprovalSession: AssistantSession = {
+            id: 'ast_auto_cont_1',
+            title: '单审批自动续写',
+            mode: 'author',
+            stAdminEnabled: false,
+            autoApproveAuthor: false,
+            connectionId: 'inherit',
+            updatedAt: 1732329000000,
+            messages: [
+                {
+                    id: 'u_ac_1',
+                    role: 'user',
+                    content: '帮我改一下脚本',
+                    timestamp: 1732328990000,
+                },
+                {
+                    id: 'a_ac_1',
+                    role: 'assistant',
+                    content: '',
+                    approvalIds: ['appr_ac_single'],
+                    timestamp: 1732329000000,
+                },
+            ],
+        };
+
+        const multiApprovalSession: AssistantSession = {
+            id: 'ast_auto_cont_2',
+            title: '多审批等待全部接受后再续写',
+            mode: 'full',
+            stAdminEnabled: true,
+            autoApproveAuthor: false,
+            connectionId: 'inherit',
+            updatedAt: 1732329100000,
+            messages: [
+                {
+                    id: 'u_ac_2',
+                    role: 'user',
+                    content: '同时改两条配置',
+                    timestamp: 1732329090000,
+                },
+                {
+                    id: 'a_ac_2',
+                    role: 'assistant',
+                    content: '',
+                    approvalIds: ['appr_ac_m1', 'appr_ac_m2'],
+                    timestamp: 1732329100000,
+                },
+            ],
+        };
+
+        const singleApproval: PendingApproval = {
+            ...structuredClone(SAMPLE_PENDING_AUTHOR_APPROVAL),
+            id: 'appr_ac_single',
+            sessionId: singleApprovalSession.id,
+            messageId: 'a_ac_1',
+            title: 'Edit TavernHelper script "02_战术雷达控制台"',
+        };
+        const multi1: PendingApproval = {
+            ...structuredClone(SAMPLE_PENDING_AUTHOR_APPROVAL),
+            id: 'appr_ac_m1',
+            sessionId: multiApprovalSession.id,
+            messageId: 'a_ac_2',
+            title: '修改条目 A',
+        };
+        const multi2: PendingApproval = {
+            ...structuredClone(SAMPLE_PENDING_ADMIN_APPROVAL),
+            id: 'appr_ac_m2',
+            sessionId: multiApprovalSession.id,
+            messageId: 'a_ac_2',
+            title: '修改条目 B',
+        };
+
+        const runtime = createMockAssistantRuntime({
+            sessions: [singleApprovalSession, multiApprovalSession],
+            approvals: [singleApproval, multi1, multi2],
+        });
+
+        const baseDecide = runtime.bridge.decideApproval.bind(runtime.bridge);
+        runtime.bridge.decideApproval = async (approvalId, decision, feedback) => {
+            const updated = await baseDecide(approvalId, decision, feedback);
+            if (updated && decision === 'approve') {
+                const sess = runtime.sessions.find((s) => s.id === updated.sessionId);
+                const hasPendingOnMsg = runtime.approvals.some(
+                    (a) =>
+                        a.sessionId === updated.sessionId
+                        && a.messageId === updated.messageId
+                        && a.status === 'pending',
+                );
+                if (sess && !hasPendingOnMsg) {
+                    sess.interruptedCheckpoint = {
+                        messageId: updated.messageId,
+                        reason: 'user_stop',
+                        inFlightMessages: [],
+                        roundsCompleted: 1,
+                        createdAt: Date.now(),
+                    };
+                }
+            }
+            return updated;
+        };
+
+        activeHarness = mountAssistantHarness({
+            runtime,
+            initialSessionId: singleApprovalSession.id,
+        });
+        await settleLayout(5);
+
+        const { shadowRoot } = getShellElements();
+
+        // 1. Single pending approval -> clicking 接受 collapses card & auto-invokes continueLastMessage
+        const singleApproveBtn = shadowRoot.querySelector(
+            '[data-approval-approve-btn="appr_ac_single"]',
+        ) as HTMLButtonElement;
+        expect(singleApproveBtn).toBeTruthy();
+        singleApproveBtn.click();
+        await settleLayout(8);
+
+        expect(runtime.decideApprovalSpy).toHaveBeenCalledWith(
+            'appr_ac_single',
+            'approve',
+            undefined,
+        );
+        expect(runtime.continueLastMessageSpy).toHaveBeenCalledTimes(1);
+        expect(runtime.continueLastMessageSpy).toHaveBeenCalledWith(
+            singleApprovalSession.id,
+            expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
+
+        const collapsedSingle = shadowRoot.querySelector(
+            '[data-approval-id="appr_ac_single"]',
+        ) as HTMLDivElement;
+        expect(collapsedSingle.getAttribute('data-approval-collapsed')).toBe('true');
+        expect(collapsedSingle.textContent).toContain('已接受：');
+        expect(
+            shadowRoot.querySelector('[data-assistant-message-content="a_ac_1"]')?.textContent,
+        ).toContain('继续完成后的最终答复。');
+
+        // 2. Multi-approval round -> first approval does NOT auto-continue; second approval DOES
+        activeHarness.store.openAssistantSession(multiApprovalSession.id);
+        await settleLayout(4);
+
+        const m1ApproveBtn = shadowRoot.querySelector(
+            '[data-approval-approve-btn="appr_ac_m1"]',
+        ) as HTMLButtonElement;
+        m1ApproveBtn.click();
+        await settleLayout(6);
+
+        expect(runtime.continueLastMessageSpy).toHaveBeenCalledTimes(1);
+        expect(
+            shadowRoot
+                .querySelector('[data-approval-id="appr_ac_m1"]')
+                ?.getAttribute('data-approval-collapsed'),
+        ).toBe('true');
+
+        const m2ApproveBtn = shadowRoot.querySelector(
+            '[data-approval-approve-btn="appr_ac_m2"]',
+        ) as HTMLButtonElement;
+        m2ApproveBtn.click();
+        await settleLayout(8);
+
+        expect(runtime.continueLastMessageSpy).toHaveBeenCalledTimes(2);
+        expect(runtime.continueLastMessageSpy).toHaveBeenLastCalledWith(
+            multiApprovalSession.id,
+            expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
+        expect(
+            shadowRoot.querySelector('[data-assistant-message-content="a_ac_2"]')?.textContent,
+        ).toContain('继续完成后的最终答复。');
+    });
 });

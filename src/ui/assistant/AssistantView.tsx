@@ -1293,6 +1293,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
 
             setBusyApprovalId(approvalId);
             const runtime = store.assistantRuntime;
+            let shouldAutoContinue = false;
             try {
                 if (runtime) {
                     const updated = await runtime.decideApproval(approvalId, decision, feedback);
@@ -1344,14 +1345,48 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                         : `✕ 已拒绝：${target.title}`,
                     decision === 'approve' ? 'success' : 'warning',
                 );
-                await refreshTokenStatus(target.sessionId);
+
+                if (decision === 'approve' && runtime?.continueLastMessage) {
+                    const snap = store.getSnapshot();
+                    const updatedSession = snap.assistantSessions.find(
+                        (s) => s.id === target.sessionId,
+                    );
+                    const hasOtherPendingOnMessage = snap.assistantPendingApprovals.some(
+                        (item) =>
+                            item.sessionId === target.sessionId
+                            && item.messageId === target.messageId
+                            && item.status === 'pending',
+                    );
+                    if (
+                        updatedSession
+                        && updatedSession.messages[updatedSession.messages.length - 1]?.id
+                            === target.messageId
+                        && updatedSession.interruptedCheckpoint?.messageId === target.messageId
+                        && !hasOtherPendingOnMessage
+                        && snap.assistantStreamingSessionId !== target.sessionId
+                    ) {
+                        shouldAutoContinue = true;
+                    }
+                }
+
+                if (!shouldAutoContinue) {
+                    await refreshTokenStatus(target.sessionId);
+                }
             } catch (err) {
                 store.pushToast(`审批操作失败：${formatErrorMessage(err)}`, 'error');
             } finally {
                 setBusyApprovalId(null);
             }
+
+            if (shouldAutoContinue && runtime?.continueLastMessage) {
+                await runStreamingOperation(
+                    target.sessionId,
+                    (hooks) => runtime.continueLastMessage!(target.sessionId, hooks),
+                    '接受改动后继续执行失败',
+                );
+            }
         },
-        [approvalsById, refreshTokenStatus, store],
+        [approvalsById, refreshTokenStatus, runStreamingOperation, store],
     );
 
     const handleRetryApproval = useCallback(

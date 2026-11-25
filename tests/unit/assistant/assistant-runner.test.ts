@@ -1408,4 +1408,272 @@ describe('AssistantRunner & AssistantSessionStore (TS2.1)', () => {
             'st_settings',
         ]);
     });
+
+    it('creates a resumable checkpoint on approval and auto-continues through follow-up tools & chained approvals in the same bubble', async () => {
+        const { bridge, transport, trajectoryStore, runner } = createRunnerHarness([
+            // Round 1: preface + approval-gated WI edit
+            {
+                content: '我先为你更新主世界书 #7 条目。',
+                reasoningContent: '准备写入规则条目 #7。',
+                toolCalls: [
+                    {
+                        id: 'call_chain_wi_1',
+                        name: 'wi_upsert_primary_entry',
+                        arguments: JSON.stringify({
+                            uid: 7,
+                            comment: '规则',
+                            keys: ['规则'],
+                            content: '@@system\n第一阶段规则已启用。',
+                        }),
+                    },
+                ],
+                usage: { inputTokens: 500, cachedTokens: 200, outputTokens: 50 },
+            },
+            // Round 2 (after approving call_chain_wi_1 + continueLastMessage): reads chat & proposes second approval-gated change
+            {
+                reasoningContent: '第一阶段已完成，继续处理设置变更。',
+                toolCalls: [
+                    {
+                        id: 'call_chain_settings_2',
+                        name: 'st_settings_patch',
+                        arguments: JSON.stringify({
+                            scope: 'power_user',
+                            patch: { fast_ui_mode: false },
+                        }),
+                    },
+                ],
+                usage: { inputTokens: 650, cachedTokens: 450, outputTokens: 45 },
+            },
+            // Round 3 (after approving call_chain_settings_2 + continueLastMessage): final summary reply
+            {
+                content: '世界书条目 #7 与 fast_ui_mode 设置均已完成更新。',
+                usage: { inputTokens: 780, cachedTokens: 580, outputTokens: 35 },
+            },
+        ]);
+
+        const session = await runner.createSession({
+            title: '审批自动续写链路测试',
+            mode: 'full',
+            stAdminEnabled: true,
+            autoApproveAuthor: false,
+        });
+
+        const bubble1 = await runner.sendPrompt(session.id, '帮我更新规则并关闭 fast_ui_mode');
+        expect(bubble1.approvalIds).toHaveLength(1);
+        expect(runner.getSession(session.id)!.interruptedCheckpoint).toBeUndefined();
+
+        const appr1Id = bubble1.approvalIds![0];
+        const approved1 = await runner.decideApproval(appr1Id, 'approve');
+        expect(approved1?.status).toBe('approved');
+
+        const afterAppr1 = runner.getSession(session.id)!;
+        const msgAfterAppr1 = afterAppr1.messages[afterAppr1.messages.length - 1]!;
+        expect(msgAfterAppr1.content).toBe('我先为你更新主世界书 #7 条目。');
+        expect(msgAfterAppr1.content).not.toContain('已执行：');
+        expect(msgAfterAppr1.interrupted).toBeUndefined();
+        expect(afterAppr1.interruptedCheckpoint?.messageId).toBe(bubble1.id);
+        expect(afterAppr1.interruptedCheckpoint?.bubbleBaseContent).toBe('我先为你更新主世界书 #7 条目。');
+
+        // Continuation 1 -> receives WI tool result and suspends on chained approval #2
+        const bubble2 = await runner.continueLastMessage(session.id);
+        expect(bubble2.id).toBe(bubble1.id);
+        expect(bubble2.approvalIds).toHaveLength(2);
+        expect(bubble2.toolCalls?.map((t) => t.id)).toEqual(['call_chain_wi_1']);
+        expect(bubble2.activity).toHaveLength(2);
+
+        // Layer 0 prefix remains identical across rounds & Round 2 received real tool output
+        expect(canonicalStringify(transport.requests[1].messages[0])).toBe(
+            canonicalStringify(transport.requests[0].messages[0]),
+        );
+        const round2ToolMsg = transport.requests[1].messages.find(
+            (m) => m.role === 'tool' && m.toolCallId === 'call_chain_wi_1',
+        );
+        expect(round2ToolMsg).toBeDefined();
+        expect(String(round2ToolMsg!.content)).toContain('"ok":true');
+
+        // Approve chained approval #2 -> sets checkpoint again, then final continuation completes turn
+        const appr2Id = bubble2.approvalIds![1];
+        const approved2 = await runner.decideApproval(appr2Id, 'approve');
+        expect(approved2?.status).toBe('approved');
+        expect(bridge.hostSettings.power_user.fast_ui_mode).toBe(false);
+
+        const finalBubble = await runner.continueLastMessage(session.id);
+        expect(finalBubble.id).toBe(bubble1.id);
+        expect(finalBubble.content).toBe(
+            '我先为你更新主世界书 #7 条目。世界书条目 #7 与 fast_ui_mode 设置均已完成更新。',
+        );
+        expect(finalBubble.approvalIds).toHaveLength(2);
+        expect(finalBubble.toolCalls?.map((t) => t.id)).toEqual([
+            'call_chain_wi_1',
+            'call_chain_settings_2',
+        ]);
+        expect(runner.getSession(session.id)!.interruptedCheckpoint).toBeUndefined();
+
+        const committed = trajectoryStore.getMessages(toAssistantThreadId(session.id));
+        expect(committed.some((m) => m.role === 'tool' && m.toolCallId === 'call_chain_wi_1')).toBe(
+            true,
+        );
+        expect(
+            committed.some((m) => m.role === 'tool' && m.toolCallId === 'call_chain_settings_2'),
+        ).toBe(true);
+        expect(committed[committed.length - 1]).toEqual({
+            role: 'assistant',
+            content: '世界书条目 #7 与 fast_ui_mode 设置均已完成更新。',
+        });
+    });
+
+    it('waits until all pending approvals in a multi-approval round are resolved before setting checkpoint (including mixed reject + approve)', async () => {
+        const { transport, runner } = createRunnerHarness([
+            // Round 1: two approval-gated tool calls in one round
+            {
+                toolCalls: [
+                    {
+                        id: 'call_multi_1',
+                        name: 'wi_upsert_primary_entry',
+                        arguments: JSON.stringify({
+                            uid: 7,
+                            keys: ['规则'],
+                            content: '@@system\n多审批更新',
+                        }),
+                    },
+                    {
+                        id: 'call_multi_2',
+                        name: 'chat_delete_message',
+                        arguments: JSON.stringify({ messageId: 1 }),
+                    },
+                ],
+            },
+            // Round 2 (after resolving both): receives both tool outputs
+            {
+                content: '两个审批结果均已处理完成。',
+            },
+            // Round 3: another multi-approval turn to test mixed reject + approve
+            {
+                toolCalls: [
+                    {
+                        id: 'call_mix_reject',
+                        name: 'wi_upsert_primary_entry',
+                        arguments: JSON.stringify({
+                            uid: 7,
+                            keys: ['规则'],
+                            content: '@@system\n不应写入',
+                        }),
+                    },
+                    {
+                        id: 'call_mix_approve',
+                        name: 'st_settings_patch',
+                        arguments: JSON.stringify({
+                            scope: 'power_user',
+                            patch: { fast_ui_mode: false },
+                        }),
+                    },
+                ],
+            },
+            {
+                content: '已保留拒绝反馈并完成另一项设置修改。',
+            },
+        ]);
+
+        const session = await runner.createSession({
+            title: '多审批同轮测试',
+            mode: 'full',
+            stAdminEnabled: true,
+            autoApproveAuthor: false,
+            autoApproveChatDelete: false,
+        });
+
+        // Case A: approve first -> no checkpoint yet; approve second -> checkpoint with both tool results
+        const b1 = await runner.sendPrompt(session.id, '同时改世界书并删掉第 1 条消息');
+        expect(b1.approvalIds).toHaveLength(2);
+        const [a1, a2] = b1.approvalIds!;
+
+        await runner.decideApproval(a1, 'approve');
+        expect(runner.getSession(session.id)!.interruptedCheckpoint).toBeUndefined();
+
+        await runner.decideApproval(a2, 'approve');
+        const cpA = runner.getSession(session.id)!.interruptedCheckpoint;
+        expect(cpA).toBeDefined();
+        expect(
+            cpA!.inFlightMessages.filter((m) => m.role === 'tool').map((m) => m.toolCallId).sort(),
+        ).toEqual(['call_multi_1', 'call_multi_2']);
+
+        const contA = await runner.continueLastMessage(session.id);
+        expect(contA.content).toBe('两个审批结果均已处理完成。');
+        expect(
+            transport.requests[1].messages
+                .filter((m) => m.role === 'tool')
+                .map((m) => m.toolCallId)
+                .sort(),
+        ).toEqual(['call_multi_1', 'call_multi_2']);
+
+        // Case B: reject first with feedback + approve second -> checkpoint pairs rejection payload & approved result
+        const b2 = await runner.sendPrompt(session.id, '再试一次混合审批');
+        expect(b2.approvalIds).toHaveLength(2);
+        const [m1, m2] = b2.approvalIds!;
+
+        await runner.decideApproval(m1, 'reject', '不要改世界书');
+        expect(runner.getSession(session.id)!.interruptedCheckpoint).toBeUndefined();
+
+        await runner.decideApproval(m2, 'approve');
+        const cpB = runner.getSession(session.id)!.interruptedCheckpoint;
+        expect(cpB).toBeDefined();
+        const rejectedTool = cpB!.inFlightMessages.find(
+            (m) => m.role === 'tool' && m.toolCallId === 'call_mix_reject',
+        );
+        expect(rejectedTool).toBeDefined();
+        expect(JSON.parse(String(rejectedTool!.content))).toEqual({
+            ok: false,
+            status: 'rejected_by_user',
+            feedback: '不要改世界书',
+        });
+
+        const contB = await runner.continueLastMessage(session.id);
+        expect(contB.content).toBe('已保留拒绝反馈并完成另一项设置修改。');
+    });
+
+    it('flushes an unresumed approval checkpoint to TrajectoryStore before starting a new sendPrompt turn', async () => {
+        const { transport, trajectoryStore, runner } = createRunnerHarness([
+            {
+                toolCalls: [
+                    {
+                        id: 'call_flush_1',
+                        name: 'wi_upsert_primary_entry',
+                        arguments: JSON.stringify({
+                            uid: 7,
+                            keys: ['规则'],
+                            content: '@@system\n待冲刷规则',
+                        }),
+                    },
+                ],
+            },
+            {
+                content: '好的，开始新话题。',
+            },
+        ]);
+
+        const session = await runner.createSession({
+            title: '未续写审批冲刷测试',
+            mode: 'author',
+            autoApproveAuthor: false,
+        });
+
+        const b1 = await runner.sendPrompt(session.id, '先改一下世界书');
+        await runner.decideApproval(b1.approvalIds![0], 'approve');
+        expect(runner.getSession(session.id)!.interruptedCheckpoint).toBeDefined();
+        expect(trajectoryStore.getMessageCount(toAssistantThreadId(session.id))).toBe(0);
+
+        // User sends a brand-new prompt instead of continuing -> previous approved tool turn is flushed safely
+        const b2 = await runner.sendPrompt(session.id, '换个话题聊聊');
+        expect(b2.content).toBe('好的，开始新话题。');
+        expect(runner.getSession(session.id)!.interruptedCheckpoint).toBeUndefined();
+
+        const req2 = transport.requests[1]!;
+        expect(req2.messages.some((m) => m.role === 'tool' && m.toolCallId === 'call_flush_1')).toBe(
+            true,
+        );
+        const committed = trajectoryStore.getMessages(toAssistantThreadId(session.id));
+        expect(committed.some((m) => m.role === 'tool' && m.toolCallId === 'call_flush_1')).toBe(
+            true,
+        );
+    });
 });
