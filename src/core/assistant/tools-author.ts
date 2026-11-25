@@ -296,6 +296,26 @@ const CARD_EMBED_AGENTIC_SCHEMA = z.object({
     files: z.record(z.string(), z.string()).optional(),
 });
 
+const CHAT_RELOAD_MESSAGES_SCHEMA = z.object({
+    messageIds: z
+        .array(z.number().int().min(0))
+        .optional()
+        .describe('Optional specific 0-based chat message IDs to reload; omit to reload recent displayed messages.'),
+    limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .optional()
+        .default(50)
+        .describe('Maximum number of displayed messages to reload when messageIds is omitted.'),
+    emitUpdateEvent: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe('Emit MESSAGE_UPDATED so active message-rendering extensions can re-mount or update UI immediately.'),
+});
+
 async function resolvePrimaryBookName(
     author: HostAuthorBridge,
     requestedBookName?: string,
@@ -818,6 +838,63 @@ export function createAuthorTools(): AssistantToolDefinition[] {
         },
     };
 
+    const chatReloadMessagesTool: AssistantToolDefinition<typeof CHAT_RELOAD_MESSAGES_SCHEMA> = {
+        name: 'chat_reload_messages',
+        description:
+            'Re-render displayed chat messages in place (re-applying ST formatting, regex rules, and any active third-party message renderers) without reloading the whole chat or triggering after_turn generation hooks. Read-only display refresh.',
+        parameters: CHAT_RELOAD_MESSAGES_SCHEMA,
+        tier: 'author',
+        readOnly: true,
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            if (ctx.bridge.reloadDisplayedMessages) {
+                const res = await ctx.bridge.reloadDisplayedMessages({
+                    ...(args.messageIds ? { messageIds: args.messageIds } : {}),
+                    limit: args.limit,
+                    emitUpdateEvent: args.emitUpdateEvent,
+                });
+                return finalizeReadToolResult({
+                    ok: true,
+                    ...res,
+                });
+            }
+
+            const chat = ctx.bridge.getChat();
+            const limit = args.limit ?? 50;
+            const candidateIds =
+                args.messageIds && args.messageIds.length > 0
+                    ? Array.from(new Set(args.messageIds))
+                    : chat
+                        .slice(Math.max(0, chat.length - limit))
+                        .map((_, offset) => Math.max(0, chat.length - limit) + offset);
+
+            const reloadedIds: number[] = [];
+            const skippedIds: number[] = [];
+            let emittedEvents = 0;
+
+            for (const id of candidateIds) {
+                if (id < 0 || id >= chat.length || !chat[id]) {
+                    skippedIds.push(id);
+                    continue;
+                }
+                const swipeId = chat[id]?.swipeId ?? 0;
+                await ctx.bridge.refreshMessageView({ messageId: id, swipeId });
+                reloadedIds.push(id);
+                if (args.emitUpdateEvent !== false) {
+                    ctx.bridge.emitHostEvent?.('message_updated', id);
+                    emittedEvents += 1;
+                }
+            }
+
+            return finalizeReadToolResult({
+                ok: true,
+                reloadedIds,
+                skippedIds,
+                emittedEvents,
+            });
+        },
+    };
+
     return [
         cardReadFullTool,
         cardPatchActiveTool,
@@ -828,5 +905,6 @@ export function createAuthorTools(): AssistantToolDefinition[] {
         regexUpsertScopedTool,
         regexDeleteScopedTool,
         cardEmbedAgenticTool,
+        chatReloadMessagesTool,
     ];
 }

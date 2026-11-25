@@ -9,6 +9,7 @@ import {
     ADMIN_TOOLS,
     AUTHOR_TOOLS,
     CHAT_READONLY_TOOLS,
+    FULL_AGENTIC_CONFIG_TOOLS,
     FULL_ENABLED_WI_TOOLS,
     evaluateToolPolicy,
     getAllowedToolsForMode,
@@ -341,7 +342,12 @@ describe('policy.ts — 4-Mode Permission Matrix & Mandatory Confirm', () => {
         ]);
 
         // Read-only author tools do not require approval
-        for (const roTool of ['card_read_full', 'wi_read_raw_book', 'regex_list_scoped']) {
+        for (const roTool of [
+            'card_read_full',
+            'wi_read_raw_book',
+            'regex_list_scoped',
+            'chat_reload_messages',
+        ]) {
             const res = evaluateToolPolicy(roTool, { bookName: '雾港侦探录' }, { mode: 'author' });
             expect(res.allowed).toBe(true);
             expect(res.mutating).toBe(false);
@@ -374,22 +380,27 @@ describe('policy.ts — 4-Mode Permission Matrix & Mandatory Confirm', () => {
         }
 
         // Full and admin tools remain denied in author mode even if stAdminEnabled is true
-        for (const tool of [...FULL_ENABLED_WI_TOOLS, ...ADMIN_TOOLS]) {
+        for (const tool of [
+            ...FULL_ENABLED_WI_TOOLS,
+            ...FULL_AGENTIC_CONFIG_TOOLS,
+            ...ADMIN_TOOLS,
+        ]) {
             const res = evaluateToolPolicy(tool, {}, { mode: 'author', stAdminEnabled: true });
             expect(res.allowed, `author must deny ${tool}`).toBe(false);
         }
     });
 
     it('separates full (stAdminEnabled: false) from full + ST Admin (stAdminEnabled: true)', () => {
-        // full without stAdminEnabled unlocks enabled WI tools ONLY, NOT admin tools
+        // full without stAdminEnabled unlocks enabled WI + ST-Agentic self-config tools ONLY, NOT admin tools
         expect(getAllowedToolsForMode('full', false)).toEqual([
             ...CHAT_READONLY_TOOLS,
             ...ADJUST_WRITE_TOOLS,
             ...AUTHOR_TOOLS,
             ...FULL_ENABLED_WI_TOOLS,
+            ...FULL_AGENTIC_CONFIG_TOOLS,
         ]);
 
-        for (const tool of FULL_ENABLED_WI_TOOLS) {
+        for (const tool of [...FULL_ENABLED_WI_TOOLS, ...FULL_AGENTIC_CONFIG_TOOLS]) {
             const res = evaluateToolPolicy(tool, { bookName: '雾港侦探录' }, { mode: 'full', stAdminEnabled: false });
             expect(res.allowed, `full(admin=false) should allow ${tool}`).toBe(true);
         }
@@ -408,8 +419,41 @@ describe('policy.ts — 4-Mode Permission Matrix & Mandatory Confirm', () => {
             ...ADJUST_WRITE_TOOLS,
             ...AUTHOR_TOOLS,
             ...FULL_ENABLED_WI_TOOLS,
+            ...FULL_AGENTIC_CONFIG_TOOLS,
             ...ADMIN_TOOLS,
         ]);
+
+        // Capability gating hides TavernHelper script tools unless tavernHelperScripts is active
+        const gatedTools = getAllowedToolsForMode('full', true, {
+            tavernHelperScripts: false,
+            tavernHelperAudio: false,
+            ejsTemplate: false,
+        });
+        expect(gatedTools).not.toContain('tavern_helper_scripts_read');
+        expect(gatedTools).not.toContain('tavern_helper_scripts_upsert');
+        expect(gatedTools).toContain('st_sync_runtime');
+
+        const deniedTh = evaluateToolPolicy('tavern_helper_scripts_read', { scope: 'global' }, {
+            mode: 'full',
+            stAdminEnabled: true,
+            extensionCapabilities: {
+                tavernHelperScripts: false,
+                tavernHelperAudio: false,
+                ejsTemplate: false,
+            },
+        });
+        expect(deniedTh.allowed).toBe(false);
+
+        const allowedTh = evaluateToolPolicy('tavern_helper_scripts_read', { scope: 'global' }, {
+            mode: 'full',
+            stAdminEnabled: true,
+            extensionCapabilities: {
+                tavernHelperScripts: true,
+                tavernHelperAudio: false,
+                ejsTemplate: false,
+            },
+        });
+        expect(allowedTh.allowed).toBe(true);
     });
 
     it('enforces non-bypassable mandatoryConfirm even when autoApproveAuthor === true', () => {
@@ -417,9 +461,12 @@ describe('policy.ts — 4-Mode Permission Matrix & Mandatory Confirm', () => {
             { tool: 'wi_delete_primary_entry', args: { bookName: '雾港侦探录', uid: 7 } },
             { tool: 'regex_delete_scoped', args: { id: 'regex_1' } },
             { tool: 'wi_delete_enabled_entry', args: { bookName: '雾港侦探录', uid: 7 } },
+            { tool: 'agentic_preset_component_delete', args: { kind: 'custom_tool', id: 'custom_helper' } },
+            { tool: 'agentic_settings_patch', args: { deletePresetId: 'old_preset' } },
             { tool: 'wi_admin_delete_entry', args: { bookName: '全局备用设定集', uid: 1 } },
             { tool: 'card_admin_delete', args: { chid: 2 } },
             { tool: 'st_settings_patch', args: { scope: 'power_user', patch: { fast_ui_mode: false } } },
+            { tool: 'tavern_helper_scripts_upsert', args: { scope: 'global', mode: 'upsert', script: { id: 's1' } } },
             { tool: 'st_preset_select', args: { name: 'Default' } },
             { tool: 'st_preset_patch', args: { name: 'Default', patch: { temp: 0.7 } } },
             { tool: 'regex_admin_global_upsert', args: { script: {} } },
@@ -452,9 +499,27 @@ describe('policy.ts — 4-Mode Permission Matrix & Mandatory Confirm', () => {
         expect(isCrossCardBatchOperation('card_admin_patch', { chids: [1, 2] })).toBe(true);
         expect(isCrossCardBatchOperation('card_admin_patch', { allCharacters: true })).toBe(true);
 
-        // Read-only admin tools do NOT trigger mandatoryConfirm or approval
-        for (const roAdmin of ['st_settings_read', 'st_preset_list', 'card_admin_list_all', 'wi_admin_list_all']) {
-            const res = evaluateToolPolicy(roAdmin, {}, { mode: 'full', stAdminEnabled: true });
+        // Normal full-tier Agentic writes (without deletePresetId) require approval by default but are not mandatoryConfirm
+        const normalAgenticPatch = evaluateToolPolicy(
+            'agentic_settings_patch',
+            { themeMode: 'light' },
+            { mode: 'full', stAdminEnabled: false, autoApproveAuthor: false },
+        );
+        expect(normalAgenticPatch.allowed).toBe(true);
+        expect(normalAgenticPatch.mandatoryConfirm).toBe(false);
+        expect(normalAgenticPatch.requiresApproval).toBe(true);
+
+        // Read-only full/admin tools do NOT trigger mandatoryConfirm or approval
+        for (const roTool of [
+            'agentic_config_read',
+            'st_settings_read',
+            'st_preset_list',
+            'card_admin_list_all',
+            'wi_admin_list_all',
+            'tavern_helper_scripts_read',
+            'st_sync_runtime',
+        ]) {
+            const res = evaluateToolPolicy(roTool, {}, { mode: 'full', stAdminEnabled: true });
             expect(res.allowed).toBe(true);
             expect(res.requiresApproval).toBe(false);
             expect(res.mandatoryConfirm).toBe(false);

@@ -1,4 +1,4 @@
-import type { AssistantMode } from '../types';
+import type { AssistantMode, HostExtensionCapabilities } from '../types';
 import { isPathAllowed, normalizeVfsPath } from '../utils/glob';
 import { isAgentsMdApprovalRequiredPath } from '../vfs/workspace-policy';
 
@@ -67,12 +67,21 @@ export const AUTHOR_TOOLS = [
     'regex_upsert_scoped',
     'regex_delete_scoped',
     'card_embed_agentic',
+    'chat_reload_messages',
 ] as const;
 
 export const FULL_ENABLED_WI_TOOLS = [
     'wi_list_enabled_books',
     'wi_upsert_enabled_entry',
     'wi_delete_enabled_entry',
+] as const;
+
+export const FULL_AGENTIC_CONFIG_TOOLS = [
+    'agentic_config_read',
+    'agentic_settings_patch',
+    'agentic_preset_component_upsert',
+    'agentic_preset_component_delete',
+    'agentic_connection_upsert',
 ] as const;
 
 export const ADMIN_TOOLS = [
@@ -99,6 +108,9 @@ export const ADMIN_TOOLS = [
     'regex_admin_global_delete',
     'st_slash_exec',
     'st_import_url',
+    'tavern_helper_scripts_read',
+    'tavern_helper_scripts_upsert',
+    'st_sync_runtime',
 ] as const;
 
 const ADMIN_DYNAMIC_PREFIXES = [
@@ -118,6 +130,7 @@ interface ToolPolicySpec {
     baseMandatoryConfirm: boolean;
     baseRiskLevel: PolicyRiskLevel;
     vfsScoped?: boolean;
+    requiredCapability?: keyof HostExtensionCapabilities;
     defaultScopeLabel: string;
 }
 
@@ -400,8 +413,17 @@ const TOOL_CATALOG: Record<string, ToolPolicySpec> = {
         baseRiskLevel: 'medium',
         defaultScopeLabel: 'Card Embed',
     },
+    chat_reload_messages: {
+        requiredMode: 'author',
+        requiresAdmin: false,
+        mutating: false,
+        baseRequiresApproval: false,
+        baseMandatoryConfirm: false,
+        baseRiskLevel: 'low',
+        defaultScopeLabel: 'Chat Reload',
+    },
 
-    // 4. full mode (default stAdminEnabled: false) — enabled World Info books
+    // 4. full mode (default stAdminEnabled: false) — enabled World Info books & ST-Agentic config
     wi_list_enabled_books: {
         requiredMode: 'full',
         requiresAdmin: false,
@@ -428,6 +450,51 @@ const TOOL_CATALOG: Record<string, ToolPolicySpec> = {
         baseMandatoryConfirm: true,
         baseRiskLevel: 'high',
         defaultScopeLabel: 'Enabled WI',
+    },
+    agentic_config_read: {
+        requiredMode: 'full',
+        requiresAdmin: false,
+        mutating: false,
+        baseRequiresApproval: false,
+        baseMandatoryConfirm: false,
+        baseRiskLevel: 'low',
+        defaultScopeLabel: 'Agentic Config',
+    },
+    agentic_settings_patch: {
+        requiredMode: 'full',
+        requiresAdmin: false,
+        mutating: true,
+        baseRequiresApproval: true,
+        baseMandatoryConfirm: false,
+        baseRiskLevel: 'medium',
+        defaultScopeLabel: 'Agentic Settings',
+    },
+    agentic_preset_component_upsert: {
+        requiredMode: 'full',
+        requiresAdmin: false,
+        mutating: true,
+        baseRequiresApproval: true,
+        baseMandatoryConfirm: false,
+        baseRiskLevel: 'medium',
+        defaultScopeLabel: 'Agentic Preset',
+    },
+    agentic_preset_component_delete: {
+        requiredMode: 'full',
+        requiresAdmin: false,
+        mutating: true,
+        baseRequiresApproval: true,
+        baseMandatoryConfirm: true,
+        baseRiskLevel: 'high',
+        defaultScopeLabel: 'Agentic Preset',
+    },
+    agentic_connection_upsert: {
+        requiredMode: 'full',
+        requiresAdmin: false,
+        mutating: true,
+        baseRequiresApproval: true,
+        baseMandatoryConfirm: true,
+        baseRiskLevel: 'high',
+        defaultScopeLabel: 'Agentic Connection',
     },
 
     // 5. full + stAdminEnabled: true — ST Admin tools
@@ -638,6 +705,35 @@ const TOOL_CATALOG: Record<string, ToolPolicySpec> = {
         baseRiskLevel: 'high',
         defaultScopeLabel: 'ST Import URL',
     },
+    tavern_helper_scripts_read: {
+        requiredMode: 'full',
+        requiresAdmin: true,
+        mutating: false,
+        baseRequiresApproval: false,
+        baseMandatoryConfirm: false,
+        baseRiskLevel: 'low',
+        requiredCapability: 'tavernHelperScripts',
+        defaultScopeLabel: 'TavernHelper Scripts',
+    },
+    tavern_helper_scripts_upsert: {
+        requiredMode: 'full',
+        requiresAdmin: true,
+        mutating: true,
+        baseRequiresApproval: true,
+        baseMandatoryConfirm: true,
+        baseRiskLevel: 'high',
+        requiredCapability: 'tavernHelperScripts',
+        defaultScopeLabel: 'TavernHelper Scripts',
+    },
+    st_sync_runtime: {
+        requiredMode: 'full',
+        requiresAdmin: true,
+        mutating: false,
+        baseRequiresApproval: false,
+        baseMandatoryConfirm: false,
+        baseRiskLevel: 'low',
+        defaultScopeLabel: 'Runtime Sync',
+    },
 };
 
 export interface PolicyEvaluationContext {
@@ -645,6 +741,7 @@ export interface PolicyEvaluationContext {
     stAdminEnabled?: boolean;
     autoApproveAuthor?: boolean;
     autoApproveChatDelete?: boolean;
+    extensionCapabilities?: HostExtensionCapabilities;
 }
 
 /**
@@ -742,6 +839,16 @@ export function isMandatoryConfirmTool(
         return true;
     }
     if (toolName === 'st_slash_exec' || toolName === 'st_import_url') {
+        return true;
+    }
+    if (toolName === 'agentic_connection_upsert' || toolName === 'tavern_helper_scripts_upsert') {
+        return true;
+    }
+    if (
+        toolName === 'agentic_settings_patch'
+        && typeof args?.deletePresetId === 'string'
+        && args.deletePresetId.trim().length > 0
+    ) {
         return true;
     }
     if (
@@ -860,6 +967,64 @@ function buildScopeLabel(
         return `Import: ${args.url}`;
     }
 
+    if (
+        toolName === 'agentic_preset_component_upsert'
+        || toolName === 'agentic_preset_component_delete'
+    ) {
+        const kind = typeof args.kind === 'string' ? args.kind.trim() : '';
+        const item =
+            args.item && typeof args.item === 'object'
+                ? (args.item as { id?: unknown; name?: unknown })
+                : undefined;
+        const itemId =
+            typeof args.id === 'string' && args.id.trim() !== ''
+                ? args.id.trim()
+                : typeof item?.id === 'string' && item.id.trim() !== ''
+                    ? item.id.trim()
+                    : typeof item?.name === 'string' && item.name.trim() !== ''
+                        ? item.name.trim()
+                        : '';
+        if (kind && itemId) {
+            return `Agentic Preset: ${kind}/${itemId}`;
+        }
+        if (kind) {
+            return `Agentic Preset: ${kind}`;
+        }
+    }
+
+    if (toolName === 'agentic_connection_upsert' && typeof args.id === 'string' && args.id.trim() !== '') {
+        return `Agentic Connection: ${args.id.trim()}`;
+    }
+
+    if (
+        (toolName === 'tavern_helper_scripts_read' || toolName === 'tavern_helper_scripts_upsert')
+        && typeof args.scope === 'string'
+        && args.scope.trim() !== ''
+    ) {
+        return `TavernHelper (${args.scope.trim()})`;
+    }
+
+    if (toolName === 'st_sync_runtime' && Array.isArray(args.targets) && args.targets.length > 0) {
+        const targets = args.targets
+            .filter((t): t is string => typeof t === 'string' && t.trim() !== '')
+            .map((t) => t.trim());
+        if (targets.length > 0) {
+            return `Runtime Sync: ${targets.join(', ')}`;
+        }
+    }
+
+    if (toolName === 'chat_reload_messages' && Array.isArray(args.messageIds) && args.messageIds.length > 0) {
+        const ids = args.messageIds.filter(
+            (id): id is number => typeof id === 'number' && Number.isInteger(id) && id >= 0,
+        );
+        if (ids.length > 0) {
+            const previewIds = ids.slice(0, 3).map((id) => `#${id}`).join(', ');
+            return ids.length > 3
+                ? `Chat Reload: ${previewIds} (+${ids.length - 3})`
+                : `Chat Reload: ${previewIds}`;
+        }
+    }
+
     return spec.defaultScopeLabel;
 }
 
@@ -870,6 +1035,7 @@ function buildScopeLabel(
 export function getAllowedToolsForMode(
     mode: AssistantMode,
     stAdminEnabled: boolean = false,
+    extensionCapabilities?: HostExtensionCapabilities,
 ): string[] {
     const tools: string[] = [...CHAT_READONLY_TOOLS];
 
@@ -880,13 +1046,20 @@ export function getAllowedToolsForMode(
         tools.push(...AUTHOR_TOOLS);
     }
     if (MODE_RANK[mode] >= MODE_RANK.full) {
-        tools.push(...FULL_ENABLED_WI_TOOLS);
+        tools.push(...FULL_ENABLED_WI_TOOLS, ...FULL_AGENTIC_CONFIG_TOOLS);
         if (stAdminEnabled) {
             tools.push(...ADMIN_TOOLS);
         }
     }
 
-    return tools;
+    if (!extensionCapabilities) {
+        return tools;
+    }
+
+    return tools.filter((name) => {
+        const cap = TOOL_CATALOG[name]?.requiredCapability;
+        return !cap || Boolean(extensionCapabilities[cap]);
+    });
 }
 
 /**
@@ -946,6 +1119,26 @@ export function evaluateToolPolicy(
             toolName,
             requiredMode: spec.requiredMode,
             requiresAdmin: true,
+            mutating: spec.mutating,
+            requiresApproval: baseRequiresApproval,
+            baseRequiresApproval,
+            mandatoryConfirm,
+            riskLevel,
+            scopeLabel,
+        };
+    }
+
+    if (
+        spec.requiredCapability
+        && ctx.extensionCapabilities
+        && !ctx.extensionCapabilities[spec.requiredCapability]
+    ) {
+        return {
+            allowed: false,
+            reason: `Tool "${toolName}" is unavailable because optional host extension capability "${spec.requiredCapability}" is not installed or active.`,
+            toolName,
+            requiredMode: spec.requiredMode,
+            requiresAdmin: spec.requiresAdmin,
             mutating: spec.mutating,
             requiresApproval: baseRequiresApproval,
             baseRequiresApproval,

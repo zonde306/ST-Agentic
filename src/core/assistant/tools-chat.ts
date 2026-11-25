@@ -46,6 +46,8 @@ export interface AssistantToolContext {
     trajectoryStore?: TrajectoryStore;
     traceLogger?: TraceLogger;
     settings?: Settings;
+    getLatestSettings?: () => Settings;
+    updateSettings?: (updater: (prev: Settings) => Settings) => Promise<Settings> | Settings;
     target: MessageTarget;
     signal: AbortSignal;
     getVariableSchema?: () => DynamicVariableSchema | undefined;

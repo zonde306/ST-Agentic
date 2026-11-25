@@ -73,7 +73,7 @@ export const ASSISTANT_MODE_META: Readonly<Record<AssistantMode, AssistantModeMe
         label: '完全控制',
         fullLabel: '完全控制',
         pillClass: 'ag-pill-error',
-        desc: '默认读写全部已开启世界书；开「ST 全权管家」解锁全库资产与设置',
+        desc: '读写全部已开启世界书 + 管理 ST-Agentic 自身设置/工具/正则；开「ST 全权管家」解锁全库与扩展热同步',
         pills: [],
     },
 };
@@ -93,14 +93,14 @@ export function getEffectiveModePills(
     }
     if (session.stAdminEnabled) {
         return [
-            { text: '写: 全库世界书 / 角色卡 / 人设 / 正则', cls: 'ag-pill-error' },
-            { text: '系统: ST 设置 / 预设 / 斜杠 / URL 导入', cls: 'ag-pill-error' },
+            { text: '写: 全库世界书 / 角色卡 / 人设 / 正则 / ST-Agentic', cls: 'ag-pill-error' },
+            { text: '系统: ST 设置 / 预设 / 已安装扩展热同步 / 运行时重载', cls: 'ag-pill-error' },
             { text: '红线: 高危强制确认 + Key 脱敏 + 撤销', cls: 'ag-pill-warning' },
         ];
     }
     return [
-        { text: '写: 全部已开启的世界书', cls: 'ag-pill-warning' },
-        { text: '写: 含写卡 & 调整模式全部能力', cls: 'ag-pill-primary' },
+        { text: '写: 已开启世界书 + ST-Agentic 设置/工具/脚本/正则', cls: 'ag-pill-warning' },
+        { text: '写: 含写卡 & 调整模式全部能力 + 刷新消息展示', cls: 'ag-pill-primary' },
         { text: 'ST 全局管家: 未启用', cls: 'ag-pill-muted' },
     ];
 }

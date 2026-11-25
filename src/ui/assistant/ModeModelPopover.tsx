@@ -204,7 +204,7 @@ export function ModeModelPopover({
                                     marginTop: '2px',
                                 }}
                             >
-                                全库卡片/世界书/设置/预设/斜杠/导入
+                                全库资产/ST与扩展设置/酒馆助手脚本/运行时热同步
                             </div>
                         </div>
                         <span
@@ -359,8 +359,7 @@ export function StAdminConfirmModal({ open, onCancel, onConfirm }: StAdminConfir
             <div class="ag-stack-v" data-assistant-st-admin-modal="true">
                 <div class="ag-banner ag-banner-error">
                     开启后，当前助手会话将获得完整 SillyTavern
-                    管理权限：读写全库世界书与角色卡、修改人设与 ST
-                    全局设置、切换预设、执行斜杠命令以及从 URL 导入资源。
+                    管理权限：读写全库世界书与角色卡、修改人设与 ST/已安装扩展设置、切换预设、执行斜杠命令及热同步已安装扩展与运行时 UI。
                 </div>
                 <div
                     class="ag-card"

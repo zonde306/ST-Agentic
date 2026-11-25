@@ -1334,4 +1334,78 @@ describe('AssistantRunner & AssistantSessionStore (TS2.1)', () => {
             '/state/variables.json',
         ]);
     });
+
+    it('exposes optional extension tools and prompt hints only when detected as active', async () => {
+        const { bridge, transport, runner } = createRunnerHarness(
+            [
+                { content: '未安装第三方扩展时的回复。' },
+                { content: '已检测到第三方扩展时的回复。' },
+            ],
+            { stream: false },
+        );
+
+        // 1. When TavernHelper & EjsTemplate are absent:
+        bridge.extensionCapabilities = {
+            tavernHelperScripts: false,
+            tavernHelperAudio: false,
+            ejsTemplate: false,
+        };
+        const withoutExtTools = runner.getAllowedToolDefinitions('full', true).map((t) => t.name);
+        expect(withoutExtTools).not.toContain('tavern_helper_scripts_read');
+        expect(withoutExtTools).not.toContain('tavern_helper_scripts_upsert');
+        expect(withoutExtTools).toContain('st_sync_runtime');
+
+        const sWithout = await runner.createSession({
+            title: '无第三方扩展',
+            mode: 'full',
+            stAdminEnabled: true,
+        });
+        await runner.sendPrompt(sWithout.id, '检查可用工具');
+        const reqWithout = transport.requests[0]!;
+        const sysWithout = String(reqWithout.messages[0]?.content ?? '');
+        expect(sysWithout).not.toContain('JS-Slash-Runner');
+        expect(sysWithout).not.toContain('TavernHelper');
+        expect(sysWithout).not.toContain('EjsTemplate');
+        const syncToolWithout = reqWithout.tools?.find((t) => t.name === 'st_sync_runtime');
+        const targetsEnumWithout = (
+            ((syncToolWithout?.parameters?.properties as Record<string, Record<string, unknown>>)?.targets
+                ?.items as Record<string, unknown>)?.enum as string[] | undefined
+        ) ?? [];
+        expect(targetsEnumWithout).toEqual(['all', 'agentic', 'messages', 'st_settings']);
+
+        // 2. When TavernHelper & EjsTemplate are active:
+        bridge.extensionCapabilities = {
+            tavernHelperScripts: true,
+            tavernHelperAudio: true,
+            ejsTemplate: true,
+        };
+        const withExtTools = runner.getAllowedToolDefinitions('full', true).map((t) => t.name);
+        expect(withExtTools).toContain('tavern_helper_scripts_read');
+        expect(withExtTools).toContain('tavern_helper_scripts_upsert');
+
+        const sWith = await runner.createSession({
+            title: '已安装扩展',
+            mode: 'full',
+            stAdminEnabled: true,
+        });
+        await runner.sendPrompt(sWith.id, '再次检查可用工具');
+        const reqWith = transport.requests[1]!;
+        const sysWith = String(reqWith.messages[0]?.content ?? '');
+        expect(sysWith).toContain('JS-Slash-Runner');
+        expect(sysWith).toContain('EjsTemplate');
+        const syncToolWith = reqWith.tools?.find((t) => t.name === 'st_sync_runtime');
+        const targetsEnumWith = (
+            ((syncToolWith?.parameters?.properties as Record<string, Record<string, unknown>>)?.targets
+                ?.items as Record<string, unknown>)?.enum as string[] | undefined
+        ) ?? [];
+        expect(targetsEnumWith).toEqual([
+            'all',
+            'agentic',
+            'ejs',
+            'tavern_helper_scripts',
+            'tavern_helper_audio',
+            'messages',
+            'st_settings',
+        ]);
+    });
 });

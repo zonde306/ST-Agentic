@@ -1,11 +1,14 @@
 import { z } from 'zod';
-import type { HostAdminBridge, ReadHostSettingsOptions } from '@/core/bridge';
+import type { HostAdminBridge, HostBridge, ReadHostSettingsOptions } from '@/core/bridge';
 import { utf8ByteLength } from '@/core/context';
 import type {
     HostCharacterCreatePayload,
     HostCharacterPatch,
     HostCharacterSummary,
+    HostExtensionCapabilities,
     HostSettingsScope,
+    HostSyncTarget,
+    TavernHelperScriptScope,
 } from '@/core/types';
 import { canonicalClone } from '@/core/utils';
 import { computeDiffLines } from './approval';
@@ -113,7 +116,7 @@ function buildAdminSettingsManifest(
         summaryOnly: true,
         totalBytes,
         manifest,
-        hint: 'Returned summary manifest to keep context compact. Pass a specific extension scope (e.g. scope: "ST-Agentic") or keyPath (e.g. keyPath: "power_user.theme") to drill down.',
+        hint: 'Returned summary manifest to keep context compact. Pass a specific extension scope (e.g. scope: "Agentic" or scope: "tavern_helper") or keyPath (e.g. keyPath: "tavern_helper.script.scripts" or "power_user.theme") to drill down.',
     };
 }
 
@@ -398,12 +401,12 @@ const ST_SETTINGS_READ_SCHEMA = z.object({
         .string()
         .optional()
         .default('all')
-        .describe('Settings scope: "power_user", "extension_settings", "all", or specific extension key.'),
+        .describe('Settings scope: "power_user", "extension_settings", "all", or any installed extension key (e.g. "Agentic").'),
     keyPath: z
         .string()
         .optional()
         .describe(
-            'Optional dot/slash key path for drill-down reads (e.g. "TavernHelper.scripts" or "power_user.theme").',
+            'Optional dot/slash key path for drill-down reads (e.g. "power_user.theme").',
         ),
     summaryOnly: z
         .boolean()
@@ -452,6 +455,490 @@ const ST_SLASH_EXEC_SCHEMA = z.object({
 const ST_IMPORT_URL_SCHEMA = z.object({
     url: z.string().min(1).describe('Remote URL of character card, World Info, or preset to import.'),
 });
+
+const TAVERN_HELPER_SCRIPTS_READ_SCHEMA = z.object({
+    scope: z
+        .enum(['global', 'character', 'preset'])
+        .optional()
+        .default('global')
+        .describe('JS-Slash-Runner (TavernHelper) script scope: "global", "character", or "preset".'),
+});
+
+const TAVERN_HELPER_SCRIPTS_UPSERT_SCHEMA = z.object({
+    scope: z
+        .enum(['global', 'character', 'preset'])
+        .describe('JS-Slash-Runner (TavernHelper) script scope: "global", "character", or "preset".'),
+    mode: z
+        .enum(['upsert', 'delete', 'replace_all'])
+        .optional()
+        .default('upsert')
+        .describe('"upsert" adds/updates one script or folder; "delete" removes by scriptId; "replace_all" replaces the entire scripts array.'),
+    script: z
+        .record(z.string(), z.unknown())
+        .optional()
+        .describe('Script or folder object for mode="upsert" (merged over existing matching id/name).'),
+    scriptId: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Target script/folder id (or exact name) for mode="delete".'),
+    scripts: z
+        .array(z.record(z.string(), z.unknown()))
+        .optional()
+        .describe('Complete ScriptTree[] replacement array when mode="replace_all".'),
+    reloadMessages: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe('Also reload displayed chat messages after updating scripts.'),
+});
+
+const DEFAULT_EXTENSION_CAPABILITIES: HostExtensionCapabilities = {
+    tavernHelperScripts: true,
+    tavernHelperAudio: true,
+    ejsTemplate: true,
+};
+
+/**
+ * Resolve optional third-party SillyTavern extension capabilities without hard dependencies.
+ */
+export function resolveHostExtensionCapabilities(bridge: HostBridge): HostExtensionCapabilities {
+    const detected = bridge.admin?.getExtensionCapabilities?.();
+    if (detected) {
+        return {
+            tavernHelperScripts: Boolean(detected.tavernHelperScripts),
+            tavernHelperAudio: Boolean(detected.tavernHelperAudio),
+            ejsTemplate: Boolean(detected.ejsTemplate),
+        };
+    }
+    return {
+        tavernHelperScripts: false,
+        tavernHelperAudio: false,
+        ejsTemplate: Boolean(bridge.evaluateOptionalEjs),
+    };
+}
+
+/**
+ * Build the `st_sync_runtime` tool tailored strictly to currently installed/active host extensions.
+ */
+export function createStSyncRuntimeTool(
+    capabilities: HostExtensionCapabilities = DEFAULT_EXTENSION_CAPABILITIES,
+): AssistantToolDefinition {
+    const syncTargetOptions: [HostSyncTarget, ...HostSyncTarget[]] = [
+        'all',
+        'agentic',
+        ...(capabilities.ejsTemplate ? (['ejs'] as const) : []),
+        ...(capabilities.tavernHelperScripts ? (['tavern_helper_scripts'] as const) : []),
+        ...(capabilities.tavernHelperAudio ? (['tavern_helper_audio'] as const) : []),
+        'messages',
+        'st_settings',
+    ];
+
+    const shape: Record<string, z.ZodTypeAny> = {
+        targets: z
+            .array(z.enum(syncTargetOptions))
+            .optional()
+            .default(['all'])
+            .describe('Active host subsystems to synchronize live in memory & UI without refreshing the page.'),
+        messageIds: z
+            .array(z.number().int().min(0))
+            .optional()
+            .describe('Optional specific 0-based chat message IDs to reload when syncing "messages" or "all".'),
+        messageLimit: z
+            .number()
+            .int()
+            .min(1)
+            .max(100)
+            .optional()
+            .default(50),
+    };
+
+    if (capabilities.tavernHelperScripts) {
+        shape.tavernHelperScriptScopes = z
+            .array(z.enum(['global', 'character', 'preset']))
+            .optional()
+            .describe('Optional TavernHelper script scopes to sync (defaults to ["global", "character", "preset"]).');
+    }
+
+    if (capabilities.ejsTemplate) {
+        shape.refreshEjsWorldInfo = z
+            .boolean()
+            .optional()
+            .default(true)
+            .describe('Refresh ST-Prompt-Template preloaded World Info cache when syncing "ejs".');
+    }
+
+    const activeLabels = [
+        'ST-Agentic settings/tools/regex',
+        ...(capabilities.ejsTemplate ? ['ST-Prompt-Template (EjsTemplate)'] : []),
+        ...(capabilities.tavernHelperScripts || capabilities.tavernHelperAudio
+            ? [
+                `JS-Slash-Runner (${[
+                    capabilities.tavernHelperScripts ? 'scripts' : '',
+                    capabilities.tavernHelperAudio ? 'audio' : '',
+                ].filter(Boolean).join('/')})`,
+            ]
+            : []),
+        'SillyTavern settings',
+        'displayed chat messages',
+    ];
+
+    return {
+        name: 'st_sync_runtime',
+        description: `Synchronize live host extension states and displayed UIs without refreshing the page (${activeLabels.join(', ')}). Read-only runtime refresh.`,
+        parameters: z.object(shape),
+        tier: 'admin',
+        readOnly: true,
+        async execute(rawArgs, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            const admin = requireAdminBridge(ctx);
+            if (!admin.syncHostRuntime) {
+                return finalizeToolError(
+                    'HostAdminBridge.syncHostRuntime is not available in this environment.',
+                    ctx.signal,
+                );
+            }
+            const parsedArgs = isPlainRecord(rawArgs) ? rawArgs : {};
+            const targets = Array.isArray(parsedArgs.targets)
+                ? (parsedArgs.targets as HostSyncTarget[])
+                : (['all'] as HostSyncTarget[]);
+            const messageIds = Array.isArray(parsedArgs.messageIds)
+                ? (parsedArgs.messageIds as number[])
+                : undefined;
+            const messageLimit =
+                typeof parsedArgs.messageLimit === 'number' ? parsedArgs.messageLimit : 50;
+            const tavernHelperScriptScopes = Array.isArray(parsedArgs.tavernHelperScriptScopes)
+                ? (parsedArgs.tavernHelperScriptScopes as TavernHelperScriptScope[])
+                : undefined;
+            const refreshEjsWorldInfo =
+                typeof parsedArgs.refreshEjsWorldInfo === 'boolean'
+                    ? parsedArgs.refreshEjsWorldInfo
+                    : undefined;
+
+            const result = await admin.syncHostRuntime({
+                targets,
+                ...(messageIds ? { messageIds } : {}),
+                messageLimit,
+                ...(tavernHelperScriptScopes ? { tavernHelperScriptScopes } : {}),
+                ...(refreshEjsWorldInfo !== undefined ? { refreshEjsWorldInfo } : {}),
+            });
+            return finalizeReadToolResult(result);
+        },
+    };
+}
+
+type TavernHelperUpsertArgs = z.infer<typeof TAVERN_HELPER_SCRIPTS_UPSERT_SCHEMA>;
+
+function buildDefaultTavernHelperScript(
+    raw: Record<string, unknown>,
+    existing?: Record<string, unknown>,
+): Record<string, unknown> {
+    if (raw.type === 'folder' || existing?.type === 'folder') {
+        const id =
+            (typeof raw.id === 'string' && raw.id.trim())
+            || (typeof existing?.id === 'string' && existing.id.trim())
+            || `th_folder_${Date.now()}`;
+        const rawScripts = Array.isArray(raw.scripts)
+            ? raw.scripts
+            : Array.isArray(existing?.scripts)
+                ? existing.scripts
+                : [];
+        const normalizedChildren = rawScripts
+            .filter(isPlainRecord)
+            .map((child) => buildDefaultTavernHelperScript(child));
+        return {
+            ...(existing ? canonicalClone(existing) : {}),
+            ...canonicalClone(raw),
+            type: 'folder',
+            id,
+            name:
+                typeof raw.name === 'string'
+                    ? raw.name
+                    : typeof existing?.name === 'string'
+                        ? existing.name
+                        : id,
+            enabled:
+                raw.enabled !== undefined
+                    ? Boolean(raw.enabled)
+                    : existing?.enabled !== undefined
+                        ? Boolean(existing.enabled)
+                        : true,
+            icon:
+                typeof raw.icon === 'string'
+                    ? raw.icon
+                    : typeof existing?.icon === 'string'
+                        ? existing.icon
+                        : 'fa-solid fa-folder',
+            color:
+                typeof raw.color === 'string'
+                    ? raw.color
+                    : typeof existing?.color === 'string'
+                        ? existing.color
+                        : '#d4a373',
+            scripts: normalizedChildren,
+        };
+    }
+
+    const id =
+        (typeof raw.id === 'string' && raw.id.trim())
+        || (typeof existing?.id === 'string' && existing.id.trim())
+        || `th_script_${Date.now()}`;
+    const mergedButton = isPlainRecord(raw.button)
+        ? {
+            enabled: true,
+            buttons: [],
+            ...(isPlainRecord(existing?.button) ? canonicalClone(existing.button) : {}),
+            ...canonicalClone(raw.button),
+        }
+        : isPlainRecord(existing?.button)
+            ? canonicalClone(existing.button)
+            : { enabled: true, buttons: [] };
+    const mergedExportWith = isPlainRecord(raw.export_with)
+        ? {
+            data: true,
+            button: true,
+            ...(isPlainRecord(existing?.export_with) ? canonicalClone(existing.export_with) : {}),
+            ...canonicalClone(raw.export_with),
+        }
+        : isPlainRecord(existing?.export_with)
+            ? canonicalClone(existing.export_with)
+            : { data: true, button: true };
+
+    return {
+        ...(existing ? canonicalClone(existing) : {}),
+        ...canonicalClone(raw),
+        type: 'script',
+        id,
+        name:
+            typeof raw.name === 'string'
+                ? raw.name
+                : typeof existing?.name === 'string'
+                    ? existing.name
+                    : id,
+        enabled:
+            raw.enabled !== undefined
+                ? Boolean(raw.enabled)
+                : existing?.enabled !== undefined
+                    ? Boolean(existing.enabled)
+                    : true,
+        content:
+            typeof raw.content === 'string'
+                ? raw.content
+                : typeof existing?.content === 'string'
+                    ? existing.content
+                    : '',
+        info:
+            typeof raw.info === 'string'
+                ? raw.info
+                : typeof existing?.info === 'string'
+                    ? existing.info
+                    : '',
+        button: mergedButton,
+        data: isPlainRecord(raw.data)
+            ? canonicalClone(raw.data)
+            : isPlainRecord(existing?.data)
+                ? canonicalClone(existing.data)
+                : {},
+        export_with: mergedExportWith,
+    };
+}
+
+function findScriptContentInTrees(
+    trees: readonly Record<string, unknown>[],
+    targetId: string,
+    targetName?: string,
+): Record<string, unknown> | undefined {
+    for (const item of trees) {
+        if (
+            (targetId && item.id === targetId)
+            || (!targetId && targetName && item.name === targetName)
+        ) {
+            return item;
+        }
+        if (item.type === 'folder' && Array.isArray(item.scripts)) {
+            for (const child of item.scripts) {
+                if (!isPlainRecord(child)) {
+                    continue;
+                }
+                if (
+                    (targetId && child.id === targetId)
+                    || (!targetId && targetName && child.name === targetName)
+                ) {
+                    return child;
+                }
+            }
+        }
+    }
+    return undefined;
+}
+
+function computeNextTavernHelperTrees(
+    existingTrees: readonly Record<string, unknown>[],
+    args: TavernHelperUpsertArgs,
+): {
+    nextTrees: Record<string, unknown>[];
+    beforeText: string;
+    afterText: string;
+    targetLabel: string;
+    title: string;
+    summary: string;
+} {
+    const cloned = canonicalClone([...existingTrees]);
+    const mode = args.mode ?? 'upsert';
+
+    if (mode === 'replace_all') {
+        if (!Array.isArray(args.scripts)) {
+            throw new Error('tavern_helper_scripts_upsert with mode="replace_all" requires "scripts" array.');
+        }
+        const nextTrees = args.scripts.map((entry) => buildDefaultTavernHelperScript(entry));
+        return {
+            nextTrees,
+            beforeText: JSON.stringify(cloned, null, 2),
+            afterText: JSON.stringify(nextTrees, null, 2),
+            targetLabel: `TavernHelper (${args.scope}): replace_all`,
+            title: `Replace all TavernHelper (${args.scope}) scripts`,
+            summary: `Replace ${cloned.length} tree(s) with ${nextTrees.length} tree(s) in scope "${args.scope}".`,
+        };
+    }
+
+    if (mode === 'delete') {
+        const delKey = args.scriptId?.trim();
+        if (!delKey) {
+            throw new Error('tavern_helper_scripts_upsert with mode="delete" requires "scriptId".');
+        }
+        let removed: Record<string, unknown> | undefined;
+        const nextTrees: Record<string, unknown>[] = [];
+        for (const item of cloned) {
+            if (item.id === delKey || item.name === delKey) {
+                removed = item;
+                continue;
+            }
+            if (item.type === 'folder' && Array.isArray(item.scripts)) {
+                const nextChildren: Record<string, unknown>[] = [];
+                for (const child of item.scripts) {
+                    if (!isPlainRecord(child)) {
+                        continue;
+                    }
+                    if (!removed && (child.id === delKey || child.name === delKey)) {
+                        removed = child;
+                        continue;
+                    }
+                    nextChildren.push(child);
+                }
+                nextTrees.push({ ...item, scripts: nextChildren });
+                continue;
+            }
+            nextTrees.push(item);
+        }
+        if (!removed) {
+            throw new Error(`TavernHelper script "${delKey}" not found in scope "${args.scope}".`);
+        }
+        const beforeText =
+            typeof removed.content === 'string'
+                ? removed.content
+                : JSON.stringify(removed, null, 2);
+        return {
+            nextTrees,
+            beforeText,
+            afterText: '',
+            targetLabel: `TavernHelper (${args.scope}): ${String(removed.name || delKey)}`,
+            title: `Delete TavernHelper (${args.scope}) script "${String(removed.name || delKey)}"`,
+            summary: `Delete script "${String(removed.name || delKey)}" from scope "${args.scope}".`,
+        };
+    }
+
+    // mode === 'upsert'
+    if (!isPlainRecord(args.script)) {
+        throw new Error('tavern_helper_scripts_upsert with mode="upsert" requires "script" object.');
+    }
+    const rawId = typeof args.script.id === 'string' ? args.script.id.trim() : '';
+    const rawName = typeof args.script.name === 'string' ? args.script.name.trim() : '';
+    if (!rawId && !rawName) {
+        throw new Error('TavernHelper script upsert requires at least "script.name" or "script.id".');
+    }
+
+    const existingTopIdx = cloned.findIndex(
+        (item) => (rawId && item.id === rawId) || (!rawId && rawName && item.name === rawName),
+    );
+    if (existingTopIdx >= 0) {
+        const existingItem = cloned[existingTopIdx]!;
+        const updated = buildDefaultTavernHelperScript(args.script, existingItem);
+        cloned[existingTopIdx] = updated;
+        const beforeText =
+            typeof existingItem.content === 'string'
+                ? existingItem.content
+                : JSON.stringify(existingItem, null, 2);
+        const afterText =
+            typeof updated.content === 'string'
+                ? updated.content
+                : JSON.stringify(updated, null, 2);
+        return {
+            nextTrees: cloned,
+            beforeText,
+            afterText,
+            targetLabel: `TavernHelper (${args.scope}): ${String(updated.name || updated.id)}`,
+            title: `Update TavernHelper (${args.scope}) script "${String(updated.name || updated.id)}"`,
+            summary: `Update script "${String(updated.name || updated.id)}" in scope "${args.scope}".`,
+        };
+    }
+
+    // Check inside folders by id (or by exact name if no top-level match)
+    let matchedFolderIdx = -1;
+    let matchedChildIdx = -1;
+    for (let f = 0; f < cloned.length; f += 1) {
+        const folder = cloned[f];
+        if (folder?.type === 'folder' && Array.isArray(folder.scripts)) {
+            const cIdx = folder.scripts.findIndex(
+                (child) =>
+                    isPlainRecord(child)
+                    && ((rawId && child.id === rawId) || (!rawId && rawName && child.name === rawName)),
+            );
+            if (cIdx >= 0) {
+                matchedFolderIdx = f;
+                matchedChildIdx = cIdx;
+                break;
+            }
+        }
+    }
+
+    if (matchedFolderIdx >= 0 && matchedChildIdx >= 0) {
+        const folder = cloned[matchedFolderIdx]!;
+        const children = [...(folder.scripts as Record<string, unknown>[])];
+        const existingChild = children[matchedChildIdx]!;
+        const updated = buildDefaultTavernHelperScript(args.script, existingChild);
+        children[matchedChildIdx] = updated;
+        cloned[matchedFolderIdx] = { ...folder, scripts: children };
+        return {
+            nextTrees: cloned,
+            beforeText:
+                typeof existingChild.content === 'string'
+                    ? existingChild.content
+                    : JSON.stringify(existingChild, null, 2),
+            afterText:
+                typeof updated.content === 'string'
+                    ? updated.content
+                    : JSON.stringify(updated, null, 2),
+            targetLabel: `TavernHelper (${args.scope}): ${String(updated.name || updated.id)}`,
+            title: `Update TavernHelper (${args.scope}) script "${String(updated.name || updated.id)}"`,
+            summary: `Update folder script "${String(updated.name || updated.id)}" in scope "${args.scope}".`,
+        };
+    }
+
+    const existingAny = findScriptContentInTrees(cloned, rawId, rawName);
+    const created = buildDefaultTavernHelperScript(args.script, existingAny);
+    cloned.push(created);
+    return {
+        nextTrees: cloned,
+        beforeText: '',
+        afterText:
+            typeof created.content === 'string'
+                ? created.content
+                : JSON.stringify(created, null, 2),
+        targetLabel: `TavernHelper (${args.scope}): ${String(created.name || created.id)}`,
+        title: `Create TavernHelper (${args.scope}) script "${String(created.name || created.id)}"`,
+        summary: `Add script "${String(created.name || created.id)}" to scope "${args.scope}".`,
+    };
+}
 
 /** Create the 23 ST Admin tools (`ADMIN_TOOLS`), accessible only when `mode === 'full' && stAdminEnabled`. */
 export function createStAdminTools(): AssistantToolDefinition[] {
@@ -1219,12 +1706,25 @@ export function createStAdminTools(): AssistantToolDefinition[] {
                         snapshot: {
                             action: 'settings_patch',
                             scope,
-                            previousValues,
+                            previousValues: redactedBefore,
                         },
                         target: ctx.target,
                     }).id;
 
-            return finalizeMutationToolResult({ scope, settings: updated }, { undoId });
+            const caps = resolveHostExtensionCapabilities(ctx.bridge);
+            let syncNote = 'Settings saved.';
+            if (scope === 'EjsTemplate' && caps.ejsTemplate) {
+                syncNote = 'Applied to extension_settings.EjsTemplate and synced live to EjsTemplate.setFeatures.';
+            } else if (scope === 'Agentic') {
+                syncNote = 'Applied to extension_settings.Agentic and synced live to ST-Agentic runtime if available.';
+            } else if (
+                (scope === 'tavern_helper' || scope === 'TavernHelper')
+                && (caps.tavernHelperScripts || caps.tavernHelperAudio)
+            ) {
+                syncNote = 'Saved to extension_settings.tavern_helper; script.scripts and audio.{bgm,ambient} sync live via TavernHelper, while render/optimize/macro/listener/script.enabled flags require a page reload.';
+            }
+
+            return finalizeMutationToolResult({ scope, settings: updated, syncNote }, { undoId });
         },
     };
 
@@ -1630,6 +2130,140 @@ export function createStAdminTools(): AssistantToolDefinition[] {
         },
     };
 
+    const tavernHelperScriptsReadTool: AssistantToolDefinition<
+        typeof TAVERN_HELPER_SCRIPTS_READ_SCHEMA
+    > = {
+        name: 'tavern_helper_scripts_read',
+        description:
+            'Read JS-Slash-Runner (TavernHelper) scripts from live store or host storage for scope "global", "character", or "preset". Read-only.',
+        parameters: TAVERN_HELPER_SCRIPTS_READ_SCHEMA,
+        tier: 'admin',
+        readOnly: true,
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            if (!resolveHostExtensionCapabilities(ctx.bridge).tavernHelperScripts) {
+                return finalizeToolError(
+                    'JS-Slash-Runner (TavernHelper) is not installed or active in this SillyTavern instance.',
+                    ctx.signal,
+                );
+            }
+            const admin = requireAdminBridge(ctx);
+            if (!admin.readTavernHelperScripts) {
+                return finalizeToolError(
+                    'HostAdminBridge.readTavernHelperScripts is not available in this environment.',
+                    ctx.signal,
+                );
+            }
+            const res = await admin.readTavernHelperScripts(args.scope as TavernHelperScriptScope);
+            return finalizeReadToolResult({
+                ok: true,
+                scope: res.scope,
+                liveApiAvailable: res.liveApiAvailable,
+                total: res.scripts.length,
+                scripts: res.scripts,
+            });
+        },
+    };
+
+    const tavernHelperScriptsUpsertTool: AssistantToolDefinition<
+        typeof TAVERN_HELPER_SCRIPTS_UPSERT_SCHEMA
+    > = {
+        name: 'tavern_helper_scripts_upsert',
+        description:
+            'Create, update, delete, or replace JS-Slash-Runner (TavernHelper) scripts in scope "global", "character", or "preset" with live zero-refresh sync via TavernHelper.replaceScriptTrees. High-risk mandatoryConfirm operation.',
+        parameters: TAVERN_HELPER_SCRIPTS_UPSERT_SCHEMA,
+        tier: 'admin',
+        readOnly: false,
+        async preview(args, ctx) {
+            if (!resolveHostExtensionCapabilities(ctx.bridge).tavernHelperScripts) {
+                throw new Error(
+                    'JS-Slash-Runner (TavernHelper) is not installed or active in this SillyTavern instance.',
+                );
+            }
+            const admin = requireAdminBridge(ctx);
+            if (!admin.readTavernHelperScripts) {
+                throw new Error(
+                    'HostAdminBridge.readTavernHelperScripts is not available in this environment.',
+                );
+            }
+            const current = await admin.readTavernHelperScripts(args.scope as TavernHelperScriptScope);
+            const computed = computeNextTavernHelperTrees(current.scripts, args);
+            return {
+                title: computed.title,
+                summary: computed.summary,
+                targetLabel: computed.targetLabel,
+                beforeText: computed.beforeText,
+                afterText: computed.afterText,
+                rawContent: computed.afterText,
+                diffLines: computeDiffLines(computed.beforeText, computed.afterText),
+            };
+        },
+        async execute(args, ctx) {
+            throwIfAssistantAborted(ctx.signal);
+            if (!resolveHostExtensionCapabilities(ctx.bridge).tavernHelperScripts) {
+                return finalizeToolError(
+                    'JS-Slash-Runner (TavernHelper) is not installed or active in this SillyTavern instance.',
+                    ctx.signal,
+                );
+            }
+            const admin = requireAdminBridge(ctx);
+            if (!admin.readTavernHelperScripts || !admin.replaceTavernHelperScripts) {
+                return finalizeToolError(
+                    'HostAdminBridge TavernHelper script methods are not available in this environment.',
+                    ctx.signal,
+                );
+            }
+            const scope = args.scope as TavernHelperScriptScope;
+            const current = await admin.readTavernHelperScripts(scope);
+            const previousScripts = canonicalClone(current.scripts);
+            const computed = computeNextTavernHelperTrees(previousScripts, args);
+            const writeRes = await admin.replaceTavernHelperScripts(scope, computed.nextTrees);
+
+            let reloadedMessageIds: number[] | undefined;
+            if (args.reloadMessages && ctx.bridge.reloadDisplayedMessages) {
+                const reloadRes = await ctx.bridge.reloadDisplayedMessages({
+                    emitUpdateEvent: true,
+                });
+                reloadedMessageIds = reloadRes.reloadedIds;
+            }
+
+            const undoId =
+                ctx.captureUndo === false
+                    ? undefined
+                    : ctx.undoStore.push({
+                        sessionId: ctx.sessionId,
+                        toolCallId: ctx.toolCallId,
+                        toolName: 'tavern_helper_scripts_upsert',
+                        kind: 'st_setting',
+                        label: computed.title,
+                        scope: `tavern_helper:${scope}`,
+                        beforeSummary: `${previousScripts.length} script tree(s)`,
+                        afterSummary: `${writeRes.count} script tree(s)`,
+                        snapshot: {
+                            action: 'tavern_helper_scripts',
+                            scope,
+                            previousScripts,
+                        },
+                        target: ctx.target,
+                    }).id;
+
+            return finalizeMutationToolResult(
+                {
+                    scope: writeRes.scope,
+                    syncedLive: writeRes.syncedLive,
+                    requiresReload: writeRes.requiresReload,
+                    count: writeRes.count,
+                    scripts: writeRes.scripts,
+                    detail: writeRes.detail,
+                    ...(reloadedMessageIds ? { reloadedMessageIds } : {}),
+                },
+                { undoId },
+            );
+        },
+    };
+
+    const stSyncRuntimeTool = createStSyncRuntimeTool();
+
     return [
         wiAdminListAllTool,
         wiAdminCreateBookTool,
@@ -1654,6 +2288,9 @@ export function createStAdminTools(): AssistantToolDefinition[] {
         regexAdminGlobalDeleteTool,
         stSlashExecTool,
         stImportUrlTool,
+        tavernHelperScriptsReadTool,
+        tavernHelperScriptsUpsertTool,
+        stSyncRuntimeTool,
     ];
 }
 

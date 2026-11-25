@@ -3,6 +3,8 @@ import type {
     MediaAttachment,
     MessageTarget,
     RawLoreEntry,
+    ReloadDisplayedMessagesOptions,
+    ReloadDisplayedMessagesResult,
     SwipeDataSnapshot,
 } from '../types';
 import type { HostAdminBridge, HostAuthorBridge } from './host-admin-bridge';
@@ -118,6 +120,9 @@ export interface HostBridge {
     executeSlashCommand?(command: string, signal?: AbortSignal): Promise<string>;
     attachMediaToMessage(target: MessageTarget, media: MediaAttachment): Promise<void>;
     refreshMessageView(target: MessageTarget): Promise<void>;
+    reloadDisplayedMessages?(
+        options?: ReloadDisplayedMessagesOptions,
+    ): Promise<ReloadDisplayedMessagesResult>;
 
     // 5. Persistence & hashing primitives
     loadExtensionData<T>(key: string, fallback: T): Promise<T>;

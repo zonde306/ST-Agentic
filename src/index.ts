@@ -1938,6 +1938,19 @@ jQuery(async () => {
             persistenceMode: 'metadata',
         });
 
+        const applyAssistantSettingsUpdate = async (
+            updater: (prev: Settings) => Settings,
+        ): Promise<Settings> => {
+            const nextNormalized = normalizeSettings(updater(canonicalClone(currentSettings)));
+            const storeUi = runtimeRefs.appStore;
+            if (storeUi) {
+                return await storeUi.updateSettings(() => nextNormalized);
+            }
+            updateSettingsState(nextNormalized, !suppressNextSave);
+            await syncCustomAndLoreTools();
+            return canonicalClone(currentSettings);
+        };
+
         const assistantRunner = new AssistantRunner({
             bridge,
             transport,
@@ -1948,6 +1961,7 @@ jQuery(async () => {
             undoStore,
             traceLogger,
             settings: () => currentSettings,
+            updateSettings: applyAssistantSettingsUpdate,
             resolveConnection: resolveConnectionById,
             getActiveTarget: () => resolveValidTarget(runtimeRefs.appStore?.getSnapshot().activeTarget),
             getStatusSnapshot: () => {
@@ -2362,6 +2376,8 @@ jQuery(async () => {
             }
             await syncCustomAndLoreTools();
         };
+
+        bridge.setAgenticSettingsReloadHook(handleSettingsReloaded);
 
         eventSource.on(event_types.CHAT_CHANGED, () => {
             void handleChatChanged();

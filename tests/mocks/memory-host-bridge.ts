@@ -21,14 +21,24 @@ import type {
     HostCharacterFull,
     HostCharacterPatch,
     HostCharacterSummary,
+    HostExtensionCapabilities,
     HostImportUrlResult,
     HostPersonaEntry,
     HostPresetInfo,
     HostRegexScript,
+    HostRuntimeSyncOptions,
+    HostRuntimeSyncResult,
     HostSettingsScope,
+    HostSyncTarget,
+    HostSyncTargetReport,
     MediaAttachment,
     MessageTarget,
     RawLoreEntry,
+    ReloadDisplayedMessagesOptions,
+    ReloadDisplayedMessagesResult,
+    TavernHelperScriptScope,
+    TavernHelperScriptsReadResult,
+    TavernHelperScriptsWriteResult,
     UpsertWorldInfoEntryOptions,
     WorldInfoBookSnapshot,
     WorldInfoEntryUpsert,
@@ -60,6 +70,7 @@ export interface MemoryHostBridgeInit {
     hostLuminance?: 'dark' | 'light';
     enableAuthorBridge?: boolean;
     enableAdminBridge?: boolean;
+    extensionCapabilities?: Partial<HostExtensionCapabilities>;
 }
 
 const DEFAULT_MOCK_HOST_SETTINGS: Record<string, Record<string, unknown>> = {
@@ -127,10 +138,23 @@ export class MemoryHostBridge implements HostBridge {
     }> = [];
     public mediaAttachments: Array<{ target: MessageTarget; media: MediaAttachment }> = [];
     public refreshedViews: MessageTarget[] = [];
+    public reloadedMessageBatches: Array<{
+        reloadedIds: number[];
+        skippedIds: number[];
+        emitUpdateEvent: boolean;
+    }> = [];
     public slashCalls: Array<{ command: string; aborted: boolean }> = [];
     public emittedEvents: Array<{ event: string; payload?: unknown }> = [];
     public embeddedPayloads: EmbedAgenticOptions[] = [];
     public importedUrls: string[] = [];
+    public tavernHelperScripts: Record<TavernHelperScriptScope, Record<string, unknown>[]> = {
+        global: [],
+        character: [],
+        preset: [],
+    };
+    public tavernHelperLiveApiAvailable = true;
+    public extensionCapabilities: HostExtensionCapabilities;
+    public runtimeSyncCalls: HostRuntimeSyncOptions[] = [];
     public characterPatchHistory: Array<{
         chid: number;
         fields: HostCharacterPatch;
@@ -147,6 +171,11 @@ export class MemoryHostBridge implements HostBridge {
     constructor(init: MemoryHostBridgeInit = {}) {
         this.chat = init.chat ? [...init.chat] : [];
         this.metadata = init.metadata ? { ...init.metadata } : {};
+        this.extensionCapabilities = {
+            tavernHelperScripts: init.extensionCapabilities?.tavernHelperScripts ?? false,
+            tavernHelperAudio: init.extensionCapabilities?.tavernHelperAudio ?? false,
+            ejsTemplate: init.extensionCapabilities?.ejsTemplate ?? Boolean(init.ejsEvaluator),
+        };
         this.identity = {
             userName: init.identity?.userName ?? 'User',
             charName: init.identity?.charName ?? 'Assistant',
@@ -633,6 +662,58 @@ export class MemoryHostBridge implements HostBridge {
 
     async refreshMessageView(target: MessageTarget): Promise<void> {
         this.refreshedViews.push({ ...target });
+    }
+
+    async reloadDisplayedMessages(
+        options: ReloadDisplayedMessagesOptions = {},
+    ): Promise<ReloadDisplayedMessagesResult> {
+        const requestedIds = Array.isArray(options.messageIds)
+            ? options.messageIds.filter((id) => Number.isInteger(id) && id >= 0)
+            : [];
+        const allIds = this.chat.map((_, idx) => idx);
+        let candidateIds: number[];
+        const skippedIds: number[] = [];
+
+        if (requestedIds.length > 0) {
+            candidateIds = [];
+            for (const id of requestedIds) {
+                if (id < this.chat.length) {
+                    candidateIds.push(id);
+                } else {
+                    skippedIds.push(id);
+                }
+            }
+        } else {
+            const limit =
+                typeof options.limit === 'number' && options.limit > 0
+                    ? Math.floor(options.limit)
+                    : 50;
+            candidateIds = allIds.slice(-limit);
+        }
+
+        const emitUpdateEvent = options.emitUpdateEvent !== false;
+        let emittedEvents = 0;
+        for (const id of candidateIds) {
+            const msg = this.chat[id];
+            const swipeId = typeof msg?.swipeId === 'number' ? msg.swipeId : 0;
+            await this.refreshMessageView({ messageId: id, swipeId });
+            if (emitUpdateEvent) {
+                this.emitHostEvent('message_updated', id);
+                emittedEvents += 1;
+            }
+        }
+
+        this.reloadedMessageBatches.push({
+            reloadedIds: [...candidateIds],
+            skippedIds: [...skippedIds],
+            emitUpdateEvent,
+        });
+
+        return {
+            reloadedIds: candidateIds,
+            skippedIds,
+            emittedEvents,
+        };
     }
 
     async loadExtensionData<T>(key: string, fallback: T): Promise<T> {
@@ -1311,24 +1392,89 @@ export class MemoryHostBridge implements HostBridge {
                 scope: HostSettingsScope,
                 patch: Record<string, unknown>,
             ): Promise<Record<string, unknown>> => {
-                if (scope === 'all') {
-                    for (const [k, v] of Object.entries(patch)) {
-                        if (v && typeof v === 'object' && !Array.isArray(v)) {
-                            this.hostSettings[k] = {
-                                ...(this.hostSettings[k] ?? {}),
-                                ...(structuredClone(v) as Record<string, unknown>),
-                            };
-                        }
+                const mergePreservingRedacted = (
+                    existing: unknown,
+                    incoming: unknown,
+                ): unknown => {
+                    if (incoming === '***REDACTED***') {
+                        return structuredClone(existing);
                     }
+                    if (
+                        existing &&
+                        typeof existing === 'object' &&
+                        !Array.isArray(existing) &&
+                        incoming &&
+                        typeof incoming === 'object' &&
+                        !Array.isArray(incoming)
+                    ) {
+                        const out = structuredClone(existing) as Record<string, unknown>;
+                        for (const [k, v] of Object.entries(incoming as Record<string, unknown>)) {
+                            if (v === '***REDACTED***') {
+                                continue;
+                            }
+                            if (
+                                v &&
+                                typeof v === 'object' &&
+                                !Array.isArray(v) &&
+                                out[k] &&
+                                typeof out[k] === 'object' &&
+                                !Array.isArray(out[k])
+                            ) {
+                                out[k] = mergePreservingRedacted(out[k], v);
+                            } else {
+                                out[k] = structuredClone(v);
+                            }
+                        }
+                        return out;
+                    }
+                    return structuredClone(incoming);
+                };
+
+                if (scope === 'all') {
+                    if (
+                        patch.power_user &&
+                        typeof patch.power_user === 'object' &&
+                        !Array.isArray(patch.power_user)
+                    ) {
+                        this.hostSettings.power_user = mergePreservingRedacted(
+                            this.hostSettings.power_user ?? {},
+                            patch.power_user,
+                        ) as Record<string, unknown>;
+                    }
+                    if (
+                        patch.extension_settings &&
+                        typeof patch.extension_settings === 'object' &&
+                        !Array.isArray(patch.extension_settings)
+                    ) {
+                        this.hostSettings.extension_settings = mergePreservingRedacted(
+                            this.hostSettings.extension_settings ?? {},
+                            patch.extension_settings,
+                        ) as Record<string, unknown>;
+                    }
+                    this.emitHostEvent('HOST_SETTINGS_UPDATED', { scope });
                     return structuredClone(this.hostSettings);
                 }
 
-                const existing = this.hostSettings[scope] ?? {};
-                const next = {
-                    ...existing,
-                    ...structuredClone(patch),
-                };
-                this.hostSettings[scope] = next;
+                if (scope === 'power_user' || scope === 'extension_settings') {
+                    const next = mergePreservingRedacted(
+                        this.hostSettings[scope] ?? {},
+                        patch,
+                    ) as Record<string, unknown>;
+                    this.hostSettings[scope] = next;
+                    this.emitHostEvent('HOST_SETTINGS_UPDATED', { scope });
+                    return structuredClone(next);
+                }
+
+                const extRoot = (this.hostSettings.extension_settings ??= {}) as Record<
+                    string,
+                    unknown
+                >;
+                const existing =
+                    (extRoot[scope] as Record<string, unknown> | undefined) ??
+                    this.hostSettings[scope] ??
+                    {};
+                const next = mergePreservingRedacted(existing, patch) as Record<string, unknown>;
+                extRoot[scope] = next;
                 this.emitHostEvent('HOST_SETTINGS_UPDATED', { scope });
                 return structuredClone(next);
             },
@@ -1357,6 +1503,102 @@ export class MemoryHostBridge implements HostBridge {
                     importedType,
                     name,
                     detail: `Mock imported ${name} from ${url}`,
+                };
+            },
+
+            getExtensionCapabilities: (): HostExtensionCapabilities => ({
+                ...this.extensionCapabilities,
+            }),
+
+            readTavernHelperScripts: async (
+                scope: TavernHelperScriptScope,
+            ): Promise<TavernHelperScriptsReadResult> => {
+                return {
+                    scope,
+                    liveApiAvailable: this.tavernHelperLiveApiAvailable,
+                    scripts: structuredClone(this.tavernHelperScripts[scope] ?? []),
+                };
+            },
+
+            replaceTavernHelperScripts: async (
+                scope: TavernHelperScriptScope,
+                scripts: Record<string, unknown>[],
+            ): Promise<TavernHelperScriptsWriteResult> => {
+                const cloned = structuredClone(scripts);
+                this.tavernHelperScripts[scope] = cloned;
+                this.emitHostEvent('TAVERN_HELPER_SCRIPTS_UPDATED', {
+                    scope,
+                    count: cloned.length,
+                });
+                return {
+                    scope,
+                    syncedLive: this.tavernHelperLiveApiAvailable,
+                    requiresReload: !this.tavernHelperLiveApiAvailable,
+                    count: cloned.length,
+                    scripts: structuredClone(cloned),
+                    detail: `Mock updated ${cloned.length} ${scope} TavernHelper script(s).`,
+                };
+            },
+
+            syncHostRuntime: async (
+                options: HostRuntimeSyncOptions = {},
+            ): Promise<HostRuntimeSyncResult> => {
+                this.runtimeSyncCalls.push(structuredClone(options));
+                const requested: HostSyncTarget[] = options.targets?.length ? options.targets : ['all'];
+                const defaultTargets: Exclude<HostSyncTarget, 'all'>[] = [
+                    'agentic',
+                    ...(this.extensionCapabilities.ejsTemplate ? (['ejs'] as const) : []),
+                    ...(this.extensionCapabilities.tavernHelperScripts
+                        ? (['tavern_helper_scripts'] as const)
+                        : []),
+                    ...(this.extensionCapabilities.tavernHelperAudio
+                        ? (['tavern_helper_audio'] as const)
+                        : []),
+                    'st_settings',
+                    'messages',
+                ];
+                const resolved: Exclude<HostSyncTarget, 'all'>[] = [];
+                for (const t of requested) {
+                    if (t === 'all') {
+                        for (const d of defaultTargets) {
+                            if (!resolved.includes(d)) resolved.push(d);
+                        }
+                    } else if (!resolved.includes(t)) {
+                        resolved.push(t);
+                    }
+                }
+
+                const results: HostSyncTargetReport[] = [];
+                let reloadedMessageIds: number[] | undefined;
+                for (const target of resolved) {
+                    if (target === 'messages') {
+                        const reloaded = await this.reloadDisplayedMessages({
+                            messageIds: options.messageIds,
+                            limit: options.messageLimit,
+                            emitUpdateEvent: true,
+                        });
+                        reloadedMessageIds = reloaded.reloadedIds;
+                        results.push({
+                            target: 'messages',
+                            ok: true,
+                            syncedLive: true,
+                            detail: `Reloaded ${reloaded.reloadedIds.length} displayed message(s).`,
+                            data: { reloadedIds: reloaded.reloadedIds },
+                        });
+                    } else {
+                        results.push({
+                            target,
+                            ok: true,
+                            syncedLive: true,
+                            requiresReload: false,
+                            detail: `Mock synchronized ${target}.`,
+                        });
+                    }
+                }
+                return {
+                    ok: true,
+                    results,
+                    ...(reloadedMessageIds ? { reloadedMessageIds } : {}),
                 };
             },
         };

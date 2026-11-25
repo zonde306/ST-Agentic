@@ -8,6 +8,8 @@ import type {
 } from '@/core/bridge';
 import {
     createDefaultSettings,
+    normalizeConnection,
+    normalizeSettings,
     resolveActivePreset,
     resolveConnection,
     selectPresetBlocksForContext,
@@ -59,12 +61,15 @@ import type {
     ChatMessageSnapshot,
     HostCharacterCreatePayload,
     HostCharacterPatch,
+    HostExtensionCapabilities,
     HostRegexScript,
     HostSettingsScope,
     MessageTarget,
     PendingApproval,
+    Preset,
     RawLoreEntry,
     Settings,
+    TavernHelperScriptScope,
     TokenUsage,
     UndoRecord,
 } from '@/core/types';
@@ -92,7 +97,12 @@ import {
     type CreateAssistantSessionOptions,
 } from './session-store';
 import { createAdjustTools } from './tools-adjust';
-import { createAdminTierTools } from './tools-admin';
+import { createFullAgenticConfigTools, preserveRedactedConnectionSecrets } from './tools-agentic';
+import {
+    createAdminTierTools,
+    createStSyncRuntimeTool,
+    resolveHostExtensionCapabilities,
+} from './tools-admin';
 import { createAuthorTools } from './tools-author';
 import {
     createAssistantAbortError,
@@ -134,6 +144,7 @@ export interface AssistantRunnerOptions {
     compactionSummaryTimeoutMs?: number;
     traceLogger?: TraceLogger;
     settings?: Settings | (() => Settings);
+    updateSettings?: (updater: (prev: Settings) => Settings) => Promise<Settings> | Settings;
     resolveConnection?: (connectionId: string) => ApiConnection | undefined;
     getActiveTarget?: () => MessageTarget;
     getVariableSchema?: () => DynamicVariableSchema | undefined;
@@ -532,7 +543,17 @@ function safeParseJsonObject(raw: string): Record<string, unknown> {
     return {};
 }
 
-function buildAssistantSystemPrompt(mode: AssistantMode, stAdminEnabled: boolean): string {
+function buildAssistantSystemPrompt(
+    mode: AssistantMode,
+    stAdminEnabled: boolean,
+    capabilities?: HostExtensionCapabilities,
+): string {
+    const hasEjs = Boolean(capabilities?.ejsTemplate);
+    const hasThScripts = Boolean(capabilities?.tavernHelperScripts);
+    const decoratorNote = hasEjs
+        ? 'raw @@ decorators and <% ... %> EJS are preserved verbatim'
+        : 'raw @@ decorators are preserved verbatim';
+
     const lines: string[] = [
         'You are the ST-Agentic Off-Mainline Assistant operating outside the mainline RP context (0 mainline token overhead).',
         `Current capability mode: ${mode}${mode === 'full' ? ` (stAdminEnabled=${String(stAdminEnabled)})` : ''}.`,
@@ -546,14 +567,27 @@ function buildAssistantSystemPrompt(mode: AssistantMode, stAdminEnabled: boolean
         );
     } else if (mode === 'author') {
         lines.push(
-            'Mode rule: Authoring mode enabled. You may edit the active character card, primary World Info (raw @@ decorators and <% ... %> EJS are preserved verbatim), and character-scoped regex. Permanent mutations require user diff approval.',
+            `Mode rule: Authoring mode enabled. You may edit the active character card, primary World Info (${decoratorNote}), and character-scoped regex, and call chat_reload_messages for immediate UI re-rendering. Permanent mutations require user diff approval.`,
         );
     } else if (mode === 'full') {
-        lines.push(
-            stAdminEnabled
-                ? 'Mode rule: Full control + ST Admin enabled. High-risk destructive, settings, preset, global regex, slash, and import operations always require mandatory manual confirmation.'
-                : 'Mode rule: Full control over all enabled World Info books (raw @@ and EJS preserved). Permanent writes require user approval.',
-        );
+        if (stAdminEnabled) {
+            const installedExtParts: string[] = [];
+            if (hasThScripts) {
+                installedExtParts.push('live JS-Slash-Runner scripts (tavern_helper_scripts_read/upsert)');
+            }
+            if (hasEjs) {
+                installedExtParts.push('ST-Prompt-Template (EjsTemplate) live sync');
+            }
+            const extClause =
+                installedExtParts.length > 0 ? `${installedExtParts.join(', ')}, ` : '';
+            lines.push(
+                `Mode rule: Full control + ST Admin enabled. You can edit enabled World Info books, ST-Agentic own settings/presets/prompts/agents/triggers/custom_tools/regex/connections (agentic_*), ${extClause}runtime sync (st_sync_runtime), displayed message reload (chat_reload_messages), and SillyTavern global assets/settings/presets/regex/slash/import. High-risk destructive, connection, settings, preset, global regex${hasThScripts ? ', TavernHelper script' : ''}, slash, and import operations always require mandatory manual confirmation.`,
+            );
+        } else {
+            lines.push(
+                `Mode rule: Full control over all enabled World Info books (${decoratorNote}) and ST-Agentic own settings/presets/prompts/agents/triggers/custom_tools/regex/connections (agentic_config_read, agentic_settings_patch, agentic_preset_component_upsert/delete, agentic_connection_upsert) plus chat_reload_messages. Permanent writes require user approval.`,
+            );
+        }
     }
     if (mode !== 'chat') {
         lines.push(
@@ -572,8 +606,9 @@ export function createAssistantUndoExecutor(deps: {
     bridge: HostBridge;
     store: ChatDataStore;
     vfs: VirtualFileSystem;
+    updateSettings?: (updater: (prev: Settings) => Settings) => Promise<Settings> | Settings;
 }): UndoExecutor {
-    const { bridge, store, vfs } = deps;
+    const { bridge, store, vfs, updateSettings } = deps;
 
     return createUndoKindDispatcher({
         chat_message: async (record: UndoRecord) => {
@@ -868,8 +903,105 @@ export function createAssistantUndoExecutor(deps: {
             if (action === 'slash_exec' || action === 'import_url') {
                 return;
             }
+            if (action === 'agentic_preset_snapshot') {
+                if (!updateSettings) {
+                    throw new Error('updateSettings is required to undo ST-Agentic preset changes.');
+                }
+                const presetId = String(snap.presetId ?? '');
+                const prevPreset = (snap.previousPreset ?? null) as Preset | null;
+                await updateSettings((prev) => {
+                    const nextPresets = { ...prev.presets };
+                    if (prevPreset) {
+                        nextPresets[presetId] = canonicalClone(prevPreset);
+                    } else {
+                        delete nextPresets[presetId];
+                    }
+                    return normalizeSettings({
+                        ...prev,
+                        presets: nextPresets,
+                    });
+                });
+                return;
+            }
+            if (action === 'agentic_settings_patch') {
+                if (!updateSettings) {
+                    throw new Error('updateSettings is required to undo ST-Agentic settings changes.');
+                }
+                const prevGlobals = (snap.previousGlobals ?? {}) as Partial<Settings>;
+                const prevPresets = (snap.previousPresets ?? {}) as Record<string, Preset | null>;
+                await updateSettings((prev) => {
+                    const nextPresets = { ...prev.presets };
+                    for (const [presetId, presetVal] of Object.entries(prevPresets)) {
+                        if (presetVal) {
+                            nextPresets[presetId] = canonicalClone(presetVal);
+                        } else {
+                            delete nextPresets[presetId];
+                        }
+                    }
+                    return normalizeSettings({
+                        ...prev,
+                        ...canonicalClone(prevGlobals),
+                        connections: prev.connections,
+                        presets: nextPresets,
+                    });
+                });
+                return;
+            }
+            if (action === 'agentic_connection_upsert') {
+                if (!updateSettings) {
+                    throw new Error('updateSettings is required to undo ST-Agentic connection changes.');
+                }
+                const connectionId = String(snap.connectionId ?? '');
+                const existed = Boolean(snap.existed);
+                const prevCurrentId =
+                    typeof snap.previousCurrentConnectionId === 'string'
+                        ? snap.previousCurrentConnectionId
+                        : undefined;
+                const prevConn = snap.previousConnection as
+                    | (Partial<ApiConnection> & Record<string, unknown>)
+                    | null
+                    | undefined;
+                await updateSettings((prev) => {
+                    const nextConnections = { ...prev.connections };
+                    if (!existed) {
+                        delete nextConnections[connectionId];
+                    } else if (prevConn) {
+                        const liveExisting = prev.connections[connectionId];
+                        const safeRestored = preserveRedactedConnectionSecrets(prevConn, liveExisting);
+                        nextConnections[connectionId] = normalizeConnection(
+                            {
+                                ...(liveExisting ? canonicalClone(liveExisting) : {}),
+                                ...safeRestored,
+                                id: connectionId,
+                            },
+                            connectionId,
+                        );
+                    }
+                    return normalizeSettings({
+                        ...prev,
+                        connections: nextConnections,
+                        ...(prevCurrentId && nextConnections[prevCurrentId]
+                            ? { currentConnectionId: prevCurrentId }
+                            : {}),
+                    });
+                });
+                return;
+            }
             if (!bridge.admin) {
                 throw new Error('HostAdminBridge is required to undo ST admin setting.');
+            }
+            if (action === 'tavern_helper_scripts') {
+                if (!bridge.admin.replaceTavernHelperScripts) {
+                    throw new Error(
+                        'HostAdminBridge.replaceTavernHelperScripts is required to undo TavernHelper scripts.',
+                    );
+                }
+                const scope = String(snap.scope ?? 'global') as TavernHelperScriptScope;
+                const prevScripts = Array.isArray(snap.previousScripts)
+                    ? (snap.previousScripts as Record<string, unknown>[])
+                    : [];
+                await bridge.admin.replaceTavernHelperScripts(scope, prevScripts);
+                return;
             }
             if (action === 'settings_patch') {
                 const scope = String(snap.scope ?? 'all') as HostSettingsScope;
@@ -935,6 +1067,9 @@ export class AssistantRunner {
     private readonly toolsByName = new Map<string, AssistantToolDefinition>();
     private readonly undoExecutor: UndoExecutor;
     private readonly settingsProvider: () => Settings;
+    private readonly settingsUpdater?: (
+        updater: (prev: Settings) => Settings,
+    ) => Promise<Settings> | Settings;
     private readonly customConnectionResolver?: (connectionId: string) => ApiConnection | undefined;
     private readonly activeTargetProvider?: () => MessageTarget;
     private readonly variableSchemaProvider?: () => DynamicVariableSchema | undefined;
@@ -991,6 +1126,7 @@ export class AssistantRunner {
                 : options.settings
                     ? () => options.settings as Settings
                     : () => createDefaultSettings();
+        this.settingsUpdater = options.updateSettings;
         this.customConnectionResolver = options.resolveConnection;
         this.activeTargetProvider = options.getActiveTarget;
         this.variableSchemaProvider = options.getVariableSchema;
@@ -1040,6 +1176,7 @@ export class AssistantRunner {
             ...createChatReadOnlyTools(),
             ...createAdjustTools(),
             ...createAuthorTools(),
+            ...createFullAgenticConfigTools(),
             ...createAdminTierTools(),
             ...(options.extraTools ?? []),
         ];
@@ -1051,6 +1188,7 @@ export class AssistantRunner {
             bridge: this.bridge,
             store: this.store,
             vfs: this.vfs,
+            updateSettings: this.settingsUpdater,
         });
     }
 
@@ -1245,16 +1383,35 @@ export class AssistantRunner {
     }
 
     /**
-     * Return canonical sorted tool definitions unlocked for `(mode, stAdminEnabled)`.
+     * Probe currently active optional third-party host extension capabilities.
+     */
+    public getExtensionCapabilities(): HostExtensionCapabilities {
+        return resolveHostExtensionCapabilities(this.bridge);
+    }
+
+    private resolveToolDefinition(
+        name: string,
+        capabilities: HostExtensionCapabilities,
+    ): AssistantToolDefinition | undefined {
+        if (name === 'st_sync_runtime') {
+            return createStSyncRuntimeTool(capabilities);
+        }
+        return this.toolsByName.get(name);
+    }
+
+    /**
+     * Return canonical sorted tool definitions unlocked for `(mode, stAdminEnabled)`
+     * and active optional host extension capabilities.
      */
     public getAllowedToolDefinitions(
         mode: AssistantMode,
         stAdminEnabled: boolean = false,
     ): AssistantToolDefinition[] {
-        const allowedNames = getAllowedToolsForMode(mode, stAdminEnabled);
+        const capabilities = this.getExtensionCapabilities();
+        const allowedNames = getAllowedToolsForMode(mode, stAdminEnabled, capabilities);
         const defs: AssistantToolDefinition[] = [];
         for (const name of allowedNames) {
-            const def = this.toolsByName.get(name);
+            const def = this.resolveToolDefinition(name, capabilities);
             if (def) {
                 defs.push(def);
             }
@@ -1813,9 +1970,11 @@ export class AssistantRunner {
             const strictToolLoop = Boolean(connection.strictToolLoop);
             const effectiveMaxRoundRetries = this.resolveRoundMaxRetries(connection);
             const budget = this.resolveSessionContextBudget(currentSession);
+            const capabilities = this.getExtensionCapabilities();
             const systemPrompt = buildAssistantSystemPrompt(
                 currentSession.mode,
                 currentSession.stAdminEnabled,
+                capabilities,
             );
             const allowedToolDefs = this.getAllowedToolDefinitions(
                 currentSession.mode,
@@ -2500,11 +2659,13 @@ export class AssistantRunner {
 
                     const startedAt = this.now();
                     const parsedArgs = safeParseJsonObject(toolCall.arguments);
+                    const capabilities = this.getExtensionCapabilities();
                     const policy = evaluateToolPolicy(toolCall.name, parsedArgs, {
                         mode: liveSession.mode,
                         stAdminEnabled: liveSession.stAdminEnabled,
                         autoApproveAuthor: liveSession.autoApproveAuthor,
                         autoApproveChatDelete: liveSession.autoApproveChatDelete,
+                        extensionCapabilities: capabilities,
                     });
 
                     const redactedArgsSummary = truncateSummary(
@@ -2539,7 +2700,7 @@ export class AssistantRunner {
                         continue;
                     }
 
-                    const toolDef = this.toolsByName.get(toolCall.name);
+                    const toolDef = this.resolveToolDefinition(toolCall.name, capabilities);
                     if (!toolDef) {
                         const missingMsg = `Tool "${toolCall.name}" is allowed by policy but not registered.`;
                         toolCallRecords.push({
@@ -2790,17 +2951,19 @@ export class AssistantRunner {
             throw new Error(`Session "${existing.sessionId}" not found for approval "${approvalId}".`);
         }
 
+        const capabilities = this.getExtensionCapabilities();
         const policy = evaluateToolPolicy(existing.toolName, existing.args, {
             mode: session.mode,
             stAdminEnabled: session.stAdminEnabled,
             autoApproveAuthor: session.autoApproveAuthor,
             autoApproveChatDelete: session.autoApproveChatDelete,
+            extensionCapabilities: capabilities,
         });
         if (!policy.allowed) {
             throw new Error(policy.reason ?? `Tool "${existing.toolName}" is no longer allowed.`);
         }
 
-        const toolDef = this.toolsByName.get(existing.toolName);
+        const toolDef = this.resolveToolDefinition(existing.toolName, capabilities);
         if (!toolDef) {
             throw new Error(`Tool "${existing.toolName}" is not registered.`);
         }
@@ -2913,7 +3076,12 @@ export class AssistantRunner {
         const target = suspended?.target ?? this.resolveActiveTarget();
         const connection = this.resolveEffectiveConnection(session.connectionId);
         const strictToolLoop = Boolean(connection.strictToolLoop);
-        const systemPrompt = buildAssistantSystemPrompt(session.mode, session.stAdminEnabled);
+        const capabilities = this.getExtensionCapabilities();
+        const systemPrompt = buildAssistantSystemPrompt(
+            session.mode,
+            session.stAdminEnabled,
+            capabilities,
+        );
         const allowedToolDefs = this.getAllowedToolDefinitions(
             session.mode,
             session.stAdminEnabled,
@@ -3023,12 +3191,14 @@ export class AssistantRunner {
 
             if (revisedCall) {
                 const revisedArgsRaw = safeParseJsonObject(revisedCall.arguments);
-                const toolDef = this.toolsByName.get(revisedCall.name);
+                const retryCapabilities = this.getExtensionCapabilities();
+                const toolDef = this.resolveToolDefinition(revisedCall.name, retryCapabilities);
                 const policy = evaluateToolPolicy(revisedCall.name, revisedArgsRaw, {
                     mode: session.mode,
                     stAdminEnabled: session.stAdminEnabled,
                     autoApproveAuthor: session.autoApproveAuthor,
                     autoApproveChatDelete: session.autoApproveChatDelete,
+                    extensionCapabilities: retryCapabilities,
                 });
 
                 if (toolDef && policy.allowed) {
@@ -3399,7 +3569,12 @@ export class AssistantRunner {
     } {
         const threadId = toAssistantThreadId(session.id);
         const connection = this.resolveEffectiveConnection(session.connectionId);
-        const systemPrompt = buildAssistantSystemPrompt(session.mode, session.stAdminEnabled);
+        const capabilities = this.getExtensionCapabilities();
+        const systemPrompt = buildAssistantSystemPrompt(
+            session.mode,
+            session.stAdminEnabled,
+            capabilities,
+        );
         const allowedToolDefs = this.getAllowedToolDefinitions(
             session.mode,
             session.stAdminEnabled,
@@ -3492,6 +3667,8 @@ export class AssistantRunner {
             trajectoryStore: this.trajectoryStore,
             traceLogger: this.traceLogger,
             settings: this.settingsProvider(),
+            getLatestSettings: this.settingsProvider,
+            ...(this.settingsUpdater ? { updateSettings: this.settingsUpdater } : {}),
             target: params.target,
             signal: params.signal,
             getVariableSchema: this.variableSchemaProvider,

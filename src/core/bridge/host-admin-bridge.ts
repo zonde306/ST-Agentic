@@ -9,10 +9,13 @@ import type {
     HostCharacterFull,
     HostCharacterPatch,
     HostCharacterSummary,
+    HostExtensionCapabilities,
     HostImportUrlResult,
     HostPersonaEntry,
     HostPresetInfo,
     HostRegexScript,
+    HostRuntimeSyncOptions,
+    HostRuntimeSyncResult,
     HostSettingsScope,
     MessageTarget,
     RawLoreEntry,
@@ -26,6 +29,9 @@ import type {
     SideSessionFilter,
     SideSessionInfo,
     SideSessionTranscriptEntry,
+    TavernHelperScriptScope,
+    TavernHelperScriptsReadResult,
+    TavernHelperScriptsWriteResult,
     UpsertWorldInfoEntryOptions,
     WorldInfoBookSnapshot,
     WorldInfoEntryUpsert,
@@ -138,6 +144,17 @@ export interface HostAdminBridge {
     listGlobalRegex(): Promise<HostRegexScript[]>;
     saveGlobalRegex(scripts: HostRegexScript[]): Promise<void>;
     importFromUrl(url: string): Promise<HostImportUrlResult>;
+
+    // 5. Optional third-party extension capability detection, live sync & host runtime sync
+    getExtensionCapabilities?(): HostExtensionCapabilities;
+    readTavernHelperScripts?(
+        scope: TavernHelperScriptScope,
+    ): Promise<TavernHelperScriptsReadResult>;
+    replaceTavernHelperScripts?(
+        scope: TavernHelperScriptScope,
+        scripts: Record<string, unknown>[],
+    ): Promise<TavernHelperScriptsWriteResult>;
+    syncHostRuntime?(options?: HostRuntimeSyncOptions): Promise<HostRuntimeSyncResult>;
 }
 
 /** Clue management facade exposed on `ToolSideGenApi.clues` and `Agentic.sideGen.clues`. */

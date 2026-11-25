@@ -4,6 +4,7 @@ import {
     ADMIN_TOOLS,
     AUTHOR_TOOLS,
     CHAT_READONLY_TOOLS,
+    FULL_AGENTIC_CONFIG_TOOLS,
     FULL_ENABLED_WI_TOOLS,
     REDACTED_PLACEHOLDER,
     UndoStore,
@@ -12,8 +13,10 @@ import {
     createAssistantUndoExecutor,
     createAuthorTools,
     createChatReadOnlyTools,
+    createFullAgenticConfigTools,
     createFullEnabledWiTools,
     createStAdminTools,
+    createStSyncRuntimeTool,
     executeAssistantTool,
     lintWorldInfoContent,
     type AssistantToolContext,
@@ -37,8 +40,13 @@ function setupToolEnv(overrides?: Partial<AssistantToolContext>) {
     const undoStore = new UndoStore();
     const trajectoryStore = new TrajectoryStore();
     const traceLogger = new TraceLogger();
-    const settings = createDefaultSettings();
+    let settings = createDefaultSettings();
     settings.connections.default.apiKey = 'sk-proj-super-secret-connection-key-999999';
+    const updateSettings = (updater: (prev: ReturnType<typeof createDefaultSettings>) => ReturnType<typeof createDefaultSettings>) => {
+        settings = updater(settings);
+        ctx.settings = settings;
+        return settings;
+    };
 
     const ctx: AssistantToolContext = {
         sessionId: 'ast_test_1',
@@ -52,6 +60,8 @@ function setupToolEnv(overrides?: Partial<AssistantToolContext>) {
         trajectoryStore,
         traceLogger,
         settings,
+        getLatestSettings: () => settings,
+        updateSettings,
         target: { messageId: 1, swipeId: 0 },
         signal: new AbortController().signal,
         ...overrides,
@@ -62,12 +72,13 @@ function setupToolEnv(overrides?: Partial<AssistantToolContext>) {
         ...createChatReadOnlyTools(),
         ...createAdjustTools(),
         ...createAuthorTools(),
+        ...createFullAgenticConfigTools(),
         ...createAdminTierTools(),
     ]) {
         allTools.set(def.name, def);
     }
 
-    const undoExecutor = createAssistantUndoExecutor({ bridge, store, vfs });
+    const undoExecutor = createAssistantUndoExecutor({ bridge, store, vfs, updateSettings });
 
     return {
         bridge,
@@ -76,7 +87,10 @@ function setupToolEnv(overrides?: Partial<AssistantToolContext>) {
         undoStore,
         trajectoryStore,
         traceLogger,
-        settings,
+        get settings() {
+            return settings;
+        },
+        getSettings: () => settings,
         ctx,
         allTools,
         undoExecutor,
@@ -89,12 +103,14 @@ describe('Assistant 4-Tier Toolsets (TS2.1)', () => {
         const adjustNames = createAdjustTools().map((t) => t.name).sort();
         const authorNames = createAuthorTools().map((t) => t.name).sort();
         const fullWiNames = createFullEnabledWiTools().map((t) => t.name).sort();
+        const fullAgenticNames = createFullAgenticConfigTools().map((t) => t.name).sort();
         const adminNames = createStAdminTools().map((t) => t.name).sort();
 
         expect(chatNames).toEqual([...CHAT_READONLY_TOOLS].sort());
         expect(adjustNames).toEqual([...ADJUST_WRITE_TOOLS].sort());
         expect(authorNames).toEqual([...AUTHOR_TOOLS].sort());
         expect(fullWiNames).toEqual([...FULL_ENABLED_WI_TOOLS].sort());
+        expect(fullAgenticNames).toEqual([...FULL_AGENTIC_CONFIG_TOOLS].sort());
         expect(adminNames).toEqual([...ADMIN_TOOLS].sort());
     });
 
@@ -784,6 +800,219 @@ describe('Assistant 4-Tier Toolsets (TS2.1)', () => {
             );
             expect(importRes.ok).toBe(true);
             expect(bridge.importedUrls).toContain('https://example.test/cards/linwan.png');
+        });
+
+        it('edits ST-Agentic config, preset components, and connections in full mode with secret preservation and undo', async () => {
+            const env = setupToolEnv({ mode: 'full', stAdminEnabled: false });
+            const { bridge, undoStore, undoExecutor, ctx, allTools } = env;
+
+            // 1. Read ST-Agentic connections (apiKey must be redacted)
+            const readConn = await executeAssistantTool(
+                allTools.get('agentic_config_read')!,
+                { section: 'connections' },
+                ctx,
+            );
+            expect(readConn.ok).toBe(true);
+            const connSerialized = JSON.stringify(readConn.data);
+            expect(connSerialized).not.toContain('sk-proj-super-secret-connection-key-999999');
+            expect(connSerialized).toContain(REDACTED_PLACEHOLDER);
+
+            // 2. Patch settings & revert with undo
+            const patchSettings = await executeAssistantTool(
+                allTools.get('agentic_settings_patch')!,
+                {
+                    themeMode: 'light',
+                    presetPatch: {
+                        builtinToolSettings: {
+                            read_file: { enabled: true, description: 'Read workspace file' },
+                        },
+                    },
+                },
+                ctx,
+            );
+            expect(patchSettings.ok).toBe(true);
+            expect(env.getSettings().themeMode).toBe('light');
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]?.builtinToolSettings?.read_file?.description,
+            ).toBe('Read workspace file');
+
+            await undoStore.revert(patchSettings.undoId!, undoExecutor);
+            expect(env.getSettings().themeMode).toBe('dark');
+
+            // 3. Upsert custom_tool & display regex_rule (auto-reloads displayed messages)
+            const customToolUpsert = await executeAssistantTool(
+                allTools.get('agentic_preset_component_upsert')!,
+                {
+                    kind: 'custom_tool',
+                    item: {
+                        type: 'js_define_tool',
+                        name: 'custom_helper',
+                        description: 'Custom JS helper',
+                        enabled: true,
+                        allowNetwork: true,
+                        code: 'export default defineTool({ name: "custom_helper", async execute() { return "ok"; } });',
+                    },
+                },
+                ctx,
+            );
+            expect(customToolUpsert.ok).toBe(true);
+            const activePresetAfterTool =
+                env.getSettings().presets[env.getSettings().currentPresetId]!;
+            expect(activePresetAfterTool.customTools.some((t) => t.name === 'custom_helper')).toBe(true);
+
+            const regexUpsert = await executeAssistantTool(
+                allTools.get('agentic_preset_component_upsert')!,
+                {
+                    kind: 'regex_rule',
+                    item: {
+                        id: 'rx_display_1',
+                        name: 'Format Card Tag',
+                        stage: 'display',
+                        pattern: '<card>(.*?)</card>',
+                        flags: 'g',
+                        replacement: '<div class="card">$1</div>',
+                        enabled: true,
+                    },
+                },
+                ctx,
+            );
+            expect(regexUpsert.ok).toBe(true);
+            expect(bridge.reloadedMessageBatches.length).toBeGreaterThanOrEqual(1);
+
+            const regexDelete = await executeAssistantTool(
+                allTools.get('agentic_preset_component_delete')!,
+                { kind: 'regex_rule', id: 'rx_display_1' },
+                ctx,
+            );
+            expect(regexDelete.ok).toBe(true);
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]!.regexRules.some(
+                    (r) => r.id === 'rx_display_1',
+                ),
+            ).toBe(false);
+
+            await undoStore.revert(regexDelete.undoId!, undoExecutor);
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]!.regexRules.some(
+                    (r) => r.id === 'rx_display_1',
+                ),
+            ).toBe(true);
+
+            // 4. Connection upsert preserves existing real apiKey and keeps secrets out of UndoRecord
+            const connUpsert = await executeAssistantTool(
+                allTools.get('agentic_connection_upsert')!,
+                {
+                    id: 'default',
+                    model: 'gpt-4.1-mini',
+                    apiKey: REDACTED_PLACEHOLDER,
+                },
+                ctx,
+            );
+            expect(connUpsert.ok).toBe(true);
+            expect(env.getSettings().connections.default.model).toBe('gpt-4.1-mini');
+            expect(env.getSettings().connections.default.apiKey).toBe(
+                'sk-proj-super-secret-connection-key-999999',
+            );
+
+            const undoRec = undoStore.get(connUpsert.undoId!);
+            expect(JSON.stringify(undoRec)).not.toContain(
+                'sk-proj-super-secret-connection-key-999999',
+            );
+
+            await undoStore.revert(connUpsert.undoId!, undoExecutor);
+            expect(env.getSettings().connections.default.apiKey).toBe(
+                'sk-proj-super-secret-connection-key-999999',
+            );
+        });
+
+        it('reloads displayed messages, manages JS-Slash-Runner scripts, and triggers st_sync_runtime with undo', async () => {
+            const { bridge, undoStore, undoExecutor, ctx, allTools } = setupToolEnv({
+                mode: 'full',
+                stAdminEnabled: true,
+            });
+            bridge.extensionCapabilities = {
+                tavernHelperScripts: true,
+                tavernHelperAudio: true,
+                ejsTemplate: true,
+            };
+
+            // 1. chat_reload_messages re-renders displayed messages & emits message_updated without rewriting text
+            const originalMes = bridge.getChat()[0]?.mes;
+            const reloadRes = await executeAssistantTool(
+                allTools.get('chat_reload_messages')!,
+                { limit: 10, emitUpdateEvent: true },
+                ctx,
+            );
+            expect(reloadRes.ok).toBe(true);
+            expect(bridge.getChat()[0]?.mes).toBe(originalMes);
+            expect(bridge.emittedEvents.some((ev) => ev.event === 'message_updated')).toBe(true);
+
+            // 2. tavern_helper_scripts_upsert + read + undo
+            const batchesBefore = bridge.reloadedMessageBatches.length;
+            const upsertScript = await executeAssistantTool(
+                allTools.get('tavern_helper_scripts_upsert')!,
+                {
+                    scope: 'global',
+                    mode: 'upsert',
+                    reloadMessages: true,
+                    script: {
+                        type: 'script',
+                        id: 'th_ui_1',
+                        name: 'Custom Status UI',
+                        content: 'console.log("status ui mounted");',
+                        enabled: true,
+                    },
+                },
+                ctx,
+            );
+            expect(upsertScript.ok).toBe(true);
+            expect(bridge.reloadedMessageBatches.length).toBe(batchesBefore + 1);
+
+            const readScripts = await executeAssistantTool(
+                allTools.get('tavern_helper_scripts_read')!,
+                { scope: 'global' },
+                ctx,
+            );
+            expect(readScripts.ok).toBe(true);
+            expect(
+                ((readScripts.data as { scripts: Array<{ id: string }> }).scripts).some(
+                    (s) => s.id === 'th_ui_1',
+                ),
+            ).toBe(true);
+
+            await undoStore.revert(upsertScript.undoId!, undoExecutor);
+            expect(bridge.tavernHelperScripts.global).toHaveLength(0);
+
+            // 3. st_sync_runtime live syncs targets including messages
+            const syncRes = await executeAssistantTool(
+                allTools.get('st_sync_runtime')!,
+                { targets: ['all'], messageLimit: 5 },
+                ctx,
+            );
+            expect(syncRes.ok).toBe(true);
+            expect(bridge.runtimeSyncCalls).toHaveLength(1);
+            expect((syncRes.data as { reloadedMessageIds?: number[] }).reloadedMessageIds).toBeDefined();
+
+            // 4. Without installed third-party extensions, TavernHelper script tools fail and dynamic st_sync_runtime omits optional targets
+            bridge.extensionCapabilities = {
+                tavernHelperScripts: false,
+                tavernHelperAudio: false,
+                ejsTemplate: false,
+            };
+            const absentRead = await executeAssistantTool(
+                allTools.get('tavern_helper_scripts_read')!,
+                { scope: 'global' },
+                ctx,
+            );
+            expect(absentRead.ok).toBe(false);
+
+            const minimalSyncTool = createStSyncRuntimeTool(bridge.extensionCapabilities);
+            expect(minimalSyncTool.description).not.toContain('JS-Slash-Runner');
+            expect(minimalSyncTool.description).not.toContain('EjsTemplate');
+            const parsedShape = minimalSyncTool.parameters.safeParse({
+                targets: ['ejs'],
+            });
+            expect(parsedShape.success).toBe(false);
         });
     });
 });

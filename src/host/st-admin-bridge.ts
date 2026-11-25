@@ -5,7 +5,9 @@ import {
     getRequestHeaders,
     saveSettingsDebounced,
     selectCharacterById as stSelectCharacterById,
+    this_chid,
 } from '@st/script.js';
+import { eventSource, event_types } from '@st/scripts/events.js';
 import { extension_settings } from '@st/scripts/extensions.js';
 import {
     SCRIPT_TYPES,
@@ -37,12 +39,22 @@ import type {
     HostCharacterFull,
     HostCharacterPatch,
     HostCharacterSummary,
+    HostExtensionCapabilities,
     HostImportUrlResult,
     HostPersonaEntry,
     HostPresetInfo,
     HostRegexScript,
+    HostRuntimeSyncOptions,
+    HostRuntimeSyncResult,
     HostSettingsScope,
+    HostSyncTarget,
+    HostSyncTargetReport,
     RawLoreEntry,
+    ReloadDisplayedMessagesOptions,
+    ReloadDisplayedMessagesResult,
+    TavernHelperScriptScope,
+    TavernHelperScriptsReadResult,
+    TavernHelperScriptsWriteResult,
     WorldInfoBookSnapshot,
 } from '@/core/types';
 
@@ -55,9 +67,15 @@ import {
     resolveStCharacterById,
 } from './st-author-bridge';
 
+const REDACTED_PLACEHOLDER = '***REDACTED***';
+
 export interface STAdminBridgeOptions {
     executeSlashCommand?: (command: string, signal?: AbortSignal) => Promise<string>;
     getExecuteSlashCommand?: () => ((command: string, signal?: AbortSignal) => Promise<string>) | undefined;
+    onAgenticSettingsPatched?: () => Promise<void> | void;
+    reloadDisplayedMessages?: (
+        options?: ReloadDisplayedMessagesOptions,
+    ) => Promise<ReloadDisplayedMessagesResult>;
 }
 
 interface PresetManagerLike {
@@ -197,7 +215,7 @@ function buildHostSettingsSummaryManifest(
         totalBytes,
         manifest,
         ...(Object.keys(subManifests).length > 0 ? { subManifests } : {}),
-        hint: 'Returned a hierarchical size manifest instead of dumping full host settings. Drill down with a specific extension scope (e.g. scope: "ST-Agentic") or keyPath (e.g. keyPath: "power_user.theme" or "TavernHelper.scripts").',
+        hint: 'Returned a hierarchical size manifest instead of dumping full host settings. Drill down with a specific extension scope (e.g. scope: "Agentic") or keyPath (e.g. keyPath: "power_user.theme").',
     };
 }
 
@@ -270,6 +288,60 @@ function cloneValue<T>(value: T): T {
     }
 }
 
+/**
+ * Recursively merge settings objects while preserving existing values wherever
+ * the incoming patch carries `'***REDACTED***'`.
+ */
+function deepMergeSettingsPreservingRedacted(
+    existing: unknown,
+    incoming: unknown,
+): unknown {
+    if (incoming === REDACTED_PLACEHOLDER) {
+        return cloneValue(existing);
+    }
+    if (isPlainRecord(existing) && isPlainRecord(incoming)) {
+        const next: Record<string, unknown> = cloneValue(existing);
+        for (const [key, val] of Object.entries(incoming)) {
+            if (val === REDACTED_PLACEHOLDER) {
+                continue;
+            }
+            if (isPlainRecord(val) && isPlainRecord(next[key])) {
+                next[key] = deepMergeSettingsPreservingRedacted(next[key], val);
+            } else {
+                next[key] = cloneValue(val);
+            }
+        }
+        return next;
+    }
+    return cloneValue(incoming);
+}
+
+interface TavernHelperGlobalApi {
+    getScriptTrees?: (opts: { type: TavernHelperScriptScope }) => Promise<unknown> | unknown;
+    replaceScriptTrees?: (
+        scripts: Record<string, unknown>[],
+        opts: { type: TavernHelperScriptScope },
+    ) => Promise<void> | void;
+    setAudioSettings?: (type: 'bgm' | 'ambient', settings: Record<string, unknown>) => void;
+}
+
+interface EjsTemplateGlobalApi {
+    getFeatures?: () => Record<string, unknown>;
+    setFeatures?: (features: Record<string, unknown>) => void;
+    refreshWorldInfo?: () => Promise<void> | void;
+    evalTemplate?: (...args: unknown[]) => unknown;
+}
+
+function getTavernHelperGlobal(): TavernHelperGlobalApi | undefined {
+    const candidate = (globalThis as Record<string, unknown>).TavernHelper;
+    return isPlainRecord(candidate) ? (candidate as TavernHelperGlobalApi) : undefined;
+}
+
+function getEjsTemplateGlobal(): EjsTemplateGlobalApi | undefined {
+    const candidate = (globalThis as Record<string, unknown>).EjsTemplate;
+    return isPlainRecord(candidate) ? (candidate as EjsTemplateGlobalApi) : undefined;
+}
+
 function parseContentDispositionName(header: string | null): string | undefined {
     if (!header) {
         return undefined;
@@ -337,10 +409,16 @@ export class STAdminBridge implements HostAdminBridge {
     private readonly getSlashExecutor?: () =>
         | ((command: string, signal?: AbortSignal) => Promise<string>)
         | undefined;
+    private readonly onAgenticSettingsPatched?: () => Promise<void> | void;
+    private readonly reloadDisplayedMessagesFn?: (
+        options?: ReloadDisplayedMessagesOptions,
+    ) => Promise<ReloadDisplayedMessagesResult>;
 
     constructor(options: STAdminBridgeOptions = {}) {
         this.slashExecutor = options.executeSlashCommand;
         this.getSlashExecutor = options.getExecuteSlashCommand;
+        this.onAgenticSettingsPatched = options.onAgenticSettingsPatched;
+        this.reloadDisplayedMessagesFn = options.reloadDisplayedMessages;
     }
 
     // ------------------------------------------------------------------------
@@ -998,37 +1076,70 @@ export class STAdminBridge implements HostAdminBridge {
     ): Promise<Record<string, unknown>> {
         const pu = power_user as unknown as Record<string, unknown>;
         const ext = extension_settings as unknown as Record<string, unknown>;
+        const touchedExtKeys = new Set<string>();
 
         if (scope === 'all') {
             if (isPlainRecord(patch.power_user)) {
-                Object.assign(pu, cloneValue(patch.power_user));
+                const mergedPu = deepMergeSettingsPreservingRedacted(
+                    pu,
+                    patch.power_user,
+                ) as Record<string, unknown>;
+                Object.assign(pu, mergedPu);
             }
             if (isPlainRecord(patch.extension_settings)) {
-                Object.assign(ext, cloneValue(patch.extension_settings));
+                for (const key of Object.keys(patch.extension_settings)) {
+                    touchedExtKeys.add(key);
+                }
+                const mergedExt = deepMergeSettingsPreservingRedacted(
+                    ext,
+                    patch.extension_settings,
+                ) as Record<string, unknown>;
+                Object.assign(ext, mergedExt);
             }
             saveSettingsDebounced();
+            await this.autoSyncPatchedExtensions(touchedExtKeys, patch.extension_settings);
             return this.readHostSettings('all');
         }
 
         if (scope === 'power_user') {
-            Object.assign(pu, cloneValue(patch));
+            const mergedPu = deepMergeSettingsPreservingRedacted(
+                pu,
+                patch,
+            ) as Record<string, unknown>;
+            Object.assign(pu, mergedPu);
             saveSettingsDebounced();
             return cloneValue(pu);
         }
 
         if (scope === 'extension_settings') {
-            Object.assign(ext, cloneValue(patch));
+            for (const key of Object.keys(patch)) {
+                touchedExtKeys.add(key);
+            }
+            const mergedExt = deepMergeSettingsPreservingRedacted(
+                ext,
+                patch,
+            ) as Record<string, unknown>;
+            Object.assign(ext, mergedExt);
             saveSettingsDebounced();
+            await this.autoSyncPatchedExtensions(touchedExtKeys, patch);
             return cloneValue(ext);
         }
 
-        const current = isPlainRecord(ext[scope]) ? (ext[scope] as Record<string, unknown>) : {};
-        const next = {
-            ...current,
-            ...cloneValue(patch),
-        };
-        ext[scope] = next;
+        const resolvedScope =
+            scope === 'ST-Agentic' && !isPlainRecord(ext['ST-Agentic']) && isPlainRecord(ext.Agentic)
+                ? 'Agentic'
+                : scope;
+        const current = isPlainRecord(ext[resolvedScope])
+            ? (ext[resolvedScope] as Record<string, unknown>)
+            : {};
+        const next = deepMergeSettingsPreservingRedacted(
+            current,
+            patch,
+        ) as Record<string, unknown>;
+        ext[resolvedScope] = next;
         saveSettingsDebounced();
+        touchedExtKeys.add(resolvedScope);
+        await this.autoSyncPatchedExtensions(touchedExtKeys, { [resolvedScope]: patch });
         return cloneValue(next);
     }
 
@@ -1118,5 +1229,548 @@ export class STAdminBridge implements HostAdminBridge {
             name,
             detail: `Imported ${importedType} "${name}" from ${trimmedUrl}`,
         };
+    }
+
+    getExtensionCapabilities(): HostExtensionCapabilities {
+        const th = getTavernHelperGlobal();
+        const ejs = getEjsTemplateGlobal();
+        return {
+            tavernHelperScripts:
+                typeof th?.getScriptTrees === 'function'
+                && typeof th?.replaceScriptTrees === 'function',
+            tavernHelperAudio: typeof th?.setAudioSettings === 'function',
+            ejsTemplate:
+                typeof ejs?.setFeatures === 'function'
+                || typeof ejs?.refreshWorldInfo === 'function'
+                || typeof ejs?.evalTemplate === 'function',
+        };
+    }
+
+    async readTavernHelperScripts(
+        scope: TavernHelperScriptScope,
+    ): Promise<TavernHelperScriptsReadResult> {
+        const th = getTavernHelperGlobal();
+        const hasLive = typeof th?.getScriptTrees === 'function';
+        if (hasLive && th?.getScriptTrees) {
+            const liveScripts = await th.getScriptTrees({ type: scope });
+            return {
+                scope,
+                liveApiAvailable: true,
+                scripts: Array.isArray(liveScripts)
+                    ? cloneValue(liveScripts as Record<string, unknown>[])
+                    : [],
+            };
+        }
+
+        const fallbackScripts = this.readTavernHelperScriptsFromStorage(scope);
+        return {
+            scope,
+            liveApiAvailable: false,
+            scripts: fallbackScripts ?? [],
+        };
+    }
+
+    async replaceTavernHelperScripts(
+        scope: TavernHelperScriptScope,
+        scripts: Record<string, unknown>[],
+    ): Promise<TavernHelperScriptsWriteResult> {
+        const normalized = Array.isArray(scripts)
+            ? cloneValue(scripts.filter((item): item is Record<string, unknown> => isPlainRecord(item)))
+            : [];
+        const th = getTavernHelperGlobal();
+
+        if (typeof th?.replaceScriptTrees === 'function') {
+            await th.replaceScriptTrees(normalized, { type: scope });
+            return {
+                scope,
+                syncedLive: true,
+                requiresReload: false,
+                count: normalized.length,
+                scripts: cloneValue(normalized),
+                detail: `Applied ${normalized.length} ${scope} JS-Slash-Runner script(s) via TavernHelper.replaceScriptTrees.`,
+            };
+        }
+
+        this.writeTavernHelperScriptsToStorage(scope, normalized);
+        return {
+            scope,
+            syncedLive: false,
+            requiresReload: true,
+            count: normalized.length,
+            scripts: cloneValue(normalized),
+            detail: `Persisted ${normalized.length} ${scope} JS-Slash-Runner script(s) to storage (TavernHelper live API unavailable; page reload may be needed).`,
+        };
+    }
+
+    async syncHostRuntime(
+        options: HostRuntimeSyncOptions = {},
+    ): Promise<HostRuntimeSyncResult> {
+        const requested: HostSyncTarget[] = options.targets?.length ? options.targets : ['all'];
+        const expanded = this.expandSyncTargets(requested);
+        const results: HostSyncTargetReport[] = [];
+        let reloadedMessageIds: number[] | undefined;
+
+        for (const target of expanded) {
+            switch (target) {
+                case 'agentic': {
+                    results.push(await this.syncAgenticLive());
+                    break;
+                }
+                case 'ejs': {
+                    results.push(await this.syncEjsLive(options.refreshEjsWorldInfo !== false));
+                    break;
+                }
+                case 'tavern_helper_scripts': {
+                    results.push(
+                        await this.syncTavernHelperScriptsLive(options.tavernHelperScriptScopes),
+                    );
+                    break;
+                }
+                case 'tavern_helper_audio': {
+                    results.push(this.syncTavernHelperAudioLive());
+                    break;
+                }
+                case 'st_settings': {
+                    results.push(this.syncStSettingsLive());
+                    break;
+                }
+                case 'messages': {
+                    if (!this.reloadDisplayedMessagesFn) {
+                        results.push({
+                            target: 'messages',
+                            ok: false,
+                            syncedLive: false,
+                            detail: 'reloadDisplayedMessages hook is not wired on host bridge.',
+                        });
+                    } else {
+                        const reloaded = await this.reloadDisplayedMessagesFn({
+                            messageIds: options.messageIds,
+                            limit: options.messageLimit,
+                            emitUpdateEvent: true,
+                        });
+                        reloadedMessageIds = reloaded.reloadedIds;
+                        results.push({
+                            target: 'messages',
+                            ok: true,
+                            syncedLive: true,
+                            detail: `Re-rendered ${reloaded.reloadedIds.length} displayed chat message(s) and emitted ${reloaded.emittedEvents} MESSAGE_UPDATED event(s).`,
+                            data: {
+                                reloadedIds: reloaded.reloadedIds,
+                                skippedIds: reloaded.skippedIds,
+                                emittedEvents: reloaded.emittedEvents,
+                            },
+                        });
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+
+        return {
+            ok: results.every((entry) => entry.ok),
+            results,
+            ...(reloadedMessageIds ? { reloadedMessageIds } : {}),
+        };
+    }
+
+    private expandSyncTargets(
+        requested: HostSyncTarget[],
+    ): Exclude<HostSyncTarget, 'all'>[] {
+        const caps = this.getExtensionCapabilities();
+        const defaultOrder: Exclude<HostSyncTarget, 'all'>[] = [
+            'agentic',
+            ...(caps.ejsTemplate ? (['ejs'] as const) : []),
+            ...(caps.tavernHelperScripts ? (['tavern_helper_scripts'] as const) : []),
+            ...(caps.tavernHelperAudio ? (['tavern_helper_audio'] as const) : []),
+            'st_settings',
+            'messages',
+        ];
+        const out: Exclude<HostSyncTarget, 'all'>[] = [];
+        const seen = new Set<string>();
+        const pushTarget = (t: Exclude<HostSyncTarget, 'all'>) => {
+            if (!seen.has(t)) {
+                seen.add(t);
+                out.push(t);
+            }
+        };
+
+        for (const item of requested) {
+            if (item === 'all') {
+                for (const def of defaultOrder) {
+                    pushTarget(def);
+                }
+            } else {
+                pushTarget(item);
+            }
+        }
+        return out;
+    }
+
+    private async autoSyncPatchedExtensions(
+        touchedExtKeys: Set<string>,
+        rawExtPatch: unknown,
+    ): Promise<void> {
+        const extPatch = isPlainRecord(rawExtPatch) ? rawExtPatch : {};
+        const caps = this.getExtensionCapabilities();
+        if (touchedExtKeys.has('Agentic') || touchedExtKeys.has('ST-Agentic')) {
+            await this.syncAgenticLive();
+        }
+        if (touchedExtKeys.has('EjsTemplate') && caps.ejsTemplate) {
+            await this.syncEjsLive(false);
+        }
+        if (
+            (touchedExtKeys.has('tavern_helper') || touchedExtKeys.has('TavernHelper'))
+            && (caps.tavernHelperScripts || caps.tavernHelperAudio)
+        ) {
+            const thPatch = isPlainRecord(extPatch.tavern_helper)
+                ? extPatch.tavern_helper
+                : isPlainRecord(extPatch.TavernHelper)
+                    ? extPatch.TavernHelper
+                    : {};
+            const scriptObj = isPlainRecord(thPatch.script) ? thPatch.script : undefined;
+            if (caps.tavernHelperScripts && scriptObj && Array.isArray(scriptObj.scripts)) {
+                const storageScripts = this.readTavernHelperScriptsFromStorage('global') ?? [];
+                const th = getTavernHelperGlobal();
+                if (typeof th?.replaceScriptTrees === 'function') {
+                    await th.replaceScriptTrees(storageScripts, { type: 'global' });
+                }
+            } else if (caps.tavernHelperScripts && Array.isArray(thPatch.scripts)) {
+                const storageScripts = this.readTavernHelperScriptsFromStorage('global') ?? [];
+                const th = getTavernHelperGlobal();
+                if (typeof th?.replaceScriptTrees === 'function') {
+                    await th.replaceScriptTrees(storageScripts, { type: 'global' });
+                }
+            }
+            if (caps.tavernHelperAudio && isPlainRecord(thPatch.audio)) {
+                this.syncTavernHelperAudioLive();
+            }
+        }
+    }
+
+    private async syncAgenticLive(): Promise<HostSyncTargetReport> {
+        if (!this.onAgenticSettingsPatched) {
+            return {
+                target: 'agentic',
+                ok: true,
+                syncedLive: false,
+                requiresReload: true,
+                detail: 'Agentic live reload hook is not configured.',
+            };
+        }
+        await this.onAgenticSettingsPatched();
+        return {
+            target: 'agentic',
+            ok: true,
+            syncedLive: true,
+            requiresReload: false,
+            detail: 'Reloaded ST-Agentic settings, AppStore UI, regex pipeline, transport, and tools.',
+        };
+    }
+
+    private async syncEjsLive(refreshWorldInfo: boolean): Promise<HostSyncTargetReport> {
+        const ejs = getEjsTemplateGlobal();
+        const ext = extension_settings as Record<string, unknown>;
+        const storedFeatures = isPlainRecord(ext.EjsTemplate)
+            ? cloneValue(ext.EjsTemplate)
+            : {};
+
+        if (!ejs || typeof ejs.setFeatures !== 'function') {
+            return {
+                target: 'ejs',
+                ok: false,
+                syncedLive: false,
+                requiresReload: false,
+                detail: 'ST-Prompt-Template (EjsTemplate) is not installed or active in this SillyTavern host.',
+            };
+        }
+
+        ejs.setFeatures(storedFeatures);
+        let refreshedWi = false;
+        if (refreshWorldInfo && typeof ejs.refreshWorldInfo === 'function') {
+            await ejs.refreshWorldInfo();
+            refreshedWi = true;
+        }
+        return {
+            target: 'ejs',
+            ok: true,
+            syncedLive: true,
+            requiresReload: false,
+            detail: refreshedWi
+                ? 'Applied EjsTemplate features and refreshed EJS World Info cache.'
+                : 'Applied EjsTemplate features via globalThis.EjsTemplate.setFeatures.',
+            data: { refreshedWorldInfo: refreshedWi },
+        };
+    }
+
+    private async syncTavernHelperScriptsLive(
+        requestedScopes?: TavernHelperScriptScope[],
+    ): Promise<HostSyncTargetReport> {
+        const th = getTavernHelperGlobal();
+        if (!th || typeof th.replaceScriptTrees !== 'function') {
+            return {
+                target: 'tavern_helper_scripts',
+                ok: false,
+                syncedLive: false,
+                requiresReload: false,
+                detail: 'JS-Slash-Runner (TavernHelper.replaceScriptTrees) is not installed or active in this SillyTavern host.',
+            };
+        }
+
+        const explicitScopes = requestedScopes?.length ? requestedScopes : undefined;
+        const scopes: TavernHelperScriptScope[] = explicitScopes ?? [
+            'global',
+            'character',
+            'preset',
+        ];
+        const syncedScopes: TavernHelperScriptScope[] = [];
+        const skippedScopes: string[] = [];
+
+        for (const scope of scopes) {
+            let scripts = this.readTavernHelperScriptsFromStorage(scope);
+            if (!scripts && typeof th.getScriptTrees === 'function') {
+                try {
+                    const live = await th.getScriptTrees({ type: scope });
+                    if (Array.isArray(live)) {
+                        scripts = cloneValue(live as Record<string, unknown>[]);
+                    }
+                } catch (err) {
+                    if (explicitScopes) {
+                        return {
+                            target: 'tavern_helper_scripts',
+                            ok: false,
+                            syncedLive: false,
+                            detail: `Failed to sync TavernHelper ${scope} scripts: ${err instanceof Error ? err.message : String(err)}`,
+                        };
+                    }
+                    skippedScopes.push(scope);
+                    continue;
+                }
+            }
+
+            if (!scripts) {
+                if (explicitScopes && scope !== 'global') {
+                    return {
+                        target: 'tavern_helper_scripts',
+                        ok: false,
+                        syncedLive: false,
+                        detail: `No active ${scope} target available to sync JS-Slash-Runner scripts.`,
+                    };
+                }
+                if (scope === 'global') {
+                    scripts = [];
+                } else {
+                    skippedScopes.push(scope);
+                    continue;
+                }
+            }
+
+            await th.replaceScriptTrees(scripts, { type: scope });
+            syncedScopes.push(scope);
+        }
+
+        return {
+            target: 'tavern_helper_scripts',
+            ok: true,
+            syncedLive: true,
+            requiresReload: false,
+            detail: `Synchronized JS-Slash-Runner script stores for scope(s): ${syncedScopes.join(', ') || 'none'}.`,
+            data: { syncedScopes, skippedScopes },
+        };
+    }
+
+    private syncTavernHelperAudioLive(): HostSyncTargetReport {
+        const th = getTavernHelperGlobal();
+        const ext = extension_settings as Record<string, unknown>;
+        const container = isPlainRecord(ext.tavern_helper)
+            ? ext.tavern_helper
+            : isPlainRecord(ext.TavernHelper)
+                ? ext.TavernHelper
+                : undefined;
+        const audio = isPlainRecord(container?.audio) ? container.audio : undefined;
+
+        if (!th || typeof th.setAudioSettings !== 'function') {
+            return {
+                target: 'tavern_helper_audio',
+                ok: false,
+                syncedLive: false,
+                requiresReload: false,
+                detail: 'JS-Slash-Runner (TavernHelper.setAudioSettings) is not installed or active in this SillyTavern host.',
+            };
+        }
+
+        const updatedChannels: string[] = [];
+        if (isPlainRecord(audio?.bgm)) {
+            th.setAudioSettings('bgm', cloneValue(audio.bgm));
+            updatedChannels.push('bgm');
+        }
+        if (isPlainRecord(audio?.ambient)) {
+            th.setAudioSettings('ambient', cloneValue(audio.ambient));
+            updatedChannels.push('ambient');
+        }
+
+        return {
+            target: 'tavern_helper_audio',
+            ok: true,
+            syncedLive: true,
+            requiresReload: false,
+            detail:
+                updatedChannels.length > 0
+                    ? `Applied JS-Slash-Runner audio settings for: ${updatedChannels.join(', ')}.`
+                    : 'No persisted TavernHelper audio settings found to apply.',
+            data: { updatedChannels },
+        };
+    }
+
+    private syncStSettingsLive(): HostSyncTargetReport {
+        saveSettingsDebounced();
+        const emitted: string[] = [];
+        const emitter = (eventSource as unknown as { emit?: (ev: string, data?: unknown) => unknown })
+            ?.emit;
+        const events = event_types as unknown as Record<string, unknown> | undefined;
+        if (typeof emitter === 'function' && events) {
+            for (const key of ['SETTINGS_LOADED', 'EXTENSION_SETTINGS_LOADED']) {
+                const evName = events[key];
+                if (typeof evName === 'string' && evName) {
+                    void emitter.call(eventSource, evName);
+                    emitted.push(evName);
+                }
+            }
+        }
+        return {
+            target: 'st_settings',
+            ok: true,
+            syncedLive: true,
+            detail:
+                emitted.length > 0
+                    ? `Flushed settings save and emitted ${emitted.join(', ')}.`
+                    : 'Flushed host settings save (saveSettingsDebounced).',
+            data: { emitted },
+        };
+    }
+
+    private readTavernHelperScriptsFromStorage(
+        scope: TavernHelperScriptScope,
+    ): Record<string, unknown>[] | undefined {
+        if (scope === 'global') {
+            const ext = extension_settings as Record<string, unknown>;
+            const thLower = isPlainRecord(ext.tavern_helper) ? ext.tavern_helper : undefined;
+            const thUpper = isPlainRecord(ext.TavernHelper) ? ext.TavernHelper : undefined;
+            const scriptNode = isPlainRecord(thLower?.script) ? thLower.script : undefined;
+            const raw = Array.isArray(scriptNode?.scripts)
+                ? scriptNode.scripts
+                : Array.isArray(thUpper?.scripts)
+                    ? thUpper.scripts
+                    : undefined;
+            return raw
+                ? cloneValue(raw.filter((item): item is Record<string, unknown> => isPlainRecord(item)))
+                : undefined;
+        }
+
+        if (scope === 'character') {
+            const index = Number(this_chid);
+            if (!Array.isArray(characters) || !Number.isInteger(index) || index < 0) {
+                return undefined;
+            }
+            const charObj = characters[index] as Record<string, unknown> | undefined;
+            if (!isPlainRecord(charObj)) {
+                return undefined;
+            }
+            const data = isPlainRecord(charObj.data) ? charObj.data : undefined;
+            const extensions = isPlainRecord(data?.extensions) ? data.extensions : undefined;
+            const th = isPlainRecord(extensions?.tavern_helper) ? extensions.tavern_helper : undefined;
+            return Array.isArray(th?.scripts)
+                ? cloneValue(
+                      th.scripts.filter((item): item is Record<string, unknown> => isPlainRecord(item)),
+                  )
+                : [];
+        }
+
+        const pm = getPresetManager() as unknown as PresetManagerLike | undefined;
+        const selectedName = pm?.getSelectedPresetName?.();
+        if (!selectedName) {
+            return undefined;
+        }
+        const presetData =
+            pm?.getPresetSettings?.(selectedName) ?? pm?.getCompletionPresetByName?.(selectedName);
+        if (!isPlainRecord(presetData)) {
+            return undefined;
+        }
+        const extensions = isPlainRecord(presetData.extensions) ? presetData.extensions : undefined;
+        const th = isPlainRecord(extensions?.tavern_helper) ? extensions.tavern_helper : undefined;
+        return Array.isArray(th?.scripts)
+            ? cloneValue(
+                  th.scripts.filter((item): item is Record<string, unknown> => isPlainRecord(item)),
+              )
+            : [];
+    }
+
+    private writeTavernHelperScriptsToStorage(
+        scope: TavernHelperScriptScope,
+        scripts: Record<string, unknown>[],
+    ): void {
+        if (scope === 'global') {
+            const ext = extension_settings as Record<string, unknown>;
+            const thLower = isPlainRecord(ext.tavern_helper)
+                ? (cloneValue(ext.tavern_helper) as Record<string, unknown>)
+                : {};
+            const scriptNode = isPlainRecord(thLower.script)
+                ? (cloneValue(thLower.script) as Record<string, unknown>)
+                : {};
+            scriptNode.scripts = cloneValue(scripts);
+            thLower.script = scriptNode;
+            ext.tavern_helper = thLower;
+            saveSettingsDebounced();
+            return;
+        }
+
+        if (scope === 'character') {
+            const index = Number(this_chid);
+            if (!Array.isArray(characters) || !Number.isInteger(index) || index < 0 || index >= characters.length) {
+                throw new Error('No active character selected for character-scoped TavernHelper scripts.');
+            }
+            const charObj = characters[index] as Record<string, unknown>;
+            const data = isPlainRecord(charObj.data)
+                ? (cloneValue(charObj.data) as Record<string, unknown>)
+                : {};
+            const extensions = isPlainRecord(data.extensions)
+                ? (cloneValue(data.extensions) as Record<string, unknown>)
+                : {};
+            const th = isPlainRecord(extensions.tavern_helper)
+                ? (cloneValue(extensions.tavern_helper) as Record<string, unknown>)
+                : {};
+            th.scripts = cloneValue(scripts);
+            extensions.tavern_helper = th;
+            data.extensions = extensions;
+            charObj.data = data;
+            saveSettingsDebounced();
+            return;
+        }
+
+        const pm = getPresetManager() as unknown as PresetManagerLike | undefined;
+        const selectedName = pm?.getSelectedPresetName?.();
+        if (!selectedName) {
+            throw new Error('No active preset selected for preset-scoped TavernHelper scripts.');
+        }
+        const presetData =
+            pm?.getPresetSettings?.(selectedName) ?? pm?.getCompletionPresetByName?.(selectedName);
+        if (!isPlainRecord(presetData)) {
+            throw new Error(`Unable to read active preset "${selectedName}" for TavernHelper scripts.`);
+        }
+        const nextPreset = cloneValue(presetData);
+        const extensions = isPlainRecord(nextPreset.extensions)
+            ? (cloneValue(nextPreset.extensions) as Record<string, unknown>)
+            : {};
+        const th = isPlainRecord(extensions.tavern_helper)
+            ? (cloneValue(extensions.tavern_helper) as Record<string, unknown>)
+            : {};
+        th.scripts = cloneValue(scripts);
+        extensions.tavern_helper = th;
+        nextPreset.extensions = extensions;
+        if (typeof pm?.savePreset === 'function') {
+            void pm.savePreset(selectedName, nextPreset);
+        }
+        saveSettingsDebounced();
     }
 }

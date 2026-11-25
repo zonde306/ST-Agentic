@@ -5,6 +5,7 @@ export * from './undo-store';
 export * from './tools-chat';
 export * from './tools-adjust';
 export * from './tools-author';
+export * from './tools-agentic';
 export * from './tools-admin';
 export * from './session-store';
 export * from './assistant-runner';

@@ -575,3 +575,73 @@ export interface HostImportUrlResult {
     name?: string;
     detail?: string;
 }
+
+export interface ReloadDisplayedMessagesOptions {
+    messageIds?: number[];
+    limit?: number;
+    emitUpdateEvent?: boolean;
+}
+
+export interface ReloadDisplayedMessagesResult {
+    reloadedIds: number[];
+    skippedIds: number[];
+    emittedEvents: number;
+}
+
+export type TavernHelperScriptScope = 'global' | 'character' | 'preset';
+
+export interface TavernHelperScriptsReadResult {
+    scope: TavernHelperScriptScope;
+    liveApiAvailable: boolean;
+    scripts: Record<string, unknown>[];
+}
+
+export interface TavernHelperScriptsWriteResult {
+    scope: TavernHelperScriptScope;
+    syncedLive: boolean;
+    requiresReload: boolean;
+    count: number;
+    scripts: Record<string, unknown>[];
+    detail: string;
+}
+
+export type HostSyncTarget =
+    | 'all'
+    | 'agentic'
+    | 'ejs'
+    | 'tavern_helper_scripts'
+    | 'tavern_helper_audio'
+    | 'messages'
+    | 'st_settings';
+
+export interface HostRuntimeSyncOptions {
+    targets?: HostSyncTarget[];
+    messageIds?: number[];
+    messageLimit?: number;
+    tavernHelperScriptScopes?: TavernHelperScriptScope[];
+    refreshEjsWorldInfo?: boolean;
+}
+
+export interface HostSyncTargetReport {
+    target: string;
+    ok: boolean;
+    syncedLive: boolean;
+    requiresReload?: boolean;
+    detail: string;
+    data?: Record<string, unknown>;
+}
+
+export interface HostRuntimeSyncResult {
+    ok: boolean;
+    results: HostSyncTargetReport[];
+    reloadedMessageIds?: number[];
+}
+
+export interface HostExtensionCapabilities {
+    /** JS-Slash-Runner (`globalThis.TavernHelper` script APIs) is installed and active. */
+    tavernHelperScripts: boolean;
+    /** JS-Slash-Runner audio settings API (`globalThis.TavernHelper.setAudioSettings`) is active. */
+    tavernHelperAudio: boolean;
+    /** ST-Prompt-Template (`globalThis.EjsTemplate`) is installed and active. */
+    ejsTemplate: boolean;
+}

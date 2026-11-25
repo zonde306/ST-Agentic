@@ -53,6 +53,8 @@ import type {
     MessageTarget,
     RawLoreEntry,
     RegexRule,
+    ReloadDisplayedMessagesOptions,
+    ReloadDisplayedMessagesResult,
     Settings,
     SwipeDataSnapshot,
 } from '@/core/types';
@@ -284,6 +286,7 @@ export class STHostBridge implements HostBridge {
     private getStoreFn?: () => ChatDataStore | undefined;
     private getSettingsFn?: () => Settings | undefined;
     private resolveFileMacroSyncFn?: (path: string) => string;
+    private onAgenticSettingsReloadFn?: () => Promise<void> | void;
     private cachedLorebooks = new Map<string, RawLoreEntry[]>();
 
     evaluateOptionalEjs?: EvaluateOptionalEjsHook;
@@ -308,7 +311,14 @@ export class STHostBridge implements HostBridge {
         });
         this.admin = new STAdminBridge({
             getExecuteSlashCommand: () => this.executeSlashCommand,
+            onAgenticSettingsPatched: () => this.onAgenticSettingsReloadFn?.(),
+            reloadDisplayedMessages: (opts) => this.reloadDisplayedMessages(opts),
         });
+    }
+
+    /** Register a callback invoked when STAdminBridge patches extension_settings.Agentic. */
+    setAgenticSettingsReloadHook(hook: () => Promise<void> | void): void {
+        this.onAgenticSettingsReloadFn = hook;
     }
 
     /** Attach `ChatDataStore` after bridge construction. */
@@ -1001,6 +1011,83 @@ export class STHostBridge implements HostBridge {
                   : '';
 
         this.renderDisplayView(target.messageId, msg, baseText);
+    }
+
+    async reloadDisplayedMessages(
+        options?: ReloadDisplayedMessagesOptions,
+    ): Promise<ReloadDisplayedMessagesResult> {
+        if (!Array.isArray(chat) || chat.length === 0) {
+            return {
+                reloadedIds: [],
+                skippedIds: Array.isArray(options?.messageIds) ? [...options.messageIds] : [],
+                emittedEvents: 0,
+            };
+        }
+
+        const limit =
+            typeof options?.limit === 'number' && Number.isFinite(options.limit) && options.limit > 0
+                ? Math.min(100, Math.floor(options.limit))
+                : 50;
+        const emitUpdateEvent = options?.emitUpdateEvent !== false;
+
+        let candidateIds: number[] = [];
+        if (Array.isArray(options?.messageIds) && options.messageIds.length > 0) {
+            const seen = new Set<number>();
+            for (const rawId of options.messageIds) {
+                if (typeof rawId === 'number' && Number.isInteger(rawId) && !seen.has(rawId)) {
+                    seen.add(rawId);
+                    candidateIds.push(rawId);
+                }
+            }
+        } else {
+            if (typeof document !== 'undefined' && typeof document.querySelectorAll === 'function') {
+                const domIds = Array.from(document.querySelectorAll<HTMLElement>('#chat .mes[mesid]'))
+                    .map((el) => Number.parseInt(el.getAttribute('mesid') ?? '', 10))
+                    .filter((id) => Number.isInteger(id) && id >= 0 && id < chat.length)
+                    .sort((a, b) => a - b);
+                if (domIds.length > 0) {
+                    candidateIds = Array.from(new Set(domIds)).slice(-limit);
+                }
+            }
+            if (candidateIds.length === 0) {
+                const start = Math.max(0, chat.length - limit);
+                for (let id = start; id < chat.length; id += 1) {
+                    candidateIds.push(id);
+                }
+            }
+        }
+
+        const reloadedIds: number[] = [];
+        const skippedIds: number[] = [];
+        let emittedEvents = 0;
+
+        for (const messageId of candidateIds) {
+            if (!Number.isInteger(messageId) || messageId < 0 || messageId >= chat.length) {
+                skippedIds.push(messageId);
+                continue;
+            }
+            const msg = chat[messageId] as Record<string, unknown> | undefined;
+            if (!msg) {
+                skippedIds.push(messageId);
+                continue;
+            }
+            const swipeId = typeof msg.swipe_id === 'number' && msg.swipe_id >= 0 ? msg.swipe_id : 0;
+            await this.refreshMessageView({ messageId, swipeId });
+            reloadedIds.push(messageId);
+
+            // Emit MESSAGE_UPDATED (NEVER CHARACTER_MESSAGE_RENDERED or CHAT_CHANGED)
+            // so JS-Slash-Runner re-mounts frontend iframes without firing after_turn hooks.
+            if (emitUpdateEvent && event_types?.MESSAGE_UPDATED && typeof eventSource?.emit === 'function') {
+                await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
+                emittedEvents += 1;
+            }
+        }
+
+        return {
+            reloadedIds,
+            skippedIds,
+            emittedEvents,
+        };
     }
 
     /**

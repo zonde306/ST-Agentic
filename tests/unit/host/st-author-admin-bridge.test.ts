@@ -155,6 +155,8 @@ const stMocks = vi.hoisted(() => {
         MESSAGE_SENT: 'message_sent',
         MESSAGE_RECEIVED: 'message_received',
         MESSAGE_UPDATED: 'message_updated',
+        SETTINGS_LOADED: 'settings_loaded',
+        EXTENSION_SETTINGS_LOADED: 'extension_settings_loaded',
         CHAT_CHANGED: 'chat_changed',
         CHARACTER_EDITED: 'character_edited',
     };
@@ -1596,5 +1598,174 @@ describe('/sidegen-* Slash Commands', () => {
         // Dispose removes registered commands
         handle.dispose();
         expect(Object.keys(stMocks.state.registeredSlashCommands)).toHaveLength(0);
+    });
+
+    it('reloads displayed messages in-place and live-syncs Agentic, EjsTemplate, and TavernHelper without page reload', async () => {
+        const setAttribute = vi.fn();
+        const mesEl0 = {
+            getAttribute: vi.fn((attr: string) => (attr === 'mesid' ? '0' : null)),
+            querySelector: vi.fn(() => null),
+            querySelectorAll: vi.fn(() => []),
+            setAttribute,
+        };
+        const mesEl1 = {
+            getAttribute: vi.fn((attr: string) => (attr === 'mesid' ? '1' : null)),
+            querySelector: vi.fn(() => null),
+            querySelectorAll: vi.fn(() => []),
+            setAttribute,
+        };
+        stMocks.state.chat.push({
+            name: 'Alice',
+            is_user: false,
+            is_system: false,
+            mes: 'Second message <ui-card>HP 100</ui-card>',
+            extra: {},
+        });
+
+        vi.stubGlobal('document', {
+            querySelectorAll: (selector: string) =>
+                selector === '#chat > .mes' ? [mesEl0, mesEl1] : [],
+            querySelector: (selector: string) => {
+                if (selector === '#chat .mes[mesid="0"]') return mesEl0;
+                if (selector === '#chat .mes[mesid="1"]') return mesEl1;
+                return null;
+            },
+        });
+
+        const ejsSetFeatures = vi.fn();
+        const ejsRefreshWi = vi.fn(async () => undefined);
+        const thScriptsStore: Record<'global' | 'character' | 'preset', Record<string, unknown>[]> = {
+            global: [{ type: 'script', id: 'g1', name: 'UI Renderer', content: 'console.log(1);', enabled: true }],
+            character: [{ type: 'script', id: 'c1', name: 'Char Script', content: 'console.log(2);', enabled: true }],
+            preset: [],
+        };
+        const thReplaceScriptTrees = vi.fn(
+            async (scripts: Record<string, unknown>[], opts: { type: 'global' | 'character' | 'preset' }) => {
+                thScriptsStore[opts.type] = scripts;
+            },
+        );
+        const thGetScriptTrees = vi.fn(
+            async (opts: { type: 'global' | 'character' | 'preset' }) => thScriptsStore[opts.type],
+        );
+        const thSetAudioSettings = vi.fn();
+
+        vi.stubGlobal('EjsTemplate', {
+            setFeatures: ejsSetFeatures,
+            refreshWorldInfo: ejsRefreshWi,
+        });
+        vi.stubGlobal('TavernHelper', {
+            getScriptTrees: thGetScriptTrees,
+            replaceScriptTrees: thReplaceScriptTrees,
+            setAudioSettings: thSetAudioSettings,
+        });
+
+        const onAgenticReload = vi.fn();
+        const hostBridge = new STHostBridge();
+        hostBridge.setAgenticSettingsReloadHook(onAgenticReload);
+
+        // 1. reloadDisplayedMessages refreshes both visible messages and emits MESSAGE_UPDATED only
+        const reloadRes = await hostBridge.reloadDisplayedMessages({ emitUpdateEvent: true });
+        expect(reloadRes.reloadedIds).toEqual([0, 1]);
+        expect(reloadRes.emittedEvents).toBe(2);
+        expect(stMocks.fns.updateMessageBlock).toHaveBeenCalledTimes(2);
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(stMocks.event_types.MESSAGE_UPDATED, 0);
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(stMocks.event_types.MESSAGE_UPDATED, 1);
+        expect(stMocks.fns.eventEmit).not.toHaveBeenCalledWith(
+            stMocks.event_types.CHARACTER_MESSAGE_RENDERED,
+            expect.anything(),
+        );
+
+        // 2. patchHostSettings deep-merges, preserves '***REDACTED***', and triggers extension live hooks
+        stMocks.state.extension_settings.Agentic = {
+            runMode: 'companion',
+            connections: { default: { apiKey: 'real-agentic-secret-key', model: 'gpt-4o' } },
+        };
+        stMocks.state.extension_settings.EjsTemplate = { enabled: false, debug: false };
+        stMocks.state.extension_settings.tavern_helper = {
+            script: { scripts: thScriptsStore.global },
+            audio: { bgm: { volume: 50 }, ambient: { volume: 30 } },
+        };
+
+        const adminBridge = new STAdminBridge({
+            onAgenticSettingsPatched: onAgenticReload,
+            reloadDisplayedMessages: (opts) => hostBridge.reloadDisplayedMessages(opts),
+        });
+
+        expect(adminBridge.getExtensionCapabilities()).toEqual({
+            tavernHelperScripts: true,
+            tavernHelperAudio: true,
+            ejsTemplate: true,
+        });
+
+        await adminBridge.patchHostSettings('Agentic', {
+            runMode: 'takeover',
+            connections: { default: { apiKey: '***REDACTED***', model: 'gpt-4.1' } },
+        });
+        expect(onAgenticReload).toHaveBeenCalledTimes(1);
+        expect(
+            ((stMocks.state.extension_settings.Agentic as Record<string, unknown>).connections as Record<
+                string,
+                Record<string, unknown>
+            >).default?.apiKey,
+        ).toBe('real-agentic-secret-key');
+
+        await adminBridge.patchHostSettings('EjsTemplate', { enabled: true });
+        expect(ejsSetFeatures).toHaveBeenCalledWith(expect.objectContaining({ enabled: true, debug: false }));
+
+        await adminBridge.patchHostSettings('tavern_helper', {
+            audio: { bgm: { volume: 80 } },
+        });
+        expect(thSetAudioSettings).toHaveBeenCalledWith('bgm', expect.objectContaining({ volume: 80 }));
+
+        // 3. readTavernHelperScripts & replaceTavernHelperScripts (live + fallback)
+        const readLive = await adminBridge.readTavernHelperScripts('global');
+        expect(readLive.liveApiAvailable).toBe(true);
+        expect(readLive.scripts).toHaveLength(1);
+
+        const nextGlobalScripts = [
+            { type: 'script', id: 'g2', name: 'New Card UI', content: 'renderUI();', enabled: true },
+        ];
+        const writeLive = await adminBridge.replaceTavernHelperScripts('global', nextGlobalScripts);
+        expect(writeLive.syncedLive).toBe(true);
+        expect(thReplaceScriptTrees).toHaveBeenCalledWith(nextGlobalScripts, { type: 'global' });
+
+        // 4. syncHostRuntime syncs all targets and re-renders displayed messages
+        stMocks.fns.eventEmit.mockClear();
+        const syncRes = await adminBridge.syncHostRuntime({ targets: ['all'], messageIds: [1] });
+        expect(syncRes.ok).toBe(true);
+        expect(syncRes.reloadedMessageIds).toEqual([1]);
+        expect(ejsRefreshWi).toHaveBeenCalledTimes(1);
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(stMocks.event_types.SETTINGS_LOADED);
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(
+            stMocks.event_types.EXTENSION_SETTINGS_LOADED,
+        );
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(stMocks.event_types.MESSAGE_UPDATED, 1);
+
+        // Capability gating & fallback storage path when globalThis.TavernHelper / EjsTemplate are absent
+        vi.stubGlobal('TavernHelper', undefined);
+        vi.stubGlobal('EjsTemplate', undefined);
+        expect(adminBridge.getExtensionCapabilities()).toEqual({
+            tavernHelperScripts: false,
+            tavernHelperAudio: false,
+            ejsTemplate: false,
+        });
+        const minimalSync = await adminBridge.syncHostRuntime({ targets: ['all'], messageIds: [1] });
+        expect(minimalSync.ok).toBe(true);
+        expect(minimalSync.results.map((r) => r.target)).toEqual([
+            'agentic',
+            'st_settings',
+            'messages',
+        ]);
+        const explicitAbsentSync = await adminBridge.syncHostRuntime({ targets: ['ejs'] });
+        expect(explicitAbsentSync.ok).toBe(false);
+
+        const fallbackWrite = await adminBridge.replaceTavernHelperScripts('character', [
+            { type: 'script', id: 'c_fallback', name: 'Fallback Char', content: 'ok()', enabled: true },
+        ]);
+        expect(fallbackWrite.syncedLive).toBe(false);
+        expect(fallbackWrite.requiresReload).toBe(true);
+        const fallbackRead = await adminBridge.readTavernHelperScripts('character');
+        expect(fallbackRead.liveApiAvailable).toBe(false);
+        expect(fallbackRead.scripts[0]?.id).toBe('c_fallback');
     });
 });
