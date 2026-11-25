@@ -1388,87 +1388,93 @@ export class PipelineOrchestrator {
         let skipped = false;
         let warning: string | undefined;
 
-        if (isEjs) {
-            if (!this.bridge.evaluateOptionalEjs) {
-                skipped = true;
-                warning = `Skipped ${rule.decorator}: HostBridge.evaluateOptionalEjs is not available.`;
-            } else {
-                const vars = await this.vfs
-                    .readVariables({ target: ctx.target, staged: ctx.staged })
-                    .catch(() => ({}));
-                const ejsVars: Record<string, unknown> = {
-                    ...vars,
-                    ...(ctx.matchOverrides ?? {}),
-                    input: ctx.userText,
-                    output: ctx.assistantText,
-                    target: ctx.target,
-                };
-                const evaluated = await this.bridge.evaluateOptionalEjs(code, ejsVars);
-                throwIfAborted(ctx.signal);
-
-                if (rule.decorator?.startsWith('@@replace_ejs') && rule.targetPath) {
-                    if (evaluated.trim().length > 0) {
-                        await toolCtx.fs.write(rule.targetPath, evaluated);
-                    }
-                    output = evaluated;
-                } else if (rule.decorator?.startsWith('@@append_output_ejs')) {
-                    if (evaluated.trim().length > 0) {
-                        await toolCtx.message.appendView(evaluated);
-                    }
-                    output = evaluated;
-                } else if (rule.decorator?.startsWith('@@replace_output_ejs')) {
-                    await toolCtx.message.replaceView(evaluated);
-                    output = evaluated;
+        try {
+            if (isEjs) {
+                if (!this.bridge.evaluateOptionalEjs) {
+                    skipped = true;
+                    warning = `Skipped ${rule.decorator}: HostBridge.evaluateOptionalEjs is not available.`;
                 } else {
-                    // @@evaluate_ejs(_before): side effects only, output discarded from brief
-                    output = '';
+                    const vars = await this.vfs
+                        .readVariables({ target: ctx.target, staged: ctx.staged })
+                        .catch(() => ({}));
+                    const ejsVars: Record<string, unknown> = {
+                        ...vars,
+                        ...(ctx.matchOverrides ?? {}),
+                        input: ctx.userText,
+                        output: ctx.assistantText,
+                        target: ctx.target,
+                    };
+                    const evaluated = await this.bridge.evaluateOptionalEjs(code, ejsVars);
+                    throwIfAborted(ctx.signal);
+
+                    if (rule.decorator?.startsWith('@@replace_ejs') && rule.targetPath) {
+                        if (evaluated.trim().length > 0) {
+                            await toolCtx.fs.write(rule.targetPath, evaluated);
+                        }
+                        output = evaluated;
+                    } else if (rule.decorator?.startsWith('@@append_output_ejs')) {
+                        if (evaluated.trim().length > 0) {
+                            await toolCtx.message.appendView(evaluated);
+                        }
+                        output = evaluated;
+                    } else if (rule.decorator?.startsWith('@@replace_output_ejs')) {
+                        await toolCtx.message.replaceView(evaluated);
+                        output = evaluated;
+                    } else {
+                        // @@evaluate_ejs(_before): side effects only, output discarded from brief
+                        output = '';
+                    }
+                }
+            } else {
+                if (!this.sandbox) {
+                    throw new Error(`Script trigger "${rule.label}" requires a ScriptSandbox instance.`);
+                }
+                const rawResult = await this.sandbox.evaluateScript(code, toolCtx, {
+                    id: runId,
+                    allowNetwork: true,
+                });
+                throwIfAborted(ctx.signal);
+                if (typeof rawResult === 'string') {
+                    output = rawResult;
+                } else if (rawResult !== undefined && rawResult !== null) {
+                    output = JSON.stringify(rawResult);
                 }
             }
-        } else {
-            if (!this.sandbox) {
-                throw new Error(`Script trigger "${rule.label}" requires a ScriptSandbox instance.`);
+        } catch (error) {
+            if (!isAbortError(error) && !ctx.signal.aborted) {
+                const endedAt = Date.now();
+                const conn = resolveConnection(this.settingsProvider(), 'inherit');
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                this.traceLogger.recordTrace(
+                    {
+                        runId,
+                        target: { ...ctx.target },
+                        phase: unit.phase,
+                        agentProfileId: rule.agentProfileId || 'script',
+                        agentName: rule.label,
+                        triggerId: rule.id,
+                        triggerLabel: rule.label,
+                        connectionId: conn.id,
+                        model: '0-token-script',
+                        status: 'error',
+                        startedAt,
+                        endedAt,
+                        durationMs: Math.max(0, endedAt - startedAt),
+                        usage: {
+                            inputTokens: 0,
+                            cachedTokens: 0,
+                            outputTokens: 0,
+                            totalTokens: 0,
+                            cacheHitRate: 0,
+                        },
+                        toolSteps: [],
+                        error: errorMessage,
+                    },
+                    true,
+                );
             }
-            const rawResult = await this.sandbox.evaluateScript(code, toolCtx, {
-                id: runId,
-                allowNetwork: true,
-            });
-            throwIfAborted(ctx.signal);
-            if (typeof rawResult === 'string') {
-                output = rawResult;
-            } else if (rawResult !== undefined && rawResult !== null) {
-                output = JSON.stringify(rawResult);
-            }
+            throw error;
         }
-
-        const endedAt = Date.now();
-        const conn = resolveConnection(this.settingsProvider(), 'inherit');
-        this.traceLogger.recordTrace(
-            {
-                runId,
-                target: { ...ctx.target },
-                phase: unit.phase,
-                agentProfileId: rule.agentProfileId || 'script',
-                agentName: rule.label,
-                triggerId: rule.id,
-                triggerLabel: rule.label,
-                connectionId: conn.id,
-                model: '0-token-script',
-                status: 'completed',
-                startedAt,
-                endedAt,
-                durationMs: Math.max(0, endedAt - startedAt),
-                usage: {
-                    inputTokens: 0,
-                    cachedTokens: 0,
-                    outputTokens: 0,
-                    totalTokens: 0,
-                    cacheHitRate: 0,
-                },
-                toolSteps: [],
-                ...(output ? { outputPreview: output.slice(0, 240) } : {}),
-            },
-            true,
-        );
 
         return {
             unitId: unit.unitId,

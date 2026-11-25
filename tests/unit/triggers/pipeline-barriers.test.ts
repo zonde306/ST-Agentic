@@ -869,7 +869,8 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
         await orchestrator.barrierCoordinator.awaitAllSettled();
 
         const scriptTraces = traceLogger.listTraces({ agentProfileId: 'script' });
-        expect(scriptTraces.some((tr) => tr.model === '0-token-script' && tr.usage.totalTokens === 0)).toBe(true);
+        expect(scriptTraces).toHaveLength(0);
+        expect(traceLogger.listTraces().some((tr) => tr.model === '0-token-script')).toBe(false);
     });
 
     it("serializes 'self' barrier FIFO across distinct agents sharing targetPath and runs legacy @@variables_json + @@zod_schema self-healing end-to-end", async () => {
@@ -1715,5 +1716,94 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
             target,
         });
         expect(loreContent).toContain('浓雾夜响起警戒钟声。');
+    });
+
+    it('records 0-token-script traces only on runtime errors and never on success or abort', async () => {
+        const abortController = new AbortController();
+        const triggers: TriggerRule[] = [
+            {
+                id: 'tr_after_script_boom',
+                label: 'Exploding Script',
+                source: 'preset',
+                phase: 'after_turn',
+                order: 1,
+                barrier: 'none',
+                agentProfileId: 'script',
+                kind: 'script',
+                condition: { type: 'always' },
+                instructionTemplate: '',
+                scriptCode: 'throw new Error("script boom");',
+                enabled: true,
+            },
+            {
+                id: 'tr_before_ejs_abort',
+                label: 'Aborting EJS Script',
+                source: 'preset',
+                phase: 'before_turn',
+                order: 1,
+                barrier: 'turn',
+                agentProfileId: 'script',
+                kind: 'script',
+                decorator: '@@evaluate_ejs_before',
+                condition: { type: 'always' },
+                instructionTemplate: '<%= "ok" %>',
+                scriptCode: '<%= "ok" %>',
+                enabled: true,
+            },
+        ];
+
+        const { bridge, transport, traceLogger, orchestrator } = createPipelineFixture({
+            triggers,
+            ejsEvaluator: async () => {
+                abortController.abort();
+                const abortErr = new Error('aborted during script');
+                abortErr.name = 'AbortError';
+                throw abortErr;
+            },
+        });
+
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '触发异常脚本' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+
+        await expect(
+            orchestrator.runBeforeTurn({
+                target: { messageId: 1, swipeId: 0 },
+                userText: '触发异常脚本',
+                turnNumber: 1,
+                signal: abortController.signal,
+            }),
+        ).rejects.toThrow();
+
+        expect(traceLogger.listTraces().some((tr) => tr.model === '0-token-script')).toBe(false);
+
+        const afterTriggersOnly: TriggerRule[] = [triggers[0]];
+        const errorFixture = createPipelineFixture({ triggers: afterTriggersOnly });
+        errorFixture.bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '触发报错脚本' });
+        errorFixture.bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+
+        errorFixture.transport.enqueue(
+            writeOutputTurn('回复完成。', 'w_script_err'),
+            { content: 'main done' },
+        );
+
+        await errorFixture.orchestrator.runTurn({
+            action: 'normal',
+            target: { messageId: 1, swipeId: 0 },
+            userInput: '触发报错脚本',
+            turnNumber: 1,
+        });
+        await errorFixture.orchestrator.barrierCoordinator.awaitAllSettled();
+
+        const scriptTraces = errorFixture.traceLogger.listTraces({ agentProfileId: 'script' });
+        expect(scriptTraces).toHaveLength(1);
+        expect(scriptTraces[0]).toMatchObject({
+            model: '0-token-script',
+            status: 'error',
+            target: { messageId: 1, swipeId: 0 },
+            triggerId: 'tr_after_script_boom',
+            triggerLabel: 'Exploding Script',
+        });
+        expect(scriptTraces[0].error).toContain('script boom');
+        expect(transport.requests).toHaveLength(0);
     });
 });

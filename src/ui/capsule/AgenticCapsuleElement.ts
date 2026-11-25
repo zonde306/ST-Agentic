@@ -90,6 +90,8 @@ const CAPSULE_STYLES = `
     max-width: 100%;
     min-width: 0;
     box-sizing: border-box;
+    /* Mirror .mes_text so the capsule never slides under ST's swipe chevron / counter. */
+    padding-right: var(--mes-right-spacing, 0px);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
     font-size: 12px;
     line-height: 1.4;
@@ -114,6 +116,10 @@ const CAPSULE_STYLES = `
     box-sizing: border-box;
 }
 
+[hidden] {
+    display: none !important;
+}
+
 .cap-shell {
     --cap-bg: var(--ag-cap-bg, #1f1f23);
     --cap-bg-hover: var(--ag-cap-bg-hover, #28282d);
@@ -124,16 +130,15 @@ const CAPSULE_STYLES = `
     --cap-success: var(--ag-cap-success, #4cc38a);
     --cap-warning: var(--ag-cap-warning, #e8a93c);
     --cap-error: var(--ag-cap-error, #f06470);
+    --cap-accent: var(--cap-primary);
+    --cap-hairline: color-mix(in srgb, var(--cap-fg) 8%, transparent);
 
+    position: relative;
     display: flex;
-    align-items: center;
-    flex-wrap: nowrap;
-    gap: 2px;
+    flex-direction: column;
     width: 100%;
     max-width: 100%;
     min-width: 0;
-    min-height: 40px;
-    padding: 0 4px 0 2px;
     border-radius: 10px;
     border: 1px solid var(--cap-border);
     background: var(--cap-bg);
@@ -143,6 +148,7 @@ const CAPSULE_STYLES = `
     line-height: 1.4;
     overflow: hidden;
     color-scheme: dark;
+    transition: border-color 0.2s;
 }
 
 .cap-shell[data-theme="light"] {
@@ -158,19 +164,35 @@ const CAPSULE_STYLES = `
     color-scheme: light;
 }
 
-.cap-shell[data-status="error"] {
-    border-color: color-mix(in srgb, var(--cap-error) 55%, var(--cap-border));
+/* Status accents (order matters: warning / error override the running tint). */
+.cap-shell[data-status="done"] {
+    --cap-accent: var(--cap-success);
+}
+
+.cap-shell[data-active="true"] {
+    border-color: color-mix(in srgb, var(--cap-primary) 38%, var(--cap-border));
 }
 
 .cap-shell[data-status="interrupted"],
 .cap-shell[data-status="retrying"] {
-    border-color: color-mix(in srgb, var(--cap-warning) 60%, var(--cap-border));
+    --cap-accent: var(--cap-warning);
+    border-color: color-mix(in srgb, var(--cap-warning) 45%, var(--cap-border));
 }
 
-.cap-shell[data-status="retrieving"],
-.cap-shell[data-status="streaming"],
-.cap-shell[data-status="background-running"] {
-    border-color: color-mix(in srgb, var(--cap-primary) 50%, var(--cap-border));
+.cap-shell[data-status="error"] {
+    --cap-accent: var(--cap-error);
+    border-color: color-mix(in srgb, var(--cap-error) 45%, var(--cap-border));
+}
+
+.cap-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 2px;
+    width: 100%;
+    min-width: 0;
+    min-height: 40px;
+    padding: 0 2px;
 }
 
 .cap-open-btn {
@@ -186,7 +208,7 @@ const CAPSULE_STYLES = `
     font: inherit;
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     overflow: hidden;
     cursor: pointer;
     text-align: left;
@@ -200,9 +222,10 @@ const CAPSULE_STYLES = `
 .cap-open-btn:focus-visible,
 .cap-badge-btn:focus-visible,
 .cap-cancel-btn:focus-visible,
-.cap-resume-btn:focus-visible {
-    outline: 2px solid var(--cap-primary);
-    outline-offset: -2px;
+.cap-resume-btn:focus-visible,
+.cap-tasks-toggle:focus-visible {
+    outline: 1.5px solid color-mix(in srgb, var(--cap-primary) 70%, transparent);
+    outline-offset: -3px;
 }
 
 .cap-indicator {
@@ -212,33 +235,25 @@ const CAPSULE_STYLES = `
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    color: var(--cap-primary);
+    color: var(--cap-accent);
 }
 
-.cap-shell[data-status="done"] .cap-indicator {
-    color: var(--cap-success);
-}
-
-.cap-shell[data-status="interrupted"] .cap-indicator,
-.cap-shell[data-status="retrying"] .cap-indicator {
-    color: var(--cap-warning);
-}
-
-.cap-shell[data-status="error"] .cap-indicator {
-    color: var(--cap-error);
-}
-
-.cap-dot-pulse {
-    width: 8px;
-    height: 8px;
+.cap-spinner {
+    width: 12px;
+    height: 12px;
     border-radius: 9999px;
-    background: currentColor;
-    animation: ag-cap-pulse 1.2s ease-in-out infinite;
+    border: 1.75px solid color-mix(in srgb, currentColor 25%, transparent);
+    border-top-color: currentColor;
+    animation: ag-cap-spin 0.8s linear infinite;
+}
+
+@keyframes ag-cap-spin {
+    to { transform: rotate(360deg); }
 }
 
 @keyframes ag-cap-pulse {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.45; transform: scale(0.8); }
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
 }
 
 .cap-summary {
@@ -248,24 +263,43 @@ const CAPSULE_STYLES = `
     overflow: hidden;
     text-overflow: ellipsis;
     font-size: 12px;
-    font-weight: 500;
     color: var(--cap-fg);
+}
+
+.cap-summary-main {
+    font-weight: 600;
+}
+
+.cap-summary-meta {
+    color: var(--cap-muted);
+    font-weight: 400;
+    font-variant-numeric: tabular-nums;
+}
+
+.cap-summary-meta::before {
+    content: "·";
+    margin: 0 6px;
+    opacity: 0.7;
 }
 
 .cap-badges {
     flex-shrink: 0;
     display: inline-flex;
     align-items: center;
-    gap: 2px;
+}
+
+.cap-badges:empty {
+    display: none;
 }
 
 .cap-badge-btn {
     flex-shrink: 0;
     min-width: 40px;
     min-height: 40px;
-    padding: 0 3px;
+    padding: 0 2px;
     margin: 0;
     border: none;
+    border-radius: 8px;
     background: transparent;
     color: inherit;
     font: inherit;
@@ -278,45 +312,71 @@ const CAPSULE_STYLES = `
 .cap-badge-pill {
     display: inline-flex;
     align-items: center;
-    padding: 2px 7px;
+    height: 20px;
+    padding: 0 8px;
     border-radius: 9999px;
-    border: 1px solid var(--cap-border);
     font-size: 11px;
     font-weight: 600;
     white-space: nowrap;
     background: color-mix(in srgb, var(--cap-primary) 12%, transparent);
     color: var(--cap-primary);
+    transition: background-color 0.15s;
 }
 
 .cap-badge-pill[data-tone="success"] {
     background: color-mix(in srgb, var(--cap-success) 14%, transparent);
-    border-color: color-mix(in srgb, var(--cap-success) 38%, transparent);
     color: var(--cap-success);
 }
 
 .cap-badge-pill[data-tone="warning"] {
     background: color-mix(in srgb, var(--cap-warning) 14%, transparent);
-    border-color: color-mix(in srgb, var(--cap-warning) 38%, transparent);
     color: var(--cap-warning);
 }
 
 .cap-badge-pill[data-tone="error"] {
     background: color-mix(in srgb, var(--cap-error) 14%, transparent);
-    border-color: color-mix(in srgb, var(--cap-error) 38%, transparent);
     color: var(--cap-error);
 }
 
+.cap-badge-pill[data-tone="neutral"] {
+    background: color-mix(in srgb, var(--cap-fg) 8%, transparent);
+    color: var(--cap-muted);
+}
+
+.cap-task-area {
+    display: contents;
+}
+
+/* Running background task chip: ● label 14s (x) */
 .cap-task-group {
-    flex-shrink: 0;
-    max-width: 56%;
+    flex: 0 1 auto;
     min-width: 0;
+    max-width: 50%;
     display: inline-flex;
     align-items: center;
-    padding-left: 8px;
-    border-radius: 8px;
-    border: 1px solid color-mix(in srgb, var(--cap-primary) 35%, transparent);
-    background: color-mix(in srgb, var(--cap-primary) 12%, transparent);
+    gap: 6px;
+    height: 26px;
+    padding: 0 0 0 10px;
+    border-radius: 9999px;
+    background: color-mix(in srgb, var(--cap-primary) 13%, transparent);
     color: var(--cap-primary);
+    font-size: 11.5px;
+    font-weight: 600;
+    transition: background-color 0.15s;
+}
+
+.cap-task-dot {
+    flex-shrink: 0;
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background: currentColor;
+    animation: ag-cap-pulse 1.4s ease-in-out infinite;
+}
+
+.cap-task-dot[data-state="queued"] {
+    animation: none;
+    opacity: 0.45;
 }
 
 .cap-task-text {
@@ -324,18 +384,18 @@ const CAPSULE_STYLES = `
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    font-size: 11px;
-    font-weight: 600;
 }
 
 .cap-task-timer {
     flex-shrink: 0;
-    margin-left: 4px;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 11px;
-    opacity: 0.9;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.8;
 }
 
+/* 40x40 hit target; negative vertical margin keeps the visual chip slim. */
 .cap-cancel-btn {
     flex-shrink: 0;
     width: 40px;
@@ -343,9 +403,9 @@ const CAPSULE_STYLES = `
     min-width: 40px;
     min-height: 40px;
     padding: 0;
-    margin: 0;
+    margin: -7px 0 -7px -8px;
     border: none;
-    border-radius: 8px;
+    border-radius: 9999px;
     background: transparent;
     color: inherit;
     display: inline-flex;
@@ -355,56 +415,187 @@ const CAPSULE_STYLES = `
 }
 
 .cap-cancel-pill {
-    width: 24px;
-    height: 24px;
+    width: 20px;
+    height: 20px;
     border-radius: 9999px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 14px;
-    font-weight: 700;
-    line-height: 1;
-    background: color-mix(in srgb, var(--cap-fg) 10%, transparent);
-    transition: background-color 0.15s;
+    background: color-mix(in srgb, currentColor 14%, transparent);
+    transition: background-color 0.15s, color 0.15s;
 }
 
 .cap-cancel-btn:hover .cap-cancel-pill {
-    background: color-mix(in srgb, var(--cap-error) 28%, transparent);
+    background: color-mix(in srgb, var(--cap-error) 22%, transparent);
     color: var(--cap-error);
+}
+
+.cap-tasks-toggle {
+    flex: 0 1 auto;
+    min-width: 40px;
+    max-width: 55%;
+    min-height: 40px;
+    padding: 0 2px;
+    margin: 0;
+    border: none;
+    border-radius: 9999px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    display: inline-flex;
+    align-items: center;
+    cursor: pointer;
+}
+
+.cap-tasks-toggle .cap-task-group {
+    max-width: 100%;
+    padding-right: 8px;
+}
+
+.cap-tasks-toggle:hover .cap-task-group,
+.cap-tasks-toggle[aria-expanded="true"] .cap-task-group {
+    background: color-mix(in srgb, var(--cap-primary) 20%, transparent);
+}
+
+.cap-chevron {
+    flex-shrink: 0;
+    transition: transform 0.2s;
+}
+
+.cap-tasks-toggle[aria-expanded="true"] .cap-chevron {
+    transform: rotate(180deg);
 }
 
 .cap-resume-btn {
     flex-shrink: 0;
     min-width: 40px;
     min-height: 40px;
-    padding: 0 10px;
+    padding: 0 2px;
     margin: 0;
     border: none;
-    border-radius: 8px;
-    background: color-mix(in srgb, var(--cap-warning) 18%, transparent);
+    border-radius: 9999px;
+    background: transparent;
     color: var(--cap-warning);
     font: inherit;
-    font-weight: 600;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 4px;
-    white-space: nowrap;
     cursor: pointer;
-    transition: background-color 0.15s, opacity 0.15s;
 }
 
-.cap-resume-btn[hidden] {
-    display: none;
+.cap-resume-pill {
+    display: inline-flex;
+    align-items: center;
+    height: 26px;
+    padding: 0 12px;
+    border-radius: 9999px;
+    background: color-mix(in srgb, var(--cap-warning) 16%, transparent);
+    font-weight: 600;
+    white-space: nowrap;
+    transition: background-color 0.15s;
 }
 
-.cap-resume-btn:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--cap-warning) 28%, transparent);
+.cap-resume-btn:hover:not(:disabled) .cap-resume-pill {
+    background: color-mix(in srgb, var(--cap-warning) 26%, transparent);
 }
 
 .cap-resume-btn:disabled {
     opacity: 0.6;
     cursor: wait;
+}
+
+/* Expanded multi-task list */
+.cap-panel {
+    display: flex;
+    flex-direction: column;
+    max-height: 216px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 2px 2px 4px;
+    border-top: 1px solid var(--cap-hairline);
+}
+
+.cap-panel-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    min-height: 40px;
+    padding-left: 12px;
+    border-radius: 8px;
+    transition: background-color 0.15s;
+}
+
+.cap-panel-item:hover {
+    background: var(--cap-bg-hover);
+}
+
+.cap-panel-item .cap-task-dot {
+    color: var(--cap-primary);
+}
+
+.cap-panel-label {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 60%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-weight: 500;
+}
+
+.cap-panel-step {
+    flex: 1 1 0;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 11px;
+    color: var(--cap-muted);
+}
+
+.cap-panel-item .cap-task-timer {
+    color: var(--cap-muted);
+}
+
+.cap-panel-item .cap-cancel-btn {
+    margin: 0;
+    color: var(--cap-muted);
+}
+
+/* Indeterminate activity bar along the bottom edge while anything is running. */
+.cap-progress {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 2px;
+    overflow: hidden;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.25s;
+}
+
+.cap-shell[data-active="true"] .cap-progress {
+    opacity: 1;
+}
+
+.cap-progress::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 40%;
+    background: linear-gradient(90deg, transparent, var(--cap-accent), transparent);
+    transform: translateX(-100%);
+    animation: ag-cap-slide 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes ag-cap-slide {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(250%); }
 }
 
 @media (max-width: 767px) {
@@ -413,7 +604,19 @@ const CAPSULE_STYLES = `
     }
 
     .cap-task-group {
-        max-width: 50%;
+        max-width: 58%;
+    }
+
+    .cap-tasks-toggle {
+        max-width: 58%;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .cap-spinner,
+    .cap-task-dot,
+    .cap-progress::before {
+        animation: none;
     }
 }
 `;
@@ -488,63 +691,112 @@ function createStatusIconSvg(status: CapsuleStatus): SVGSVGElement {
     return svg;
 }
 
-function buildDefaultSummary(state: AgenticCapsuleData): string {
-    if (state.summary.trim()) {
-        return state.summary.trim();
+const RUNNING_STATUSES: ReadonlySet<CapsuleStatus> = new Set<CapsuleStatus>([
+    'retrieving',
+    'streaming',
+    'retrying',
+    'background-running',
+]);
+
+const TASK_PANEL_ID = 'cap-task-panel';
+
+function formatElapsed(startedAt: number, now = Date.now()): string {
+    const sec = Math.max(0, Math.floor((now - startedAt) / 1000));
+    if (sec < 60) {
+        return `${sec}s`;
+    }
+    const min = Math.floor(sec / 60);
+    if (min < 60) {
+        return `${min}m${String(sec % 60).padStart(2, '0')}s`;
+    }
+    const hr = Math.floor(min / 60);
+    return `${hr}h${String(min % 60).padStart(2, '0')}m`;
+}
+
+function createStrokeIcon(size: number, strokeWidth: number, paths: string[]): SVGSVGElement {
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('width', String(size));
+    svg.setAttribute('height', String(size));
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', String(strokeWidth));
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+    svg.setAttribute('aria-hidden', 'true');
+    for (const d of paths) {
+        const path = document.createElementNS(ns, 'path');
+        path.setAttribute('d', d);
+        svg.appendChild(path);
+    }
+    return svg;
+}
+
+interface CapsuleSummaryParts {
+    main: string;
+    meta: string;
+}
+
+function joinMeta(parts: string[]): string {
+    return parts.filter((p) => p.length > 0).join(' · ');
+}
+
+function buildSummaryParts(state: AgenticCapsuleData): CapsuleSummaryParts {
+    const custom = state.summary.trim();
+    if (custom) {
+        return { main: custom, meta: '' };
     }
 
     const hitText = formatHitRatePercent(state.cacheHitRate);
+    const steps = state.stepCount > 0 ? `${state.stepCount} 步` : '';
+    const cache = hitText ? `缓存 ${hitText}` : '';
+
     switch (state.status) {
         case 'retrieving':
             return state.currentStep
-                ? `正在检索 ${state.currentStep}`
-                : `正在检索资料（第 ${Math.max(1, state.stepCount)} 步）...`;
+                ? { main: `正在检索 ${state.currentStep}`, meta: '' }
+                : { main: '正在检索资料', meta: `第 ${Math.max(1, state.stepCount)} 步` };
         case 'streaming':
-            if (state.stepCount > 0 && hitText) {
-                return `已检索 ${state.stepCount} 步 · 缓存命中 ${hitText} · 流式输出中`;
-            }
-            return hitText ? `缓存命中 ${hitText} · 流式输出中` : '主叙事流式生成中...';
+            return { main: '正在生成正文', meta: joinMeta([steps, cache]) };
         case 'retrying': {
             const attempt = state.retryAttempt ?? 1;
             const maxAttempts = state.retryMaxAttempts;
             const progress =
                 typeof maxAttempts === 'number' && maxAttempts > 0
-                    ? ` (${attempt}/${maxAttempts})`
-                    : ` (${attempt})`;
-            return `网络/模型异常，自动重试${progress}...`;
+                    ? ` ${attempt}/${maxAttempts}`
+                    : ` ${attempt}`;
+            return {
+                main: `自动重试${progress}`,
+                meta: state.retryReason?.trim() || '网络/模型异常',
+            };
         }
         case 'background-running':
-            return state.stepCount > 0 && hitText
-                ? `${state.stepCount} 步 · 缓存 ${hitText} · 后台运行中`
-                : '后台触发任务执行中...';
-        case 'interrupted':
+            return { main: '后台任务运行中', meta: joinMeta([steps, cache]) };
+        case 'interrupted': {
+            const resumable = state.canResume !== false;
             switch (state.interruptedReason) {
-                case 'user_stop':
-                    return '已暂停 · 可恢复';
                 case 'length':
-                    return '输出截断 · 可续写';
+                    return { main: '输出被截断', meta: resumable ? '可续写' : '' };
                 case 'empty_output':
-                    return '未写入 /output.md · 可重试';
+                    return { main: '未写入 /output.md', meta: resumable ? '可重试' : '' };
                 case 'error':
-                    return '连接中断 · 可恢复';
+                    return { main: '连接中断', meta: resumable ? '可恢复' : '' };
+                case 'user_stop':
                 default:
-                    return '已暂停 · 可恢复';
+                    return { main: '已暂停', meta: resumable ? '可恢复' : '' };
             }
-        case 'error':
-            return state.errorMessage?.trim() || '生成或后台任务发生错误';
-        case 'done': {
-            const parts: string[] = [];
-            if (state.stepCount > 0) {
-                parts.push(`${state.stepCount} 步`);
-            }
-            if (hitText) {
-                parts.push(`缓存 ${hitText}`);
-            }
-            return parts.length > 0 ? parts.join(' · ') : '生成完成 · 点击查看日志';
         }
+        case 'error':
+            return {
+                main: '运行出错',
+                meta: state.errorMessage?.trim() || '生成或后台任务发生错误',
+            };
+        case 'done':
+            return { main: '已完成', meta: joinMeta([steps, cache]) || '点击查看日志' };
         case 'idle':
         default:
-            return 'ST-Agentic 就绪 · 点击查看日志';
+            return { main: 'ST-Agentic 就绪', meta: '点击查看日志' };
     }
 }
 
@@ -583,10 +835,13 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
     private _shellEl: HTMLDivElement | null = null;
     private _openBtnEl: HTMLButtonElement | null = null;
     private _indicatorEl: HTMLSpanElement | null = null;
-    private _summaryEl: HTMLSpanElement | null = null;
+    private _summaryMainEl: HTMLSpanElement | null = null;
+    private _summaryMetaEl: HTMLSpanElement | null = null;
     private _badgesEl: HTMLDivElement | null = null;
     private _resumeBtnEl: HTMLButtonElement | null = null;
-    private _tasksEl: HTMLDivElement | null = null;
+    private _taskAreaEl: HTMLDivElement | null = null;
+    private _panelEl: HTMLDivElement | null = null;
+    private _tasksExpanded = false;
 
     constructor() {
         super();
@@ -1052,6 +1307,9 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
         const shell = document.createElement('div');
         shell.className = 'cap-shell';
 
+        const row = document.createElement('div');
+        row.className = 'cap-row';
+
         const openBtn = document.createElement('button');
         openBtn.type = 'button';
         openBtn.className = 'cap-open-btn';
@@ -1062,6 +1320,11 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
 
         const summary = document.createElement('span');
         summary.className = 'cap-summary';
+        const summaryMain = document.createElement('span');
+        summaryMain.className = 'cap-summary-main';
+        const summaryMeta = document.createElement('span');
+        summaryMeta.className = 'cap-summary-meta';
+        summary.append(summaryMain, summaryMeta);
 
         openBtn.append(indicator, summary);
         openBtn.addEventListener('click', () => {
@@ -1074,33 +1337,50 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
         const badges = document.createElement('div');
         badges.className = 'cap-badges';
 
+        const taskArea = document.createElement('div');
+        taskArea.className = 'cap-task-area';
+
         const resumeBtn = document.createElement('button');
         resumeBtn.type = 'button';
         resumeBtn.className = 'cap-resume-btn';
         resumeBtn.setAttribute('data-action', 'resume');
         resumeBtn.setAttribute('aria-label', '恢复生成 /output.md');
         resumeBtn.title = '从中断点继续生成 /output.md';
-        resumeBtn.textContent = '↻ 恢复';
+        const resumePill = document.createElement('span');
+        resumePill.className = 'cap-resume-pill';
+        resumePill.textContent = '↻ 恢复';
+        resumeBtn.appendChild(resumePill);
         resumeBtn.hidden = true;
         resumeBtn.addEventListener('click', (event) => {
             event.stopPropagation();
             void this.handleResume();
         });
 
-        const tasks = document.createElement('div');
-        tasks.className = 'cap-tasks';
-        tasks.style.display = 'contents';
+        row.append(openBtn, badges, taskArea, resumeBtn);
 
-        shell.append(openBtn, badges, resumeBtn, tasks);
+        const panel = document.createElement('div');
+        panel.className = 'cap-panel';
+        panel.id = TASK_PANEL_ID;
+        panel.setAttribute('role', 'list');
+        panel.setAttribute('aria-label', '后台任务列表');
+        panel.hidden = true;
+
+        const progress = document.createElement('div');
+        progress.className = 'cap-progress';
+        progress.setAttribute('aria-hidden', 'true');
+
+        shell.append(row, panel, progress);
         shadow.append(styleEl, shell);
 
         this._shellEl = shell;
         this._openBtnEl = openBtn;
         this._indicatorEl = indicator;
-        this._summaryEl = summary;
+        this._summaryMainEl = summaryMain;
+        this._summaryMetaEl = summaryMeta;
         this._badgesEl = badges;
         this._resumeBtnEl = resumeBtn;
-        this._tasksEl = tasks;
+        this._taskAreaEl = taskArea;
+        this._panelEl = panel;
     }
 
     private handleOpenConsole(tab: ConsoleTabId, deepLink: DeepLinkState): void {
@@ -1246,16 +1526,14 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
     }
 
     private updateTimersOnly(): void {
-        if (!this._tasksEl) {
+        if (!this._shellEl) {
             return;
         }
-        const activeTasks = this.getActiveBackgroundTasks();
-        const timerEls = this._tasksEl.querySelectorAll('.cap-task-timer');
-        activeTasks.forEach((task, idx) => {
-            const el = timerEls[idx];
-            if (el) {
-                const sec = Math.max(0, Math.floor((Date.now() - task.startedAt) / 1000));
-                el.textContent = `${sec}s`;
+        const now = Date.now();
+        this._shellEl.querySelectorAll<HTMLElement>('[data-started-at]').forEach((el) => {
+            const startedAt = Number(el.dataset.startedAt);
+            if (Number.isFinite(startedAt)) {
+                el.textContent = formatElapsed(startedAt, now);
             }
         });
     }
@@ -1264,62 +1542,54 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
         if (
             !this._shellEl
             || !this._indicatorEl
-            || !this._summaryEl
+            || !this._summaryMainEl
+            || !this._summaryMetaEl
             || !this._badgesEl
             || !this._resumeBtnEl
-            || !this._tasksEl
+            || !this._taskAreaEl
+            || !this._panelEl
             || !this._openBtnEl
         ) {
             return;
         }
 
+        const status = this._state.status;
         const activeTasks = this.getActiveBackgroundTasks();
-        const isActive =
-            activeTasks.length > 0
-            || this._state.status === 'retrieving'
-            || this._state.status === 'streaming'
-            || this._state.status === 'retrying'
-            || this._state.status === 'background-running'
-            || this._state.status === 'interrupted'
-            || this._state.status === 'error';
+        const isRunning = activeTasks.length > 0 || RUNNING_STATUSES.has(status);
+        const isActive = isRunning || status === 'interrupted' || status === 'error';
 
         const shouldHide = this._state.persistMode === 'auto_hide' && !isActive;
         this.setAttribute('data-hidden', shouldHide ? 'true' : 'false');
 
         const resolvedTheme = this.resolveTheme();
         this._shellEl.setAttribute('data-theme', resolvedTheme);
-        this._shellEl.setAttribute('data-status', this._state.status);
+        this._shellEl.setAttribute('data-status', status);
         this._shellEl.setAttribute('data-position', this._state.position);
+        this._shellEl.setAttribute('data-active', isRunning ? 'true' : 'false');
 
-        // Indicator icon
+        // Indicator: spinner while working, otherwise a status glyph.
         this._indicatorEl.replaceChildren();
-        if (
-            this._state.status === 'retrieving'
-            || this._state.status === 'streaming'
-            || this._state.status === 'retrying'
-            || this._state.status === 'background-running'
-        ) {
-            const pulse = document.createElement('span');
-            pulse.className = 'cap-dot-pulse';
-            this._indicatorEl.appendChild(pulse);
+        if (RUNNING_STATUSES.has(status)) {
+            const spinner = document.createElement('span');
+            spinner.className = 'cap-spinner';
+            this._indicatorEl.appendChild(spinner);
         } else {
-            this._indicatorEl.appendChild(createStatusIconSvg(this._state.status));
+            this._indicatorEl.appendChild(createStatusIconSvg(status));
         }
 
-        // Summary text (single-line truncated via CSS ellipsis)
-        const summaryText = buildDefaultSummary(this._state);
-        this._summaryEl.textContent = summaryText;
+        // Summary: bold headline + muted meta (single-line ellipsis on .cap-summary).
+        const { main, meta } = buildSummaryParts(this._state);
+        this._summaryMainEl.textContent = main;
+        this._summaryMetaEl.textContent = meta;
+        this._summaryMetaEl.hidden = meta.length === 0;
         const detailSuffix =
-            this._state.status === 'interrupted' && this._state.errorMessage?.trim()
+            status === 'interrupted' && this._state.errorMessage?.trim()
                 ? ` (${this._state.errorMessage.trim()})`
-                : this._state.status === 'retrying' && this._state.retryReason?.trim()
-                    ? ` (${this._state.retryReason.trim()})`
-                    : '';
-        this._openBtnEl.title = `#${this._state.messageId}#${this._state.swipeId} · ${summaryText}${detailSuffix}`;
+                : '';
+        this._openBtnEl.title = `#${this._state.messageId}#${this._state.swipeId} · ${main}${meta ? ` · ${meta}` : ''}${detailSuffix}`;
 
         // Dedicated resume action button when interrupted
-        const showResume =
-            this._state.status === 'interrupted' && this._state.canResume !== false;
+        const showResume = status === 'interrupted' && this._state.canResume !== false;
         this._resumeBtnEl.hidden = !showResume;
         this._resumeBtnEl.disabled = this._resumePending;
 
@@ -1350,43 +1620,171 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
             this._badgesEl.appendChild(btn);
         }
 
-        // Active background task chips with `>= 40x40px` [×] cancel button
-        this._tasksEl.replaceChildren();
-        for (const task of activeTasks) {
-            const group = document.createElement('div');
-            group.className = 'cap-task-group';
-
-            const labelEl = document.createElement('span');
-            labelEl.className = 'cap-task-text';
-            labelEl.textContent = task.label || '后台任务';
-            labelEl.title = task.currentStep ? `${task.label}: ${task.currentStep}` : task.label;
-
-            const timerEl = document.createElement('span');
-            timerEl.className = 'cap-task-timer';
-            const sec = Math.max(0, Math.floor((Date.now() - task.startedAt) / 1000));
-            timerEl.textContent = `${sec}s`;
-
-            const cancelBtn = document.createElement('button');
-            cancelBtn.type = 'button';
-            cancelBtn.className = 'cap-cancel-btn';
-            cancelBtn.setAttribute('data-task-id', task.taskId);
-            cancelBtn.setAttribute('aria-label', `取消后台任务 ${task.label}`);
-            cancelBtn.title = '仅中止该后台任务';
-
-            const cancelPill = document.createElement('span');
-            cancelPill.className = 'cap-cancel-pill';
-            cancelPill.setAttribute('aria-hidden', 'true');
-            cancelPill.textContent = '×';
-
-            cancelBtn.appendChild(cancelPill);
-            cancelBtn.addEventListener('click', (event) => {
-                event.stopPropagation();
-                this.handleCancelTask(task.taskId);
-            });
-
-            group.append(labelEl, timerEl, cancelBtn);
-            this._tasksEl.appendChild(group);
+        // Background tasks: one chip inline; 2+ collapse into a toggle with an expandable list.
+        if (activeTasks.length <= 1) {
+            this._tasksExpanded = false;
         }
+        const focusKey = this.getFocusedKey();
+        this._taskAreaEl.replaceChildren();
+        this._panelEl.replaceChildren();
+
+        if (activeTasks.length === 1) {
+            this._taskAreaEl.appendChild(this.buildSingleTaskChip(activeTasks[0]));
+        } else if (activeTasks.length > 1) {
+            this._taskAreaEl.appendChild(this.buildTasksToggle(activeTasks));
+            if (this._tasksExpanded) {
+                for (const task of activeTasks) {
+                    this._panelEl.appendChild(this.buildPanelItem(task));
+                }
+            }
+        }
+        this._panelEl.hidden = !(this._tasksExpanded && activeTasks.length > 1);
+        this.restoreFocus(focusKey);
+    }
+
+    private getFocusedKey(): string | undefined {
+        const active = this._shadow?.activeElement as HTMLElement | null | undefined;
+        return active?.dataset?.focusKey;
+    }
+
+    private restoreFocus(key: string | undefined): void {
+        if (!key || !this._shadow) {
+            return;
+        }
+        const match = Array.from(
+            this._shadow.querySelectorAll<HTMLElement>('[data-focus-key]'),
+        ).find((el) => el.dataset.focusKey === key);
+        match?.focus();
+    }
+
+    private buildTaskDot(task: BackgroundTaskStatus): HTMLSpanElement {
+        const dot = document.createElement('span');
+        dot.className = 'cap-task-dot';
+        dot.setAttribute('data-state', task.state);
+        dot.setAttribute('aria-hidden', 'true');
+        return dot;
+    }
+
+    private buildTaskTimer(task: BackgroundTaskStatus): HTMLSpanElement {
+        const timer = document.createElement('span');
+        timer.className = 'cap-task-timer';
+        if (task.state === 'queued') {
+            timer.textContent = '排队';
+        } else {
+            timer.dataset.startedAt = String(task.startedAt);
+            timer.textContent = formatElapsed(task.startedAt);
+        }
+        return timer;
+    }
+
+    private buildCancelButton(task: BackgroundTaskStatus): HTMLButtonElement {
+        const label = task.label || '后台任务';
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.className = 'cap-cancel-btn';
+        cancelBtn.setAttribute('data-task-id', task.taskId);
+        cancelBtn.dataset.focusKey = `cancel:${task.taskId}`;
+        cancelBtn.setAttribute('aria-label', `取消后台任务 ${label}`);
+        cancelBtn.title = '仅中止该后台任务';
+
+        const cancelPill = document.createElement('span');
+        cancelPill.className = 'cap-cancel-pill';
+        cancelPill.setAttribute('aria-hidden', 'true');
+        cancelPill.appendChild(createStrokeIcon(11, 2.6, ['M18 6 6 18', 'm6 6 12 12']));
+
+        cancelBtn.appendChild(cancelPill);
+        cancelBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            this.handleCancelTask(task.taskId);
+        });
+        return cancelBtn;
+    }
+
+    private buildSingleTaskChip(task: BackgroundTaskStatus): HTMLDivElement {
+        const label = task.label || '后台任务';
+        const group = document.createElement('div');
+        group.className = 'cap-task-group';
+        group.title = task.currentStep ? `${label}: ${task.currentStep}` : label;
+
+        const text = document.createElement('span');
+        text.className = 'cap-task-text';
+        text.textContent = label;
+
+        group.append(
+            this.buildTaskDot(task),
+            text,
+            this.buildTaskTimer(task),
+            this.buildCancelButton(task),
+        );
+        return group;
+    }
+
+    private buildTasksToggle(tasks: BackgroundTaskStatus[]): HTMLButtonElement {
+        const expanded = this._tasksExpanded;
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'cap-tasks-toggle';
+        toggle.dataset.focusKey = 'toggle';
+        toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+        toggle.setAttribute('aria-controls', TASK_PANEL_ID);
+        toggle.setAttribute(
+            'aria-label',
+            `${tasks.length} 个后台任务运行中，${expanded ? '收起' : '展开'}列表`,
+        );
+        toggle.title = tasks.map((t) => t.label || '后台任务').join('\n');
+
+        const chip = document.createElement('span');
+        chip.className = 'cap-task-group';
+
+        const running = tasks.filter((t) => t.state === 'running');
+        const lead = running[0] ?? tasks[0];
+
+        const text = document.createElement('span');
+        text.className = 'cap-task-text';
+        text.textContent = `${tasks.length} 个后台任务`;
+
+        const timerSource =
+            running.length > 0
+                ? running.reduce((a, b) => (b.startedAt < a.startedAt ? b : a))
+                : lead;
+
+        const chevron = createStrokeIcon(12, 2.4, ['m6 9 6 6 6-6']);
+        chevron.classList.add('cap-chevron');
+
+        chip.append(this.buildTaskDot(lead), text, this.buildTaskTimer(timerSource), chevron);
+        toggle.appendChild(chip);
+        toggle.addEventListener('click', (event) => {
+            event.stopPropagation();
+            this._tasksExpanded = !this._tasksExpanded;
+            this.render();
+        });
+        return toggle;
+    }
+
+    private buildPanelItem(task: BackgroundTaskStatus): HTMLDivElement {
+        const label = task.label || '后台任务';
+        const item = document.createElement('div');
+        item.className = 'cap-panel-item';
+        item.setAttribute('role', 'listitem');
+        item.setAttribute('data-state', task.state);
+        item.title = task.currentStep ? `${label}: ${task.currentStep}` : label;
+
+        const labelEl = document.createElement('span');
+        labelEl.className = 'cap-panel-label';
+        labelEl.textContent = label;
+
+        const stepEl = document.createElement('span');
+        stepEl.className = 'cap-panel-step';
+        stepEl.textContent = task.currentStep ?? '';
+
+        item.append(
+            this.buildTaskDot(task),
+            labelEl,
+            stepEl,
+            this.buildTaskTimer(task),
+            this.buildCancelButton(task),
+        );
+        return item;
     }
 }
 

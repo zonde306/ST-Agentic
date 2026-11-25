@@ -347,6 +347,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                 <div class="ag-list" style={{ padding: 0, gap: '8px' }}>
                     {filteredTraces.map((trace) => {
                         const isSelected = selectedTrace?.runId === trace.runId;
+                        const isScriptTrace = trace.model === '0-token-script';
                         const hitRate = computeCacheHitPercent(trace.usage);
                         const statusMeta = getRunStatusMeta(trace.status);
                         return (
@@ -384,16 +385,22 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                             {trace.agentName}
                                         </span>
                                         <span style={{ flexShrink: 0 }}>
-                                            <Badge tone={hitRate >= 70 ? 'success' : 'neutral'}>
-                                                {hitRate.toFixed(1)}% 命中
-                                            </Badge>
+                                            {isScriptTrace ? (
+                                                <Badge tone="neutral">脚本</Badge>
+                                            ) : (
+                                                <Badge tone={hitRate >= 70 ? 'success' : 'neutral'}>
+                                                    {hitRate.toFixed(1)}% 命中
+                                                </Badge>
+                                            )}
                                         </span>
                                     </div>
                                     <div class="ag-list-item-meta">
                                         <span class="ag-row" style={{ gap: '4px' }}>
                                             <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
                                             <span>
-                                                {trace.phase} · {trace.toolSteps.length} 步
+                                                {isScriptTrace
+                                                    ? trace.phase
+                                                    : `${trace.phase} · ${trace.toolSteps.length} 步`}
                                             </span>
                                         </span>
                                         <span class="ag-mono">
@@ -481,6 +488,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
     );
 
     const detailPane = selectedTrace ? (() => {
+        const isScriptTrace = selectedTrace.model === '0-token-script';
         const hitRate = computeCacheHitPercent(selectedTrace.usage);
         const statusMeta = getRunStatusMeta(selectedTrace.status);
         const extractedCalls = extractToolCallsFromTrace(selectedTrace);
@@ -552,55 +560,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                     </div>
 
                     {/* TokenUsage & Duration Cards */}
-                    <div class="ag-grid-4">
-                        <div class="ag-card">
-                            <div class="ag-card-body">
-                                <div class="ag-field-label">Input Tokens</div>
-                                <div
-                                    class="ag-mono"
-                                    style={{ fontSize: '18px', fontWeight: 700, marginTop: '4px' }}
-                                >
-                                    {formatTokenCount(selectedTrace.usage.inputTokens)}
-                                </div>
-                            </div>
-                        </div>
-
-                        <div
-                            class="ag-card"
-                            style={{
-                                borderColor: 'color-mix(in srgb, var(--success) 42%, transparent)',
-                            }}
-                        >
-                            <div class="ag-card-body">
-                                <div class="ag-field-label" style={{ color: 'var(--success)' }}>
-                                    Cached 命中 ({hitRate.toFixed(1)}%)
-                                </div>
-                                <div
-                                    class="ag-mono"
-                                    style={{
-                                        fontSize: '18px',
-                                        fontWeight: 700,
-                                        marginTop: '4px',
-                                        color: 'var(--success)',
-                                    }}
-                                >
-                                    {formatTokenCount(selectedTrace.usage.cachedTokens)}
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="ag-card">
-                            <div class="ag-card-body">
-                                <div class="ag-field-label">Output Tokens</div>
-                                <div
-                                    class="ag-mono"
-                                    style={{ fontSize: '18px', fontWeight: 700, marginTop: '4px' }}
-                                >
-                                    {formatTokenCount(selectedTrace.usage.outputTokens)}
-                                </div>
-                            </div>
-                        </div>
-
+                    {isScriptTrace ? (
                         <div class="ag-card">
                             <div class="ag-card-body">
                                 <div class="ag-field-label">Duration 耗时</div>
@@ -612,7 +572,69 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                 </div>
                             </div>
                         </div>
-                    </div>
+                    ) : (
+                        <div class="ag-grid-4">
+                            <div class="ag-card">
+                                <div class="ag-card-body">
+                                    <div class="ag-field-label">Input Tokens</div>
+                                    <div
+                                        class="ag-mono"
+                                        style={{ fontSize: '18px', fontWeight: 700, marginTop: '4px' }}
+                                    >
+                                        {formatTokenCount(selectedTrace.usage.inputTokens)}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div
+                                class="ag-card"
+                                style={{
+                                    borderColor: 'color-mix(in srgb, var(--success) 42%, transparent)',
+                                }}
+                            >
+                                <div class="ag-card-body">
+                                    <div class="ag-field-label" style={{ color: 'var(--success)' }}>
+                                        Cached 命中 ({hitRate.toFixed(1)}%)
+                                    </div>
+                                    <div
+                                        class="ag-mono"
+                                        style={{
+                                            fontSize: '18px',
+                                            fontWeight: 700,
+                                            marginTop: '4px',
+                                            color: 'var(--success)',
+                                        }}
+                                    >
+                                        {formatTokenCount(selectedTrace.usage.cachedTokens)}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="ag-card">
+                                <div class="ag-card-body">
+                                    <div class="ag-field-label">Output Tokens</div>
+                                    <div
+                                        class="ag-mono"
+                                        style={{ fontSize: '18px', fontWeight: 700, marginTop: '4px' }}
+                                    >
+                                        {formatTokenCount(selectedTrace.usage.outputTokens)}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="ag-card">
+                                <div class="ag-card-body">
+                                    <div class="ag-field-label">Duration 耗时</div>
+                                    <div
+                                        class="ag-mono"
+                                        style={{ fontSize: '18px', fontWeight: 700, marginTop: '4px' }}
+                                    >
+                                        {formatDurationMs(selectedTrace.durationMs)}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
 
                     {selectedTrace.error ? (
                         <div class="ag-banner ag-banner-error ag-row" style={{ alignItems: 'flex-start' }}>
@@ -627,7 +649,9 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                         <div class="ag-stack-v">
                             {selectedTrace.toolSteps.length === 0 ? (
                                 <div class="ag-banner ag-banner-neutral">
-                                    本轮运行未调用工具（纯文本推理/输出）。
+                                    {isScriptTrace
+                                        ? '纯脚本触发器运行（无 LLM 生成步骤）。'
+                                        : '本轮运行未调用工具（纯文本推理/输出）。'}
                                 </div>
                             ) : (
                                 selectedTrace.toolSteps.map((step: ToolStepLog) => {
