@@ -25,6 +25,7 @@ import {
     estimateRequestTokens,
     prerenderPromptBlocks,
     resolveEffectiveContextBudget,
+    shouldFloatTailPromptBlocks,
     TrajectoryStore,
     TransientToolSpillStore,
     WatermarkCompactor,
@@ -1483,10 +1484,12 @@ export class AgentRunner {
                 }
             }
 
+            const floatTailBlocks = shouldFloatTailPromptBlocks(promptTriggerContext);
             const floatingTailBlocksToRender = promptBlocks.filter(
                 (block) =>
                     block.enabled
-                    && block.placement === 'floating_tail'
+                    && (block.placement === 'floating_tail'
+                        || (floatTailBlocks && block.placement === 'tail'))
                     && block.content.trim().length > 0
                     && matchesPromptTriggers(block.triggers, promptTriggerContext),
             );

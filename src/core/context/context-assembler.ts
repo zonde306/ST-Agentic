@@ -378,6 +378,16 @@ export function formatSideBriefXml(clues: readonly SideClueDoc[]): string {
 }
 
 /**
+ * Whether `placement: 'tail'` PromptBlocks should float after `inFlightMessages` alongside
+ * `floating_tail` (matching Workbench/SideGen behavior) instead of staying inside Layer 2.
+ */
+export function shouldFloatTailPromptBlocks(
+    context?: PromptTriggerContext,
+): boolean {
+    return context?.kind === 'trigger' || context?.kind === 'subagent';
+}
+
+/**
  * Three-layer KV-cache-friendly Context Assembler:
  * - **Layer 0 (Static Prefix)**: canonical sorted tools + decoupled multi-character/world-simulator
  *   system base + Category ① `system_rule` compiled block + `Core Manifest` + `prefix` `PromptBlock`s.
@@ -875,7 +885,9 @@ export class ContextAssembler {
             }
         }
 
-        if (rest.inFlightMessages === undefined) {
+        const floatTailBlocks = shouldFloatTailPromptBlocks(rest.promptTriggerContext);
+
+        if (!floatTailBlocks && rest.inFlightMessages === undefined) {
             const tailBlocksToRender = promptBlocks.filter(
                 (b: PromptBlock) =>
                     b.enabled
@@ -900,7 +912,7 @@ export class ContextAssembler {
         const floatingBlocksToRender = promptBlocks.filter(
             (b: PromptBlock) =>
                 b.enabled
-                && b.placement === 'floating_tail'
+                && (b.placement === 'floating_tail' || (floatTailBlocks && b.placement === 'tail'))
                 && b.content.trim().length > 0
                 && matchesPromptTriggers(b.triggers, rest.promptTriggerContext)
                 && !preRenderedBlocks.has(b.id),
@@ -1046,15 +1058,17 @@ export class ContextAssembler {
         }
 
         // 3. Enabled `tail` PromptBlocks (supporting multi-message custom blocks & async pre-rendered EJS)
-        layer2Messages.push(
-            ...this.renderPlacementBlocks('tail', input, macroOverrides, layer2Messages),
-        );
+        if (!shouldFloatTailPromptBlocks(input.promptTriggerContext)) {
+            layer2Messages.push(
+                ...this.renderPlacementBlocks(['tail'], input, macroOverrides, layer2Messages),
+            );
+        }
 
         return layer2Messages;
     }
 
     private renderPlacementBlocks(
-        placement: 'tail' | 'floating_tail',
+        placements: ReadonlyArray<'tail' | 'floating_tail'>,
         input: ContextAssembleInput,
         macroOverrides: Record<string, string> | undefined,
         precedingSeed: readonly CanonicalMessage[],
@@ -1062,7 +1076,7 @@ export class ContextAssembler {
         const blocks = (input.agent.promptBlocks ?? []).filter(
             (b: PromptBlock) =>
                 b.enabled
-                && b.placement === placement
+                && placements.includes(b.placement as 'tail' | 'floating_tail')
                 && b.content.trim().length > 0
                 && matchesPromptTriggers(b.triggers, input.promptTriggerContext),
         );
@@ -1093,7 +1107,12 @@ export class ContextAssembler {
         precedingMessages: readonly CanonicalMessage[],
     ): CanonicalMessage[] {
         const macroOverrides = buildLayer2MacroOverrides(input.vars, input.macroOverrides);
-        return this.renderPlacementBlocks('floating_tail', input, macroOverrides, precedingMessages);
+        const placements: ReadonlyArray<'tail' | 'floating_tail'> = shouldFloatTailPromptBlocks(
+            input.promptTriggerContext,
+        )
+            ? ['tail', 'floating_tail']
+            : ['floating_tail'];
+        return this.renderPlacementBlocks(placements, input, macroOverrides, precedingMessages);
     }
 
     private computeCacheBreakpoints(params: {

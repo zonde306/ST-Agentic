@@ -17,8 +17,10 @@ import {
     validateCustomPromptBlock,
 } from '@/core/context';
 import { PayloadCompiler } from '@/core/llm';
+import { TraceLogger } from '@/core/logger';
 import { createBuiltinToolRegistry } from '@/core/tools';
-import type { CanonicalMessage, PromptBlock } from '@/core/types';
+import { PipelineOrchestrator } from '@/core/triggers';
+import type { CanonicalMessage, PromptBlock, TriggerRule } from '@/core/types';
 import { MemoryHostBridge, ScriptedLLMTransport } from '../../mocks';
 
 describe('floating_tail prompt block placement', () => {
@@ -741,5 +743,462 @@ describe('floating_tail prompt block placement', () => {
         expect(aMsgs[0].role).toBe('user');
         expect(aMsgs[aMsgs.length - 2].role).toBe('assistant');
         expect(aMsgs[aMsgs.length - 1].role).toBe('user');
+    });
+
+    it('sandwiches multi-round trigger tool calls BEFORE inherited tail and floating_tail blocks in exact order and compiles cleanly for Gemini', async () => {
+        const bridge = new MemoryHostBridge({
+            identity: { userName: 'Player', charName: 'Hero' },
+            characterFields: { description: 'Hero character bio.' },
+            chat: [
+                { id: 0, name: 'Hero', isUser: false, mes: 'Opening scene.', swipeId: 0 },
+                { id: 1, name: 'Player', isUser: true, mes: 'Inspect room', swipeId: 0 },
+            ],
+            metadata: { variables: { hp: 88 } },
+            ejsEvaluator: async (text, vars) =>
+                text.replace(/<%-\s*hp\s*%>/g, String(vars.hp ?? '')),
+        });
+
+        const mainAgent = createDefaultMainAgent({
+            id: 'main',
+            connectionId: 'conn_trigger',
+            promptBlocks: [
+                {
+                    id: 'system_base',
+                    name: 'Base',
+                    role: 'system',
+                    placement: 'prefix',
+                    enabled: true,
+                    content: 'MAIN_PREFIX_BASE',
+                    triggers: ['main'],
+                },
+                {
+                    id: 'tail_suffix_assistant',
+                    name: '主体后缀',
+                    role: 'assistant',
+                    placement: 'tail',
+                    enabled: true,
+                    content: 'ASSISTANT_TAIL_RULE',
+                    triggers: ['main', 'assistant', 'trigger'],
+                },
+                {
+                    id: 'float_mid',
+                    name: '中间浮动提示',
+                    role: 'system',
+                    placement: 'floating_tail',
+                    enabled: true,
+                    content: 'MID_FLOATING_HP=<%- hp %>',
+                    triggers: ['trigger'],
+                },
+                {
+                    id: 'tail_end_user',
+                    name: '末尾结束',
+                    role: 'user',
+                    placement: 'tail',
+                    enabled: true,
+                    content: 'USER_TAIL_END',
+                    triggers: ['main', 'assistant', 'trigger'],
+                },
+                {
+                    id: 'tail_end_custom',
+                    name: '最终结尾',
+                    role: 'custom',
+                    placement: 'tail',
+                    enabled: true,
+                    content: JSON.stringify([
+                        {
+                            role: 'assistant',
+                            content: '',
+                            tool_calls: [
+                                {
+                                    id: 'call_tail_shell',
+                                    type: 'function',
+                                    function: { name: 'read_variables', arguments: '{}' },
+                                    thoughtSignature: 'skip_thought_signature_validator',
+                                },
+                            ],
+                        },
+                        {
+                            role: 'tool',
+                            tool_call_id: 'call_tail_shell',
+                            name: 'read_variables',
+                            content: { ok: true, tailShell: true },
+                        },
+                    ]),
+                    triggers: ['main', 'assistant', 'trigger'],
+                },
+            ],
+        });
+
+        const triggerAgent = createDefaultMainAgent({
+            id: 'ag_trigger',
+            name: 'Trigger Worker',
+            connectionId: 'conn_trigger',
+            sessionMode: 'ephemeral',
+            ephemeralWindowSize: 2,
+            strictToolLoop: 'off',
+            enabledTools: ['read_variables', 'patch_variables'],
+            permissions: { read: ['/**'], write: ['/state/variables.json'] },
+            promptBlocks: [
+                {
+                    id: 'trigger_prefix',
+                    name: 'Trigger Base',
+                    role: 'system',
+                    placement: 'prefix',
+                    enabled: true,
+                    content: 'TRIGGER_OWN_PREFIX',
+                },
+            ],
+        });
+
+        const triggerRule: TriggerRule = {
+            id: 'tr_before_check',
+            label: 'Before State Check',
+            source: 'preset',
+            phase: 'before_turn',
+            order: 1,
+            barrier: 'turn',
+            agentProfileId: 'ag_trigger',
+            kind: 'agent',
+            condition: { type: 'always' },
+            instructionTemplate: 'Read variables first, then respond briefly.',
+            targetPath: '/state/variables.json',
+            enabled: true,
+        };
+
+        const connection = createDefaultConnection({
+            id: 'conn_trigger',
+            providerFormat: 'gemini',
+            model: 'gemini-2.5-pro',
+            strictToolLoop: false,
+            roundMaxRetries: 0,
+        });
+        const preset = createDefaultPreset({
+            mainAgentId: 'main',
+            agents: { main: mainAgent, ag_trigger: triggerAgent },
+            triggers: [triggerRule],
+        });
+        const settings = createDefaultSettings({
+            currentConnectionId: connection.id,
+            connections: { [connection.id]: connection },
+            presets: { [preset.id]: preset },
+            currentPresetId: preset.id,
+        });
+
+        const transport = new ScriptedLLMTransport([
+            // Round 0: trigger calls read_variables
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'real_trig_tc_1',
+                        name: 'read_variables',
+                        arguments: '{}',
+                        thoughtSignature: 'skip_thought_signature_validator',
+                    },
+                ],
+            },
+            // Round 1: trigger calls read_variables a second time to verify multi-round sandwiching
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'real_trig_tc_2',
+                        name: 'read_variables',
+                        arguments: '{}',
+                        thoughtSignature: 'skip_thought_signature_validator',
+                    },
+                ],
+            },
+            // Round 2: trigger finishes
+            { content: 'State checked.' },
+        ]);
+
+        const orchestrator = new PipelineOrchestrator({
+            bridge,
+            transport,
+            settings: () => settings,
+            traceLogger: new TraceLogger(),
+        });
+
+        const res = await orchestrator.runBeforeTurn({
+            target: { messageId: 1, swipeId: 0 },
+            userText: 'Inspect room',
+        });
+
+        expect(res.brief).toBe('State checked.');
+        expect(transport.requests).toHaveLength(3);
+
+        // Round 0: trigger user prompt followed by floated tail + floating_tail in exact preset order
+        const req0 = transport.requests[0];
+        const req0TailSlice = req0.messages.slice(-5);
+        expect(req0TailSlice.map((m) => [m.role, m.toolCallId ?? m.content])).toEqual([
+            ['assistant', 'ASSISTANT_TAIL_RULE'],
+            ['system', 'MID_FLOATING_HP=88'],
+            ['user', 'USER_TAIL_END'],
+            ['assistant', ''],
+            ['tool', 'call_tail_shell'],
+        ]);
+
+        // Round 1: real_trig_tc_1 call + result are sandwiched BEFORE all floated tail blocks
+        const req1 = transport.requests[1];
+        const r1RealToolIdx = req1.messages.findIndex(
+            (m) => m.role === 'tool' && m.toolCallId === 'real_trig_tc_1',
+        );
+        const r1AssistantTailIdx = req1.messages.findIndex(
+            (m) => m.role === 'assistant' && m.content === 'ASSISTANT_TAIL_RULE',
+        );
+        const r1FloatMidIdx = req1.messages.findIndex(
+            (m) => m.role === 'system' && m.content === 'MID_FLOATING_HP=88',
+        );
+        const r1UserTailIdx = req1.messages.findIndex(
+            (m) => m.role === 'user' && m.content === 'USER_TAIL_END',
+        );
+        const r1CustomShellIdx = req1.messages.findIndex(
+            (m) => m.role === 'tool' && m.toolCallId === 'call_tail_shell',
+        );
+
+        expect(r1RealToolIdx).toBeGreaterThan(0);
+        expect(r1AssistantTailIdx).toBe(r1RealToolIdx + 1);
+        expect(r1FloatMidIdx).toBe(r1RealToolIdx + 2);
+        expect(r1UserTailIdx).toBe(r1RealToolIdx + 3);
+        expect(r1CustomShellIdx).toBe(req1.messages.length - 1);
+
+        // Round 2: both real_trig_tc_1 and real_trig_tc_2 chains sit BEFORE the floated tail blocks
+        const req2 = transport.requests[2];
+        const r2RealTool2Idx = req2.messages.findIndex(
+            (m) => m.role === 'tool' && m.toolCallId === 'real_trig_tc_2',
+        );
+        const r2AssistantTailIdx = req2.messages.findIndex(
+            (m) => m.role === 'assistant' && m.content === 'ASSISTANT_TAIL_RULE',
+        );
+        expect(r2RealTool2Idx).toBeGreaterThan(r1RealToolIdx);
+        expect(r2AssistantTailIdx).toBe(r2RealTool2Idx + 1);
+        expect(req2.messages[req2.messages.length - 1].toolCallId).toBe('call_tail_shell');
+
+        // Verify Gemini payload compiler produces valid contents with real tool chain before tail shell
+        const compiler = new PayloadCompiler();
+        const compiledGemini = compiler.compile(req2, connection);
+        const contents = compiledGemini.body.contents as Array<{
+            role: string;
+            parts: Array<Record<string, unknown>>;
+        }>;
+        const lastPart = contents[contents.length - 1].parts[0] as {
+            functionResponse?: { name: string };
+        };
+        expect(lastPart.functionResponse?.name).toBe('read_variables');
+        expect(
+            contents.some((c) =>
+                c.parts.some((p) => typeof p.text === 'string' && p.text.includes('ASSISTANT_TAIL_RULE')),
+            ),
+        ).toBe(true);
+    });
+
+    it('keeps persistent trigger TrajectoryStore free of floated tail blocks and also floats tail blocks for subagent runs', async () => {
+        const bridge = new MemoryHostBridge({
+            identity: { userName: 'User', charName: 'Char' },
+            characterFields: { description: 'Detective world.' },
+            metadata: { variables: { clueCount: 3 } },
+            ejsEvaluator: async (text, vars) =>
+                text.replace(/<%-\s*clueCount\s*%>/g, String(vars.clueCount ?? '')),
+        });
+
+        const persistentTriggerAgent = createDefaultMainAgent({
+            id: 'trig_persist',
+            name: 'Persistent Trigger',
+            sessionMode: 'persistent',
+            strictToolLoop: 'off',
+            enabledTools: ['read_variables'],
+            permissions: { read: ['/**'], write: [] },
+            promptBlocks: [
+                {
+                    id: 'system_base',
+                    name: 'Base',
+                    role: 'system',
+                    placement: 'prefix',
+                    enabled: true,
+                    content: 'PERSIST_TRIG_PREFIX',
+                },
+                {
+                    id: 'trig_tail',
+                    name: 'Trigger Tail',
+                    role: 'user',
+                    placement: 'tail',
+                    enabled: true,
+                    content: 'TRIG_TAIL_CLUES=<%- clueCount %>',
+                },
+            ],
+        });
+
+        const subagentProfile = createDefaultMainAgent({
+            id: 'sub_worker',
+            name: 'Sub Worker',
+            sessionMode: 'ephemeral',
+            ephemeralWindowSize: 0,
+            strictToolLoop: 'off',
+            enabledTools: ['read_variables'],
+            permissions: { read: ['/**'], write: [] },
+            promptBlocks: [
+                {
+                    id: 'sub_prefix',
+                    name: 'Sub Prefix',
+                    role: 'system',
+                    placement: 'prefix',
+                    enabled: true,
+                    content: 'SUBAGENT_PREFIX',
+                },
+                {
+                    id: 'sub_tail',
+                    name: 'Sub Tail',
+                    role: 'system',
+                    placement: 'tail',
+                    enabled: true,
+                    content: 'SUBAGENT_TAIL_RULE',
+                    triggers: ['subagent'],
+                },
+            ],
+        });
+
+        const connection = createDefaultConnection({
+            id: 'conn_test',
+            providerFormat: 'openai',
+            strictToolLoop: false,
+            roundMaxRetries: 0,
+        });
+        const preset = createDefaultPreset({
+            agents: {
+                main: persistentTriggerAgent,
+                sub_worker: subagentProfile,
+            },
+        });
+        const settings = createDefaultSettings({
+            currentConnectionId: connection.id,
+            connections: { [connection.id]: connection },
+            presets: { [preset.id]: preset },
+            currentPresetId: preset.id,
+        });
+
+        const transport = new ScriptedLLMTransport([
+            // Persistent trigger round 0 -> tool call -> round 1 -> final text
+            {
+                content: '',
+                toolCalls: [{ id: 'pt_tc_1', name: 'read_variables', arguments: '{}' }],
+            },
+            { content: 'Persistent trigger done.' },
+            // Subagent round 0 -> tool call -> round 1 -> final text
+            {
+                content: '',
+                toolCalls: [{ id: 'sub_tc_1', name: 'read_variables', arguments: '{}' }],
+            },
+            { content: 'Subagent done.' },
+        ]);
+
+        const trajectoryStore = new TrajectoryStore();
+        const runner = new AgentRunner({
+            bridge,
+            transport,
+            settings,
+            trajectoryStore,
+        });
+
+        const trigRes = await runner.run({
+            agent: persistentTriggerAgent,
+            preset,
+            connection,
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'after_turn',
+            promptTriggerContext: { kind: 'trigger', phase: 'after_turn' },
+            userInput: 'Analyze turn 1',
+            runTailRadar: false,
+            includeCategory4DynamicEntries: false,
+        });
+        expect(trigRes.content).toBe('Persistent trigger done.');
+
+        const trigReq1 = transport.requests[1];
+        const trigToolIdx = trigReq1.messages.findIndex(
+            (m) => m.role === 'tool' && m.toolCallId === 'pt_tc_1',
+        );
+        const trigTailIdx = trigReq1.messages.findIndex(
+            (m) => m.role === 'user' && m.content === 'TRIG_TAIL_CLUES=3',
+        );
+        expect(trigToolIdx).toBeGreaterThan(0);
+        expect(trigTailIdx).toBe(trigToolIdx + 1);
+        expect(trigTailIdx).toBe(trigReq1.messages.length - 1);
+
+        const storedTrig = trajectoryStore.getMessages(persistentTriggerAgent.id);
+        expect(
+            storedTrig.some((m) => typeof m.content === 'string' && m.content.includes('TRIG_TAIL_CLUES')),
+        ).toBe(false);
+
+        const subRes = await runner.run({
+            agent: subagentProfile,
+            preset,
+            connection,
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'main_turn',
+            delegationDepth: 1,
+            promptTriggerContext: { kind: 'subagent', phase: 'main_turn' },
+            userInput: 'Check variables for main agent',
+            runTailRadar: false,
+            includeCategory4DynamicEntries: false,
+        });
+        expect(subRes.content).toBe('Subagent done.');
+
+        const subReq1 = transport.requests[3];
+        const subToolIdx = subReq1.messages.findIndex(
+            (m) => m.role === 'tool' && m.toolCallId === 'sub_tc_1',
+        );
+        const subTailIdx = subReq1.messages.findIndex(
+            (m) => m.role === 'system' && m.content === 'SUBAGENT_TAIL_RULE',
+        );
+        expect(subToolIdx).toBeGreaterThan(0);
+        expect(subTailIdx).toBe(subToolIdx + 1);
+        expect(subTailIdx).toBe(subReq1.messages.length - 1);
+    });
+
+    it('preserves main_turn distinction where placement: "tail" stays in layer2Messages while floating_tail stays in floatingTailMessages', async () => {
+        const bridge = new MemoryHostBridge({
+            identity: { userName: 'Player', charName: 'Hero' },
+        });
+        const agent = createDefaultMainAgent({
+            promptBlocks: [
+                {
+                    id: 'system_base',
+                    name: 'Base',
+                    role: 'system',
+                    placement: 'prefix',
+                    enabled: true,
+                    content: 'MAIN_BASE',
+                },
+                {
+                    id: 'main_tail',
+                    name: 'Main Tail',
+                    role: 'user',
+                    placement: 'tail',
+                    enabled: true,
+                    content: 'MAIN_LAYER2_TAIL',
+                },
+                {
+                    id: 'main_float',
+                    name: 'Main Float',
+                    role: 'system',
+                    placement: 'floating_tail',
+                    enabled: true,
+                    content: 'MAIN_FLOATING_TAIL',
+                },
+            ],
+        });
+
+        const assembler = new ContextAssembler();
+        const assembled = await assembler.assembleWithHost({
+            agent,
+            hostBridge: bridge,
+            promptTriggerContext: { kind: 'main', action: 'normal' },
+            userInput: 'Hello',
+            runTailRadar: false,
+            includeCategory4DynamicEntries: false,
+        });
+
+        expect(assembled.layer2Messages.map((m) => m.content)).toEqual(['Hello', 'MAIN_LAYER2_TAIL']);
+        expect(assembled.floatingTailMessages.map((m) => m.content)).toEqual(['MAIN_FLOATING_TAIL']);
     });
 });
