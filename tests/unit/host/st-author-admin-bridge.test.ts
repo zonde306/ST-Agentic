@@ -1316,6 +1316,88 @@ describe('Companion Hooks /side/* Bridge & Zero-Residue Cleanup', () => {
 
         handle.dispose();
     });
+
+    it('skips auto-triggering after_turn on floor #0 initial greeting while allowing normal turns (>= #1)', async () => {
+        stMocks.state.chat = [
+            {
+                name: 'Alice',
+                is_user: false,
+                is_system: false,
+                mes: '欢迎来到港湾镇。',
+                swipe_id: 0,
+                swipes: ['欢迎来到港湾镇。'],
+            },
+        ];
+
+        const settings: Settings = {
+            ...createDefaultSettings(),
+            runMode: 'companion',
+        };
+        const bridge = new STHostBridge({ getSettings: () => settings });
+        const store = new ChatDataStore(bridge);
+        bridge.setStore(store);
+        const vfs = new VirtualFileSystem({ bridge, store });
+
+        const rerunAfterTurn = vi.fn(async () => []);
+        const mockOrchestrator = {
+            store,
+            vfs,
+            barrierCoordinator: {
+                awaitTurnBarriers: vi.fn(async () => undefined),
+                abortFromMessage: vi.fn(),
+                abortTarget: vi.fn(),
+            },
+            decoratorCompiler: {
+                compile: vi.fn(() => ({ triggers: [] })),
+            },
+            rerunAfterTurn,
+            trajectoryStore: {
+                listInterruptedCheckpoints: vi.fn(() => new Map()),
+                pruneFromMessage: vi.fn(() => 0),
+                pruneSwipe: vi.fn(() => 0),
+                saveToHost: vi.fn(),
+            },
+        } as unknown as PipelineOrchestrator;
+
+        const handle = setupCompanionHooks({
+            bridge,
+            orchestrator: mockOrchestrator,
+            getSettings: () => settings,
+        });
+
+        await stMocks.eventSource.emit(stMocks.event_types.CHARACTER_MESSAGE_RENDERED, 0, 'first_message');
+        await stMocks.eventSource.emit(stMocks.event_types.CHARACTER_MESSAGE_RENDERED, 0);
+        await stMocks.eventSource.emit(stMocks.event_types.CHARACTER_MESSAGE_RENDERED, 0, 'regenerate');
+        expect(rerunAfterTurn).not.toHaveBeenCalled();
+
+        stMocks.state.chat.push(
+            {
+                name: 'Tester',
+                is_user: true,
+                is_system: false,
+                mes: '你好，爱丽丝。',
+                swipe_id: 0,
+                swipes: ['你好，爱丽丝。'],
+            },
+            {
+                name: 'Alice',
+                is_user: false,
+                is_system: false,
+                mes: '很高兴见到你！',
+                swipe_id: 0,
+                swipes: ['很高兴见到你！'],
+            },
+        );
+
+        await stMocks.eventSource.emit(stMocks.event_types.CHARACTER_MESSAGE_RENDERED, 2, 'normal');
+        expect(rerunAfterTurn).toHaveBeenCalledTimes(1);
+        expect(rerunAfterTurn).toHaveBeenCalledWith(
+            { messageId: 2, swipeId: 0 },
+            { turnNumber: 3 },
+        );
+
+        handle.dispose();
+    });
 });
 
 describe('/sidegen-* Slash Commands', () => {

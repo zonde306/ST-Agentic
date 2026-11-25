@@ -860,7 +860,7 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         }
     };
 
-    const onCharacterMessageRendered = async (messageId: unknown) => {
+    const onCharacterMessageRendered = async (messageId: unknown, renderType?: unknown) => {
         clearCompanionPrompt();
         clearSideBridgePrompt();
 
@@ -917,6 +917,15 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
             }
         } else {
             await bridge.refreshMessageView(target);
+        }
+
+        const normalizedRenderType =
+            typeof renderType === 'string' ? renderType.trim().toLowerCase() : '';
+        const isFirstFloorOnly =
+            normalizedRenderType === 'first_message'
+            || (messageId === 0 && (!Array.isArray(chat) || chat.length <= 1));
+        if (isFirstFloorOnly) {
+            return;
         }
 
         const capsule = mountCompanionCapsule(messageId, target, settings, getAppStore);
