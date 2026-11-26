@@ -168,6 +168,71 @@ function formatTraceLorebooks(trace: AgentRunTrace): string | null {
     return names.length > 0 ? names.join(' · ') : null;
 }
 
+function buildAfterTurnTriggerIdentityKey(trace: AgentRunTrace): string | null {
+    if (trace.phase !== 'after_turn') {
+        return null;
+    }
+    const triggerIds = (trace.triggerId ?? '')
+        .split(',')
+        .map((id) => id.trim())
+        .filter(Boolean)
+        .sort();
+    const identity = triggerIds.length > 0
+        ? triggerIds.join(',')
+        : trace.agentProfileId.trim();
+    if (!identity) {
+        return null;
+    }
+    return `${trace.target.messageId}#${trace.target.swipeId}::${trace.phase}::${identity}`;
+}
+
+export function computeSupersededRunIds(
+    traces: readonly AgentRunTrace[],
+): ReadonlySet<string> {
+    const latestCompleted = new Map<string, { startedAt: number; index: number }>();
+    for (let i = 0; i < traces.length; i += 1) {
+        const trace = traces[i];
+        if (trace.status !== 'completed') {
+            continue;
+        }
+        const key = buildAfterTurnTriggerIdentityKey(trace);
+        if (!key) {
+            continue;
+        }
+        const prev = latestCompleted.get(key);
+        if (
+            !prev
+            || trace.startedAt > prev.startedAt
+            || (trace.startedAt === prev.startedAt && i < prev.index)
+        ) {
+            latestCompleted.set(key, { startedAt: trace.startedAt, index: i });
+        }
+    }
+
+    const superseded = new Set<string>();
+    for (let i = 0; i < traces.length; i += 1) {
+        const trace = traces[i];
+        if (trace.status === 'running') {
+            continue;
+        }
+        const key = buildAfterTurnTriggerIdentityKey(trace);
+        if (!key) {
+            continue;
+        }
+        const latest = latestCompleted.get(key);
+        if (!latest) {
+            continue;
+        }
+        if (
+            trace.startedAt < latest.startedAt
+            || (trace.startedAt === latest.startedAt && i > latest.index)
+        ) {
+            superseded.add(trace.runId);
+        }
+    }
+    return superseded;
+}
+
 function matchesSearch(trace: AgentRunTrace, query: string): boolean {
     if (!query) {
         return true;
@@ -322,6 +387,8 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             ?? null,
         [filteredTraces, selectedRunId],
     );
+
+    const supersededRunIds = useMemo(() => computeSupersededRunIds(traces), [traces]);
 
     const handleClickRunItem = (trace: AgentRunTrace) => {
         const wasSelected = selectedTrace?.runId === trace.runId;
@@ -587,6 +654,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                         const statusMeta = getRunStatusMeta(trace.status);
                         const hasSteps = trace.toolSteps.length > 0;
                         const isStepsExpanded = hasSteps && expandedRunId === trace.runId;
+                        const isSuperseded = supersededRunIds.has(trace.runId);
                         return (
                             <div
                                 key={trace.runId}
@@ -595,13 +663,17 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                             >
                                 <button
                                     type="button"
-                                    class={
+                                    class={[
                                         isSelected && !isMobile
                                             ? 'ag-list-item ag-list-item-active'
-                                            : 'ag-list-item'
-                                    }
+                                            : 'ag-list-item',
+                                        isSuperseded ? 'ag-log-run-superseded' : '',
+                                    ]
+                                        .filter(Boolean)
+                                        .join(' ')}
                                     aria-expanded={hasSteps ? isStepsExpanded : undefined}
                                     data-log-run-item={trace.runId}
+                                    data-log-superseded={isSuperseded ? 'true' : undefined}
                                     onClick={() => handleClickRunItem(trace)}
                                 >
                                     <div
@@ -633,6 +705,9 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                     <div class="ag-list-item-meta">
                                         <span class="ag-row" style={{ gap: '4px', flexWrap: 'wrap' }}>
                                             <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
+                                            {isSuperseded ? (
+                                                <Badge tone="neutral">已重跑</Badge>
+                                            ) : null}
                                             {(trace.retryCount ?? 0) > 0 ? (
                                                 <Badge tone="warning">重试 {trace.retryCount} 次</Badge>
                                             ) : null}
@@ -789,7 +864,18 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             && Boolean(store.services.resumeTurn);
         const isRerunningThis = rerunningRunId === selectedTrace.runId;
         const isResumingThis = resumingRunId === selectedTrace.runId;
-        const rerunLabel = selectedTrace.triggerId ? '重试此触发器' : '重跑后置触发';
+        const isSelectedSuperseded = supersededRunIds.has(selectedTrace.runId);
+        const isFailedOrAborted =
+            selectedTrace.status === 'error'
+            || selectedTrace.status === 'aborted'
+            || selectedTrace.status === 'interrupted';
+        const rerunLabel = selectedTrace.triggerId
+            ? isFailedOrAborted
+                ? '重试此触发器'
+                : '重跑此触发器'
+            : '重跑后置触发';
+        const rerunVariant =
+            isFailedOrAborted && !isSelectedSuperseded ? 'primary' : 'secondary';
 
         return (
             <div
@@ -808,6 +894,14 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                 </div>
                                 <div class="ag-card-subtitle ag-row-wrap" style={{ marginTop: '4px' }}>
                                     <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
+                                    {isSelectedSuperseded ? (
+                                        <Badge
+                                            tone="neutral"
+                                            title="该楼层的此触发器已有更新的成功运行记录"
+                                        >
+                                            已重跑
+                                        </Badge>
+                                    ) : null}
                                     {(selectedTrace.retryCount ?? 0) > 0 ? (
                                         <Badge tone="warning">
                                             自动重试 {selectedTrace.retryCount} 次
@@ -845,15 +939,10 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                 {isAfterTurnRerunnable ? (
                                     <Button
                                         size="sm"
-                                        variant={
-                                            selectedTrace.status === 'error'
-                                            || selectedTrace.status === 'aborted'
-                                                ? 'primary'
-                                                : 'secondary'
-                                        }
+                                        variant={rerunVariant}
                                         icon={<IconRefresh size={14} />}
                                         loading={isRerunningThis}
-                                        disabled={isRerunningThis}
+                                        disabled={rerunningRunId !== null || selectedTrace.status === 'running'}
                                         ariaLabel={rerunLabel}
                                         className="ag-log-rerun-btn"
                                         onClick={() => void handleRerunTrace(selectedTrace)}

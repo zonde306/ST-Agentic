@@ -33,6 +33,7 @@ export interface CompiledWorldInfoArtifacts {
 
 export interface DecoratorCompilerOptions {
     preset?: Preset;
+    includeDisabled?: boolean;
 }
 
 export interface TriggerExecutionUnit {
@@ -106,6 +107,10 @@ function sanitizeSegment(raw: string): string {
         .trim()
         .replace(/[^\p{L}\p{N}_-]+/gu, '_')
         .replace(/^_+|_+$/g, '') || 'item';
+}
+
+export function buildWorldInfoTriggerRuleId(world: string, uid: number): string {
+    return `wi_${sanitizeSegment(world)}_${uid}`;
 }
 
 function stripLeadingCodeFence(raw: string): { code: string; remainder: string } {
@@ -378,12 +383,30 @@ export class DecoratorCompiler {
         const subAgents = extractSubAgentDescriptors(entries);
 
         for (const entry of entries) {
-            if (entry.disable) {
+            const isDisabled = Boolean(entry.disable);
+            if (isDisabled && !options.includeDisabled) {
                 continue;
             }
 
             const compiled = this.compileEntry(entry, options);
             if (!compiled) {
+                continue;
+            }
+
+            if (isDisabled) {
+                if (compiled.trigger) {
+                    const disabledTrigger: TriggerRule = {
+                        ...compiled.trigger,
+                        enabled: false,
+                    };
+                    triggers.push(disabledTrigger);
+                    if (compiled.derivedAgent) {
+                        derivedAgentsByRuleId[disabledTrigger.id] = canonicalClone(compiled.derivedAgent);
+                        if (!derivedAgents[compiled.derivedAgent.id]) {
+                            derivedAgents[compiled.derivedAgent.id] = compiled.derivedAgent;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -494,7 +517,7 @@ export class DecoratorCompiler {
         }
 
         const vfsPath = buildLoreVfsPath(entry, decorators);
-        const ruleId = `wi_${sanitizeSegment(entry.world)}_${entry.uid}`;
+        const ruleId = buildWorldInfoTriggerRuleId(entry.world, entry.uid);
         const label = entry.comment?.trim() || `${entry.world}#${entry.uid}`;
         const sourceWorld = entry.world?.trim() || undefined;
         const sourceMeta = {
@@ -842,9 +865,10 @@ export class DecoratorCompiler {
  */
 export function groupTriggersForExecution(
     triggers: readonly TriggerRule[],
+    options?: { includeDisabled?: boolean },
 ): TriggerExecutionUnit[] {
     const enabled = triggers
-        .filter((rule) => rule.enabled)
+        .filter((rule) => options?.includeDisabled || rule.enabled)
         .map((rule, idx) => ({ rule: canonicalClone(rule), idx }))
         .sort(
             (a, b) =>

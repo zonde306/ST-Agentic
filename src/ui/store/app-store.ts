@@ -172,12 +172,18 @@ export interface AssistantRuntimeBridge {
  */
 export type SideGenRuntimeBridge = ToolSideGenApi;
 
+export interface ToastAction {
+    label: string;
+    onClick: () => void;
+}
+
 export interface ToastItem {
     id: string;
     message: string;
     tone: ToastTone;
     createdAt: number;
     durationMs: number;
+    action?: ToastAction;
 }
 
 export type ActiveModalState =
@@ -329,7 +335,7 @@ export interface AgenticUIServices {
     // Traces & Execution Actions (View 2 & Capsule / Magic Menu)
     listTraces(filter?: { messageId?: number; swipeId?: number }): Promise<AgentRunTrace[]>;
     clearTraces?(): Promise<void>;
-    rerunAfterTurn(target?: MessageTarget, options?: { triggerIds?: string[] }): Promise<void>;
+    rerunAfterTurn(target?: MessageTarget, options?: { triggerIds?: string[]; force?: boolean }): Promise<void>;
     resumeTurn?(target: MessageTarget): Promise<void>;
     cancelBackgroundTask(taskId: string): Promise<void>;
 
@@ -1135,19 +1141,33 @@ export class AppStore {
 
     async rerunAfterTurn(
         target?: MessageTarget,
-        options?: { triggerIds?: string[]; label?: string },
+        options?: {
+            triggerIds?: string[];
+            force?: boolean;
+            label?: string;
+            silentToast?: boolean;
+        },
     ): Promise<void> {
         const resolved = target ?? this.state.activeTarget;
-        const serviceOpts = options?.triggerIds?.length
-            ? { triggerIds: options.triggerIds }
-            : undefined;
-        await this.services.rerunAfterTurn(resolved, serviceOpts);
-        this.pushToast(
-            options?.label
-                ? `已重新派发 #${resolved.messageId}#${resolved.swipeId} 的后置触发：${options.label}`
-                : `已重新派发楼层 #${resolved.messageId}#${resolved.swipeId} 的后置触发任务`,
-            'primary',
+        const serviceOpts: { triggerIds?: string[]; force?: boolean } = {};
+        if (options?.triggerIds?.length) {
+            serviceOpts.triggerIds = options.triggerIds;
+        }
+        if (options?.force) {
+            serviceOpts.force = true;
+        }
+        await this.services.rerunAfterTurn(
+            resolved,
+            Object.keys(serviceOpts).length > 0 ? serviceOpts : undefined,
         );
+        if (!options?.silentToast) {
+            this.pushToast(
+                options?.label
+                    ? `已重新派发 #${resolved.messageId}#${resolved.swipeId} 的后置触发：${options.label}`
+                    : `已重新派发楼层 #${resolved.messageId}#${resolved.swipeId} 的后置触发任务`,
+                'primary',
+            );
+        }
     }
 
     async resumeTurn(target?: MessageTarget): Promise<void> {
@@ -1166,7 +1186,12 @@ export class AppStore {
         }
     }
 
-    pushToast(message: string, tone: ToastTone = 'primary', durationMs = 2800): string {
+    pushToast(
+        message: string,
+        tone: ToastTone = 'primary',
+        durationMs = 2800,
+        action?: ToastAction,
+    ): string {
         this.toastCounter += 1;
         const id = `toast_${Date.now()}_${this.toastCounter}`;
         const item: ToastItem = {
@@ -1175,6 +1200,7 @@ export class AppStore {
             tone,
             createdAt: Date.now(),
             durationMs,
+            ...(action ? { action } : {}),
         };
         const nextQueue = [...this.state.toastQueue.slice(-4), item];
         this.setState({ toastQueue: nextQueue });

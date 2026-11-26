@@ -8,7 +8,12 @@ import {
 } from '@/core/config';
 import { TrajectoryStore } from '@/core/context';
 import { TraceLogger } from '@/core/logger';
-import { PipelineOrchestrator, TurnInterruptedError } from '@/core/triggers';
+import {
+    buildWorldInfoTriggerRuleId,
+    DecoratorCompiler,
+    PipelineOrchestrator,
+    TurnInterruptedError,
+} from '@/core/triggers';
 import type { GenerationEventPayload, RawLoreEntry, Settings, TriggerRule } from '@/core/types';
 import { IframeJsSandbox } from '@/sandbox';
 import {
@@ -2489,5 +2494,216 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
             target: { messageId: 1, swipeId: 0 },
         });
         expect(varsAfterRerun.fatigue).toBe(42);
+    }, 15_000);
+
+    it('supports forced single-trigger rerun for disabled/unmatched preset & WI triggers and deduplicates imported WI overrides', async () => {
+        const disabledWiRuleId = buildWorldInfoTriggerRuleId('玄幻世界', 31);
+        const importedWiRuleId = buildWorldInfoTriggerRuleId('玄幻世界', 32);
+
+        const compiler = new DecoratorCompiler();
+        const enabledCompile = compiler.compile([
+            {
+                world: '玄幻世界',
+                uid: 31,
+                comment: '停用的世界书触发器',
+                content: '@@trigger phase=after order=1\n更新变量 flag_wi = true',
+                keys: [],
+                keysecondary: [],
+                constant: false,
+                selective: false,
+                disable: true,
+                position: 0,
+                depth: 0,
+                order: 1,
+                role: 0,
+            },
+        ]);
+        expect(enabledCompile.triggers).toHaveLength(0);
+
+        const includeDisabledCompile = compiler.compile(
+            [
+                {
+                    world: '玄幻世界',
+                    uid: 31,
+                    comment: '停用的世界书触发器',
+                    content: '@@trigger phase=after order=1\n更新变量 flag_wi = true',
+                    keys: [],
+                    keysecondary: [],
+                    constant: false,
+                    selective: false,
+                    disable: true,
+                    position: 0,
+                    depth: 0,
+                    order: 1,
+                    role: 0,
+                },
+                {
+                    world: '玄幻世界',
+                    uid: 99,
+                    comment: '停用工具不应泄露',
+                    content: '@@tool disabled_secret_tool\nreturn 1;',
+                    keys: [],
+                    keysecondary: [],
+                    constant: false,
+                    selective: false,
+                    disable: true,
+                    position: 0,
+                    depth: 0,
+                    order: 2,
+                    role: 0,
+                },
+            ],
+            { includeDisabled: true },
+        );
+        expect(includeDisabledCompile.triggers).toHaveLength(1);
+        expect(includeDisabledCompile.triggers[0].id).toBe(disabledWiRuleId);
+        expect(includeDisabledCompile.triggers[0].enabled).toBe(false);
+        expect(includeDisabledCompile.toolEntries).toHaveLength(0);
+
+        const disabledPresetRule: TriggerRule = {
+            id: 'tr_disabled_unmatched',
+            label: '停用且条件不满足的预设触发器',
+            source: 'preset',
+            phase: 'after_turn',
+            order: 1,
+            barrier: 'self',
+            agentProfileId: 'main',
+            kind: 'agent',
+            condition: { type: 'interval', interval: 99 },
+            instructionTemplate: '强制补跑预设规则并写入 presetForced=1',
+            enabled: false,
+        };
+
+        const importedWiOverrideRule: TriggerRule = {
+            id: importedWiRuleId,
+            label: '已导入预设的世界书触发器',
+            source: 'worldinfo',
+            sourceWorld: '玄幻世界',
+            sourceEntryUid: 32,
+            phase: 'after_turn',
+            order: 2,
+            barrier: 'self',
+            agentProfileId: 'main',
+            kind: 'agent',
+            condition: { type: 'always' },
+            instructionTemplate: 'PRESET_OVERRIDE_PROMPT',
+            enabled: true,
+        };
+
+        const { bridge, transport, orchestrator } = createPipelineFixture({
+            triggers: [disabledPresetRule, importedWiOverrideRule],
+            lorebooks: {
+                玄幻世界: [
+                    {
+                        world: '玄幻世界',
+                        uid: 31,
+                        comment: '停用的世界书触发器',
+                        content: '@@trigger phase=after order=1 target=/state/variables.json\nWI_FORCED_PROMPT',
+                        keys: [],
+                        keysecondary: [],
+                        constant: false,
+                        selective: false,
+                        disable: true,
+                        position: 0,
+                        depth: 0,
+                        order: 1,
+                        role: 0,
+                    },
+                    {
+                        world: '玄幻世界',
+                        uid: 32,
+                        comment: '已被预设导入覆写的世界书触发器',
+                        content: '@@trigger phase=after order=2\nRAW_WI_PROMPT_SHOULD_NOT_DUPLICATE',
+                        keys: [],
+                        keysecondary: [],
+                        constant: false,
+                        selective: false,
+                        disable: false,
+                        position: 0,
+                        depth: 0,
+                        order: 2,
+                        role: 0,
+                    },
+                ],
+            },
+        });
+
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '第一轮' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: 'AI回复', swipeId: 0 });
+
+        // Without force, disabled rules do NOT run even if targeted, and imported WI rule runs only once.
+        let overrideExecCount = 0;
+        transport.enqueue((req) => {
+            const joined = req.messages.map((m) => String(m.content)).join('\n');
+            if (joined.includes('PRESET_OVERRIDE_PROMPT')) {
+                overrideExecCount += 1;
+            }
+            expect(joined).not.toContain('RAW_WI_PROMPT_SHOULD_NOT_DUPLICATE');
+            return { content: 'ok' };
+        });
+
+        const noForceDisabledHandles = await orchestrator.rerunAfterTurn(
+            { messageId: 1, swipeId: 0 },
+            { triggerIds: [disabledPresetRule.id, disabledWiRuleId], turnNumber: 1 },
+        );
+        expect(noForceDisabledHandles).toHaveLength(0);
+
+        const dedupHandles = await orchestrator.rerunAfterTurn(
+            { messageId: 1, swipeId: 0 },
+            { triggerIds: [importedWiRuleId], turnNumber: 1 },
+        );
+        expect(dedupHandles).toHaveLength(1);
+        await Promise.allSettled(dedupHandles.map((h) => h.promise));
+        expect(overrideExecCount).toBe(1);
+
+        // With force: true, disabled preset rule (even with interval=99) runs once.
+        transport.enqueue(
+            () => ({
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'force_preset_patch',
+                        name: 'patch_variables',
+                        arguments: JSON.stringify({ scope: 'message', json_merge: { presetForced: 1 } }),
+                    },
+                ],
+            }),
+            { content: '' },
+        );
+        const forcedPresetHandles = await orchestrator.rerunAfterTurn(
+            { messageId: 1, swipeId: 0 },
+            { triggerIds: [disabledPresetRule.id], force: true, turnNumber: 1 },
+        );
+        expect(forcedPresetHandles).toHaveLength(1);
+        await Promise.allSettled(forcedPresetHandles.map((h) => h.promise));
+
+        // With force: true, disabled WI rule runs once.
+        transport.enqueue(
+            (req) => {
+                const joined = req.messages.map((m) => String(m.content)).join('\n');
+                expect(joined).toContain('WI_FORCED_PROMPT');
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'force_wi_patch',
+                            name: 'patch_variables',
+                            arguments: JSON.stringify({ scope: 'message', json_merge: { wiForced: 2 } }),
+                        },
+                    ],
+                };
+            },
+            { content: '' },
+        );
+        const forcedWiHandles = await orchestrator.rerunAfterTurn(
+            { messageId: 1, swipeId: 0 },
+            { triggerIds: [disabledWiRuleId], force: true, turnNumber: 1 },
+        );
+        expect(forcedWiHandles).toHaveLength(1);
+        await Promise.allSettled(forcedWiHandles.map((h) => h.promise));
+
+        const vars = await orchestrator.vfs.readVariables({ target: { messageId: 1, swipeId: 0 } });
+        expect(vars.presetForced).toBe(1);
+        expect(vars.wiForced).toBe(2);
     }, 15_000);
 });

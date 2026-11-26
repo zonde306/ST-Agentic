@@ -2,6 +2,7 @@ import { render } from 'preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { page, userEvent } from 'vitest/browser';
 import type { ConsoleTabId } from '@/core/types';
+import { buildWorldInfoTriggerRuleId } from '@/core/triggers';
 import { registerAssistantView } from '@/ui/assistant';
 import {
     type AgenticCapsuleElement,
@@ -1773,6 +1774,288 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
                 target: { messageId: 4, swipeId: 3 },
                 options: { triggerIds: ['tr_phys_1'] },
             });
+        }
+    });
+
+    it('supports single-trigger manual run in PipelineView and superseded log badges in LogsView across desktop and mobile', async () => {
+        for (const vp of [
+            { label: 'desktop', width: 1280, height: 800, isMobile: false },
+            { label: 'mobile', width: 390, height: 844, isMobile: true },
+        ]) {
+            activeHarness?.cleanup();
+            activeHarness = null;
+            await page.viewport(vp.width, vp.height);
+
+            const rerunCalls: Array<{
+                target?: { messageId: number; swipeId: number };
+                options?: { triggerIds?: string[]; force?: boolean };
+            }> = [];
+            const baseServices = createMockUIServices();
+            const now = Date.now();
+            const initialTraces = [...createMockTraces()];
+            let dynamicTraces = [...initialTraces];
+
+            activeHarness = createHarness({
+                initialTab: 'pipeline',
+                initialOpen: true,
+                services: {
+                    ...baseServices,
+                    listTraces: async () => dynamicTraces.map((t) => ({ ...t })),
+                    rerunAfterTurn: async (target, options) => {
+                        rerunCalls.push({ target, options });
+                        const triggerId = options?.triggerIds?.[0] ?? 'tr_manual';
+                        dynamicTraces = [
+                            {
+                                runId: `run_manual_${rerunCalls.length}`,
+                                target: target ?? { messageId: 12, swipeId: 0 },
+                                phase: 'after_turn',
+                                agentProfileId: 'ag_vars',
+                                agentName: '手动运行测试',
+                                triggerId,
+                                triggerLabel: triggerId,
+                                triggerSource: 'preset',
+                                connectionId: 'conn_gemini',
+                                model: 'gemini-4-hydrogen',
+                                status: 'completed',
+                                startedAt: now + rerunCalls.length * 1000,
+                                endedAt: now + rerunCalls.length * 1000 + 250,
+                                durationMs: 250,
+                                usage: {
+                                    inputTokens: 500,
+                                    cachedTokens: 300,
+                                    outputTokens: 60,
+                                    totalTokens: 560,
+                                    cacheHitRate: 0.6,
+                                },
+                                toolSteps: [],
+                            },
+                            ...dynamicTraces,
+                        ];
+                    },
+                },
+            });
+            activeHarness.store.setActiveTarget({ messageId: 12, swipeId: 0 });
+            await settleLayout(5);
+
+            const { dialog, shadowRoot } = getShellElements();
+
+            const returnToListIfMobile = async () => {
+                if (!vp.isMobile) {
+                    return;
+                }
+                const backBtn = shadowRoot.querySelector(
+                    'button.ag-stack-back-btn',
+                ) as HTMLButtonElement | null;
+                if (backBtn) {
+                    backBtn.click();
+                    await settleLayout(5);
+                }
+            };
+
+            // 1. Select an after_turn preset rule (e.g., tr_outline) and run it manually.
+            const outlineBtn = Array.from(shadowRoot.querySelectorAll('.ag-list-item')).find((el) =>
+                el.textContent?.includes('大纲与伏笔记录'),
+            ) as HTMLButtonElement | undefined;
+            expect(outlineBtn, `${vp.label}: expected tr_outline rule item`).toBeTruthy();
+            outlineBtn!.click();
+            await settleLayout(5);
+
+            const runPresetBtn = shadowRoot.querySelector(
+                'button.ag-pipeline-run-btn',
+            ) as HTMLButtonElement | null;
+            expect(runPresetBtn, `${vp.label}: expected preset manual run button`).toBeTruthy();
+            expect(runPresetBtn!.disabled).toBe(false);
+            expect(runPresetBtn!.textContent).toContain('立即运行 (#12#0)');
+
+            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:pipeline:preset_detail`);
+            assertInteractiveTargetsAndTypography(shadowRoot, `${vp.label}:pipeline:preset_detail`);
+
+            runPresetBtn!.click();
+            await vi.waitFor(() => {
+                expect(rerunCalls).toHaveLength(1);
+            });
+            expect(rerunCalls[0]).toEqual({
+                target: { messageId: 12, swipeId: 0 },
+                options: { triggerIds: ['tr_outline'], force: true },
+            });
+
+            await settleLayout(5);
+            const toastActionBtn = shadowRoot.querySelector(
+                'button.ag-toast-action',
+            ) as HTMLButtonElement | null;
+            expect(toastActionBtn, `${vp.label}: expected toast 查看日志 button`).toBeTruthy();
+            expect(toastActionBtn!.textContent).toContain('查看日志');
+            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:pipeline:toast_action`);
+            assertInteractiveTargetsAndTypography(shadowRoot, `${vp.label}:pipeline:toast_action`);
+
+            // 2. Select non-after_turn rule (maintenance: Watermark Compaction) -> disabled.
+            await returnToListIfMobile();
+            const compactBtn = Array.from(shadowRoot.querySelectorAll('.ag-list-item')).find((el) =>
+                el.textContent?.includes('Watermark Compaction'),
+            ) as HTMLButtonElement | undefined;
+            expect(compactBtn, `${vp.label}: expected maintenance rule item`).toBeTruthy();
+            compactBtn!.click();
+            await settleLayout(5);
+
+            const disabledRunBtn = shadowRoot.querySelector(
+                'button.ag-pipeline-run-btn',
+            ) as HTMLButtonElement | null;
+            expect(disabledRunBtn).toBeTruthy();
+            expect(disabledRunBtn!.disabled).toBe(true);
+
+            // 3. Select scanned WI after_turn rule (uid 20 in 玄幻世界) -> can run without importing.
+            await returnToListIfMobile();
+            const scannedWiBtn = Array.from(shadowRoot.querySelectorAll('.ag-list-item')).find(
+                (el) =>
+                    el.textContent?.includes('好感与灵力结算')
+                    && el.textContent?.includes('世界书 @@ (实时扫描)'),
+            ) as HTMLButtonElement | undefined;
+            expect(scannedWiBtn, `${vp.label}: expected scanned WI rule item`).toBeTruthy();
+            scannedWiBtn!.click();
+            await settleLayout(5);
+
+            const runWiBtn = shadowRoot.querySelector(
+                'button.ag-pipeline-run-btn',
+            ) as HTMLButtonElement | null;
+            expect(runWiBtn).toBeTruthy();
+            expect(runWiBtn!.disabled).toBe(false);
+            expect(runWiBtn!.textContent).toContain('立即运行 (#12#0)');
+            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:pipeline:scanned_wi`);
+            assertInteractiveTargetsAndTypography(shadowRoot, `${vp.label}:pipeline:scanned_wi`);
+
+            runWiBtn!.click();
+            await vi.waitFor(() => {
+                expect(rerunCalls).toHaveLength(2);
+            });
+            expect(rerunCalls[1]).toEqual({
+                target: { messageId: 12, swipeId: 0 },
+                options: {
+                    triggerIds: [buildWorldInfoTriggerRuleId('玄幻世界', 20)],
+                    force: true,
+                },
+            });
+
+            // 4. Click "查看日志" on toast -> jumps to logs tab and highlights newest manual trace.
+            await settleLayout(5);
+            const jumpLogsBtn = shadowRoot.querySelector(
+                'button.ag-toast-action',
+            ) as HTMLButtonElement | null;
+            expect(jumpLogsBtn).toBeTruthy();
+            jumpLogsBtn!.click();
+            await settleLayout(5);
+            expect(activeHarness.store.getSnapshot().activeTab).toBe('logs');
+
+            // 5. Verify LogsView non-destructive superseded markers ("已重跑") and button labels.
+            const newerDoneTrace = {
+                runId: 'run_superseded_new',
+                target: { messageId: 8, swipeId: 0 },
+                phase: 'after_turn' as const,
+                agentProfileId: 'ag_phys',
+                agentName: '生理更新',
+                triggerId: 'tr_phys_8',
+                triggerLabel: '生理更新',
+                connectionId: 'conn_gemini',
+                model: 'gemini-4-hydrogen',
+                status: 'completed' as const,
+                startedAt: now + 50_000,
+                endedAt: now + 51_000,
+                durationMs: 1000,
+                usage: { inputTokens: 100, cachedTokens: 0, outputTokens: 20, cacheHitRate: 0 },
+                toolSteps: [],
+            };
+            const olderErrTrace = {
+                ...newerDoneTrace,
+                runId: 'run_superseded_old',
+                status: 'error' as const,
+                startedAt: now + 10_000,
+                endedAt: now + 12_000,
+                durationMs: 2000,
+                error: 'Transient failure',
+            };
+            const unrecoveredErrTrace = {
+                ...newerDoneTrace,
+                runId: 'run_unrecovered_err',
+                target: { messageId: 9, swipeId: 0 },
+                triggerId: 'tr_other_9',
+                status: 'error' as const,
+                startedAt: now + 20_000,
+                endedAt: now + 22_000,
+                durationMs: 2000,
+                error: 'Still failing',
+            };
+            activeHarness.store.setTraces([
+                newerDoneTrace,
+                olderErrTrace,
+                unrecoveredErrTrace,
+            ]);
+            await settleLayout(5);
+            await returnToListIfMobile();
+
+            const allFloorsBtn = Array.from(shadowRoot.querySelectorAll('button')).find((el) =>
+                el.textContent?.trim() === '全部楼层',
+            ) as HTMLButtonElement | undefined;
+            expect(allFloorsBtn).toBeTruthy();
+            allFloorsBtn!.click();
+            await settleLayout(5);
+
+            const getOldItem = () =>
+                shadowRoot.querySelector(
+                    '[data-log-run-item="run_superseded_old"]',
+                ) as HTMLButtonElement | null;
+            const getNewItem = () =>
+                shadowRoot.querySelector(
+                    '[data-log-run-item="run_superseded_new"]',
+                ) as HTMLButtonElement | null;
+            const getUnrecoveredItem = () =>
+                shadowRoot.querySelector(
+                    '[data-log-run-item="run_unrecovered_err"]',
+                ) as HTMLButtonElement | null;
+
+            expect(getOldItem()).toBeTruthy();
+            expect(getNewItem()).toBeTruthy();
+            expect(getUnrecoveredItem()).toBeTruthy();
+
+            expect(getOldItem()!.getAttribute('data-log-superseded')).toBe('true');
+            expect(getOldItem()!.classList.contains('ag-log-run-superseded')).toBe(true);
+            expect(getOldItem()!.textContent).toContain('已重跑');
+
+            expect(getNewItem()!.getAttribute('data-log-superseded')).toBeNull();
+            expect(getNewItem()!.textContent).not.toContain('已重跑');
+
+            expect(getUnrecoveredItem()!.getAttribute('data-log-superseded')).toBeNull();
+            expect(getUnrecoveredItem()!.textContent).not.toContain('已重跑');
+
+            // Select superseded old error -> shows 已重跑 in detail and secondary button
+            getOldItem()!.click();
+            await settleLayout(5);
+            const oldRerunBtn = shadowRoot.querySelector(
+                'button.ag-log-rerun-btn',
+            ) as HTMLButtonElement | null;
+            expect(oldRerunBtn).toBeTruthy();
+            expect(oldRerunBtn!.textContent).toContain('重试此触发器');
+            expect(oldRerunBtn!.classList.contains('ag-btn-secondary')).toBe(true);
+
+            // Select newer completed trace -> button says "重跑此触发器" (secondary)
+            await returnToListIfMobile();
+            getNewItem()!.click();
+            await settleLayout(5);
+            const newRerunBtn = shadowRoot.querySelector(
+                'button.ag-log-rerun-btn',
+            ) as HTMLButtonElement | null;
+            expect(newRerunBtn).toBeTruthy();
+            expect(newRerunBtn!.textContent).toContain('重跑此触发器');
+            expect(newRerunBtn!.classList.contains('ag-btn-secondary')).toBe(true);
+
+            // Select unrecovered error trace -> button says "重试此触发器" (primary)
+            await returnToListIfMobile();
+            getUnrecoveredItem()!.click();
+            await settleLayout(5);
+            const unrecoveredBtn = shadowRoot.querySelector(
+                'button.ag-log-rerun-btn',
+            ) as HTMLButtonElement | null;
+            expect(unrecoveredBtn).toBeTruthy();
+            expect(unrecoveredBtn!.textContent).toContain('重试此触发器');
+            expect(unrecoveredBtn!.classList.contains('ag-btn-primary')).toBe(true);
         }
     });
 });

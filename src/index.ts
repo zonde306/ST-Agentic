@@ -1377,13 +1377,18 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
 
         async rerunAfterTurn(
             targetInput?: MessageTarget,
-            options?: { triggerIds?: string[] },
+            options?: { triggerIds?: string[]; force?: boolean },
         ): Promise<void> {
             const target = resolveTarget(targetInput);
-            const handles = await orchestrator.rerunAfterTurn(
-                target,
-                options?.triggerIds?.length ? { triggerIds: options.triggerIds } : {},
-            );
+            const handles = await orchestrator.rerunAfterTurn(target, {
+                ...(options?.triggerIds?.length ? { triggerIds: options.triggerIds } : {}),
+                ...(options?.force ? { force: true } : {}),
+            });
+            if (options?.triggerIds?.length && handles.length === 0) {
+                throw new Error(
+                    '未找到可运行的后置触发器规则（请确认规则处于 after_turn 阶段且所在世界书已激活）',
+                );
+            }
             const storeUi = getAppStore();
             storeUi?.setBackgroundTasks(barrierCoordinator.listTasks());
             await Promise.allSettled(handles.map((handle) => handle.promise));

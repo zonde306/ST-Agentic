@@ -1779,8 +1779,9 @@ textarea:focus-visible {
 }
 
 .ag-toast-close {
-    min-width: 40px;
-    min-height: 40px;
+    min-width: 42px;
+    min-height: 42px;
+    flex-shrink: 0;
     border-radius: var(--radius-md);
     border: none;
     background: transparent;
@@ -1795,6 +1796,32 @@ textarea:focus-visible {
 .ag-toast-close:hover {
     background: var(--hover);
     color: var(--foreground);
+}
+
+.ag-toast-action {
+    min-height: 42px;
+    min-width: 42px;
+    padding: 0 10px;
+    border-radius: var(--radius-md);
+    border: 1px solid color-mix(in srgb, var(--primary) 30%, transparent);
+    background: var(--primary-soft);
+    color: var(--primary);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+    white-space: nowrap;
+    transition: background var(--dur) var(--ease);
+}
+
+.ag-toast-action:hover {
+    background: color-mix(in srgb, var(--primary) 20%, transparent);
+}
+
+.ag-toast-action:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 1px;
 }
 
 /* ========================================================================= */
@@ -5462,6 +5489,15 @@ textarea:focus-visible {
     flex-direction: column;
     gap: 4px;
     min-width: 0;
+}
+
+.ag-log-run-superseded {
+    opacity: 0.66;
+}
+
+.ag-log-run-superseded:hover,
+.ag-log-run-superseded.ag-list-item-active {
+    opacity: 1;
 }
 
 .ag-log-run-steps-hint {

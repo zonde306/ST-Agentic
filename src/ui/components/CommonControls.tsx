@@ -627,6 +627,18 @@ export function ToastContainer({ toasts, onDismiss }: ToastContainerProps) {
                         <ToastToneIcon tone={toast.tone} />
                     </span>
                     <span class="ag-toast-msg">{toast.message}</span>
+                    {toast.action ? (
+                        <button
+                            type="button"
+                            class="ag-toast-action"
+                            onClick={() => {
+                                toast.action?.onClick();
+                                onDismiss(toast.id);
+                            }}
+                        >
+                            {toast.action.label}
+                        </button>
+                    ) : null}
                     <button
                         type="button"
                         class="ag-toast-close"

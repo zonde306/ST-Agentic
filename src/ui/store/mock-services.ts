@@ -1617,7 +1617,10 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
                 .map((t) => ({ ...t }));
         },
 
-        async rerunAfterTurn(_target?: MessageTarget, _options?: { triggerIds?: string[] }) {
+        async rerunAfterTurn(
+            _target?: MessageTarget,
+            _options?: { triggerIds?: string[]; force?: boolean },
+        ) {
             // Mock hook: real runtime dispatches TriggerPipeline.runPhase('after_turn')
         },
 

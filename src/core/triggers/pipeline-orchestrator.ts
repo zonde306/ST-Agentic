@@ -85,6 +85,33 @@ import {
 
 export type GenerationAction = 'normal' | 'swipe' | 'regenerate' | 'continue';
 
+function mergePresetAndCompiledTriggers(
+    presetTriggers: readonly TriggerRule[],
+    compiledTriggers: readonly TriggerRule[],
+): TriggerRule[] {
+    const presetIds = new Set(presetTriggers.map((t) => t.id));
+    const presetWorldUidKeys = new Set<string>();
+    for (const rule of presetTriggers) {
+        if (rule.source === 'worldinfo' && rule.sourceWorld && rule.sourceEntryUid !== undefined) {
+            presetWorldUidKeys.add(`${rule.sourceWorld}::${rule.sourceEntryUid}`);
+        }
+    }
+    const filteredCompiled = compiledTriggers.filter((rule) => {
+        if (presetIds.has(rule.id)) {
+            return false;
+        }
+        if (
+            rule.sourceWorld
+            && rule.sourceEntryUid !== undefined
+            && presetWorldUidKeys.has(`${rule.sourceWorld}::${rule.sourceEntryUid}`)
+        ) {
+            return false;
+        }
+        return true;
+    });
+    return [...presetTriggers, ...filteredCompiled];
+}
+
 export interface PipelineOrchestratorDependencies {
     bridge: HostBridge;
     transport: LLMTransport;
@@ -712,10 +739,7 @@ export class PipelineOrchestrator {
             ...compiled.derivedAgents,
             ...preset.agents,
         };
-        const allTriggers: TriggerRule[] = [
-            ...preset.triggers,
-            ...compiled.triggers,
-        ];
+        const allTriggers = mergePresetAndCompiledTriggers(preset.triggers, compiled.triggers);
         const globalVarSchema = await this.compileGlobalVariableSchema(compiled.schemaEntries);
         throwIfAborted(signal);
 
@@ -896,7 +920,12 @@ export class PipelineOrchestrator {
      */
     async rerunAfterTurn(
         targetInput: MessageTarget,
-        options: { turnNumber?: number; triggerIds?: readonly string[]; signal?: AbortSignal } = {},
+        options: {
+            turnNumber?: number;
+            triggerIds?: readonly string[];
+            force?: boolean;
+            signal?: AbortSignal;
+        } = {},
     ): Promise<DispatchedTaskHandle<TriggerExecutionResult>[]> {
         const target = freezeTarget(targetInput);
         if (options.signal) {
@@ -908,6 +937,7 @@ export class PipelineOrchestrator {
             .filter(Boolean);
         const onlyTriggerIds =
             requestedTriggerIds.length > 0 ? new Set(requestedTriggerIds) : undefined;
+        const allowDisabled = Boolean(options.force && onlyTriggerIds);
 
         if (!onlyTriggerIds) {
             // Full floor rerun aborts any stuck after_turn tasks for this exact target and clears pending staging.
@@ -920,12 +950,15 @@ export class PipelineOrchestrator {
         const settings = this.settingsProvider();
         const preset = resolveActivePreset(settings);
         const loreEntries = await this.loadRawLoreEntries();
-        const compiled = this.decoratorCompiler.compile(loreEntries, { preset });
+        const compiled = this.decoratorCompiler.compile(loreEntries, {
+            preset,
+            includeDisabled: allowDisabled,
+        });
         const effectiveAgents: Record<string, AgentProfile> = {
             ...compiled.derivedAgents,
             ...preset.agents,
         };
-        const allTriggers: TriggerRule[] = [...preset.triggers, ...compiled.triggers];
+        const allTriggers = mergePresetAndCompiledTriggers(preset.triggers, compiled.triggers);
         const globalVarSchema = await this.compileGlobalVariableSchema(compiled.schemaEntries);
 
         const { userText, assistantText } = this.readTurnExchangeText(target);
@@ -944,6 +977,7 @@ export class PipelineOrchestrator {
             subAgents: compiled.subAgents,
             globalVarSchema,
             ...(onlyTriggerIds ? { onlyTriggerIds } : {}),
+            ...(allowDisabled ? { force: true } : {}),
             signal: options.signal,
         });
     }
@@ -1174,15 +1208,24 @@ export class PipelineOrchestrator {
         const matchedRules: TriggerRule[] = [];
         const matchOverridesByRuleId = new Map<string, Record<string, string>>();
         for (const rule of ruleBatch) {
-            const evaluated = await this.evaluateCondition(rule, {
-                target: context.target,
-                turnNumber: context.turnNumber,
-                scanText: context.scanText,
-                signal: context.signal,
-                staged: context.staged,
-                injectionSession: context.injectionSession,
-            });
-            if (evaluated.matched || context.onlyTriggerIds?.has(rule.id)) {
+            const isForcedSingle = Boolean(context.onlyTriggerIds?.has(rule.id));
+            let evaluated: { matched: boolean; matchOverrides?: Record<string, string> };
+            try {
+                evaluated = await this.evaluateCondition(rule, {
+                    target: context.target,
+                    turnNumber: context.turnNumber,
+                    scanText: context.scanText,
+                    signal: context.signal,
+                    staged: context.staged,
+                    injectionSession: context.injectionSession,
+                });
+            } catch (error) {
+                if (isAbortError(error) || context.signal.aborted || !isForcedSingle) {
+                    throw error;
+                }
+                evaluated = { matched: true };
+            }
+            if (evaluated.matched || isForcedSingle) {
                 matchedRules.push(rule);
                 if (evaluated.matchOverrides) {
                     matchOverridesByRuleId.set(rule.id, evaluated.matchOverrides);
@@ -1206,12 +1249,14 @@ export class PipelineOrchestrator {
         globalVarSchema?: z.ZodTypeAny;
         injectionSession?: PromptInjectionSession;
         onlyTriggerIds?: ReadonlySet<string>;
+        force?: boolean;
         signal?: AbortSignal;
     }): Promise<DispatchedTaskHandle<TriggerExecutionResult>[]> {
+        const allowDisabled = Boolean(params.force && params.onlyTriggerIds);
         const afterRules = params.allTriggers.filter(
             (t) =>
                 t.phase === 'after_turn'
-                && t.enabled
+                && (t.enabled || allowDisabled)
                 && (!params.onlyTriggerIds || params.onlyTriggerIds.has(t.id)),
         );
         if (afterRules.length === 0) {
@@ -1246,7 +1291,9 @@ export class PipelineOrchestrator {
                     continue;
                 }
 
-                const units = groupTriggersForExecution(matchedRules);
+                const units = groupTriggersForExecution(matchedRules, {
+                    includeDisabled: allowDisabled,
+                });
                 const batchTurnPromises: Promise<unknown>[] = [];
                 const batchAllPromises: Promise<unknown>[] = [];
 
@@ -1356,7 +1403,9 @@ export class PipelineOrchestrator {
                         };
                     }
 
-                    const units = groupTriggersForExecution(matchedRules);
+                    const units = groupTriggersForExecution(matchedRules, {
+                        includeDisabled: allowDisabled,
+                    });
                     taskCtx.setCurrentStep(
                         units.length === 1
                             ? `Running ${units[0].label}`

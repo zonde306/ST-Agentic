@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
 import { resolveActivePreset } from '@/core/config';
+import { buildWorldInfoTriggerRuleId } from '@/core/triggers';
 import type {
     BarrierPolicy,
     ClassifiedLoreEntry,
@@ -22,6 +23,7 @@ import {
 } from '@/ui/components';
 import {
     IconGitBranch,
+    IconPlay,
     IconPlus,
     IconRefresh,
     IconTrash,
@@ -120,7 +122,7 @@ function inferRuleFromLoreEntry(
 
     const sourceWorld = item.entry.world?.trim() || undefined;
     return {
-        id: `wi:${item.entry.world}:${item.entry.uid}`,
+        id: buildWorldInfoTriggerRuleId(item.entry.world, item.entry.uid),
         label: item.entry.comment?.trim() || `${decName} (${item.slug})`,
         source: 'worldinfo',
         ...(sourceWorld ? { sourceWorld } : {}),
@@ -189,12 +191,23 @@ export function PipelineView(props: Partial<ConsoleViewProps> = {}) {
     const isMobile = props.isMobile ?? detectedMobile;
 
     const settings = useAppStore((s) => s.settings);
+    const activeTarget = useAppStore((s) => s.activeTarget);
     const activePreset = resolveActivePreset(settings);
 
     const [loreEntries, setLoreEntries] = useState<ClassifiedLoreEntry[]>([]);
     const [scanningLore, setScanningLore] = useState(false);
     const [selection, setSelection] = useState<PipelineSelection | null>(null);
     const [detailOpen, setDetailOpen] = useState(false);
+    const [runningRuleId, setRunningRuleId] = useState<string | null>(null);
+
+    const hasValidTarget =
+        Number.isInteger(activeTarget.messageId)
+        && activeTarget.messageId >= 0
+        && Number.isInteger(activeTarget.swipeId)
+        && activeTarget.swipeId >= 0;
+    const targetLabel = hasValidTarget
+        ? `#${activeTarget.messageId}#${activeTarget.swipeId}`
+        : '无楼层';
 
     const refreshLoreScan = useCallback(async () => {
         try {
@@ -216,12 +229,29 @@ export function PipelineView(props: Partial<ConsoleViewProps> = {}) {
 
     const scannedVirtualEntries = useMemo(() => {
         const existingIds = new Set(activePreset.triggers.map((t) => t.id));
+        const importedWorldUids = new Set<string>();
+        for (const rule of activePreset.triggers) {
+            if (rule.source === 'worldinfo' && rule.sourceWorld && rule.sourceEntryUid !== undefined) {
+                importedWorldUids.add(`${rule.sourceWorld}::${rule.sourceEntryUid}`);
+            }
+        }
         return loreEntries
             .map((entry) => ({
                 lore: entry,
                 inferred: inferRuleFromLoreEntry(entry, activePreset.mainAgentId),
             }))
-            .filter(({ inferred }) => !existingIds.has(inferred.id));
+            .filter(({ lore, inferred }) => {
+                if (existingIds.has(inferred.id)) {
+                    return false;
+                }
+                if (existingIds.has(`wi:${lore.entry.world}:${lore.entry.uid}`)) {
+                    return false;
+                }
+                if (importedWorldUids.has(`${lore.entry.world}::${lore.entry.uid}`)) {
+                    return false;
+                }
+                return true;
+            });
     }, [activePreset.mainAgentId, activePreset.triggers, loreEntries]);
 
     useEffect(() => {
@@ -458,6 +488,69 @@ export function PipelineView(props: Partial<ConsoleViewProps> = {}) {
         });
     };
 
+    const handleRunRule = async (rule: TriggerRule) => {
+        if (runningRuleId !== null || rule.phase !== 'after_turn' || !hasValidTarget) {
+            return;
+        }
+        const target = { ...activeTarget };
+        const prevRunIds = new Set(store.getSnapshot().traces.map((t) => t.runId));
+        setRunningRuleId(rule.id);
+        try {
+            await store.rerunAfterTurn(target, {
+                triggerIds: [rule.id],
+                force: true,
+                label: rule.label,
+                silentToast: true,
+            });
+            await store.refreshTraces().catch(() => {});
+            const newestTrace = store
+                .getSnapshot()
+                .traces.find(
+                    (t) =>
+                        !prevRunIds.has(t.runId)
+                        && t.target.messageId === target.messageId
+                        && t.target.swipeId === target.swipeId
+                        && t.phase === 'after_turn',
+                );
+            const action = {
+                label: '查看日志',
+                onClick: () =>
+                    store.openConsole('logs', {
+                        messageId: target.messageId,
+                        swipeId: target.swipeId,
+                        ...(newestTrace ? { logId: newestTrace.runId } : {}),
+                    }),
+            };
+            if (newestTrace?.status === 'error') {
+                store.pushToast(
+                    `触发器「${rule.label}」在 ${targetLabel} 执行失败：${newestTrace.error || '请查看日志'}`,
+                    'error',
+                    5000,
+                    action,
+                );
+            } else if (newestTrace) {
+                store.pushToast(
+                    `已在 ${targetLabel} 运行触发器「${rule.label}」`,
+                    'success',
+                    5000,
+                    action,
+                );
+            } else {
+                store.pushToast(
+                    `已派发 ${targetLabel} 的后置触发：${rule.label}`,
+                    'primary',
+                    5000,
+                    action,
+                );
+            }
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            store.pushToast(`运行触发器失败：${msg}`, 'error');
+        } finally {
+            setRunningRuleId((prev) => (prev === rule.id ? null : prev));
+        }
+    };
+
     const masterPane = (
         <div class="ag-stack-v" style={{ padding: '10px' }}>
             <div class="ag-row-wrap" style={{ justifyContent: 'space-between' }}>
@@ -645,12 +738,36 @@ export function PipelineView(props: Partial<ConsoleViewProps> = {}) {
                             />
                             <Button
                                 size="sm"
+                                variant="primary"
+                                className="ag-pipeline-run-btn"
+                                icon={<IconPlay size={14} />}
+                                loading={runningRuleId === activePresetRule.id}
+                                disabled={
+                                    runningRuleId !== null
+                                    || activePresetRule.phase !== 'after_turn'
+                                    || !hasValidTarget
+                                }
+                                title={
+                                    activePresetRule.phase !== 'after_turn'
+                                        ? '仅支持手动运行后置触发（after_turn）'
+                                        : !hasValidTarget
+                                            ? '当前会话暂无可作用的楼层'
+                                            : `在当前楼层 ${targetLabel} 手动强制运行一次此触发器（忽略条件与停用状态）`
+                                }
+                                onClick={() => void handleRunRule(activePresetRule)}
+                            >
+                                {runningRuleId === activePresetRule.id
+                                    ? '运行中...'
+                                    : `立即运行 (${targetLabel})`}
+                            </Button>
+                            <Button
+                                size="sm"
                                 variant="danger"
                                 icon={<IconTrash size={14} />}
+                                ariaLabel={`删除规则 ${activePresetRule.label}`}
+                                title="删除此触发规则"
                                 onClick={() => handleDeleteRule(activePresetRule)}
-                            >
-                                删除
-                            </Button>
+                            />
                         </div>
                     }
                 >
@@ -941,14 +1058,40 @@ export function PipelineView(props: Partial<ConsoleViewProps> = {}) {
                     title={activeScannedItem.inferred.label}
                     subtitle={`扫描自世界书：${activeScannedItem.lore.vfsPath} (UID #${activeScannedItem.lore.entry.uid})`}
                     actions={
-                        <Button
-                            size="sm"
-                            variant="primary"
-                            icon={<IconPlus size={14} />}
-                            onClick={() => handleImportScannedRule(activeScannedItem.inferred)}
-                        >
-                            导入为预设可编辑规则
-                        </Button>
+                        <div class="ag-row-wrap">
+                            <Button
+                                size="sm"
+                                variant="secondary"
+                                className="ag-pipeline-run-btn"
+                                icon={<IconPlay size={14} />}
+                                loading={runningRuleId === activeScannedItem.inferred.id}
+                                disabled={
+                                    runningRuleId !== null
+                                    || activeScannedItem.inferred.phase !== 'after_turn'
+                                    || !hasValidTarget
+                                }
+                                title={
+                                    activeScannedItem.inferred.phase !== 'after_turn'
+                                        ? '仅支持手动运行后置触发（after_turn）'
+                                        : !hasValidTarget
+                                            ? '当前会话暂无可作用的楼层'
+                                            : `无需导入预设，直接在当前楼层 ${targetLabel} 强制运行一次此世界书触发器`
+                                }
+                                onClick={() => void handleRunRule(activeScannedItem.inferred)}
+                            >
+                                {runningRuleId === activeScannedItem.inferred.id
+                                    ? '运行中...'
+                                    : `立即运行 (${targetLabel})`}
+                            </Button>
+                            <Button
+                                size="sm"
+                                variant="primary"
+                                icon={<IconPlus size={14} />}
+                                onClick={() => handleImportScannedRule(activeScannedItem.inferred)}
+                            >
+                                导入为预设可编辑规则
+                            </Button>
+                        </div>
                     }
                 >
                     <div class="ag-stack-v">
