@@ -41,6 +41,8 @@ import {
 } from '@/ui/capsule';
 import type { AppStore } from '@/ui/store';
 
+import { emitMessageRenderedEvent } from './st-bridge';
+
 export interface StreamRendererDependencies {
     getSettings: () => Settings | undefined;
     getStore: () => ChatDataStore | undefined;
@@ -809,6 +811,9 @@ export class StreamRenderer {
             await this.persistCommittedOutput(msg, visibleText, reasoningText, {
                 showSwipeFallback: true,
             });
+            if (visibleText.trim().length > 0) {
+                await emitMessageRenderedEvent(this.target.messageId, msg);
+            }
         }
 
         if (typeof scrollChatToBottom === 'function') {

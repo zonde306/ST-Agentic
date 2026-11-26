@@ -12,6 +12,7 @@ import { translate } from '@st/scripts/i18n.js';
 import { power_user } from '@st/scripts/power-user.js';
 import { accountStorage } from '@st/scripts/util/AccountStorage.js';
 import type { HostBridge, WriteChatMessageOptions } from '@/core/bridge';
+import { emitMessageRenderedEvent } from './render-events';
 import {
     DEFAULT_FILE_MAP_SIZE_LIMIT,
     exportPreset,
@@ -247,7 +248,8 @@ function createFallbackStBridge(): HostBridge {
             swipes[target.swipeId] = content;
 
             const activeSwipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
-            if (activeSwipeId === target.swipeId) {
+            const isActiveSwipe = activeSwipeId === target.swipeId;
+            if (isActiveSwipe) {
                 msg.mes = content;
                 await bridge.refreshMessageView(target);
             }
@@ -256,6 +258,14 @@ function createFallbackStBridge(): HostBridge {
 
             if (options?.emitEvent && event_types?.MESSAGE_UPDATED && typeof eventSource?.emit === 'function') {
                 await eventSource.emit(event_types.MESSAGE_UPDATED, target.messageId);
+            }
+
+            const shouldEmitRenderEvent =
+                isActiveSwipe
+                && (options?.emitRenderEvent === true
+                    || (options?.emitEvent === true && options?.emitRenderEvent !== false));
+            if (shouldEmitRenderEvent) {
+                await emitMessageRenderedEvent(target.messageId, msg);
             }
         },
         getActiveIdentity() {

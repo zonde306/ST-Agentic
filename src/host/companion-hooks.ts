@@ -46,7 +46,11 @@ import {
 } from '@/ui/capsule';
 import type { AppStore } from '@/ui/store';
 
-import type { STHostBridge } from './st-bridge';
+import {
+    AGENTIC_RERENDER_EVENT_TYPE,
+    isInternalMessageRenderEmit,
+    type STHostBridge,
+} from './st-bridge';
 
 const COMPANION_PROMPT_KEY = 'agentic_companion_before';
 export const COMPANION_SIDE_BRIDGE_PROMPT_KEY = 'agentic_side_bridge';
@@ -903,6 +907,10 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
     };
 
     const onCharacterMessageRendered = async (messageId: unknown, renderType?: unknown) => {
+        if (isInternalMessageRenderEmit() || renderType === AGENTIC_RERENDER_EVENT_TYPE) {
+            return;
+        }
+
         clearCompanionPrompt();
         clearSideBridgePrompt();
 
@@ -953,12 +961,21 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
                       ? `${currentText}${bufferedOutput}`
                       : `${currentText}\n${bufferedOutput}`;
             if (nextText !== currentText) {
-                await bridge.writeChatMessage(target, nextText, { emitEvent: false });
+                await bridge.writeChatMessage(target, nextText, {
+                    emitEvent: false,
+                    emitRenderEvent: true,
+                });
             } else {
-                await bridge.refreshMessageView(target);
+                await bridge.refreshMessageView(target, {
+                    onlyIfTransformed: true,
+                    emitRenderEvent: true,
+                });
             }
         } else {
-            await bridge.refreshMessageView(target);
+            await bridge.refreshMessageView(target, {
+                onlyIfTransformed: true,
+                emitRenderEvent: true,
+            });
         }
 
         const normalizedRenderType =
@@ -1035,7 +1052,10 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         const swipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
         const target: MessageTarget = { messageId, swipeId };
         getAppStore?.()?.setActiveTarget(target);
-        void bridge.refreshMessageView(target);
+        void bridge.refreshMessageView(target, {
+            onlyIfTransformed: true,
+            emitRenderEvent: true,
+        });
     };
 
     const onMessageDeleted = (messageId: unknown) => {

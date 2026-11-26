@@ -1496,6 +1496,7 @@ export class AgentRunner {
                     target,
                     staged,
                     source: 'salvage',
+                    emitRenderEvent: false,
                 });
                 this.traceLogger.emit({
                     kind: 'output_preview',
@@ -2913,6 +2914,10 @@ export class AgentRunner {
                                     target,
                                     staged,
                                     source: 'agentic_output_process',
+                                    emitRenderEvent:
+                                        input.phase === 'before_turn' || input.phase === 'main_turn'
+                                            ? false
+                                            : true,
                                 });
                                 extractor?.markToolExecuted(finishOutcome.result.text);
                             } else {
@@ -2979,6 +2984,11 @@ export class AgentRunner {
                                                 target,
                                                 staged,
                                                 source: 'agentic_output_process',
+                                                emitRenderEvent:
+                                                    input.phase === 'before_turn'
+                                                    || input.phase === 'main_turn'
+                                                        ? false
+                                                        : true,
                                             },
                                         );
                                         extractor?.markToolExecuted(resolvedFinalContent);
@@ -3262,14 +3272,13 @@ export class AgentRunner {
                                             target,
                                             staged,
                                             source: 'agentic_output_process',
+                                            emitRenderEvent:
+                                                input.phase === 'before_turn'
+                                                || input.phase === 'main_turn'
+                                                    ? false
+                                                    : true,
                                         },
                                     );
-                                    if (
-                                        mutationDirective.operation === 'append_reply_view'
-                                        || mutationDirective.operation === 'replace_reply_view'
-                                    ) {
-                                        await this.bridge.refreshMessageView({ ...target });
-                                    }
                                 }
                                 if (
                                     mutationDirective.result.action === 'fix'

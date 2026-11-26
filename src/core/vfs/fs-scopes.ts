@@ -21,6 +21,7 @@ export interface ScopedToolGuardOptions {
     target?: MessageTarget;
     staged?: boolean;
     source?: string;
+    emitRenderEvent?: boolean;
 }
 
 /**
@@ -119,6 +120,9 @@ export class ScopedToolGuard implements ToolFsApi {
             target: this.options.target,
             staged: this.options.staged,
             source: this.options.source ?? 'tool',
+            ...(this.options.emitRenderEvent !== undefined
+                ? { emitRenderEvent: this.options.emitRenderEvent }
+                : {}),
         });
     }
 
@@ -128,6 +132,9 @@ export class ScopedToolGuard implements ToolFsApi {
             target: this.options.target,
             staged: this.options.staged,
             source: this.options.source ?? 'tool',
+            ...(this.options.emitRenderEvent !== undefined
+                ? { emitRenderEvent: this.options.emitRenderEvent }
+                : {}),
         });
     }
 
@@ -143,6 +150,9 @@ export class ScopedToolGuard implements ToolFsApi {
             target: this.options.target,
             staged: this.options.staged,
             source: this.options.source ?? 'tool',
+            ...(this.options.emitRenderEvent !== undefined
+                ? { emitRenderEvent: this.options.emitRenderEvent }
+                : {}),
         });
     }
 
@@ -152,6 +162,9 @@ export class ScopedToolGuard implements ToolFsApi {
             target: this.options.target,
             staged: this.options.staged,
             source: this.options.source ?? 'tool-delete',
+            ...(this.options.emitRenderEvent !== undefined
+                ? { emitRenderEvent: this.options.emitRenderEvent }
+                : {}),
         });
     }
 

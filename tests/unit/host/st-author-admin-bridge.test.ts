@@ -146,6 +146,7 @@ const stMocks = vi.hoisted(() => {
     const event_types = {
         GENERATION_AFTER_COMMANDS: 'generation_after_commands',
         WORLDINFO_ENTRIES_LOADED: 'worldinfo_entries_loaded',
+        USER_MESSAGE_RENDERED: 'user_message_rendered',
         CHARACTER_MESSAGE_RENDERED: 'character_message_rendered',
         GENERATION_STOPPED: 'generation_stopped',
         GENERATION_ENDED: 'generation_ended',
@@ -381,7 +382,7 @@ import {
 } from '@/host/sidegen-slash';
 import { STAdminBridge } from '@/host/st-admin-bridge';
 import { STAuthorBridge } from '@/host/st-author-bridge';
-import { STHostBridge } from '@/host/st-bridge';
+import { AGENTIC_RERENDER_EVENT_TYPE, STHostBridge } from '@/host/st-bridge';
 
 function resetStState() {
     stMocks.eventListeners.clear();
@@ -1999,5 +2000,204 @@ describe('/sidegen-* Slash Commands', () => {
         const fallbackRead = await adminBridge.readTavernHelperScripts('character');
         expect(fallbackRead.liveApiAvailable).toBe(false);
         expect(fallbackRead.scripts[0]?.id).toBe('c_fallback');
+    });
+
+    it('emits CHARACTER_MESSAGE_RENDERED / USER_MESSAGE_RENDERED on /output.md updates without recursing in companion mode', async () => {
+        stMocks.state.chat = [
+            {
+                name: 'Tester',
+                is_user: true,
+                is_system: false,
+                mes: '你好',
+                swipe_id: 0,
+                swipes: ['你好'],
+                swipe_info: [{}],
+            },
+            {
+                name: 'Alice',
+                is_user: false,
+                is_system: false,
+                mes: '初始正文',
+                swipe_id: 0,
+                swipes: ['初始正文', '次选分页'],
+                swipe_info: [{}, {}],
+            },
+            {
+                name: 'System',
+                is_user: false,
+                is_system: true,
+                mes: '系统注记',
+                swipe_id: 0,
+                swipes: ['系统注记'],
+                swipe_info: [{}],
+            },
+        ];
+
+        const makeFakeMesEl = (mesid: string) => {
+            const fakeEl: Record<string, unknown> = {
+                mesid,
+                classList: { contains: () => false },
+                querySelectorAll: () => [],
+                appendChild: vi.fn(),
+                insertBefore: vi.fn(),
+            };
+            const fakeCapsule: Record<string, unknown> = {
+                getAttribute: () => 'bottom',
+                setAttribute: vi.fn(),
+                setState: vi.fn(),
+                connectStore: vi.fn(),
+                parentElement: fakeEl,
+                nextSibling: null,
+            };
+            fakeEl.querySelector = (sel: string) => (sel === 'agentic-capsule' ? fakeCapsule : null);
+            return fakeEl;
+        };
+        const mesDomMap = new Map<string, Record<string, unknown>>([
+            ['#chat .mes[mesid="0"]', makeFakeMesEl('0')],
+            ['#chat .mes[mesid="1"]', makeFakeMesEl('1')],
+            ['#chat .mes[mesid="2"]', makeFakeMesEl('2')],
+        ]);
+        vi.stubGlobal('document', {
+            querySelector: (selector: string) => mesDomMap.get(selector) ?? null,
+            querySelectorAll: () => [],
+        });
+
+        const settings: Settings = createDefaultSettings({ runMode: 'companion' });
+        const bridge = new STHostBridge({ getSettings: () => settings });
+        const store = new ChatDataStore(bridge);
+        bridge.setStore(store);
+        const vfs = new VirtualFileSystem({ bridge, store });
+
+        // 1. Assistant /output.md write/edit/append updates DOM and emits CHARACTER_MESSAGE_RENDERED
+        await vfs.writeFile('/output.md', '<div>html panel</div>', {
+            target: { messageId: 1, swipeId: 0 },
+        });
+        expect(stMocks.fns.updateMessageBlock).toHaveBeenCalledTimes(1);
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(
+            stMocks.event_types.CHARACTER_MESSAGE_RENDERED,
+            1,
+            AGENTIC_RERENDER_EVENT_TYPE,
+        );
+
+        stMocks.fns.eventEmit.mockClear();
+        await vfs.editFile('/output.md', 'html panel', 'updated panel', {
+            target: { messageId: 1, swipeId: 0 },
+        });
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(
+            stMocks.event_types.CHARACTER_MESSAGE_RENDERED,
+            1,
+            AGENTIC_RERENDER_EVENT_TYPE,
+        );
+
+        // 2. Inactive swipe write does NOT emit CHARACTER_MESSAGE_RENDERED
+        stMocks.fns.eventEmit.mockClear();
+        await vfs.writeFile('/output.md', '次选更新', {
+            target: { messageId: 1, swipeId: 1 },
+        });
+        expect(stMocks.fns.eventEmit).not.toHaveBeenCalled();
+
+        // 3. User message /output.md write emits USER_MESSAGE_RENDERED; hidden system message emits neither
+        stMocks.fns.eventEmit.mockClear();
+        await vfs.writeFile('/output.md', '修改后的用户消息', {
+            target: { messageId: 0, swipeId: 0 },
+        });
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(
+            stMocks.event_types.USER_MESSAGE_RENDERED,
+            0,
+        );
+
+        stMocks.fns.eventEmit.mockClear();
+        await vfs.writeFile('/output.md', '修改后的系统注记', {
+            target: { messageId: 2, swipeId: 0 },
+        });
+        expect(stMocks.fns.eventEmit).not.toHaveBeenCalled();
+
+        // 4. Suppressed emitRenderEvent: false (e.g. main_turn / before_turn) does NOT emit render event
+        stMocks.fns.eventEmit.mockClear();
+        await vfs.writeFile('/output.md', '草稿正文', {
+            target: { messageId: 1, swipeId: 0 },
+            emitRenderEvent: false,
+        });
+        expect(stMocks.fns.eventEmit).not.toHaveBeenCalled();
+
+        // 5. Companion hooks guard against internal re-render recursion & preserve iframes when no display regex matches
+        const rerunAfterTurn = vi.fn(async () => []);
+        const mockOrchestrator = {
+            store,
+            vfs,
+            barrierCoordinator: {
+                awaitTurnBarriers: vi.fn(async () => undefined),
+                abortFromMessage: vi.fn(),
+                abortTarget: vi.fn(),
+            },
+            decoratorCompiler: {
+                compile: vi.fn(() => ({ triggers: [] })),
+            },
+            rerunAfterTurn,
+            trajectoryStore: {
+                listInterruptedCheckpoints: vi.fn(() => new Map()),
+                pruneFromMessage: vi.fn(() => 0),
+                pruneSwipe: vi.fn(() => 0),
+                saveToHost: vi.fn(),
+            },
+        } as unknown as PipelineOrchestrator;
+
+        const handle = setupCompanionHooks({
+            bridge,
+            orchestrator: mockOrchestrator,
+            getSettings: () => settings,
+        });
+
+        // Native turn completion triggers companion rerunAfterTurn once without overwriting DOM (no display regex)
+        stMocks.fns.updateMessageBlock.mockClear();
+        stMocks.fns.eventEmit.mockClear();
+        await stMocks.eventSource.emit(stMocks.event_types.CHARACTER_MESSAGE_RENDERED, 1, 'normal');
+        expect(rerunAfterTurn).toHaveBeenCalledTimes(1);
+        expect(stMocks.fns.updateMessageBlock).not.toHaveBeenCalled();
+
+        // Subsequent after_turn /output.md write emits CHARACTER_MESSAGE_RENDERED (agentic_rerender)
+        // which updates DOM & lets JS-Slash-Runner render, WITHOUT recursively re-triggering rerunAfterTurn
+        // or clearing companion prompts.
+        stMocks.fns.setExtensionPrompt.mockClear();
+        await vfs.appendFile('/output.md', '\n<pre><code><!DOCTYPE html></html></code></pre>', {
+            target: { messageId: 1, swipeId: 0 },
+            staged: true,
+        });
+        expect(stMocks.fns.updateMessageBlock).toHaveBeenCalledTimes(1);
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(
+            stMocks.event_types.CHARACTER_MESSAGE_RENDERED,
+            1,
+            AGENTIC_RERENDER_EVENT_TYPE,
+        );
+        expect(rerunAfterTurn).toHaveBeenCalledTimes(1);
+        expect(stMocks.fns.setExtensionPrompt).not.toHaveBeenCalled();
+
+        // Flushing preCreateBuffers on a newly created message emits guarded CHARACTER_MESSAGE_RENDERED once
+        // without causing infinite recursion in companion hooks.
+        const futureTarget = { messageId: 3, swipeId: 0 };
+        await vfs.writeFile('/output.md', '<pre><code><!DOCTYPE html></html></code></pre>', {
+            target: futureTarget,
+            emitRenderEvent: false,
+        });
+        stMocks.state.chat.push({
+            name: 'Alice',
+            is_user: false,
+            is_system: false,
+            mes: '正文内容',
+            swipe_id: 0,
+            swipes: ['正文内容'],
+            swipe_info: [{}],
+        });
+        mesDomMap.set('#chat .mes[mesid="3"]', makeFakeMesEl('3'));
+        stMocks.fns.eventEmit.mockClear();
+        await stMocks.eventSource.emit(stMocks.event_types.CHARACTER_MESSAGE_RENDERED, 3, 'normal');
+        expect(rerunAfterTurn).toHaveBeenCalledTimes(2);
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(
+            stMocks.event_types.CHARACTER_MESSAGE_RENDERED,
+            3,
+            AGENTIC_RERENDER_EVENT_TYPE,
+        );
+
+        handle.dispose();
     });
 });

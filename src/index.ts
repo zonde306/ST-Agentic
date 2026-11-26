@@ -836,7 +836,6 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                     staged: false,
                     source: 'ui-edit',
                 });
-                await bridge.refreshMessageView(target);
                 await saveMetadata();
 
                 const refreshed = await listFilesAndOverrides(target);
@@ -1108,7 +1107,6 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                     staged: false,
                     source: 'ui-delete',
                 });
-                await bridge.refreshMessageView(target);
                 await saveMetadata();
                 return;
             }

@@ -51,6 +51,7 @@ import {
     type PromptTransformInput,
     type PromptTransformResult,
     type PromptTransformTurnLifecyclePayload,
+    type RefreshMessageViewOptions,
     type SerializedPromptInjected,
     type WriteChatMessageOptions,
     createNoopOutputProcessResult,
@@ -78,10 +79,20 @@ import type {
 import { hashText } from '@/core/utils';
 import { detectHostLuminanceFromCssVars } from '@/ui/store';
 
+import {
+    AGENTIC_RERENDER_EVENT_TYPE,
+    emitMessageRenderedEvent,
+    isInternalMessageRenderEmit,
+} from './render-events';
 import { STAdminBridge } from './st-admin-bridge';
 import { STAuthorBridge } from './st-author-bridge';
 
 export const DEFAULT_EXTENSION_SETTINGS_KEY = 'Agentic';
+export {
+    AGENTIC_RERENDER_EVENT_TYPE,
+    emitMessageRenderedEvent,
+    isInternalMessageRenderEmit,
+};
 
 const VALID_MACRO_IDENTIFIER = /^[a-zA-Z][\w-_]*$/;
 const GETVAR_MACRO_PATTERN = /\{\{getvar::([^}]+)\}\}/gi;
@@ -662,7 +673,8 @@ export class STHostBridge implements HostBridge {
         swipes[target.swipeId] = content;
 
         const activeSwipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
-        if (activeSwipeId === target.swipeId) {
+        const isActiveSwipe = activeSwipeId === target.swipeId;
+        if (isActiveSwipe) {
             msg.mes = content;
             this.renderDisplayView(target.messageId, msg, content);
         }
@@ -671,6 +683,14 @@ export class STHostBridge implements HostBridge {
 
         if (options?.emitEvent && event_types.MESSAGE_UPDATED) {
             await eventSource.emit(event_types.MESSAGE_UPDATED, target.messageId);
+        }
+
+        const shouldEmitRenderEvent =
+            isActiveSwipe
+            && (options?.emitRenderEvent === true
+                || (options?.emitEvent === true && options?.emitRenderEvent !== false));
+        if (shouldEmitRenderEvent) {
+            await emitMessageRenderedEvent(target.messageId, msg);
         }
     }
 
@@ -1233,7 +1253,10 @@ export class STHostBridge implements HostBridge {
         saveChatDebounced();
     }
 
-    async refreshMessageView(target: MessageTarget): Promise<void> {
+    async refreshMessageView(
+        target: MessageTarget,
+        options?: RefreshMessageViewOptions,
+    ): Promise<void> {
         if (!Array.isArray(chat) || target.messageId < 0 || target.messageId >= chat.length) {
             return;
         }
@@ -1267,7 +1290,16 @@ export class STHostBridge implements HostBridge {
                   ? msg.mes
                   : '';
 
-        this.renderDisplayView(target.messageId, msg, baseText);
+        const displayText = this.computeDisplayText(msg, baseText);
+        if (options?.onlyIfTransformed && displayText === baseText) {
+            return;
+        }
+
+        this.renderDisplayView(target.messageId, msg, baseText, displayText);
+
+        if (options?.emitRenderEvent) {
+            await emitMessageRenderedEvent(target.messageId, msg);
+        }
     }
 
     async reloadDisplayedMessages(
@@ -1347,6 +1379,20 @@ export class STHostBridge implements HostBridge {
         };
     }
 
+    private computeDisplayText(msg: Record<string, unknown>, rawText: string): string {
+        const settings = this.getSettingsFn?.();
+        const regexRules = collectDisplayRegexRules(settings);
+        const sender = msg.is_user ? 'user' : 'assistant';
+        return regexRules.length > 0
+            ? this.substituteMacros(
+                  applyRegexRules(rawText, regexRules, {
+                      stage: 'display',
+                      sender,
+                  }),
+              )
+            : rawText;
+    }
+
     /**
      * Render raw markdown into `.mes_text` with transient `display`-stage regexes and macros.
      * Never writes transformed HTML/display text back to `msg.mes` or `msg.swipes`.
@@ -1355,19 +1401,9 @@ export class STHostBridge implements HostBridge {
         messageId: number,
         msg: Record<string, unknown>,
         rawText: string,
+        precomputedDisplayText?: string,
     ): void {
-        const settings = this.getSettingsFn?.();
-        const regexRules = collectDisplayRegexRules(settings);
-        const sender = msg.is_user ? 'user' : 'assistant';
-        const displayText =
-            regexRules.length > 0
-                ? this.substituteMacros(
-                      applyRegexRules(rawText, regexRules, {
-                          stage: 'display',
-                          sender,
-                      }),
-                  )
-                : rawText;
+        const displayText = precomputedDisplayText ?? this.computeDisplayText(msg, rawText);
 
         if (typeof document === 'undefined') {
             return;

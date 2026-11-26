@@ -721,12 +721,20 @@ export class VirtualFileSystem {
     /** Create a `ScopedToolGuard` enforcing `ScopedPermissions` over this VFS. */
     createScopedGuard(
         permissions: ScopedPermissions,
-        opts?: { target?: MessageTarget; staged?: boolean; source?: string },
+        opts?: {
+            target?: MessageTarget;
+            staged?: boolean;
+            source?: string;
+            emitRenderEvent?: boolean;
+        },
     ): ScopedToolGuard {
         return new ScopedToolGuard(this, permissions, {
             target: opts?.target ?? this.defaultTarget,
             staged: opts?.staged ?? this.defaultStaged,
             source: opts?.source,
+            ...(opts?.emitRenderEvent !== undefined
+                ? { emitRenderEvent: opts.emitRenderEvent }
+                : {}),
         });
     }
 

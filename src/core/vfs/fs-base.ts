@@ -75,6 +75,8 @@ export interface VfsReadOptions extends VfsTargetOptions {
 export interface VfsWriteOptions extends VfsTargetOptions {
     source?: string;
     layerMode?: 'auto' | 'base' | 'branch';
+    /** Forwarded to `HostBridge.writeChatMessage` for `/output.md` writes/deletes. */
+    emitRenderEvent?: boolean;
 }
 
 export interface VfsEditOptions extends VfsWriteOptions, ToolEditOptions {}

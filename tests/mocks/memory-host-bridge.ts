@@ -23,6 +23,7 @@ import {
     type PromptTransformTurnLifecycleListener,
     type PromptTransformTurnLifecyclePayload,
     type ReadHostSettingsOptions,
+    type RefreshMessageViewOptions,
     type SerializedPromptInjected,
     type WriteChatMessageOptions,
     createEjsPromptTransformListener,
@@ -500,6 +501,14 @@ export class MemoryHostBridge implements HostBridge {
         if (options?.emitEvent) {
             this.emitHostEvent('MESSAGE_UPDATED', target.messageId);
         }
+
+        if (activeSwipeId === target.swipeId && options?.emitRenderEvent === true) {
+            if (msg.isUser) {
+                this.emitHostEvent('USER_MESSAGE_RENDERED', target.messageId);
+            } else if (!msg.isSystem) {
+                this.emitHostEvent('CHARACTER_MESSAGE_RENDERED', target.messageId);
+            }
+        }
     }
 
     async createChatMessage(
@@ -930,8 +939,21 @@ export class MemoryHostBridge implements HostBridge {
         });
     }
 
-    async refreshMessageView(target: MessageTarget): Promise<void> {
+    async refreshMessageView(
+        target: MessageTarget,
+        options?: RefreshMessageViewOptions,
+    ): Promise<void> {
         this.refreshedViews.push({ ...target });
+        if (options?.emitRenderEvent === true) {
+            const msg = this.chat[target.messageId];
+            if (msg) {
+                if (msg.isUser) {
+                    this.emitHostEvent('USER_MESSAGE_RENDERED', target.messageId);
+                } else if (!msg.isSystem) {
+                    this.emitHostEvent('CHARACTER_MESSAGE_RENDERED', target.messageId);
+                }
+            }
+        }
     }
 
     async reloadDisplayedMessages(

@@ -1567,7 +1567,10 @@ export class OutputMount implements VfsMount {
         const branchKey = toBranchKey(target);
         if (this.bridge.readChatMessage(target) !== null) {
             this.preCreateBuffers.delete(branchKey);
-            await this.bridge.writeChatMessage(target, content, { emitEvent: false });
+            await this.bridge.writeChatMessage(target, content, {
+                emitEvent: false,
+                emitRenderEvent: opts.emitRenderEvent !== false,
+            });
         } else {
             this.preCreateBuffers.set(branchKey, content);
         }
@@ -1628,7 +1631,10 @@ export class OutputMount implements VfsMount {
         }
         this.preCreateBuffers.delete(toBranchKey(target));
         if (this.bridge.readChatMessage(target) !== null) {
-            await this.bridge.writeChatMessage(target, '', { emitEvent: false });
+            await this.bridge.writeChatMessage(target, '', {
+                emitEvent: false,
+                emitRenderEvent: opts.emitRenderEvent !== false,
+            });
         }
         return true;
     }

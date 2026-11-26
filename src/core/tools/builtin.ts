@@ -92,10 +92,14 @@ export function createToolExecutionContext(
         write: [...(options.permissions?.write ?? [])],
     };
 
+    const suppressOutputRenderEvent =
+        options.phase === 'before_turn' || options.phase === 'main_turn';
+
     const fs = vfs.createScopedGuard(permissions, {
         target,
         staged: options.staged,
         source: options.source,
+        ...(suppressOutputRenderEvent ? { emitRenderEvent: false } : {}),
     });
 
     const vars = new VfsVarsAdapter(vfs, {
@@ -109,6 +113,7 @@ export function createToolExecutionContext(
     const message = new ChatMessageViewAdapter(options.bridge, store, target, signal, {
         staged: options.staged,
         vfs,
+        ...(suppressOutputRenderEvent ? { emitRenderEvent: false } : {}),
     });
 
     const st: ToolStApi = {

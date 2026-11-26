@@ -36,6 +36,23 @@ export interface WriteChatMessageOptions {
      * Keep `false` during streaming or internal staging; set `true` on post-turn edits.
      */
     emitEvent?: boolean;
+    /**
+     * Whether to emit native host render events (`USER_MESSAGE_RENDERED` for user messages,
+     * `CHARACTER_MESSAGE_RENDERED` with internal re-render type for non-user non-system messages)
+     * when updating the active swipe so renderers (e.g. JS-Slash-Runner) re-mount updated content.
+     */
+    emitRenderEvent?: boolean;
+}
+
+export interface RefreshMessageViewOptions {
+    /**
+     * Whether to emit `USER_MESSAGE_RENDERED` / `CHARACTER_MESSAGE_RENDERED` after re-rendering `.mes_text`.
+     */
+    emitRenderEvent?: boolean;
+    /**
+     * When `true`, skip re-rendering `.mes_text` if display-stage regexes/macros did not modify the raw text.
+     */
+    onlyIfTransformed?: boolean;
 }
 
 export type ChatMessageRole = 'user' | 'assistant' | 'system';
@@ -174,7 +191,7 @@ export interface HostBridge {
     // 4. External extension integration & slash commands
     executeSlashCommand?(command: string, signal?: AbortSignal): Promise<string>;
     attachMediaToMessage(target: MessageTarget, media: MediaAttachment): Promise<void>;
-    refreshMessageView(target: MessageTarget): Promise<void>;
+    refreshMessageView(target: MessageTarget, options?: RefreshMessageViewOptions): Promise<void>;
     reloadDisplayedMessages?(
         options?: ReloadDisplayedMessagesOptions,
     ): Promise<ReloadDisplayedMessagesResult>;

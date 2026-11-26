@@ -24,17 +24,19 @@ function assertValidMessageTarget(target: MessageTarget | undefined): MessageTar
 export interface ChatMessageViewAdapterOptions {
     staged?: boolean;
     vfs?: VirtualFileSystem;
+    emitRenderEvent?: boolean;
 }
 
 /**
  * `ToolMessageApi` adapter strictly bound to a frozen `MessageTarget` and `AbortSignal`.
  * Reads and writes `/output.md` (real host `chat[messageId]` / `swipes[swipeId]` via VFS
- * or `HostBridge.readChatMessage`/`writeChatMessage`) and triggers `refreshMessageView`.
+ * or `HostBridge.readChatMessage`/`writeChatMessage`) and triggers native render events.
  */
 export class ChatMessageViewAdapter implements ToolMessageApi {
     private readonly target: MessageTarget;
     private readonly staged: boolean;
     private readonly vfs?: VirtualFileSystem;
+    private readonly emitRenderEvent?: boolean;
 
     constructor(
         private readonly bridge: HostBridge,
@@ -46,6 +48,7 @@ export class ChatMessageViewAdapter implements ToolMessageApi {
         this.target = { messageId: target.messageId, swipeId: target.swipeId };
         this.staged = options.staged === true;
         this.vfs = options.vfs;
+        this.emitRenderEvent = options.emitRenderEvent;
     }
 
     async appendView(text: string): Promise<void> {
@@ -71,12 +74,17 @@ export class ChatMessageViewAdapter implements ToolMessageApi {
                 target: boundTarget,
                 staged: this.staged,
                 source: 'append_reply_view',
+                ...(this.emitRenderEvent !== undefined
+                    ? { emitRenderEvent: this.emitRenderEvent }
+                    : {}),
             });
         } else {
-            await this.bridge.writeChatMessage(boundTarget, nextText, { emitEvent: false });
+            await this.bridge.writeChatMessage(boundTarget, nextText, {
+                emitEvent: false,
+                emitRenderEvent: this.emitRenderEvent !== false,
+            });
         }
 
-        await this.bridge.refreshMessageView({ ...boundTarget });
         throwIfAborted(this.signal);
     }
 
@@ -89,12 +97,17 @@ export class ChatMessageViewAdapter implements ToolMessageApi {
                 target: boundTarget,
                 staged: this.staged,
                 source: 'replace_reply_view',
+                ...(this.emitRenderEvent !== undefined
+                    ? { emitRenderEvent: this.emitRenderEvent }
+                    : {}),
             });
         } else {
-            await this.bridge.writeChatMessage(boundTarget, text, { emitEvent: false });
+            await this.bridge.writeChatMessage(boundTarget, text, {
+                emitEvent: false,
+                emitRenderEvent: this.emitRenderEvent !== false,
+            });
         }
 
-        await this.bridge.refreshMessageView({ ...boundTarget });
         throwIfAborted(this.signal);
     }
 

@@ -1720,6 +1720,7 @@ export class PipelineOrchestrator {
             target: ctx.target,
             signal: ctx.signal,
             permissions,
+            phase: unit.phase,
             staged: ctx.staged,
             source: `script:${rule.id}`,
             getVariableSchema: ctx.globalVarSchema ? () => ctx.globalVarSchema : undefined,
