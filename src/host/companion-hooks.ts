@@ -12,7 +12,11 @@ import { worldInfoCache } from '@st/scripts/world-info.js';
 
 import { resolveActivePreset } from '@/core/config';
 import { formatSideBriefXml, selectUnconsumedSideBriefClues } from '@/core/context';
-import { DecoratorParser, TailRadar } from '@/core/lore';
+import {
+    isAgenticControlEntry,
+    stripAgenticPassiveDecorators,
+    TailRadar,
+} from '@/core/lore';
 import {
     CHAT_VARIABLES_DOC_KEY,
     ChatDataStore,
@@ -27,7 +31,7 @@ import {
     PipelineOrchestrator,
     type TriggerExecutionUnit,
 } from '@/core/triggers';
-import type { MessageTarget, RawLoreEntry, Settings, TriggerRule } from '@/core/types';
+import type { MessageTarget, Settings, TriggerRule } from '@/core/types';
 import { normalizeVfsPath } from '@/core/utils';
 import {
     GLOBAL_VFS_EXTENSION_KEY,
@@ -46,30 +50,6 @@ import type { STHostBridge } from './st-bridge';
 
 const COMPANION_PROMPT_KEY = 'agentic_companion_before';
 export const COMPANION_SIDE_BRIDGE_PROMPT_KEY = 'agentic_side_bridge';
-
-const CONTROL_DECORATOR_NAMES = new Set([
-    'trigger',
-    'agent',
-    'tool',
-    'script',
-    'skill',
-    'json_schema',
-    'zod_schema',
-    'replace',
-    'replace_before',
-    'replace_diff',
-    'replace_diff_before',
-    'replace_prompt',
-    'replace_search',
-    'replace_pattern',
-    'replace_user',
-    'replace_ai',
-    'append_output',
-    'evaluate_ejs',
-    'variables',
-    'initvar',
-    'var',
-]);
 
 export interface CompanionHooksOptions {
     bridge: STHostBridge;
@@ -121,48 +101,6 @@ function resolveUpcomingTarget(genType: string): MessageTarget {
         return { messageId: chat.length, swipeId: 0 };
     }
     return { messageId: chat.length, swipeId: 0 };
-}
-
-function parseNumericUid(rawUid: unknown, fallback: number): number {
-    if (typeof rawUid === 'number' && Number.isFinite(rawUid)) {
-        return rawUid;
-    }
-    if (typeof rawUid === 'string') {
-        const parsed = Number.parseInt(rawUid, 10);
-        if (Number.isFinite(parsed)) {
-            return parsed;
-        }
-    }
-    return fallback;
-}
-
-function isControlLoreEntry(rawEntry: Record<string, unknown>, idx: number): boolean {
-    const candidate: RawLoreEntry = {
-        world: typeof rawEntry.world === 'string' ? rawEntry.world : '',
-        uid: parseNumericUid(rawEntry.uid, idx),
-        comment: typeof rawEntry.comment === 'string' ? rawEntry.comment : '',
-        content: typeof rawEntry.content === 'string' ? rawEntry.content : '',
-        keys: Array.isArray(rawEntry.key)
-            ? rawEntry.key.map(String)
-            : Array.isArray(rawEntry.keys)
-              ? rawEntry.keys.map(String)
-              : [],
-        keysecondary: Array.isArray(rawEntry.keysecondary) ? rawEntry.keysecondary.map(String) : [],
-        constant: Boolean(rawEntry.constant),
-        selective: rawEntry.selective !== undefined ? Boolean(rawEntry.selective) : true,
-        disable: Boolean(rawEntry.disable),
-        position: typeof rawEntry.position === 'number' ? rawEntry.position : 0,
-        depth: typeof rawEntry.depth === 'number' ? rawEntry.depth : 4,
-        order: typeof rawEntry.order === 'number' ? rawEntry.order : 100,
-        role: typeof rawEntry.role === 'number' ? rawEntry.role : 0,
-    };
-    const parsed = DecoratorParser.parseEntry(candidate);
-    if (parsed.decorators.some((dec) => CONTROL_DECORATOR_NAMES.has(dec.name.toLowerCase()))) {
-        return true;
-    }
-    return /^@@(?:trigger|agent|tool|script|skill|json_schema|zod_schema|replace(?:_\w+)?|append_output|evaluate_ejs|variables|initvar)\b/im.test(
-        candidate.content,
-    );
 }
 
 function resolveLoreContentSync(
@@ -879,11 +817,6 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
 
     const onWorldInfoEntriesLoaded = (data: unknown) => {
         const settings = getSettings();
-        if (!settings || settings.runMode === 'off') {
-            clearSideBridgePrompt();
-            return;
-        }
-
         const payload = (data && typeof data === 'object' ? data : {}) as {
             globalLore?: Array<Record<string, unknown>>;
             characterLore?: Array<Record<string, unknown>>;
@@ -898,37 +831,59 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
             payload.personaLore,
         ].filter((list): list is Array<Record<string, unknown>> => Array.isArray(list));
 
-        if (settings.runMode === 'takeover') {
+        if (settings?.runMode === 'takeover') {
             // Short-circuit redundant ST WI scan during single-chat takeover unless in passthrough (/gen or group).
             if (!selected_group && (isTakeoverActive?.() || activeGenType !== 'quiet')) {
                 for (const list of lists) {
                     list.length = 0;
                 }
+                return;
             }
-            return;
         }
 
-        const target = pendingCompanionTurn?.target ?? getLatestMessageTarget();
+        if (!settings || settings.runMode === 'off') {
+            clearSideBridgePrompt();
+        }
+
+        const applyVfsOverrides = settings?.runMode === 'companion';
+        const target = applyVfsOverrides
+            ? (pendingCompanionTurn?.target ?? getLatestMessageTarget())
+            : undefined;
+
         for (const list of lists) {
             for (let i = list.length - 1; i >= 0; i--) {
                 const entry = list[i];
                 if (!entry) {
                     continue;
                 }
-                if (isControlLoreEntry(entry, i)) {
+                const candidate = {
+                    comment: typeof entry.comment === 'string' ? entry.comment : '',
+                    content: typeof entry.content === 'string' ? entry.content : '',
+                    decorators: Array.isArray(entry.decorators) ? entry.decorators.map(String) : undefined,
+                };
+                if (isAgenticControlEntry(candidate)) {
                     list.splice(i, 1);
                     continue;
                 }
 
-                const worldName = typeof entry.world === 'string' ? entry.world : '';
-                const uid = entry.uid as string | number | undefined;
-                if (worldName && uid !== undefined) {
-                    const key = worldInfoKey(worldName, uid);
-                    const override =
-                        orchestrator.store.getPending(DATA_NAMESPACES.WORLDINFO, key, { target }) ??
-                        orchestrator.store.get(DATA_NAMESPACES.WORLDINFO, key, { target });
-                    if (typeof override?.content === 'string') {
-                        entry.content = unescapeAt(override.content);
+                let nextEntry = entry;
+                const stripped = stripAgenticPassiveDecorators(candidate.content);
+                if (stripped.stripped) {
+                    nextEntry = { ...nextEntry, content: stripped.content };
+                    list[i] = nextEntry;
+                }
+
+                if (applyVfsOverrides && target) {
+                    const worldName = typeof entry.world === 'string' ? entry.world : '';
+                    const uid = entry.uid as string | number | undefined;
+                    if (worldName && uid !== undefined) {
+                        const key = worldInfoKey(worldName, uid);
+                        const override =
+                            orchestrator.store.getPending(DATA_NAMESPACES.WORLDINFO, key, { target }) ??
+                            orchestrator.store.get(DATA_NAMESPACES.WORLDINFO, key, { target });
+                        if (typeof override?.content === 'string') {
+                            list[i] = { ...nextEntry, content: unescapeAt(override.content) };
+                        }
                     }
                 }
             }
@@ -1125,8 +1080,19 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         [event_types.CHAT_CHANGED, onChatChanged],
     ];
 
+    const maybeMakeFirst = (
+        eventSource as unknown as { makeFirst?: (event: string, listener: (...args: unknown[]) => unknown) => void }
+    ).makeFirst;
+
     for (const [eventName, handler] of registrations) {
-        if (eventName) {
+        if (!eventName) {
+            continue;
+        }
+        // Run before ST-Prompt-Template on WORLDINFO_ENTRIES_LOADED so ST-Agentic control entries
+        // are stripped prior to EJS/@@if/@@preprocessing evaluation during native generation.
+        if (eventName === event_types.WORLDINFO_ENTRIES_LOADED && typeof maybeMakeFirst === 'function') {
+            maybeMakeFirst.call(eventSource, eventName, handler);
+        } else {
             eventSource.on(eventName, handler);
         }
     }

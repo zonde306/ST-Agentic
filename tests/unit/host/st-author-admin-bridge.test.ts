@@ -363,7 +363,7 @@ vi.mock('@st/scripts/slash-commands/SlashCommandParser.js', () => ({
 
 import type { ToolSideGenApi } from '@/core/bridge';
 import { createDefaultSettings } from '@/core/config';
-import { ChatDataStore } from '@/core/store';
+import { ChatDataStore, DATA_NAMESPACES } from '@/core/store';
 import type { PipelineOrchestrator } from '@/core/triggers';
 import type { Settings } from '@/core/types';
 import { VirtualFileSystem } from '@/core/vfs';
@@ -1395,6 +1395,118 @@ describe('Companion Hooks /side/* Bridge & Zero-Residue Cleanup', () => {
             { messageId: 2, swipeId: 0 },
             { turnNumber: 3 },
         );
+
+        handle.dispose();
+    });
+
+    it('excludes ST-Agentic control decorators & strips @@system in WORLDINFO_ENTRIES_LOADED across off, companion, and takeover-passthrough modes', async () => {
+        stMocks.state.chat = [
+            {
+                name: 'Tester',
+                is_user: true,
+                is_system: false,
+                mes: 'Hello',
+                swipe_id: 0,
+                swipes: ['Hello'],
+            },
+        ];
+
+        const settings: Settings = createDefaultSettings({ runMode: 'off' });
+        const bridge = new STHostBridge({ getSettings: () => settings });
+        const store = new ChatDataStore(bridge);
+        bridge.setStore(store);
+        const vfs = new VirtualFileSystem({ bridge, store });
+        store.set(
+            DATA_NAMESPACES.WORLDINFO,
+            'LoreBook/10',
+            '/lorebooks/LoreBook/Normal-10.md',
+            'Companion overridden content',
+            { target: { messageId: 0, swipeId: 0 } },
+        );
+
+        const mockOrchestrator = {
+            store,
+            vfs,
+            barrierCoordinator: {
+                awaitTurnBarriers: vi.fn(async () => undefined),
+                abortFromMessage: vi.fn(),
+                abortTarget: vi.fn(),
+            },
+            decoratorCompiler: {
+                compile: vi.fn(() => ({ triggers: [] })),
+            },
+            rerunAfterTurn: vi.fn(async () => []),
+            trajectoryStore: {
+                listInterruptedCheckpoints: vi.fn(() => new Map()),
+                pruneFromMessage: vi.fn(() => 0),
+                pruneSwipe: vi.fn(() => 0),
+                saveToHost: vi.fn(),
+            },
+        } as unknown as PipelineOrchestrator;
+
+        const handle = setupCompanionHooks({
+            bridge,
+            orchestrator: mockOrchestrator,
+            getSettings: () => settings,
+        });
+
+        const buildPayload = () => ({
+            globalLore: [
+                { uid: 1, world: 'LoreBook', comment: 'Vars', content: '@@variables_json\nhp: 10' },
+                { uid: 2, world: 'LoreBook', comment: 'EJS', content: '@@evaluate_ejs_before\n<% 1 %>' },
+                { uid: 3, world: 'LoreBook', comment: 'Tool', content: '@@tool my_tool\nreturn 1;' },
+                { uid: 4, world: 'LoreBook', comment: 'Plain', content: 'Normal lore about harbor' },
+                { uid: 5, world: 'LoreBook', comment: '[InitVar] Stats', content: 'hp: 100' },
+            ],
+            characterLore: [
+                { uid: 6, world: 'LoreBook', comment: 'CondTrig', content: '@@if vars.x\n@@trigger phase=after\nRun' },
+                { uid: 7, world: 'LoreBook', comment: 'Group', content: '@@group g1\nMerged' },
+                { uid: 8, world: 'LoreBook', comment: 'Schema', content: '@@zod_schema z.object({ a: z.string() })' },
+                { uid: 9, world: 'LoreBook', comment: 'Sys', content: '@@system\nAlways follow rules.' },
+                { uid: 10, world: 'LoreBook', comment: 'Normal', content: 'Original normal lore' },
+            ],
+            chatLore: [],
+            personaLore: [
+                { uid: 11, world: 'LoreBook', comment: 'CondSys', content: '@@if vars.ok\n@@system\nConditioned rule' },
+            ],
+        });
+
+        // 1. runMode === 'off': control entries removed, @@system stripped cleanly without mutating originals, NO VFS override
+        const offPayload = buildPayload();
+        const originalSysRef = offPayload.characterLore[3];
+        const originalNormalRef = offPayload.characterLore[4];
+        await stMocks.eventSource.emit(stMocks.event_types.WORLDINFO_ENTRIES_LOADED, offPayload);
+
+        expect(offPayload.globalLore.map((e) => e.uid)).toEqual([4]);
+        expect(offPayload.characterLore.map((e) => e.uid)).toEqual([9, 10]);
+        expect(offPayload.characterLore[0]?.content).toBe('Always follow rules.');
+        expect(offPayload.characterLore[1]?.content).toBe('Original normal lore');
+        expect(originalSysRef?.content).toBe('@@system\nAlways follow rules.');
+        expect(originalNormalRef?.content).toBe('Original normal lore');
+        expect(offPayload.personaLore[0]?.content).toBe('@@if vars.ok\nConditioned rule');
+
+        // 2. runMode === 'companion': control entries removed, @@system stripped, AND VFS overrides applied on shallow clone
+        settings.runMode = 'companion';
+        const compPayload = buildPayload();
+        const compNormalOriginal = compPayload.characterLore[4];
+        await stMocks.eventSource.emit(stMocks.event_types.WORLDINFO_ENTRIES_LOADED, compPayload);
+
+        expect(compPayload.globalLore.map((e) => e.uid)).toEqual([4]);
+        expect(compPayload.characterLore.map((e) => e.uid)).toEqual([9, 10]);
+        expect(compPayload.characterLore[0]?.content).toBe('Always follow rules.');
+        expect(compPayload.characterLore[1]?.content).toBe('Companion overridden content');
+        expect(compNormalOriginal?.content).toBe('Original normal lore');
+
+        // 3. runMode === 'takeover' during group-chat passthrough: still filters ST-Agentic decorators instead of leaking!
+        settings.runMode = 'takeover';
+        stMocks.state.selected_group = 'group-123';
+        const groupPayload = buildPayload();
+        await stMocks.eventSource.emit(stMocks.event_types.WORLDINFO_ENTRIES_LOADED, groupPayload);
+
+        expect(groupPayload.globalLore.map((e) => e.uid)).toEqual([4]);
+        expect(groupPayload.characterLore.map((e) => e.uid)).toEqual([9, 10]);
+        expect(groupPayload.characterLore[0]?.content).toBe('Always follow rules.');
+        expect(groupPayload.characterLore[1]?.content).toBe('Original normal lore');
 
         handle.dispose();
     });

@@ -39,6 +39,8 @@ const NON_LORE_MOUNT_DECORATORS = new Set([
     '@@agent',
     '@@trigger',
     '@@system',
+    '@@json_schema',
+    '@@zod_schema',
     '@@variables_json',
     '@@variables_json_before',
     '@@variables_yaml',

@@ -9,10 +9,12 @@ import {
     evaluateIfConditions,
     extractIfConditions,
     hasPrivateDecorator,
+    isAgenticControlEntry,
     isEjsEntryEnabled,
     isEjsForceDisabledEntry,
     isEjsSpecialEntry,
     parseDecorators,
+    stripAgenticPassiveDecorators,
 } from '@/core/lore';
 import type { RawLoreEntry } from '@/core/types';
 import { MemoryHostBridge } from '../../mocks';
@@ -248,5 +250,64 @@ describe('DecoratorParser', () => {
         expect(await evaluateIfConditions(['vars.hp > 50'], bridgeNoEjs, { hp: 10 })).toBe(true);
         expect(bridgeNoEjs.compatWarnings).toHaveLength(1);
         expect(bridgeNoEjs.compatWarnings[0].code).toBe('ejs_missing_for_if');
+    });
+
+    it('identifies ST-Agentic control entries and strips passive @@system decorators without disturbing ST/EJS decorators', () => {
+        const controlSamples: Array<Parameters<typeof isAgenticControlEntry>[0]> = [
+            makeEntry('@@trigger phase=after\nSummarize turn'),
+            makeEntry('@@Trigger phase=before\nCase-insensitive check'),
+            makeEntry('@@tool fetch_clue\nreturn 1;'),
+            makeEntry('@@script\nvars.a = 1;'),
+            makeEntry('@@group party_sync\nSync group'),
+            makeEntry('@@agent archivist\nResearch lore'),
+            makeEntry('@@skill decode\nDecode runes'),
+            makeEntry('@@variables_json\nUpdate hp'),
+            makeEntry('@@variables_yaml_before\nUpdate mood'),
+            makeEntry('@@evaluate_ejs_before\n<% setvar("x", 1) %>'),
+            makeEntry('@@append_output_before\nAdd epilogue'),
+            makeEntry('@@replace_output_ejs\n<%- vars.text %>'),
+            makeEntry('@@replace\nUpdate archive'),
+            makeEntry('@@json_schema {"type":"object"}'),
+            makeEntry('@@zod_schema z.object({ hp: z.number() })'),
+            makeEntry('@@batch_order 2\nBatch rule'),
+            makeEntry('@@preset fast\nPreset hint'),
+            makeEntry('@@if vars.flag\n@@trigger phase=after\nConditional trigger'),
+            { ...makeEntry('hp: 100'), comment: '[InitVar] Initial State' },
+            makeEntry('[InitVar]\nhp: 100'),
+        ];
+
+        for (const sample of controlSamples) {
+            expect(isAgenticControlEntry(sample)).toBe(true);
+        }
+
+        // Normal entries and passive @@system entries are NOT control entries
+        expect(isAgenticControlEntry(makeEntry('普通世界书条目内容'))).toBe(false);
+        expect(isAgenticControlEntry(makeEntry('@@if vars.hp > 0\n<div>Status</div>'))).toBe(false);
+        expect(isAgenticControlEntry(makeEntry('@@system\n严格遵守文风约束'))).toBe(false);
+        expect(isAgenticControlEntry(makeEntry('@@@trigger\n转义注释，不应识别为触发器'))).toBe(false);
+
+        // stripAgenticPassiveDecorators strips @@system but preserves sibling @@ decorators & CRLF body
+        const strippedSystem = stripAgenticPassiveDecorators('@@system\n保持冷峻克制。');
+        expect(strippedSystem).toEqual({ content: '保持冷峻克制。', stripped: true });
+
+        const preservedSiblings = stripAgenticPassiveDecorators(
+            '@@if vars.mode === "dark"\r\n@@system\r\n@@private\r\n只保留正文与条件装饰器',
+        );
+        expect(preservedSiblings).toEqual({
+            content: '@@if vars.mode === "dark"\r\n@@private\r\n只保留正文与条件装饰器',
+            stripped: true,
+        });
+
+        const unchangedNormal = stripAgenticPassiveDecorators('@@if vars.hp > 0\nNormal lore');
+        expect(unchangedNormal).toEqual({
+            content: '@@if vars.hp > 0\nNormal lore',
+            stripped: false,
+        });
+
+        const escapedSystem = stripAgenticPassiveDecorators('@@@system\nLiteral');
+        expect(escapedSystem).toEqual({
+            content: '@@@system\nLiteral',
+            stripped: false,
+        });
     });
 });

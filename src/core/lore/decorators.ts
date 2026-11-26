@@ -77,6 +77,35 @@ export const KNOWN_DECORATORS: ReadonlySet<string> = new Set([
     ...AGENTIC_DECORATORS,
 ]);
 
+/**
+ * ST-Agentic control & automation decorators that must never leak verbatim into
+ * SillyTavern native prompt assembly when ST-Agentic is off, in companion mode,
+ * or passing through a group/quiet generation.
+ */
+export const AGENTIC_CONTROL_DECORATORS: ReadonlySet<string> = new Set([
+    ...LEGACY_DECORATORS,
+    '@@trigger',
+    '@@tool',
+    '@@script',
+    '@@group',
+    // Legacy compatibility aliases
+    '@@replace_prompt',
+    '@@replace_pattern',
+    '@@replace_user',
+    '@@replace_ai',
+    '@@variables',
+    '@@initvar',
+    '@@var',
+]);
+
+/**
+ * ST-Agentic passive semantic markers whose decorator line should be stripped
+ * before native SillyTavern generation while keeping the entry's body text.
+ */
+export const AGENTIC_PASSIVE_DECORATORS: ReadonlySet<string> = new Set([
+    '@@system',
+]);
+
 /** Decorators whose argument payload should be kept verbatim without quote-stripping. */
 const VERBATIM_ARG_DECORATORS = new Set(['@@json_schema', '@@zod_schema', '@@if', '@@iframe']);
 
@@ -531,4 +560,130 @@ export async function evaluateIfConditions(
     }
 
     return true;
+}
+
+const INITVAR_TAG_PATTERN = /\[initvar\]/i;
+const LEADING_INITVAR_TAG_PATTERN = /^\s*\[initvar\]/i;
+
+function extractLeadingDecoratorToken(line: string): string {
+    const trimmedEnd = line.replace(/\r$/, '');
+    const wsIdx = trimmedEnd.search(/\s/);
+    return (wsIdx === -1 ? trimmedEnd : trimmedEnd.slice(0, wsIdx)).toLowerCase();
+}
+
+/**
+ * Determine whether a raw World Info entry is an ST-Agentic control entry
+ * (`@@trigger`, `@@tool`, `@@script`, `@@group`, `@@agent`, `@@skill`,
+ * `@@replace*`, `@@variables*`, `@@evaluate_ejs*`, `@@*_output*`,
+ * `@@json_schema`, `@@zod_schema`, `@@batch_order`, `@@preset`, `[InitVar]`)
+ * that must be excluded from SillyTavern's native WI prompt assembly.
+ */
+export function isAgenticControlEntry(
+    entry: Pick<RawLoreEntry, 'comment' | 'content' | 'decorators'>,
+): boolean {
+    const parsed = DecoratorParser.parseEntry(entry);
+    if (parsed.decorators.some((d) => AGENTIC_CONTROL_DECORATORS.has(d.name.toLowerCase()))) {
+        return true;
+    }
+
+    const content = entry.content ?? '';
+    if (content.startsWith('@@')) {
+        let lineStart = 0;
+        let fallbacked = false;
+        while (lineStart < content.length) {
+            if (!content.startsWith('@@', lineStart)) {
+                break;
+            }
+            const rawLineEnd = content.indexOf('\n', lineStart);
+            const lineEnd = rawLineEnd === -1 ? content.length : rawLineEnd;
+            const line = content.slice(lineStart, lineEnd).replace(/\r$/, '');
+            const isEscaped = line.startsWith('@@@');
+            if (isEscaped && !fallbacked) {
+                break;
+            }
+            const candidate = isEscaped ? line.slice(1) : line;
+            const token = extractLeadingDecoratorToken(candidate);
+            if (AGENTIC_CONTROL_DECORATORS.has(token)) {
+                return true;
+            }
+            if (!KNOWN_DECORATORS.has(token)) {
+                fallbacked = true;
+            } else {
+                fallbacked = false;
+            }
+            if (rawLineEnd === -1) {
+                break;
+            }
+            lineStart = rawLineEnd + 1;
+        }
+    }
+
+    if (entry.decorators) {
+        for (const raw of entry.decorators) {
+            const candidate = raw.startsWith('@@') ? raw : `@@${raw}`;
+            const token = extractLeadingDecoratorToken(candidate);
+            if (AGENTIC_CONTROL_DECORATORS.has(token)) {
+                return true;
+            }
+        }
+    }
+
+    if (
+        INITVAR_TAG_PATTERN.test(entry.comment ?? '')
+        || LEADING_INITVAR_TAG_PATTERN.test(parsed.cleanContent)
+    ) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Strip ST-Agentic passive header decorators (e.g. `@@system`) from leading decorator
+ * lines so they do not render as raw text in SillyTavern native generation, while
+ * keeping sibling decorators (`@@if`, `@@private`, `@@activate`, etc.) and body intact.
+ */
+export function stripAgenticPassiveDecorators(
+    content: string,
+): { content: string; stripped: boolean } {
+    if (!content || !content.startsWith('@@')) {
+        return { content, stripped: false };
+    }
+
+    const keptHeaderSlices: string[] = [];
+    let stripped = false;
+    let lineStart = 0;
+
+    while (lineStart < content.length) {
+        if (!content.startsWith('@@', lineStart)) {
+            break;
+        }
+        const rawLineEnd = content.indexOf('\n', lineStart);
+        const lineEnd = rawLineEnd === -1 ? content.length : rawLineEnd;
+        const nextLineStart = rawLineEnd === -1 ? content.length : rawLineEnd + 1;
+        const rawLineNoNl = content.slice(lineStart, lineEnd);
+        const line = rawLineNoNl.replace(/\r$/, '');
+
+        if (line.startsWith('@@@')) {
+            break;
+        }
+
+        const token = extractLeadingDecoratorToken(line);
+        if (AGENTIC_PASSIVE_DECORATORS.has(token)) {
+            stripped = true;
+        } else {
+            keptHeaderSlices.push(content.slice(lineStart, nextLineStart));
+        }
+
+        lineStart = nextLineStart;
+    }
+
+    if (!stripped) {
+        return { content, stripped: false };
+    }
+
+    return {
+        content: keptHeaderSlices.join('') + content.slice(lineStart),
+        stripped: true,
+    };
 }
