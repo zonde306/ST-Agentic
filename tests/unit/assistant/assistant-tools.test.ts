@@ -25,6 +25,7 @@ import {
 import { DEFAULT_MAIN_AGENT_ID, createDefaultSettings } from '@/core/config';
 import { TrajectoryStore } from '@/core/context';
 import { TraceLogger } from '@/core/logger';
+import { LoreReadEvaluator } from '@/core/lore';
 import { ChatDataStore, DATA_NAMESPACES, MESSAGE_OVERRIDE_KEY, worldInfoKey } from '@/core/store';
 import { canonicalStringify } from '@/core/utils';
 import { VirtualFileSystem } from '@/core/vfs';
@@ -1013,6 +1014,138 @@ describe('Assistant 4-Tier Toolsets (TS2.1)', () => {
                 targets: ['ejs'],
             });
             expect(parsedShape.success).toBe(false);
+        });
+    });
+
+    describe('Assistant read_file template evaluation vs edit-capable raw reads', () => {
+        it('evaluates macros/EJS in chat mode and returns verbatim raw templates in adjust/author/full modes and edit snapshots', async () => {
+            const { bridge, store, ctx, allTools, undoStore } = setupToolEnv({
+                mode: 'chat',
+                stAdminEnabled: false,
+            });
+            bridge.characterFields = {
+                description: '角色 {{char}}，与 {{user}} 相遇，信任=<%= vars.trust %>。',
+            };
+            bridge.personaDescription = '{{user}} 的人设描述。';
+            bridge.lorebooks.set('MainBook', [
+                {
+                    world: 'MainBook',
+                    uid: 10,
+                    comment: 'Template Lore',
+                    content: '世界书：{{char}} / {{user}} / <%= vars.trust %>',
+                    keys: ['模板'],
+                    keysecondary: [],
+                    constant: true,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 4,
+                    order: 10,
+                    role: 0,
+                },
+            ]);
+            bridge.setEjsEvaluator(async (text, vars) =>
+                text.replace(/<%=\s*vars\.trust\s*%>/g, String(vars.trust ?? '')),
+            );
+
+            const loreEval = new LoreReadEvaluator(bridge);
+            const vfsWithHook = new VirtualFileSystem({
+                bridge,
+                store,
+                loreReadHook: loreEval.toLoreReadHook(),
+                getPresetFiles: () => ({ 'style.md': '预设文风：{{char}} (<%= vars.trust %>)' }),
+            });
+            bridge.setVariable('trust', 88);
+            await vfsWithHook.writeFile('/workspace/plan.md', '计划：{{user}} / <%= vars.trust %>', {
+                target: ctx.target,
+                staged: false,
+            });
+            ctx.vfs = vfsWithHook;
+
+            const readFile = allTools.get('read_file')!;
+            const editFile = allTools.get('edit_file')!;
+
+            // 1. chat mode (read-only): returns evaluated macros + EJS
+            ctx.mode = 'chat';
+            const chatChar = await executeAssistantTool(readFile, { path: '/character/description.md' }, ctx);
+            expect(chatChar.ok).toBe(true);
+            expect(chatChar.output).toContain('角色 林晚，与 调查员 相遇，信任=88。');
+            expect(chatChar.output).not.toContain('{{char}}');
+
+            const chatPersona = await executeAssistantTool(readFile, { path: '/persona/description.md' }, ctx);
+            expect(chatPersona.output).toContain('调查员 的人设描述。');
+
+            const chatLore = await executeAssistantTool(
+                readFile,
+                { path: '/lorebooks/MainBook/Template-Lore-10.md' },
+                ctx,
+            );
+            expect(chatLore.output).toContain('世界书：林晚 / 调查员 / 88');
+
+            const chatPreset = await executeAssistantTool(readFile, { path: '/preset/style.md' }, ctx);
+            expect(chatPreset.output).toContain('预设文风：林晚 (88)');
+
+            const chatWs = await executeAssistantTool(readFile, { path: '/workspace/plan.md' }, ctx);
+            expect(chatWs.output).toContain('计划：调查员 / 88');
+
+            // /docs/* always remains raw
+            const chatDoc = await executeAssistantTool(readFile, { path: '/docs/ejs-macros.md' }, ctx);
+            expect(chatDoc.output).toContain('<%=');
+
+            // 2. edit-capable modes (adjust / author / full): return verbatim raw templates
+            for (const editMode of ['adjust', 'author', 'full'] as const) {
+                ctx.mode = editMode;
+                const rawChar = await executeAssistantTool(readFile, { path: '/character/description.md' }, ctx);
+                expect(rawChar.output).toContain('角色 {{char}}，与 {{user}} 相遇，信任=<%= vars.trust %>。');
+
+                const rawLore = await executeAssistantTool(
+                    readFile,
+                    { path: '/lorebooks/MainBook/Template-Lore-10.md' },
+                    ctx,
+                );
+                expect(rawLore.output).toContain('世界书：{{char}} / {{user}} / <%= vars.trust %>');
+
+                const rawWs = await executeAssistantTool(readFile, { path: '/workspace/plan.md' }, ctx);
+                expect(rawWs.output).toContain('计划：{{user}} / <%= vars.trust %>');
+            }
+
+            // 3. edit_file preview and UndoRecord snapshots capture raw source verbatim
+            ctx.mode = 'adjust';
+            const preview = await editFile.preview!(
+                {
+                    path: '/workspace/plan.md',
+                    search: '{{user}} / <%= vars.trust %>',
+                    replace: '{{char}} / <%= vars.trust %>',
+                },
+                ctx,
+            );
+            expect(preview.beforeText).toBe('计划：{{user}} / <%= vars.trust %>');
+            expect(preview.afterText).toBe('计划：{{char}} / <%= vars.trust %>');
+
+            const editRes = await executeAssistantTool(
+                editFile,
+                {
+                    path: '/workspace/plan.md',
+                    search: '{{user}} / <%= vars.trust %>',
+                    replace: '{{char}} / <%= vars.trust %>',
+                },
+                ctx,
+            );
+            expect(editRes.ok).toBe(true);
+            const undoRecord = undoStore.get(editRes.undoId!);
+            expect((undoRecord?.snapshot as { previousContent?: string }).previousContent).toBe(
+                '计划：{{user}} / <%= vars.trust %>',
+            );
+            expect(await vfsWithHook.readFile('/workspace/plan.md', { target: ctx.target, staged: false })).toBe(
+                '计划：林晚 / 88',
+            );
+            expect(
+                await vfsWithHook.readFile('/workspace/plan.md', {
+                    target: ctx.target,
+                    staged: false,
+                    raw: true,
+                }),
+            ).toBe('计划：{{char}} / <%= vars.trust %>');
         });
     });
 });

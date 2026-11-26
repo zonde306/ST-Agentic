@@ -491,4 +491,147 @@ describe('VirtualFileSystem', () => {
             rank: 'A',
         });
     });
+
+    it('evaluates macros and optional EJS by default across template mounts while preserving raw: true and keeping non-template mounts verbatim', async () => {
+        const bridge = new MemoryHostBridge({
+            identity: {
+                userName: '铃木丸太',
+                charName: '爱丽丝',
+                characterAvatar: 'alice.png',
+                personaAvatar: 'maruta.png',
+            },
+            characterFields: {
+                description: '标题 {{char}}，{{user}} 扮演路人。\n<% if (Number(vars.trust) >= 50) { %>\n秘密：信任已达标(<%= vars.trust %>)。\n<% } else { %>\n秘密：尚在观察。\n<% } %>',
+            },
+            personaDescription: '{{user}} 是普通男人，好感={{getvar::trust}}。',
+            lorebooks: {
+                BookA: [
+                    {
+                        world: 'BookA',
+                        uid: 1,
+                        comment: 'Lore Entry',
+                        content: '档案：{{char}} 与 {{user}}，trust=<%= vars.trust %>',
+                        keys: ['档案'],
+                        keysecondary: [],
+                        constant: false,
+                        selective: false,
+                        disable: false,
+                        position: 0,
+                        depth: 4,
+                        order: 10,
+                        role: 0,
+                    },
+                    {
+                        world: 'BookA',
+                        uid: 2,
+                        comment: 'Skill Entry',
+                        content: '@@skill inspect-skill\n技能摘要：{{user}} 查看 <%= vars.trust %>\n正文：{{char}} 的细节。',
+                        keys: [],
+                        keysecondary: [],
+                        constant: true,
+                        selective: false,
+                        disable: false,
+                        position: 0,
+                        depth: 4,
+                        order: 10,
+                        role: 0,
+                    },
+                ],
+            },
+        });
+        bridge.pushMessage({ name: 'User', isUser: true, mes: 'hi' });
+        bridge.pushMessage({ name: 'Alice', isUser: false, mes: '回复 {{user}} <% if (true) { %>原文<% } %>' });
+        bridge.setEjsEvaluator(async (text, vars) => {
+            let out = text.replace(
+                /<% if \(Number\(vars\.trust\) >= 50\) \{ %>([\s\S]*?)<% \} else \{ %>([\s\S]*?)<% \} %>/g,
+                (_m, truthy: string, falsy: string) => (Number(vars.trust) >= 50 ? truthy : falsy),
+            );
+            out = out.replace(/<%=\s*vars\.trust\s*%>/g, String(vars.trust ?? ''));
+            return out;
+        });
+
+        const vfs = new VirtualFileSystem({
+            bridge,
+            getPresetFiles: () => ({
+                'guide.md': '预设指南：{{char}} / <%= vars.trust %>',
+            }),
+        });
+        const target = { messageId: 1, swipeId: 0 };
+        await vfs.writeVariables({ trust: 65 }, { target, staged: true });
+        await vfs.writeFile('/workspace/notes.md', '工作区：{{user}} trust=<%= vars.trust %>', {
+            target,
+            staged: true,
+        });
+        await vfs.writeFile('/global/rules.md', '全局：{{char}}');
+        await vfs.writeHistoryInternal('/history/chunk-001.md', '归档：{{user}} <% raw %>');
+        await vfs.writeSideClue(
+            {
+                path: '/side/notes/clue.md',
+                title: '线索',
+                body: '线外：{{user}} <% raw %>',
+            },
+            { target, staged: false },
+        );
+
+        // Default reads evaluate macros + EJS using target/staged variables
+        const charText = await vfs.readFile('/character/description.md', { target, staged: true });
+        expect(charText).toContain('标题 爱丽丝，铃木丸太 扮演路人。');
+        expect(charText).toContain('秘密：信任已达标(65)。');
+        expect(charText).not.toContain('<%');
+
+        // Line-sliced read evaluates full multi-line EJS block before slicing lines
+        const charLine2 = await vfs.readFile('/character/description.md', {
+            target,
+            staged: true,
+            startLine: 2,
+            endLine: 3,
+        });
+        expect(charLine2).toContain('秘密：信任已达标(65)。');
+
+        expect(await vfs.readFile('/persona/description.md', { target, staged: true })).toBe(
+            '铃木丸太 是普通男人，好感=65。',
+        );
+        expect(await vfs.readFile('/preset/guide.md', { target, staged: true })).toBe('预设指南：爱丽丝 / 65');
+        expect(await vfs.readFile('/workspace/notes.md', { target, staged: true })).toBe('工作区：铃木丸太 trust=65');
+        expect(await vfs.readFile('/global/rules.md', { target, staged: true })).toBe('全局：爱丽丝');
+
+        const skillText = await vfs.readFile('/skills/inspect-skill.md', { target, staged: true });
+        expect(skillText).toContain('skill: inspect-skill');
+        expect(skillText).toContain('技能摘要：铃木丸太 查看 65');
+        expect(skillText).toContain('正文：爱丽丝 的细节。');
+
+        // /lorebooks/* fallback evaluation without LoreReadHook
+        const loreText = await vfs.readFile('/lorebooks/BookA/Lore-Entry-1.md', { target, staged: true });
+        expect(loreText).toContain('world: BookA');
+        expect(loreText).toContain('档案：爱丽丝 与 铃木丸太，trust=65');
+
+        // { raw: true } preserves verbatim templates across all evaluated mounts
+        expect(await vfs.readFile('/character/description.md', { target, staged: true, raw: true })).toContain('{{char}}');
+        expect(await vfs.readFile('/character/description.md', { target, staged: true, raw: true })).toContain('<% if');
+        expect(await vfs.readFile('/persona/description.md', { target, staged: true, raw: true })).toContain('{{user}}');
+        expect(await vfs.readFile('/preset/guide.md', { target, staged: true, raw: true })).toContain('<%= vars.trust %>');
+        expect(await vfs.readFile('/workspace/notes.md', { target, staged: true, raw: true })).toContain('{{user}}');
+        expect(await vfs.readFile('/global/rules.md', { target, staged: true, raw: true })).toBe('全局：{{char}}');
+        expect(await vfs.readFile('/skills/inspect-skill.md', { target, staged: true, raw: true })).toContain('{{user}}');
+        expect(await vfs.readFile('/lorebooks/BookA/Lore-Entry-1.md', { target, staged: true, raw: true })).toContain('{{char}}');
+
+        // Also bypasses LoreReadHook when loreReadHook is wired
+        const hookSpy = vi.fn(async () => 'HOOK_EVALUATED');
+        vfs.setLoreReadHook(hookSpy);
+        expect(await vfs.readFile('/lorebooks/BookA/Lore-Entry-1.md', { target, staged: true })).toContain('HOOK_EVALUATED');
+        expect(hookSpy).toHaveBeenCalledTimes(1);
+        const rawLore = await vfs.readFile('/lorebooks/BookA/Lore-Entry-1.md', {
+            target,
+            staged: true,
+            raw: true,
+        });
+        expect(rawLore).toContain('档案：{{char}} 与 {{user}}');
+        expect(hookSpy).toHaveBeenCalledTimes(1);
+
+        // Non-template mounts always return raw content
+        expect(await vfs.readFile('/docs/ejs-macros.md', { target })).toContain('<%=');
+        expect(await vfs.readFile('/output.md', { target })).toBe('回复 {{user}} <% if (true) { %>原文<% } %>');
+        expect(await vfs.readFile('/history/chunk-001.md', { target })).toBe('归档：{{user}} <% raw %>');
+        expect(await vfs.readFile('/side/notes/clue.md', { target, staged: false })).toContain('线外：{{user}} <% raw %>');
+    });
 });

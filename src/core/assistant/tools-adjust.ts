@@ -227,6 +227,7 @@ async function captureVfsSnapshot(
         previousContent = await ctx.vfs.readFile(normalizedPath, {
             target: ctx.target,
             staged: false,
+            raw: true,
         });
     } catch (error) {
         if (!(error instanceof VfsNotFoundError)) {
@@ -551,7 +552,7 @@ export function createAdjustTools(): AssistantToolDefinition[] {
             }
 
             const afterContent = await ctx.vfs
-                .readFile(normalizedPath, { target: ctx.target, staged: false })
+                .readFile(normalizedPath, { target: ctx.target, staged: false, raw: true })
                 .catch(() => '');
             const undoId = recordVfsUndo(ctx, 'edit_file', snapshot, afterContent);
             return finalizeMutationToolResult(

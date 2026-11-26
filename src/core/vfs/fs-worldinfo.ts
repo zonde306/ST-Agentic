@@ -18,6 +18,7 @@ import {
     VfsReadOnlyError,
     type VfsSearchDocument,
     type VfsTargetOptions,
+    type VfsTemplateEvaluator,
     type VfsWriteOptions,
     sanitizeFileName,
     sliceLines,
@@ -423,6 +424,7 @@ export class WorldInfoMount implements VfsMount {
         private readonly bridge: HostBridge,
         private readonly store: ChatDataStore,
         loreReadHook?: LoreReadHook,
+        private readonly defaultTemplateEvaluator?: VfsTemplateEvaluator,
     ) {
         this.loreReadHook = loreReadHook;
     }
@@ -519,7 +521,9 @@ export class WorldInfoMount implements VfsMount {
         const canonicalPath = this.entryPath(book, normalizedEntry);
 
         let body: string;
-        if (this.loreReadHook) {
+        if (opts.raw) {
+            body = overriddenContent ?? rawContent;
+        } else if (this.loreReadHook) {
             body = await this.loreReadHook({
                 world: normalizedEntry.world,
                 uid: normalizedEntry.uid,
@@ -528,6 +532,8 @@ export class WorldInfoMount implements VfsMount {
                 rawContent,
                 overriddenContent,
             });
+        } else if (this.defaultTemplateEvaluator) {
+            body = await this.defaultTemplateEvaluator(overriddenContent ?? rawContent, opts);
         } else {
             body = overriddenContent ?? rawContent;
         }
@@ -788,7 +794,10 @@ export class SkillsMount implements VfsMount {
     public readonly mountName = SKILLS_MOUNT;
     public readonly writable = false;
 
-    constructor(private readonly bridge: HostBridge) {}
+    constructor(
+        private readonly bridge: HostBridge,
+        private readonly templateEvaluator?: VfsTemplateEvaluator,
+    ) {}
 
     async stat(relPath: string): Promise<VfsEntryStat | null> {
         if (!relPath) {
@@ -827,12 +836,16 @@ export class SkillsMount implements VfsMount {
     }
 
     async readFile(relPath: string, opts: VfsReadOptions = {}): Promise<string> {
-        const snapshot = await this.snapshot();
-        const content = snapshot.get(relPath);
-        if (content === undefined) {
+        const entries = await this.snapshotEntries();
+        const entry = entries.get(relPath);
+        if (!entry) {
             throw new VfsNotFoundError(`/${SKILLS_MOUNT}/${relPath}`);
         }
-        return sliceLines(content, opts.startLine, opts.endLine);
+        let body = entry.body;
+        if (!opts.raw && this.templateEvaluator) {
+            body = await this.templateEvaluator(body, opts);
+        }
+        return sliceLines(`${entry.frontmatter}\n\n${body}`, opts.startLine, opts.endLine);
     }
 
     async writeFile(relPath: string): Promise<void> {
@@ -877,9 +890,9 @@ export class SkillsMount implements VfsMount {
         return docs;
     }
 
-    private async snapshot(): Promise<Map<string, string>> {
+    private async snapshotEntries(): Promise<Map<string, { frontmatter: string; body: string }>> {
         const books = await this.bridge.listEnabledLorebooks();
-        const files = new Map<string, string>();
+        const files = new Map<string, { frontmatter: string; body: string }>();
 
         for (const entries of books.values()) {
             for (const entry of entries) {
@@ -888,21 +901,28 @@ export class SkillsMount implements VfsMount {
                     continue;
                 }
                 const fileName = `${sanitizeFileName(info.name)}.md`;
-                const lines = [
+                const frontmatter = [
                     '---',
                     `skill: ${info.name}`,
                     `activation: call add_skill("${info.name}") to keep this skill in context`,
                     '---',
-                    '',
-                    info.description,
-                ];
-                if (info.body) {
-                    lines.push('', info.body);
-                }
-                files.set(fileName, lines.join('\n'));
+                ].join('\n');
+                const body = info.body
+                    ? `${info.description}\n\n${info.body}`
+                    : info.description;
+                files.set(fileName, { frontmatter, body });
             }
         }
 
+        return files;
+    }
+
+    private async snapshot(): Promise<Map<string, string>> {
+        const entries = await this.snapshotEntries();
+        const files = new Map<string, string>();
+        for (const [fileName, entry] of entries.entries()) {
+            files.set(fileName, `${entry.frontmatter}\n\n${entry.body}`);
+        }
         return files;
     }
 }

@@ -23,7 +23,9 @@ import {
     VfsReadOnlyError,
     type VfsSearchDocument,
     type VfsTargetOptions,
+    type VfsTemplateEvaluator,
     type VfsWriteOptions,
+    sliceLines,
     sortStats,
 } from './fs-base';
 import { countLines, grepLinesInText, lineNumberAtOffset } from './text-ops';
@@ -281,6 +283,21 @@ function buildSnippet(content: string, matchedTerms: string[], rawQuery: string 
     return `${start > 0 ? '...' : ''}${slice}${end < content.length ? '...' : ''}`;
 }
 
+const EJS_DETECT_PATTERN = /<%[\s\S]*?%>/;
+
+function stringifyMacroVar(value: unknown): string {
+    if (value === undefined || value === null) {
+        return '';
+    }
+    if (typeof value === 'string') {
+        return value;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+        return String(value);
+    }
+    return JSON.stringify(value);
+}
+
 /**
  * Full-topology Virtual File System for ST-Agentic.
  *
@@ -342,8 +359,15 @@ export class VirtualFileSystem {
             'persona-files',
             () => this.bridge.getActiveIdentity().personaAvatar || 'default',
         );
-        this.worldInfoMount = new WorldInfoMount(this.bridge, this.store, options.loreReadHook);
-        this.skillsMount = new SkillsMount(this.bridge);
+        const templateEvaluator: VfsTemplateEvaluator = (text, evalOpts) =>
+            this.evaluateTemplateText(text, evalOpts);
+        this.worldInfoMount = new WorldInfoMount(
+            this.bridge,
+            this.store,
+            options.loreReadHook,
+            templateEvaluator,
+        );
+        this.skillsMount = new SkillsMount(this.bridge, templateEvaluator);
         this.presetMount = new PresetMount(options.getPresetFiles ?? (() => ({})));
         this.globalMount = new GlobalMount(this.bridge);
         this.historyMount = new HistoryMount(this.bridge);
@@ -460,7 +484,14 @@ export class VirtualFileSystem {
         if (routed.normalizedPath === '/') {
             throw new VfsError('Path is a directory: /', 'EISDIR', '/');
         }
-        return await routed.mount.readFile(routed.relPath, this.mergeReadOpts(opts));
+        const merged = this.mergeReadOpts(opts);
+        if (!merged.raw && this.shouldEvaluatePlainMount(routed.mount)) {
+            const { startLine, endLine, ...fullReadOpts } = merged;
+            const rawContent = await routed.mount.readFile(routed.relPath, fullReadOpts);
+            const evaluated = await this.evaluateTemplateText(rawContent, fullReadOpts);
+            return sliceLines(evaluated, startLine, endLine);
+        }
+        return await routed.mount.readFile(routed.relPath, merged);
     }
 
     async writeFile(path: string, content: string, opts?: VfsWriteOptions): Promise<void> {
@@ -486,7 +517,10 @@ export class VirtualFileSystem {
         }
         let current = '';
         try {
-            current = await routed.mount.readFile(routed.relPath, this.mergeReadOpts(opts));
+            current = await routed.mount.readFile(routed.relPath, {
+                ...this.mergeReadOpts(opts),
+                raw: true,
+            });
         } catch (error) {
             if (!(error instanceof VfsNotFoundError)) {
                 throw error;
@@ -819,6 +853,69 @@ export class VirtualFileSystem {
             return [named];
         }
         return [this.workspaceMount];
+    }
+
+    private shouldEvaluatePlainMount(mount: VfsMount): boolean {
+        return (
+            mount === this.characterMount
+            || mount === this.personaMount
+            || mount === this.presetMount
+            || mount === this.workspaceMount
+            || mount === this.globalMount
+        );
+    }
+
+    private async evaluateTemplateText(
+        rawText: string,
+        opts?: VfsTargetOptions,
+    ): Promise<string> {
+        if (!rawText || (!rawText.includes('{{') && !rawText.includes('<%'))) {
+            return rawText;
+        }
+
+        const rawMetaVars = this.bridge.getMetadata()?.variables;
+        const metadataVars: Record<string, unknown> =
+            rawMetaVars && typeof rawMetaVars === 'object' && !Array.isArray(rawMetaVars)
+                ? { ...(rawMetaVars as Record<string, unknown>) }
+                : {};
+
+        let messageVars: Record<string, unknown> = {};
+        try {
+            messageVars = await this.variablesMount.readVariables({
+                target: opts?.target,
+                staged: opts?.staged,
+                scope: 'message',
+            });
+        } catch {
+            messageVars = {};
+        }
+
+        const effectiveVars: Record<string, unknown> = {
+            ...metadataVars,
+            ...messageVars,
+        };
+
+        const macroOverrides: Record<string, string> = {};
+        for (const [k, v] of Object.entries(effectiveVars)) {
+            macroOverrides[`var:${k}`] = stringifyMacroVar(v);
+        }
+
+        let workingText = rawText.includes('{{')
+            ? this.bridge.substituteMacros(
+                rawText,
+                Object.keys(macroOverrides).length > 0 ? macroOverrides : undefined,
+            )
+            : rawText;
+
+        if (this.bridge.evaluateOptionalEjs && EJS_DETECT_PATTERN.test(workingText)) {
+            try {
+                workingText = await this.bridge.evaluateOptionalEjs(workingText, effectiveVars);
+            } catch {
+                // Keep macro-substituted fallback text when optional EJS throws.
+            }
+        }
+
+        return workingText;
     }
 
     private mergeReadOpts<T extends VfsTargetOptions>(opts?: T): T {

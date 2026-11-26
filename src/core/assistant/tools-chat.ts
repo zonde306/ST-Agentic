@@ -770,7 +770,7 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
     const readFileTool: AssistantToolDefinition<typeof READ_FILE_SCHEMA> = {
         name: 'read_file',
         description:
-            'Read a VFS file or /tmp/tool-spill/* spilled tool output with 1-based "N| " line prefixes and metadata header. Soft-paginates at 200 lines / 24 KB; pass start_line/end_line or char_offset/char_limit to page. Read-only.',
+            'Read a VFS file or /tmp/tool-spill/* spilled tool output with 1-based "N| " line prefixes and metadata header. Soft-paginates at 200 lines / 24 KB; pass start_line/end_line or char_offset/char_limit to page. Returns macro/EJS-evaluated template content in chat (read-only) mode and raw source verbatim in edit-capable modes (adjust/author/full). Read-only.',
         parameters: READ_FILE_SCHEMA,
         tier: 'chat',
         readOnly: true,
@@ -814,9 +814,11 @@ export function createChatReadOnlyTools(): AssistantToolDefinition[] {
                 return formatted.truncated ? { ...res, truncated: true } : res;
             }
 
+            const raw = ctx.mode !== 'chat';
             const rawContent = await ctx.vfs.readFile(normalizedPath, {
                 target: ctx.target,
                 staged: false,
+                raw,
             });
             const formatted = formatFileReadResult({
                 path: normalizedPath,

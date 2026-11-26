@@ -51,9 +51,19 @@ export interface VfsTargetOptions {
     scope?: VariableScope;
 }
 
+export type VfsTemplateEvaluator = (
+    text: string,
+    opts?: VfsTargetOptions,
+) => Promise<string>;
+
 export interface VfsReadOptions extends VfsTargetOptions {
     startLine?: number;
     endLine?: number;
+    /**
+     * When `true`, return raw stored text without macro (`{{...}}`) or
+     * optional EJS (`<% ... %>`) evaluation (and bypass `LoreReadHook` on `/lorebooks/*`).
+     */
+    raw?: boolean;
 }
 
 export interface VfsWriteOptions extends VfsTargetOptions {
