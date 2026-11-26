@@ -193,6 +193,18 @@ function uniqueStrings(items: readonly string[]): string[] {
     return result;
 }
 
+function parseToolListParam(raw: string | undefined): string[] {
+    if (!raw) {
+        return [];
+    }
+    return uniqueStrings(
+        raw
+            .split(',')
+            .map((t) => t.trim())
+            .filter(Boolean),
+    );
+}
+
 export function mergeDerivedAgentProfiles(
     existing: AgentProfile,
     incoming: AgentProfile,
@@ -437,6 +449,37 @@ export class DecoratorCompiler {
             }
         }
 
+        const enabledToolNamesByWorld = new Map<string, string[]>();
+        for (const loreTool of toolEntries) {
+            const world = loreTool.entry.world?.trim();
+            const toolName = loreTool.name.trim();
+            if (!world || !toolName) {
+                continue;
+            }
+            const existing = enabledToolNamesByWorld.get(world) ?? [];
+            if (!existing.includes(toolName)) {
+                existing.push(toolName);
+                enabledToolNamesByWorld.set(world, existing);
+            }
+        }
+        for (const rule of triggers) {
+            if (rule.kind !== 'agent' || !rule.sourceWorld) {
+                continue;
+            }
+            const worldTools = enabledToolNamesByWorld.get(rule.sourceWorld);
+            if (!worldTools || worldTools.length === 0) {
+                continue;
+            }
+            const byRule = derivedAgentsByRuleId[rule.id];
+            if (byRule) {
+                byRule.enabledTools = uniqueStrings([...byRule.enabledTools, ...worldTools]);
+            }
+            const byProfile = derivedAgents[rule.agentProfileId];
+            if (byProfile) {
+                byProfile.enabledTools = uniqueStrings([...byProfile.enabledTools, ...worldTools]);
+            }
+        }
+
         return {
             triggers,
             derivedAgents,
@@ -584,6 +627,7 @@ export class DecoratorCompiler {
             }
 
             const { schemaSource, instructionText } = extractInlineSchema(decorators, parsed.cleanContent);
+            const explicitTools = parseToolListParam(params.tools);
             const requestedProfileId = params.profile?.trim() || params.agent?.trim();
             const existingProfile = requestedProfileId ? presetAgents[requestedProfileId] : undefined;
             const agentProfileId = existingProfile
@@ -626,7 +670,7 @@ export class DecoratorCompiler {
                     name: label,
                     systemInstruction:
                         'You are a scoped trigger agent. Follow the trigger instruction carefully and invoke the granted tools cleanly.',
-                    enabledTools: tools,
+                    enabledTools: uniqueStrings([...tools, ...explicitTools]),
                     permissions,
                 });
             }
@@ -646,6 +690,7 @@ export class DecoratorCompiler {
                 condition,
                 instructionTemplate: instructionText,
                 ...(targetPath ? { targetPath } : {}),
+                ...(explicitTools.length > 0 ? { extraTools: explicitTools } : {}),
                 ...(schemaSource ? { schemaSource } : {}),
                 decorator: '@@trigger',
                 ...ifField,

@@ -1248,4 +1248,124 @@ describe('AgentRunner & TraceLogger', () => {
         // All per-run sandboxes must be disposed after both runs complete
         expect(sandbox.lifecycle.getActiveIds()).toEqual([]);
     });
+
+    it('auto-attaches same-lorebook @@tool entries (including array exports) to after_turn runs matching lorebookNames without leaking to other lorebooks', async () => {
+        const multiToolEntry: RawLoreEntry = {
+            world: 'ComfyUI生图',
+            uid: 10,
+            comment: '生图工具组',
+            content: [
+                '@@tool comfyui_bundle allowNetwork=false',
+                'export default [',
+                '  defineTool({',
+                '    name: "comfyui_generate",',
+                '    description: "Generate illustration",',
+                '    parameters: z.object({ prompt: z.string() }),',
+                '    async execute(args) { return { ok: true, imgTag: `<img src="${args.prompt}.png" />` }; },',
+                '  }),',
+                '  defineTool({',
+                '    name: "comfyui_check",',
+                '    description: "Check ComfyUI",',
+                '    parameters: z.object({}),',
+                '    async execute() { return { ok: true }; },',
+                '  }),',
+                '];',
+            ].join('\n'),
+            keys: [],
+            keysecondary: [],
+            constant: false,
+            selective: false,
+            disable: false,
+            position: 0,
+            depth: 0,
+            order: 1,
+            role: 0,
+        };
+
+        const bridge = new MemoryHostBridge({
+            identity: { userName: '沈默', charName: '林晚' },
+            lorebooks: { ComfyUI生图: [multiToolEntry] },
+        });
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '画一张图' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+
+        const conn = createDefaultConnection({ id: 'conn_main', model: 'test-model', stream: false });
+        const scopedTriggerAgent = createDefaultMainAgent({
+            id: 'scoped_trigger_agent',
+            connectionId: 'conn_main',
+            sessionMode: 'ephemeral',
+            enabledTools: ['read_file'],
+            permissions: { read: ['/**'], write: [] },
+        });
+        const preset = createDefaultPreset({
+            id: 'preset_same_book',
+            mainAgentId: 'scoped_trigger_agent',
+            agents: { scoped_trigger_agent: scopedTriggerAgent },
+        });
+        const settings = createDefaultSettings({
+            connections: { [conn.id]: conn },
+            currentConnectionId: conn.id,
+            presets: { [preset.id]: preset },
+            currentPresetId: preset.id,
+        });
+
+        const observedToolsByBook: Record<string, string[]> = {};
+        const transport = new ScriptedLLMTransport([
+            (req) => {
+                observedToolsByBook.same = req.tools.map((t) => t.name);
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'call_gen_1',
+                            name: 'comfyui_generate',
+                            arguments: JSON.stringify({ prompt: 'cat_girl' }),
+                        },
+                    ],
+                };
+            },
+            (req) => {
+                const toolMsg = req.messages.find((m) => m.role === 'tool');
+                return { content: `done:${String(toolMsg?.content ?? '')}` };
+            },
+            (req) => {
+                observedToolsByBook.other = req.tools.map((t) => t.name);
+                return { content: 'other done' };
+            },
+        ]);
+
+        const sandbox = new IframeJsSandbox();
+        const runner = new AgentRunner({
+            bridge,
+            transport,
+            settings,
+            sandbox,
+        });
+
+        const sameBookResult = await runner.run({
+            agent: 'scoped_trigger_agent',
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'after_turn',
+            lorebookNames: ['ComfyUI生图'],
+            userInput: '执行生图',
+        });
+
+        expect(observedToolsByBook.same).toEqual(
+            expect.arrayContaining(['read_file', 'comfyui_generate', 'comfyui_check']),
+        );
+        expect(sameBookResult.toolSteps).toHaveLength(1);
+        expect(sameBookResult.toolSteps[0].ok).toBe(true);
+        expect(sameBookResult.content).toContain('cat_girl.png');
+
+        const otherBookResult = await runner.run({
+            agent: 'scoped_trigger_agent',
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'after_turn',
+            lorebookNames: ['通用状态栏'],
+            userInput: '更新状态栏',
+        });
+
+        expect(observedToolsByBook.other).toEqual(['read_file']);
+        expect(otherBookResult.content).toBe('other done');
+    });
 });

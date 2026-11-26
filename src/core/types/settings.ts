@@ -139,6 +139,7 @@ export interface TriggerRule {
     condition: TriggerCondition;
     instructionTemplate: string;
     targetPath?: string;
+    extraTools?: string[];
     schemaSource?: { kind: 'json' | 'zod'; raw: string };
     decorator?: string;
     ifConditions?: string[];

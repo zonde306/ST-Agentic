@@ -468,6 +468,12 @@ export function normalizeTriggerRule(input: unknown, fallbackId = 'trigger_1'): 
     if (typeof raw.targetPath === 'string' && raw.targetPath.trim()) {
         rule.targetPath = raw.targetPath.trim();
     }
+    if (Array.isArray(raw.extraTools)) {
+        const extraTools = normalizeStringArray(raw.extraTools);
+        if (extraTools.length > 0) {
+            rule.extraTools = extraTools;
+        }
+    }
     if (isPlainRecord(raw.schemaSource) && typeof raw.schemaSource.raw === 'string') {
         rule.schemaSource = {
             kind: raw.schemaSource.kind === 'zod' ? 'zod' : 'json',

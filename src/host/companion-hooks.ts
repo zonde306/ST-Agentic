@@ -457,13 +457,25 @@ async function runCompanionBeforeTurnUnits(
                 ?? compiled.derivedAgentsByRuleId?.[rule.id]
                 ?? compiled.derivedAgents?.[rule.agentProfileId]
                 ?? rule.agentProfileId;
+            const effectiveAgentProfile =
+                rule.extraTools?.length && typeof agentProfile !== 'string'
+                    ? {
+                        ...agentProfile,
+                        enabledTools: Array.from(
+                            new Set([...agentProfile.enabledTools, ...rule.extraTools]),
+                        ),
+                    }
+                    : agentProfile;
+            const sourceWorld = rule.sourceWorld?.trim();
             const result = await orchestrator.agentRunner.run({
-                agent: agentProfile,
+                agent: effectiveAgentProfile,
                 userInput: substitutedPrompt,
                 target,
                 phase: 'before_turn',
                 triggerId: rule.id,
                 triggerLabel: rule.label,
+                triggerSource: rule.source,
+                ...(sourceWorld ? { lorebookNames: [sourceWorld] } : {}),
                 promptTriggerContext: {
                     kind: 'trigger',
                     phase: 'before_turn',

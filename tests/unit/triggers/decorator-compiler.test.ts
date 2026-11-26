@@ -626,4 +626,67 @@ describe('DecoratorCompiler & Trigger Grouping', () => {
         expect(inferred.agentProfileId).toBe('main');
         expect(inferred.enabled).toBe(true);
     });
+
+    it('auto-inherits same-world enabled @@tool entries and parses @@trigger tools=... opt-in', () => {
+        const compiler = new DecoratorCompiler();
+        const compiled = compiler.compile([
+            makeEntry({
+                world: 'ComfyUI生图',
+                uid: 1,
+                comment: '生图工具',
+                content: '@@tool comfyui_generate allowNetwork=true\nexport default defineTool({ name: "comfyui_generate", description: "gen", parameters: z.object({}), execute: () => "ok" });',
+            }),
+            makeEntry({
+                world: 'ComfyUI生图',
+                uid: 2,
+                comment: '禁用工具',
+                disable: true,
+                content: '@@tool disabled_tool\nexport default defineTool({ name: "disabled_tool", description: "off", parameters: z.object({}), execute: () => "no" });',
+            }),
+            makeEntry({
+                world: 'ComfyUI生图',
+                uid: 3,
+                comment: '生图调用',
+                content: '@@trigger phase=after order=2 barrier=self target=/output.md\n调用生图工具。',
+            }),
+            makeEntry({
+                world: '其他世界书',
+                uid: 4,
+                comment: '外部工具',
+                content: '@@tool external_lookup\nexport default defineTool({ name: "external_lookup", description: "ext", parameters: z.object({}), execute: () => "ext" });',
+            }),
+            makeEntry({
+                world: '通用状态栏',
+                uid: 5,
+                comment: '状态栏更新',
+                content: '@@trigger phase=after order=3 barrier=turn target=/state/variables.json\n更新状态栏。',
+            }),
+            makeEntry({
+                world: '通用状态栏',
+                uid: 6,
+                comment: '跨世界书显式引用',
+                content: '@@trigger phase=after order=4 barrier=self tools="comfyui_generate, external_lookup"\n显式引用指定工具。',
+            }),
+        ]);
+
+        const drawRule = compiled.triggers.find((t) => t.label === '生图调用')!;
+        const statusRule = compiled.triggers.find((t) => t.label === '状态栏更新')!;
+        const crossRule = compiled.triggers.find((t) => t.label === '跨世界书显式引用')!;
+
+        expect(drawRule).toBeDefined();
+        expect(compiled.derivedAgents[drawRule.agentProfileId].enabledTools).toContain('comfyui_generate');
+        expect(compiled.derivedAgents[drawRule.agentProfileId].enabledTools).not.toContain('disabled_tool');
+        expect(compiled.derivedAgents[drawRule.agentProfileId].enabledTools).not.toContain('external_lookup');
+        expect(compiled.derivedAgentsByRuleId[drawRule.id].enabledTools).toContain('comfyui_generate');
+
+        expect(statusRule).toBeDefined();
+        expect(compiled.derivedAgents[statusRule.agentProfileId].enabledTools).not.toContain('comfyui_generate');
+        expect(compiled.derivedAgents[statusRule.agentProfileId].enabledTools).not.toContain('external_lookup');
+
+        expect(crossRule).toBeDefined();
+        expect(crossRule.extraTools).toEqual(['comfyui_generate', 'external_lookup']);
+        expect(compiled.derivedAgents[crossRule.agentProfileId].enabledTools).toEqual(
+            expect.arrayContaining(['comfyui_generate', 'external_lookup']),
+        );
+    });
 });

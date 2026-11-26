@@ -1230,6 +1230,9 @@ export class AgentRunner {
         throwIfAborted(signal);
 
         const runSandboxScope = `${runId}_s${++agentRunSandboxSeq}`;
+        const normalizedLorebookNames = input.lorebookNames
+            ? Array.from(new Set(input.lorebookNames.map((n) => n.trim()).filter(Boolean)))
+            : [];
 
         // Compile tool registry for this run (built-ins + preset customTools + @@tool + @@agent + extraTools)
         const { registry, autoAttachedToolNames } = await this.buildRunRegistry({
@@ -1247,6 +1250,7 @@ export class AgentRunner {
             includeSubAgentTools: input.includeSubAgentTools ?? true,
             delegationDepth,
             parentPhase: input.phase,
+            lorebookNames: normalizedLorebookNames,
             target,
             connection,
             presetFiles: preset.files,
@@ -1327,9 +1331,6 @@ export class AgentRunner {
         let lastReasoning = '';
         let roundsCompleted = 0;
 
-        const normalizedLorebookNames = input.lorebookNames
-            ? Array.from(new Set(input.lorebookNames.map((n) => n.trim()).filter(Boolean)))
-            : [];
         const traceTriggerMeta = {
             ...(input.triggerId ? { triggerId: input.triggerId } : {}),
             ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
@@ -3720,6 +3721,7 @@ export class AgentRunner {
         includeSubAgentTools: boolean;
         delegationDepth: number;
         parentPhase: PipelinePhase;
+        lorebookNames?: readonly string[];
         target: MessageTarget;
         connection: ApiConnection;
         presetFiles: Record<string, string>;
@@ -3758,14 +3760,20 @@ export class AgentRunner {
                 for (const tool of compiled) {
                     registry.register(tool, { replace: true });
                 }
-            } catch {
-                // Skip invalid custom tools without breaking the run; logged if invoked.
+            } catch (error) {
+                console.warn(
+                    `[ST-Agentic] Failed to compile custom tool "${custom.name || custom.id}":`,
+                    error,
+                );
             }
         }
 
         // 2. Register @@tool World Info entries when ScriptSandbox is available
         const rawLore = unwrapRawLoreEntries(params.loreEntries);
         if (this.sandbox) {
+            const triggerWorldSet = new Set(
+                (params.lorebookNames ?? []).map((n) => n.trim()).filter(Boolean),
+            );
             let loreIdx = 0;
             for (const entry of rawLore) {
                 if (entry.disable) {
@@ -3782,14 +3790,21 @@ export class AgentRunner {
                         sandboxId,
                         signal: params.signal,
                     });
+                    const entryWorld = entry.world?.trim() ?? '';
+                    const shouldAutoAttach =
+                        params.parentPhase === 'main_turn'
+                        || (entryWorld.length > 0 && triggerWorldSet.has(entryWorld));
                     for (const tool of compiled) {
                         registry.register(tool, { replace: true });
-                        if (params.parentPhase === 'main_turn') {
+                        if (shouldAutoAttach) {
                             autoAttachedToolNames.push(tool.name);
                         }
                     }
-                } catch {
-                    // Ignore malformed @@tool entry during tool compilation.
+                } catch (error) {
+                    console.warn(
+                        `[ST-Agentic] Failed to compile @@tool "${entry.world}/${entry.uid}":`,
+                        error,
+                    );
                 }
             }
         }

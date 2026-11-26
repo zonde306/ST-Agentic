@@ -2238,6 +2238,12 @@ function resolveUnitTools(
                 merged.add('append_file');
                 merged.add('write_file');
             }
+            for (const toolName of rule.extraTools ?? []) {
+                const trimmed = toolName.trim();
+                if (trimmed) {
+                    merged.add(trimmed);
+                }
+            }
         }
         return Array.from(merged);
     }
@@ -2252,6 +2258,12 @@ function resolveUnitTools(
         } else if (rule.targetPath) {
             tools.add('edit_file');
             tools.add('write_file');
+        }
+        for (const toolName of rule.extraTools ?? []) {
+            const trimmed = toolName.trim();
+            if (trimmed) {
+                tools.add(trimmed);
+            }
         }
     }
     return Array.from(tools);

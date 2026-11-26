@@ -53,7 +53,7 @@ ST-Agentic 的自动化逻辑可以放在**预设触发器规则（`TriggerRule`
 
 | 装饰器 | 常用参数 | 说明 |
 | :--- | :--- | :--- |
-| `@@trigger` | `[tag] phase=before\|after\|main\|maintenance order=1 barrier=turn\|self\|none profile=<agentId> group=<name> target=/state/variables.json\|/output.md interval=3 regex="..." keys="a,b"` | 声明式触发器；可配合 `@@zod_schema` / `@@json_schema` 约束变量写回；`profile` 可绑定已有智能体，省略则自动生成最小权限专用智能体 |
+| `@@trigger` | `[tag] phase=before\|after\|main\|maintenance order=1 barrier=turn\|self\|none profile=<agentId> group=<name> target=/state/variables.json\|/output.md tools="a,b" interval=3 regex="..." keys="a,b"` | 声明式触发器；可配合 `@@zod_schema` / `@@json_schema` 约束变量写回；`profile` 可绑定已有智能体，省略则自动生成最小权限专用智能体；`tools` 可显式追加跨世界书 `@@tool` 或预设自定义工具（同世界书内启用的 `@@tool` 会自动继承） |
 | `@@script` | `phase=... order=... barrier=... group=... target=... interval=... regex="..." keys="..."` | 零 Token 确定性 JS 脚本（正文写 JS，支持 ```` ```js ```` 代码块）；可与 `@@trigger` 同用 |
 | `@@tool` | `<toolName> allowNetwork=true\|false` | 把世界书条目编译为自定义 JS 工具（正文使用 `export default defineTool(...)`） |
 | `@@group` | `<groupName>` | 指定同 `phase`/`order`/`profile` 的 Agent 触发器合并分组名 |

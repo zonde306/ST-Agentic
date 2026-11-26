@@ -2767,4 +2767,175 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
         expect(traces[0].error).toContain('@@zod_schema');
         expect(traces[0].error).toContain('坏掉的 Zod Schema 触发器');
     }, 15_000);
+
+    it('exposes same-lorebook @@tool and @@trigger tools=... to after_turn trigger agents without leaking across unrelated lorebooks', async () => {
+        const sameBookTriggerId = buildWorldInfoTriggerRuleId('ComfyUI生图', 2);
+        const crossBookOptInId = buildWorldInfoTriggerRuleId('跨书调用', 1);
+        const unrelatedTriggerId = buildWorldInfoTriggerRuleId('通用状态栏', 1);
+
+        const { bridge, transport, orchestrator } = createPipelineFixture({
+            lorebooks: {
+                ComfyUI生图: [
+                    {
+                        world: 'ComfyUI生图',
+                        uid: 5,
+                        comment: '生图工具 [comfyui_generate]',
+                        content: [
+                            '@@tool comfyui_generate allowNetwork=false',
+                            '```js',
+                            'export default defineTool({',
+                            '  name: "comfyui_generate",',
+                            '  description: "Generate illustration",',
+                            '  parameters: z.object({ positive: z.string() }),',
+                            '  async execute(args) {',
+                            '    return { ok: true, imgTag: `<img src="${args.positive}.webp" />` };',
+                            '  },',
+                            '});',
+                            '```',
+                        ].join('\n'),
+                        keys: [],
+                        keysecondary: [],
+                        constant: true,
+                        selective: false,
+                        disable: false,
+                        position: 0,
+                        depth: 0,
+                        order: 1,
+                        role: 0,
+                    },
+                    {
+                        world: 'ComfyUI生图',
+                        uid: 2,
+                        comment: '🎨生图调用',
+                        content: '@@trigger phase=after order=2 barrier=self target=/output.md\nSAME_BOOK_DRAW',
+                        keys: [],
+                        keysecondary: [],
+                        constant: true,
+                        selective: false,
+                        disable: false,
+                        position: 0,
+                        depth: 0,
+                        order: 2,
+                        role: 0,
+                    },
+                ],
+                跨书调用: [
+                    {
+                        world: '跨书调用',
+                        uid: 1,
+                        comment: '显式引用生图',
+                        content: '@@trigger phase=after order=3 barrier=self tools=comfyui_generate\nCROSS_BOOK_DRAW',
+                        keys: [],
+                        keysecondary: [],
+                        constant: true,
+                        selective: false,
+                        disable: false,
+                        position: 0,
+                        depth: 0,
+                        order: 3,
+                        role: 0,
+                    },
+                ],
+                通用状态栏: [
+                    {
+                        world: '通用状态栏',
+                        uid: 1,
+                        comment: '状态栏更新',
+                        content: '@@trigger phase=after order=4 barrier=self target=/state/variables.json\nUNRELATED_STATUS',
+                        keys: [],
+                        keysecondary: [],
+                        constant: true,
+                        selective: false,
+                        disable: false,
+                        position: 0,
+                        depth: 0,
+                        order: 4,
+                        role: 0,
+                    },
+                ],
+            },
+        });
+
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '第一轮' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: 'AI回复', swipeId: 0 });
+
+        const seenToolsByPrompt: Record<string, string[]> = {};
+
+        transport.enqueue(
+            (req) => {
+                const text = req.messages.map((m) => String(m.content)).join('\n');
+                expect(text).toContain('SAME_BOOK_DRAW');
+                seenToolsByPrompt.same = req.tools.map((t) => t.name);
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'call_same_draw',
+                            name: 'comfyui_generate',
+                            arguments: JSON.stringify({ positive: 'forest_cabin' }),
+                        },
+                    ],
+                };
+            },
+            (req) => {
+                const toolMsg = req.messages.find((m) => m.role === 'tool');
+                return { content: `same:${String(toolMsg?.content ?? '')}` };
+            },
+        );
+        const sameHandles = await orchestrator.rerunAfterTurn(
+            { messageId: 1, swipeId: 0 },
+            { triggerIds: [sameBookTriggerId], force: true, turnNumber: 1 },
+        );
+        expect(sameHandles).toHaveLength(1);
+        const sameResults = await Promise.all(sameHandles.map((h) => h.promise));
+
+        transport.enqueue(
+            (req) => {
+                const text = req.messages.map((m) => String(m.content)).join('\n');
+                expect(text).toContain('CROSS_BOOK_DRAW');
+                seenToolsByPrompt.cross = req.tools.map((t) => t.name);
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'call_cross_draw',
+                            name: 'comfyui_generate',
+                            arguments: JSON.stringify({ positive: 'night_sky' }),
+                        },
+                    ],
+                };
+            },
+            (req) => {
+                const toolMsg = req.messages.find((m) => m.role === 'tool');
+                return { content: `cross:${String(toolMsg?.content ?? '')}` };
+            },
+        );
+        const crossHandles = await orchestrator.rerunAfterTurn(
+            { messageId: 1, swipeId: 0 },
+            { triggerIds: [crossBookOptInId], force: true, turnNumber: 1 },
+        );
+        expect(crossHandles).toHaveLength(1);
+        const crossResults = await Promise.all(crossHandles.map((h) => h.promise));
+
+        transport.enqueue(
+            (req) => {
+                const text = req.messages.map((m) => String(m.content)).join('\n');
+                expect(text).toContain('UNRELATED_STATUS');
+                seenToolsByPrompt.unrelated = req.tools.map((t) => t.name);
+                return { content: 'status ok' };
+            },
+        );
+        const unrelatedHandles = await orchestrator.rerunAfterTurn(
+            { messageId: 1, swipeId: 0 },
+            { triggerIds: [unrelatedTriggerId], force: true, turnNumber: 1 },
+        );
+        expect(unrelatedHandles).toHaveLength(1);
+        await Promise.all(unrelatedHandles.map((h) => h.promise));
+
+        expect(seenToolsByPrompt.same).toContain('comfyui_generate');
+        expect(seenToolsByPrompt.cross).toContain('comfyui_generate');
+        expect(seenToolsByPrompt.unrelated).not.toContain('comfyui_generate');
+        expect(sameResults[0].output).toContain('forest_cabin.webp');
+        expect(crossResults[0].output).toContain('night_sky.webp');
+    }, 15_000);
 });
