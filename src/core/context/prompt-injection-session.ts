@@ -273,12 +273,19 @@ export class LocalPromptInjectionSession implements PromptInjectionSession {
     }
 }
 
+export interface ApplyOutletsOptions {
+    /** Trim expanded string content and drop plain text messages whose content becomes empty/whitespace-only. */
+    dropEmptyTextMessages?: boolean;
+}
+
 /** Expand delayed `{{outletPromptsInjected:...}}` placeholders across canonical messages without mutating inputs. */
 export function applyOutletsToCanonicalMessages(
     messages: readonly CanonicalMessage[],
     session: PromptInjectionSession,
+    options?: ApplyOutletsOptions,
 ): CanonicalMessage[] {
-    return messages.map((msg) => {
+    const result: CanonicalMessage[] = [];
+    for (const msg of messages) {
         const cloned = canonicalClone(msg);
         if (typeof cloned.content === 'string') {
             cloned.content = session.applyOutlets(cloned.content);
@@ -296,8 +303,22 @@ export function applyOutletsToCanonicalMessages(
         if (typeof cloned.reasoningContent === 'string') {
             cloned.reasoningContent = session.applyOutlets(cloned.reasoningContent);
         }
-        return cloned;
-    });
+
+        if (options?.dropEmptyTextMessages && typeof cloned.content === 'string') {
+            cloned.content = cloned.content.trim();
+            if (
+                !cloned.content
+                && !cloned.toolCalls?.length
+                && !cloned.reasoningContent?.trim()
+                && !cloned.extraFields
+            ) {
+                continue;
+            }
+        }
+
+        result.push(cloned);
+    }
+    return result;
 }
 
 const INJECT_USAGE_PATTERN = /\b(?:injectPrompt|getPromptsInjected|hasPromptsInjected)\s*\(/;

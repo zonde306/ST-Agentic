@@ -1583,10 +1583,13 @@ export class AgentRunner {
                 }
 
                 if (preRenderedBlocks && input.injectionSession) {
+                    const promptBlockById = new Map(promptBlocks.map((b) => [b.id, b]));
                     for (const [blockId, msgs] of preRenderedBlocks.entries()) {
                         preRenderedBlocks.set(
                             blockId,
-                            applyOutletsToCanonicalMessages(msgs, input.injectionSession),
+                            applyOutletsToCanonicalMessages(msgs, input.injectionSession, {
+                                dropEmptyTextMessages: promptBlockById.get(blockId)?.role !== 'custom',
+                            }),
                         );
                     }
                 }

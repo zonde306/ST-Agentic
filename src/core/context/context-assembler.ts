@@ -1513,10 +1513,16 @@ export class ContextAssembler {
         }
 
         // Step E: Phase 2 — Expand delayed {{outletPromptsInjected:...}} placeholders across all rendered parts
+        const promptBlockById = new Map(promptBlocks.map((b) => [b.id, b]));
         for (const blockId of [...newlyRenderedPrefixIds, ...newlyRenderedTailIds, ...newlyRenderedFloatingIds]) {
             const msgs = preRenderedBlocks.get(blockId);
             if (msgs) {
-                preRenderedBlocks.set(blockId, applyOutletsToCanonicalMessages(msgs, session));
+                preRenderedBlocks.set(
+                    blockId,
+                    applyOutletsToCanonicalMessages(msgs, session, {
+                        dropEmptyTextMessages: promptBlockById.get(blockId)?.role !== 'custom',
+                    }),
+                );
             }
         }
         if (preRenderedSystemRules) {

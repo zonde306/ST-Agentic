@@ -589,6 +589,138 @@ describe('ContextAssembler', () => {
         expect(turn2.layer2Messages[0].content).toContain('DYN=VISIBLE');
     });
 
+    it('drops standard prompt blocks whose delayed getPromptsInjected placeholders expand to empty/whitespace, while preserving custom JSON blocks', async () => {
+        const bridge = new MemoryHostBridge({
+            ejsEvaluator: async (text, _vars, opts) => {
+                const session = opts?.injectionSession;
+                if (text.includes('__MISSING_PREFIX__')) {
+                    return text.replace(
+                        '<% __MISSING_PREFIX__ %>',
+                        session?.getPromptsInjected('missing_prefix_key') ?? '',
+                    );
+                }
+                if (text.includes('__MISSING_TAIL__')) {
+                    return text.replace(
+                        '<% __MISSING_TAIL__ %>',
+                        session?.getPromptsInjected('missing_tail_key') ?? '',
+                    );
+                }
+                if (text.includes('__WHITESPACE_ONLY_INJECT__')) {
+                    session?.injectPrompt('ws_key', '   \n\t  ', 10, 0, 'ws1');
+                    return text.replace(
+                        '<% __WHITESPACE_ONLY_INJECT__ %>',
+                        session?.getPromptsInjected('ws_key') ?? '',
+                    );
+                }
+                if (text.includes('__ACTIVE_TAIL__')) {
+                    session?.injectPrompt('active_key', '  InjectedLine  ', 10, 0, 'act1');
+                    return text.replace(
+                        '<% __ACTIVE_TAIL__ %>',
+                        session?.getPromptsInjected('active_key') ?? '',
+                    );
+                }
+                if (text.includes('__CUSTOM_MISSING__')) {
+                    return text.replace(
+                        '<% __CUSTOM_MISSING__ %>',
+                        session?.getPromptsInjected('missing_custom_key') ?? '',
+                    );
+                }
+                return text;
+            },
+        });
+
+        const agent = createDefaultMainAgent({
+            sessionMode: 'persistent',
+            promptBlocks: [
+                {
+                    id: 'system_base',
+                    name: 'Base',
+                    role: 'system',
+                    placement: 'prefix',
+                    content: 'System Base',
+                    enabled: true,
+                },
+                {
+                    id: 'empty_prefix_outlet',
+                    name: 'Empty Prefix Outlet',
+                    role: 'system',
+                    placement: 'prefix',
+                    content: '   <% __MISSING_PREFIX__ %>   ',
+                    enabled: true,
+                },
+                {
+                    id: 'whitespace_prefix_outlet',
+                    name: 'Whitespace Prefix Outlet',
+                    role: 'user',
+                    placement: 'prefix',
+                    content: '<% __WHITESPACE_ONLY_INJECT__ %>',
+                    enabled: true,
+                },
+                {
+                    id: 'empty_tail_outlet',
+                    name: 'Empty Tail Outlet',
+                    role: 'assistant',
+                    placement: 'tail',
+                    content: '\n<% __MISSING_TAIL__ %>\n',
+                    enabled: true,
+                },
+                {
+                    id: 'active_tail_outlet',
+                    name: 'Active Tail Outlet',
+                    role: 'system',
+                    placement: 'floating_tail',
+                    content: '  <% __ACTIVE_TAIL__ %>  ',
+                    enabled: true,
+                },
+                {
+                    id: 'custom_with_empty_outlet',
+                    name: 'Custom JSON Block',
+                    role: 'custom',
+                    placement: 'tail',
+                    content: JSON.stringify({
+                        role: 'assistant',
+                        content: '<% __CUSTOM_MISSING__ %>',
+                        tool_calls: [
+                            {
+                                id: 'call_custom_1',
+                                type: 'function',
+                                function: { name: 'noop', arguments: '{}' },
+                            },
+                        ],
+                    }),
+                    enabled: true,
+                },
+            ],
+        });
+
+        const assembler = new ContextAssembler();
+        const store = new TrajectoryStore();
+        const session = new LocalPromptInjectionSession();
+
+        const assembled = await assembler.assembleWithHost({
+            agent,
+            hostBridge: bridge,
+            trajectoryStore: store,
+            injectionSession: session,
+            userInput: '你好',
+        });
+
+        // Empty/whitespace standard prefix blocks are dropped (only system_base + core-manifest remain)
+        expect(assembled.layer0Messages).toHaveLength(2);
+        expect(assembled.layer0Messages[0].content).toBe('System Base');
+        expect(assembled.layer0Messages[1].content).toContain('<core-manifest>');
+
+        // Empty standard tail block is dropped; active tail block is trimmed; custom block is preserved
+        expect(assembled.floatingTailMessages).toHaveLength(2);
+        expect(assembled.floatingTailMessages[0]).toEqual({
+            role: 'system',
+            content: 'InjectedLine',
+        });
+        expect(assembled.floatingTailMessages[1].role).toBe('assistant');
+        expect(assembled.floatingTailMessages[1].content).toBe('');
+        expect(assembled.floatingTailMessages[1].toolCalls?.[0]?.name).toBe('noop');
+    });
+
     it('applies ingest regex once to /output.md and reply view tool-call payloads in finalizeTurn without touching non-output paths or mutating frozen history', () => {
         const store = new TrajectoryStore();
         const assembler = new ContextAssembler();
