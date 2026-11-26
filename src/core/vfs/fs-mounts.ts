@@ -1577,7 +1577,11 @@ export class OutputMount implements VfsMount {
         if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
             throw new VfsNotFoundError(`/${relPath}`);
         }
-        const current = await this.readFile(relPath, opts);
+        const current = await this.readFile(relPath, {
+            target: opts.target,
+            staged: opts.staged,
+            scope: opts.scope,
+        });
         await this.writeFile(relPath, `${current}${content}`, opts);
     }
 
@@ -1590,7 +1594,11 @@ export class OutputMount implements VfsMount {
         if (relPath !== '' && relPath !== OUTPUT_FILE_NAME) {
             return { ok: false, code: 'ENOENT', path: `/${relPath}`, message: `File not found: /${relPath}` };
         }
-        const current = await this.readFile(relPath, opts);
+        const current = await this.readFile(relPath, {
+            target: opts.target,
+            staged: opts.staged,
+            scope: opts.scope,
+        });
         const ops = resolveEditOperations(oldText, newText, opts);
         const applied = applyTextEdits({ path: OUTPUT_FILE_PATH, content: current, edits: ops });
         if (!applied.ok || applied.updatedContent === undefined) {

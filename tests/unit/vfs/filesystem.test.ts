@@ -354,6 +354,55 @@ describe('VirtualFileSystem', () => {
         await expect(emptyVfs.writeFile('/output.md', 'x')).rejects.toBeInstanceOf(VfsError);
     });
 
+    it('preserves full /output.md content during line-scoped edits (startLine/endLine)', async () => {
+        const bridge = createFixtureBridge();
+        const vfs = new VirtualFileSystem({ bridge });
+        const target = { messageId: 1, swipeId: 0 };
+
+        const initialLines = Array.from({ length: 10 }, (_, idx) => `Line ${idx + 1}: original`);
+        await vfs.writeFile('/output.md', initialLines.join('\n'), { target });
+
+        // Multi-edit with top-level startLine/endLine lifted from the first op (mirrors edit_file tool)
+        const multiEditRes = await vfs.editFile('/output.md', 'Line 4: original', 'Line 4: updated', {
+            target,
+            startLine: 4,
+            endLine: 5,
+            edits: [
+                { search: 'Line 4: original', replace: 'Line 4: updated', startLine: 4, endLine: 5 },
+                { search: 'Line 8: original', replace: 'Line 8: updated', startLine: 8, endLine: 9 },
+            ],
+        });
+        expect(multiEditRes).toMatchObject({
+            ok: true,
+            replacements: 2,
+            totalLines: 10,
+        });
+        const afterMulti = (bridge.readChatMessage(target) ?? '').split('\n');
+        expect(afterMulti).toHaveLength(10);
+        expect(afterMulti[0]).toBe('Line 1: original');
+        expect(afterMulti[3]).toBe('Line 4: updated');
+        expect(afterMulti[7]).toBe('Line 8: updated');
+        expect(afterMulti[9]).toBe('Line 10: original');
+
+        // Single edit starting at line 1 must not truncate lines 3..10
+        const headEditRes = await vfs.editFile('/output.md', 'Line 1: original', 'Line 1: head-updated', {
+            target,
+            startLine: 1,
+            endLine: 2,
+        });
+        expect(headEditRes).toMatchObject({
+            ok: true,
+            replacements: 1,
+            totalLines: 10,
+        });
+        const afterHead = (bridge.readChatMessage(target) ?? '').split('\n');
+        expect(afterHead).toHaveLength(10);
+        expect(afterHead[0]).toBe('Line 1: head-updated');
+        expect(afterHead[3]).toBe('Line 4: updated');
+        expect(afterHead[7]).toBe('Line 8: updated');
+        expect(afterHead[9]).toBe('Line 10: original');
+    });
+
     it('excludes ST-Prompt-Template special entries from /lorebooks/* and parses @@initial_variables into /state/variables.json', async () => {
         const specialEntries: RawLoreEntry[] = [
             {
