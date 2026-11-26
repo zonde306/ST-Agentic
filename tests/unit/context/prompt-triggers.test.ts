@@ -191,11 +191,13 @@ describe('PromptBlock trigger filtering (ST-native triggers compatibility)', () 
         });
         const normalLayer0Text = normalCtx.layer0Messages.map((m) => String(m.content)).join('\n');
         const normalLayer2Text = normalCtx.layer2Messages.map((m) => String(m.content)).join('\n');
+        const normalTailText = normalCtx.floatingTailMessages.map((m) => String(m.content)).join('\n');
         expect(normalLayer0Text).toContain('MAIN_ONLY_SYSTEM_BASE');
         expect(normalLayer0Text).toContain('UNTAGGED_PREFIX');
         expect(normalLayer0Text).not.toContain('TRIGGER_ONLY_PREFIX');
-        expect(normalLayer2Text).toContain('NORMAL_ONLY_TAIL');
-        expect(normalLayer2Text).not.toContain('CONTINUE_ONLY_TAIL');
+        expect(normalLayer2Text).not.toContain('NORMAL_ONLY_TAIL');
+        expect(normalTailText).toContain('NORMAL_ONLY_TAIL');
+        expect(normalTailText).not.toContain('CONTINUE_ONLY_TAIL');
 
         // 2. Non-main trigger_before run on the SAME persistent agent:
         //    - excludes MAIN_ONLY_SYSTEM_BASE (and does NOT fall back to defaultSystemBase)
@@ -224,10 +226,12 @@ describe('PromptBlock trigger filtering (ST-native triggers compatibility)', () 
         });
         const continueLayer0Text = continueCtx.layer0Messages.map((m) => String(m.content)).join('\n');
         const continueLayer2Text = continueCtx.layer2Messages.map((m) => String(m.content)).join('\n');
+        const continueTailText = continueCtx.floatingTailMessages.map((m) => String(m.content)).join('\n');
         expect(continueLayer0Text).toContain('MAIN_ONLY_SYSTEM_BASE');
         expect(continueLayer0Text).not.toContain('TRIGGER_ONLY_PREFIX');
-        expect(continueLayer2Text).toContain('CONTINUE_ONLY_TAIL');
-        expect(continueLayer2Text).not.toContain('NORMAL_ONLY_TAIL');
+        expect(continueLayer2Text).not.toContain('CONTINUE_ONLY_TAIL');
+        expect(continueTailText).toContain('CONTINUE_ONLY_TAIL');
+        expect(continueTailText).not.toContain('NORMAL_ONLY_TAIL');
     });
 
     it('filters prompts across main actions, triggers, derived WI agents, and subagents in PipelineOrchestrator', async () => {

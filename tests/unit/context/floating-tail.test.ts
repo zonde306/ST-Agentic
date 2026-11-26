@@ -120,14 +120,12 @@ describe('floating_tail prompt block placement', () => {
             includeCategory4DynamicEntries: false,
         });
 
-        expect(round0.layer2Messages.map((m) => m.content)).toEqual([
-            'Hello world',
-            'Persisted tail note',
-        ]);
+        expect(round0.layer2Messages.map((m) => m.content)).toEqual(['Hello world']);
         expect(round0.floatingTailMessages).toEqual([
+            { role: 'user', content: 'Persisted tail note' },
             { role: 'system', content: 'Floating reminder [EJS_OK] for Traveler' },
         ]);
-        expect(round0.stats.floatingTailMessageCount).toBe(1);
+        expect(round0.stats.floatingTailMessageCount).toBe(2);
         expect(round0.request.messages.slice(-3)).toEqual([
             { role: 'user', content: 'Hello world' },
             { role: 'user', content: 'Persisted tail note' },
@@ -162,15 +160,17 @@ describe('floating_tail prompt block placement', () => {
 
         expect(round1.layer2Messages).toEqual(inFlight);
         expect(round1.floatingTailMessages).toEqual([
+            { role: 'user', content: 'Persisted tail note' },
             { role: 'system', content: 'Floating reminder [EJS_OK] for Traveler' },
         ]);
-        expect(round1.request.messages.slice(-3)).toEqual([
+        expect(round1.request.messages.slice(-4)).toEqual([
             {
                 role: 'assistant',
                 content: '',
                 toolCalls: [{ id: 'tc_1', name: 'read_file', arguments: '{"path":"/character/bio.md"}' }],
             },
             { role: 'tool', toolCallId: 'tc_1', toolName: 'read_file', content: 'Character bio text' },
+            { role: 'user', content: 'Persisted tail note' },
             { role: 'system', content: 'Floating reminder [EJS_OK] for Traveler' },
         ]);
     });
@@ -1155,11 +1155,24 @@ describe('floating_tail prompt block placement', () => {
         expect(subTailIdx).toBe(subReq1.messages.length - 1);
     });
 
-    it('preserves main_turn distinction where placement: "tail" stays in layer2Messages while floating_tail stays in floatingTailMessages', async () => {
+    it('floats placement: "tail" blocks in Takeover main_turn so multi-round tool calls sandwich before tail without persisting into TrajectoryStore across turns', async () => {
         const bridge = new MemoryHostBridge({
             identity: { userName: 'Player', charName: 'Hero' },
+            characterFields: { description: 'Hero character bio.' },
+            chat: [
+                { id: 0, name: 'Hero', isUser: false, mes: 'Opening scene.', swipeId: 0 },
+                { id: 1, name: 'Player', isUser: true, mes: 'Turn 1 action', swipeId: 0 },
+            ],
+            metadata: { variables: { mood: 'calm' } },
+            ejsEvaluator: async (text, vars) =>
+                text.replace(/<%-\s*mood\s*%>/g, String(vars.mood ?? '')),
         });
-        const agent = createDefaultMainAgent({
+
+        const mainAgent = createDefaultMainAgent({
+            id: 'main',
+            sessionMode: 'persistent',
+            strictToolLoop: 'on',
+            enabledTools: ['read_file', 'write_file', 'read_variables'],
             promptBlocks: [
                 {
                     id: 'system_base',
@@ -1167,38 +1180,241 @@ describe('floating_tail prompt block placement', () => {
                     role: 'system',
                     placement: 'prefix',
                     enabled: true,
-                    content: 'MAIN_BASE',
+                    content: 'MAIN_PREFIX_BASE',
                 },
                 {
-                    id: 'main_tail',
-                    name: 'Main Tail',
+                    id: 'tail_asst',
+                    name: '尾缀',
+                    role: 'assistant',
+                    placement: 'tail',
+                    enabled: true,
+                    content: 'MAIN_TAIL_ASSISTANT',
+                    triggers: ['main', 'assistant'],
+                },
+                {
+                    id: 'tail_user',
+                    name: '末尾约束',
                     role: 'user',
                     placement: 'tail',
                     enabled: true,
-                    content: 'MAIN_LAYER2_TAIL',
+                    content: 'MAIN_TAIL_USER [<%- mood %>]',
+                    triggers: ['main', 'assistant'],
                 },
                 {
-                    id: 'main_float',
-                    name: 'Main Float',
-                    role: 'system',
-                    placement: 'floating_tail',
+                    id: 'tail_custom',
+                    name: '最终结尾（普通）',
+                    role: 'custom',
+                    placement: 'tail',
                     enabled: true,
-                    content: 'MAIN_FLOATING_TAIL',
+                    content: JSON.stringify([
+                        {
+                            role: 'assistant',
+                            content: '',
+                            tool_calls: [
+                                {
+                                    id: 'call_main_tail_shell_{{lastMessageId}}',
+                                    type: 'function',
+                                    function: { name: 'read_variables', arguments: '{}' },
+                                    thoughtSignature: 'skip_thought_signature_validator',
+                                },
+                            ],
+                        },
+                        {
+                            role: 'tool',
+                            tool_call_id: 'call_main_tail_shell_{{lastMessageId}}',
+                            name: 'read_variables',
+                            content: { ok: true, mode: 'theater' },
+                        },
+                    ]),
+                    triggers: ['main', 'assistant'],
                 },
             ],
         });
 
-        const assembler = new ContextAssembler();
-        const assembled = await assembler.assembleWithHost({
-            agent,
-            hostBridge: bridge,
-            promptTriggerContext: { kind: 'main', action: 'normal' },
-            userInput: 'Hello',
+        const connection = createDefaultConnection({
+            id: 'conn_takeover',
+            providerFormat: 'gemini',
+            model: 'gemini-2.5-pro',
+            strictToolLoop: true,
+            roundMaxRetries: 0,
+        });
+        const preset = createDefaultPreset({
+            mainAgentId: 'main',
+            agents: { main: mainAgent },
+        });
+        const settings = createDefaultSettings({
+            runMode: 'takeover',
+            currentConnectionId: connection.id,
+            connections: { [connection.id]: connection },
+            presets: { [preset.id]: preset },
+            currentPresetId: preset.id,
+        });
+
+        const transport = new ScriptedLLMTransport([
+            // Turn 1 Round 0 -> read_file
+            {
+                toolCalls: [
+                    {
+                        id: 'm1_r0_read',
+                        name: 'read_file',
+                        arguments: JSON.stringify({ path: '/character/description.md' }),
+                        thoughtSignature: 'skip_thought_signature_validator',
+                    },
+                ],
+            },
+            // Turn 1 Round 1 -> write_file('/output.md')
+            {
+                toolCalls: [
+                    {
+                        id: 'm1_r1_write',
+                        name: 'write_file',
+                        arguments: JSON.stringify({ path: '/output.md', content: 'Turn 1 story.' }),
+                        thoughtSignature: 'skip_thought_signature_validator',
+                    },
+                ],
+            },
+            // Turn 1 Round 2 -> finish_turn
+            {
+                toolCalls: [
+                    {
+                        id: 'm1_r2_fin',
+                        name: FINISH_TURN_TOOL_NAME,
+                        arguments: JSON.stringify({ step_brief: 'Turn 1 done' }),
+                        thoughtSignature: 'skip_thought_signature_validator',
+                    },
+                ],
+            },
+            // Turn 2 Round 0 -> write_file('/output.md')
+            {
+                toolCalls: [
+                    {
+                        id: 'm2_r0_write',
+                        name: 'write_file',
+                        arguments: JSON.stringify({ path: '/output.md', content: 'Turn 2 story.' }),
+                        thoughtSignature: 'skip_thought_signature_validator',
+                    },
+                ],
+            },
+            // Turn 2 Round 1 -> finish_turn
+            {
+                toolCalls: [
+                    {
+                        id: 'm2_r1_fin',
+                        name: FINISH_TURN_TOOL_NAME,
+                        arguments: JSON.stringify({ step_brief: 'Turn 2 done' }),
+                        thoughtSignature: 'skip_thought_signature_validator',
+                    },
+                ],
+            },
+        ]);
+
+        const trajectoryStore = new TrajectoryStore();
+        const runner = new AgentRunner({
+            bridge,
+            transport,
+            settings,
+            trajectoryStore,
+        });
+
+        const res1 = await runner.run({
+            agent: mainAgent,
+            preset,
+            connection,
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'main_turn',
+            userInput: 'Turn 1 action',
+            userName: 'Player',
+            vars: { mood: 'calm' },
+            macroOverrides: { lastMessageId: '1' },
             runTailRadar: false,
             includeCategory4DynamicEntries: false,
         });
+        expect(res1.content).toBe('Turn 1 story.');
 
-        expect(assembled.layer2Messages.map((m) => m.content)).toEqual(['Hello', 'MAIN_LAYER2_TAIL']);
-        expect(assembled.floatingTailMessages.map((m) => m.content)).toEqual(['MAIN_FLOATING_TAIL']);
+        const [t1r0, t1r1, t1r2] = transport.requests;
+
+        // Turn 1 Round 0 ends with all 3 tail blocks after user input
+        expect(t1r0.messages.slice(-5).map((m) => [m.role, m.toolCallId ?? m.content])).toEqual([
+            ['user', 'Turn 1 action'],
+            ['assistant', 'MAIN_TAIL_ASSISTANT'],
+            ['user', 'MAIN_TAIL_USER [calm]'],
+            ['assistant', ''],
+            ['tool', 'call_main_tail_shell_1'],
+        ]);
+
+        // Turn 1 Round 1 sandwiches m1_r0_read BEFORE all 3 tail blocks
+        const t1r1ReadIdx = t1r1.messages.findIndex(
+            (m) => m.role === 'tool' && m.toolCallId === 'm1_r0_read',
+        );
+        const t1r1TailAsstIdx = t1r1.messages.findIndex(
+            (m) => m.role === 'assistant' && m.content === 'MAIN_TAIL_ASSISTANT',
+        );
+        expect(t1r1ReadIdx).toBeGreaterThan(0);
+        expect(t1r1TailAsstIdx).toBe(t1r1ReadIdx + 1);
+        expect(t1r1.messages[t1r1.messages.length - 1].toolCallId).toBe('call_main_tail_shell_1');
+
+        // Turn 1 Round 2 sandwiches both m1_r0_read and m1_r1_write BEFORE all 3 tail blocks
+        const t1r2WriteIdx = t1r2.messages.findIndex(
+            (m) => m.role === 'tool' && m.toolCallId === 'm1_r1_write',
+        );
+        const t1r2TailAsstIdx = t1r2.messages.findIndex(
+            (m) => m.role === 'assistant' && m.content === 'MAIN_TAIL_ASSISTANT',
+        );
+        expect(t1r2WriteIdx).toBeGreaterThan(t1r1ReadIdx);
+        expect(t1r2TailAsstIdx).toBe(t1r2WriteIdx + 1);
+        expect(t1r2.messages[t1r2.messages.length - 1].toolCallId).toBe('call_main_tail_shell_1');
+
+        // TrajectoryStore after Turn 1 contains ZERO transient tail block messages
+        const storedAfterTurn1 = trajectoryStore.getMessages('main');
+        expect(
+            storedAfterTurn1.some(
+                (m) =>
+                    (typeof m.content === 'string' && m.content.includes('MAIN_TAIL_'))
+                    || m.toolCallId === 'call_main_tail_shell_1',
+            ),
+        ).toBe(false);
+
+        // Turn 2 on messageId 3 with updated mood: Turn 2 history stays clean, tail renders fresh at the very end
+        bridge.chat.push(
+            { id: 2, name: 'Hero', isUser: false, mes: 'Turn 1 story.', swipeId: 0 },
+            { id: 3, name: 'Player', isUser: true, mes: 'Turn 2 action', swipeId: 0 },
+        );
+
+        const res2 = await runner.run({
+            agent: mainAgent,
+            preset,
+            connection,
+            target: { messageId: 3, swipeId: 0 },
+            phase: 'main_turn',
+            userInput: 'Turn 2 action',
+            userName: 'Player',
+            vars: { mood: 'tense' },
+            macroOverrides: { lastMessageId: '3' },
+            runTailRadar: false,
+            includeCategory4DynamicEntries: false,
+        });
+        expect(res2.content).toBe('Turn 2 story.');
+
+        const t2r0 = transport.requests[3];
+        const t2r1 = transport.requests[4];
+
+        expect(
+            t2r0.messages.filter((m) => m.role === 'assistant' && m.content === 'MAIN_TAIL_ASSISTANT'),
+        ).toHaveLength(1);
+        expect(t2r0.messages.some((m) => m.toolCallId === 'call_main_tail_shell_1')).toBe(false);
+        expect(t2r0.messages[t2r0.messages.length - 1].toolCallId).toBe('call_main_tail_shell_3');
+
+        const t2r1WriteIdx = t2r1.messages.findIndex(
+            (m) => m.role === 'tool' && m.toolCallId === 'm2_r0_write',
+        );
+        const t2r1TailAsstIdx = t2r1.messages.findIndex(
+            (m) => m.role === 'assistant' && m.content === 'MAIN_TAIL_ASSISTANT',
+        );
+        expect(t2r1WriteIdx).toBeGreaterThan(0);
+        expect(t2r1TailAsstIdx).toBe(t2r1WriteIdx + 1);
+        expect(
+            t2r1.messages.filter((m) => m.role === 'user' && m.content === 'MAIN_TAIL_USER [tense]'),
+        ).toHaveLength(1);
+        expect(t2r1.messages[t2r1.messages.length - 1].toolCallId).toBe('call_main_tail_shell_3');
     });
 });

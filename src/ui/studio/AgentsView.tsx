@@ -1083,7 +1083,7 @@ export function AgentsView(props: Partial<ConsoleViewProps> = {}) {
                 {/* Prompt Blocks Editor */}
                 <Card
                     title="模块化提示词积木 (promptBlocks)"
-                    subtitle="严格限定为 Layer 0 Prefix (静态前缀) 或 Layer 2 Tail (当轮尾部)，禁止 @D1~@DN 历史中间插拔"
+                    subtitle="严格限定为 Layer 0 Prefix (静态前缀) 或 Tail (瞬态沉底，不入历史)，禁止 @D1~@DN 历史中间插拔"
                     actions={
                         <Button
                             size="sm"

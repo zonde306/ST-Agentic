@@ -18,6 +18,7 @@ import {
     IconAlertTriangle,
     IconBookOpen,
     IconCheck,
+    IconChevronRight,
     IconCopy,
     IconRefresh,
     IconTerminal,
@@ -94,6 +95,74 @@ function extractToolCallsFromTrace(trace: AgentRunTrace): {
     return { fromMessages, fromSteps };
 }
 
+function getStepDomKey(step: ToolStepLog, arrayIndex: number): string {
+    return `${step.stepIndex}:${step.toolCallId}:${arrayIndex}`;
+}
+
+function stepMatchesSearch(step: ToolStepLog, lowerQuery: string): boolean {
+    if (!lowerQuery) {
+        return false;
+    }
+    return (
+        step.toolName.toLowerCase().includes(lowerQuery)
+        || step.result.toLowerCase().includes(lowerQuery)
+        || (step.error?.toLowerCase().includes(lowerQuery) ?? false)
+        || formatJsonBlock(step.args).toLowerCase().includes(lowerQuery)
+    );
+}
+
+function buildStepTooltip(step: ToolStepLog): string {
+    const base = `#${step.stepIndex + 1} ${step.toolName}`;
+    if (!step.args || typeof step.args !== 'object' || Array.isArray(step.args)) {
+        return base;
+    }
+    const argsObj = step.args as Record<string, unknown>;
+    const summaryKeys = ['path', 'query', 'command', 'url', 'key'] as const;
+    for (const key of summaryKeys) {
+        const val = argsObj[key];
+        if (typeof val === 'string') {
+            const trimmed = val.trim();
+            if (trimmed) {
+                const combined = `${base} · ${trimmed}`;
+                return combined.length > 80 ? `${combined.slice(0, 77)}...` : combined;
+            }
+        }
+    }
+    return base;
+}
+
+function findDetailScrollContainer(el: HTMLElement | null): HTMLElement | null {
+    let fallbackOverflowContainer: HTMLElement | null = null;
+    let current = el;
+    while (current) {
+        if (typeof window !== 'undefined') {
+            const overflowY = window.getComputedStyle(current).overflowY;
+            if (overflowY === 'auto' || overflowY === 'scroll') {
+                if (!fallbackOverflowContainer) {
+                    fallbackOverflowContainer = current;
+                }
+                if (current.scrollHeight > current.clientHeight + 1) {
+                    return current;
+                }
+            }
+        }
+        current = current.parentElement;
+    }
+    return fallbackOverflowContainer;
+}
+
+function scrollContainerToTop(
+    container: HTMLElement,
+    top: number,
+    behavior: ScrollBehavior,
+): void {
+    if (typeof container.scrollTo === 'function') {
+        container.scrollTo({ top, behavior });
+    } else {
+        container.scrollTop = top;
+    }
+}
+
 function formatTraceLorebooks(trace: AgentRunTrace): string | null {
     const names = trace.lorebookNames?.map((name) => name.trim()).filter(Boolean) ?? [];
     return names.length > 0 ? names.join(' · ') : null;
@@ -117,13 +186,7 @@ function matchesSearch(trace: AgentRunTrace, query: string): boolean {
     ) {
         return true;
     }
-    return trace.toolSteps.some(
-        (step) =>
-            step.toolName.toLowerCase().includes(q)
-            || step.result.toLowerCase().includes(q)
-            || (step.error?.toLowerCase().includes(q) ?? false)
-            || formatJsonBlock(step.args).toLowerCase().includes(q),
-    );
+    return trace.toolSteps.some((step) => stepMatchesSearch(step, q));
 }
 
 export function LogsView({ store, isMobile }: ConsoleViewProps) {
@@ -138,13 +201,22 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
     const [selectedRunId, setSelectedRunId] = useState<string | null>(
         () => deepLink.logId ?? traces[0]?.runId ?? null,
     );
-    const [highlightedStepIndex, setHighlightedStepIndex] = useState<number | null>(null);
+    const [highlightedStepKey, setHighlightedStepKey] = useState<string | null>(null);
+    const [expandedRunIds, setExpandedRunIds] = useState<ReadonlySet<string>>(() => new Set());
+    const [scrollRequest, setScrollRequest] = useState<{
+        runId: string;
+        stepKey: string | null;
+        nonce: number;
+    } | null>(null);
     const [detailOpen, setDetailOpen] = useState(false);
     const [detailTab, setDetailTab] = useState<DetailViewTab>('steps');
     const [refreshing, setRefreshing] = useState(false);
 
     const lastDeepLinkSigRef = useRef<string>('');
     const didAutoLoadRef = useRef(false);
+    const lastHandledScrollNonceRef = useRef(0);
+    const detailContentRef = useRef<HTMLDivElement | null>(null);
+    const stepCardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
 
     const handleRefresh = useCallback(async () => {
         setRefreshing(true);
@@ -186,8 +258,13 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
         }
         if (deepLink.logId) {
             setSelectedRunId(deepLink.logId);
-            setHighlightedStepIndex(null);
+            setHighlightedStepKey(null);
             setDetailOpen(true);
+            setScrollRequest((prev) => ({
+                runId: deepLink.logId!,
+                stepKey: null,
+                nonce: (prev?.nonce ?? 0) + 1,
+            }));
         } else if (deepLink.messageId !== undefined) {
             const matched = traces.find(
                 (t) =>
@@ -196,8 +273,13 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             );
             if (matched) {
                 setSelectedRunId(matched.runId);
-                setHighlightedStepIndex(null);
+                setHighlightedStepKey(null);
                 setDetailOpen(true);
+                setScrollRequest((prev) => ({
+                    runId: matched.runId,
+                    stepKey: null,
+                    nonce: (prev?.nonce ?? 0) + 1,
+                }));
             }
         }
     }, [deepLink.logId, deepLink.messageId, deepLink.swipeId, traces]);
@@ -236,14 +318,85 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
         [filteredTraces, selectedRunId],
     );
 
-    const handleSelectRun = (runId: string, stepIndex: number | null = null) => {
+    const handleToggleRunSteps = useCallback((runId: string) => {
+        setExpandedRunIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(runId)) {
+                next.delete(runId);
+            } else {
+                next.add(runId);
+            }
+            return next;
+        });
+    }, []);
+
+    const handleSelectRun = (runId: string, stepKey: string | null = null) => {
         setSelectedRunId(runId);
-        setHighlightedStepIndex(stepIndex);
-        if (stepIndex !== null) {
+        setHighlightedStepKey(stepKey);
+        if (stepKey !== null) {
             setDetailTab('steps');
         }
         setDetailOpen(true);
+        setScrollRequest((prev) => ({
+            runId,
+            stepKey,
+            nonce: (prev?.nonce ?? 0) + 1,
+        }));
     };
+
+    useEffect(() => {
+        if (!scrollRequest || scrollRequest.nonce === lastHandledScrollNonceRef.current) {
+            return;
+        }
+        if (!selectedTrace || selectedTrace.runId !== scrollRequest.runId) {
+            return;
+        }
+        if (isMobile && !detailOpen) {
+            return;
+        }
+        if (scrollRequest.stepKey !== null && detailTab !== 'steps') {
+            return;
+        }
+
+        const rafId = requestAnimationFrame(() => {
+            const prefersReducedMotion =
+                typeof window !== 'undefined'
+                && typeof window.matchMedia === 'function'
+                && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+            const behavior: ScrollBehavior = prefersReducedMotion ? 'auto' : 'smooth';
+
+            if (scrollRequest.stepKey === null) {
+                const container = findDetailScrollContainer(detailContentRef.current);
+                if (container) {
+                    scrollContainerToTop(container, 0, behavior);
+                }
+                lastHandledScrollNonceRef.current = scrollRequest.nonce;
+                return;
+            }
+
+            const refMapKey = `${scrollRequest.runId}::${scrollRequest.stepKey}`;
+            const stepEl = stepCardRefs.current.get(refMapKey);
+            if (!stepEl) {
+                return;
+            }
+
+            const container = findDetailScrollContainer(stepEl.parentElement);
+            if (container) {
+                const containerRect = container.getBoundingClientRect();
+                const stepRect = stepEl.getBoundingClientRect();
+                const nextTop = Math.max(
+                    0,
+                    container.scrollTop + (stepRect.top - containerRect.top) - 12,
+                );
+                scrollContainerToTop(container, nextTop, behavior);
+            } else if (typeof stepEl.scrollIntoView === 'function') {
+                stepEl.scrollIntoView({ behavior, block: 'start', inline: 'nearest' });
+            }
+            lastHandledScrollNonceRef.current = scrollRequest.nonce;
+        });
+
+        return () => cancelAnimationFrame(rafId);
+    }, [detailOpen, detailTab, isMobile, scrollRequest, selectedTrace]);
 
     const handleClearTraces = async () => {
         if (!store.services.clearTraces) {
@@ -253,6 +406,8 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             await store.services.clearTraces();
             store.setTraces([]);
             setSelectedRunId(null);
+            setHighlightedStepKey(null);
+            setExpandedRunIds(new Set());
             store.pushToast('已清空内存运行日志', 'warning');
         } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
@@ -350,185 +505,210 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                     title="暂无匹配的生成或工具日志"
                     description="请尝试切换楼层/阶段筛选，或在聊天中触发一次生成。"
                 />
-            ) : (
-                <div class="ag-list" style={{ padding: 0, gap: '8px' }}>
-                    {filteredTraces.map((trace) => {
-                        const isSelected = selectedTrace?.runId === trace.runId;
-                        const isScriptTrace = trace.model === '0-token-script';
-                        const lorebookLabel = formatTraceLorebooks(trace);
-                        const hitRate = computeCacheHitPercent(trace.usage);
-                        const statusMeta = getRunStatusMeta(trace.status);
-                        return (
-                            <div
-                                key={trace.runId}
-                                style={{
-                                    display: 'flex',
-                                    flexDirection: 'column',
-                                    gap: '4px',
-                                }}
-                            >
-                                <button
-                                    type="button"
-                                    class={
-                                        isSelected && !isMobile
-                                            ? 'ag-list-item ag-list-item-active'
-                                            : 'ag-list-item'
-                                    }
-                                    onClick={() => handleSelectRun(trace.runId, null)}
+            ) : (() => {
+                const trimmedLowerQuery = searchQuery.trim().toLowerCase();
+                return (
+                    <div class="ag-list" style={{ padding: 0, gap: '8px' }}>
+                        {filteredTraces.map((trace) => {
+                            const isSelected = selectedTrace?.runId === trace.runId;
+                            const isScriptTrace = trace.model === '0-token-script';
+                            const lorebookLabel = formatTraceLorebooks(trace);
+                            const hitRate = computeCacheHitPercent(trace.usage);
+                            const statusMeta = getRunStatusMeta(trace.status);
+                            const isStepsExpanded = expandedRunIds.has(trace.runId);
+                            const failedStepsCount = trace.toolSteps.reduce(
+                                (count, step) => count + (step.ok ? 0 : 1),
+                                0,
+                            );
+                            const matchedStepsCount = trimmedLowerQuery
+                                ? trace.toolSteps.reduce(
+                                    (count, step) =>
+                                        count + (stepMatchesSearch(step, trimmedLowerQuery) ? 1 : 0),
+                                    0,
+                                )
+                                : 0;
+                            return (
+                                <div
+                                    key={trace.runId}
+                                    class="ag-log-run-group"
+                                    data-log-run-id={trace.runId}
                                 >
-                                    <div
-                                        class="ag-row"
-                                        style={{ justifyContent: 'space-between', gap: '6px' }}
+                                    <button
+                                        type="button"
+                                        class={
+                                            isSelected && !isMobile
+                                                ? 'ag-list-item ag-list-item-active'
+                                                : 'ag-list-item'
+                                        }
+                                        data-log-run-item={trace.runId}
+                                        onClick={() => handleSelectRun(trace.runId, null)}
                                     >
-                                        <span
-                                            class="ag-list-item-title"
-                                            style={{
-                                                minWidth: 0,
-                                                overflow: 'hidden',
-                                                textOverflow: 'ellipsis',
-                                                whiteSpace: 'nowrap',
-                                            }}
-                                        >
-                                            #{trace.target.messageId}#{trace.target.swipeId} ·{' '}
-                                            {trace.agentName}
-                                        </span>
-                                        <span style={{ flexShrink: 0 }}>
-                                            {isScriptTrace ? (
-                                                <Badge tone="neutral">脚本</Badge>
-                                            ) : (
-                                                <Badge tone={hitRate >= 70 ? 'success' : 'neutral'}>
-                                                    {hitRate.toFixed(1)}% 命中
-                                                </Badge>
-                                            )}
-                                        </span>
-                                    </div>
-                                    <div class="ag-list-item-meta">
-                                        <span class="ag-row" style={{ gap: '4px' }}>
-                                            <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
-                                            <span>
-                                                {isScriptTrace
-                                                    ? trace.phase
-                                                    : `${trace.phase} · ${trace.toolSteps.length} 步`}
-                                            </span>
-                                        </span>
-                                        <span class="ag-mono">
-                                            {formatDurationMs(trace.durationMs)}
-                                        </span>
-                                    </div>
-                                    {lorebookLabel ? (
                                         <div
                                             class="ag-row"
-                                            title={`世界书：${lorebookLabel}`}
-                                            style={{
-                                                gap: '4px',
-                                                fontSize: '11px',
-                                                color: 'var(--muted-foreground)',
-                                                minWidth: 0,
-                                                marginTop: '2px',
-                                            }}
+                                            style={{ justifyContent: 'space-between', gap: '6px' }}
                                         >
-                                            <span style={{ display: 'inline-flex', flexShrink: 0 }}>
-                                                <IconBookOpen size={12} />
-                                            </span>
                                             <span
+                                                class="ag-list-item-title"
                                                 style={{
+                                                    minWidth: 0,
                                                     overflow: 'hidden',
                                                     textOverflow: 'ellipsis',
                                                     whiteSpace: 'nowrap',
-                                                    minWidth: 0,
                                                 }}
                                             >
-                                                {lorebookLabel}
+                                                #{trace.target.messageId}#{trace.target.swipeId} ·{' '}
+                                                {trace.agentName}
+                                            </span>
+                                            <span style={{ flexShrink: 0 }}>
+                                                {isScriptTrace ? (
+                                                    <Badge tone="neutral">脚本</Badge>
+                                                ) : (
+                                                    <Badge tone={hitRate >= 70 ? 'success' : 'neutral'}>
+                                                        {hitRate.toFixed(1)}% 命中
+                                                    </Badge>
+                                                )}
                                             </span>
                                         </div>
-                                    ) : trace.triggerSource === 'preset' ? (
-                                        <div
-                                            style={{
-                                                fontSize: '11px',
-                                                color: 'var(--muted-foreground)',
-                                                marginTop: '2px',
-                                            }}
-                                        >
-                                            来源：预设触发器
+                                        <div class="ag-list-item-meta">
+                                            <span class="ag-row" style={{ gap: '4px' }}>
+                                                <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
+                                                <span>
+                                                    {isScriptTrace
+                                                        ? trace.phase
+                                                        : `${trace.phase} · ${trace.toolSteps.length} 步`}
+                                                </span>
+                                            </span>
+                                            <span class="ag-mono">
+                                                {formatDurationMs(trace.durationMs)}
+                                            </span>
+                                        </div>
+                                        {lorebookLabel ? (
+                                            <div
+                                                class="ag-row"
+                                                title={`世界书：${lorebookLabel}`}
+                                                style={{
+                                                    gap: '4px',
+                                                    fontSize: '11px',
+                                                    color: 'var(--muted-foreground)',
+                                                    minWidth: 0,
+                                                    marginTop: '2px',
+                                                }}
+                                            >
+                                                <span style={{ display: 'inline-flex', flexShrink: 0 }}>
+                                                    <IconBookOpen size={12} />
+                                                </span>
+                                                <span
+                                                    style={{
+                                                        overflow: 'hidden',
+                                                        textOverflow: 'ellipsis',
+                                                        whiteSpace: 'nowrap',
+                                                        minWidth: 0,
+                                                    }}
+                                                >
+                                                    {lorebookLabel}
+                                                </span>
+                                            </div>
+                                        ) : trace.triggerSource === 'preset' ? (
+                                            <div
+                                                style={{
+                                                    fontSize: '11px',
+                                                    color: 'var(--muted-foreground)',
+                                                    marginTop: '2px',
+                                                }}
+                                            >
+                                                来源：预设触发器
+                                            </div>
+                                        ) : null}
+                                    </button>
+
+                                    {trace.toolSteps.length > 0 ? (
+                                        <div class="ag-log-step-branch">
+                                            <button
+                                                type="button"
+                                                class="ag-log-steps-toggle"
+                                                aria-expanded={isStepsExpanded}
+                                                data-log-steps-toggle={trace.runId}
+                                                onClick={() => handleToggleRunSteps(trace.runId)}
+                                            >
+                                                <span class="ag-log-steps-toggle-main">
+                                                    <span
+                                                        class="ag-log-steps-chevron"
+                                                        data-open={isStepsExpanded ? 'true' : 'false'}
+                                                        aria-hidden="true"
+                                                    >
+                                                        <IconChevronRight size={14} />
+                                                    </span>
+                                                    <span class="ag-log-steps-toggle-label">
+                                                        {isStepsExpanded
+                                                            ? `收起工具调用 (${trace.toolSteps.length})`
+                                                            : `展开 ${trace.toolSteps.length} 个工具调用`}
+                                                    </span>
+                                                </span>
+                                                {(matchedStepsCount > 0 || failedStepsCount > 0) ? (
+                                                    <span class="ag-log-steps-toggle-meta">
+                                                        {matchedStepsCount > 0 ? (
+                                                            <Badge tone="primary">
+                                                                命中 {matchedStepsCount}
+                                                            </Badge>
+                                                        ) : null}
+                                                        {failedStepsCount > 0 ? (
+                                                            <Badge tone="error">
+                                                                {failedStepsCount} 失败
+                                                            </Badge>
+                                                        ) : null}
+                                                    </span>
+                                                ) : null}
+                                            </button>
+
+                                            {isStepsExpanded ? (
+                                                <div
+                                                    class="ag-log-steps-list"
+                                                    data-log-steps-list={trace.runId}
+                                                >
+                                                    {trace.toolSteps.map((step, arrayIndex) => {
+                                                        const stepKey = getStepDomKey(step, arrayIndex);
+                                                        const stepSelected =
+                                                            isSelected && highlightedStepKey === stepKey;
+                                                        return (
+                                                            <button
+                                                                key={`${trace.runId}_${stepKey}`}
+                                                                type="button"
+                                                                class={
+                                                                    stepSelected && !isMobile
+                                                                        ? 'ag-log-step-item ag-log-step-item-active'
+                                                                        : 'ag-log-step-item'
+                                                                }
+                                                                data-log-step-btn={stepKey}
+                                                                data-log-step-index={step.stepIndex}
+                                                                title={buildStepTooltip(step)}
+                                                                onClick={() =>
+                                                                    handleSelectRun(trace.runId, stepKey)
+                                                                }
+                                                            >
+                                                                <span class="ag-mono ag-log-step-name">
+                                                                    #{step.stepIndex + 1} {step.toolName}
+                                                                </span>
+                                                                <span class="ag-log-step-meta">
+                                                                    <Badge tone={step.ok ? 'success' : 'error'}>
+                                                                        {step.ok ? 'OK' : 'ERR'}
+                                                                    </Badge>
+                                                                    <span class="ag-log-step-duration">
+                                                                        {formatDurationMs(step.durationMs)}
+                                                                    </span>
+                                                                </span>
+                                                            </button>
+                                                        );
+                                                    })}
+                                                </div>
+                                            ) : null}
                                         </div>
                                     ) : null}
-                                </button>
-
-                                {trace.toolSteps.length > 0 ? (
-                                    <div
-                                        style={{
-                                            display: 'flex',
-                                            flexDirection: 'column',
-                                            gap: '4px',
-                                            paddingLeft: '14px',
-                                            borderLeft: '2px solid var(--border)',
-                                            marginLeft: '10px',
-                                        }}
-                                    >
-                                        {trace.toolSteps.map((step) => {
-                                            const stepSelected =
-                                                isSelected
-                                                && highlightedStepIndex === step.stepIndex;
-                                            return (
-                                                <button
-                                                    key={`${trace.runId}_${step.toolCallId}_${step.stepIndex}`}
-                                                    type="button"
-                                                    class={
-                                                        stepSelected && !isMobile
-                                                            ? 'ag-list-item ag-list-item-active'
-                                                            : 'ag-list-item'
-                                                    }
-                                                    style={{
-                                                        minHeight: '40px',
-                                                        padding: '6px 10px',
-                                                    }}
-                                                    onClick={() =>
-                                                        handleSelectRun(trace.runId, step.stepIndex)
-                                                    }
-                                                >
-                                                    <div
-                                                        class="ag-row"
-                                                        style={{
-                                                            justifyContent: 'space-between',
-                                                            fontSize: '12px',
-                                                        }}
-                                                    >
-                                                        <span
-                                                            class="ag-mono"
-                                                            style={{
-                                                                fontWeight: 600,
-                                                                minWidth: 0,
-                                                                overflow: 'hidden',
-                                                                textOverflow: 'ellipsis',
-                                                                whiteSpace: 'nowrap',
-                                                            }}
-                                                        >
-                                                            #{step.stepIndex + 1} {step.toolName}
-                                                        </span>
-                                                        <span class="ag-row" style={{ gap: '4px', flexShrink: 0 }}>
-                                                            <Badge tone={step.ok ? 'success' : 'error'}>
-                                                                {step.ok ? 'OK' : 'ERR'}
-                                                            </Badge>
-                                                            <span
-                                                                style={{
-                                                                    fontSize: '11px',
-                                                                    color: 'var(--muted-foreground)',
-                                                                }}
-                                                            >
-                                                                {formatDurationMs(step.durationMs)}
-                                                            </span>
-                                                        </span>
-                                                    </div>
-                                                </button>
-                                            );
-                                        })}
-                                    </div>
-                                ) : null}
-                            </div>
-                        );
-                    })}
-                </div>
-            )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                );
+            })()}
         </div>
     );
 
@@ -562,6 +742,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
 
         return (
             <div
+                ref={detailContentRef}
                 class="ag-view-scroll ag-thin-scroll"
                 style={{ padding: isMobile ? '12px' : '14px' }}
             >
@@ -723,17 +904,28 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                         : '本轮运行未调用工具（纯文本推理/输出）。'}
                                 </div>
                             ) : (
-                                selectedTrace.toolSteps.map((step: ToolStepLog) => {
-                                    const isFocused = highlightedStepIndex === step.stepIndex;
+                                selectedTrace.toolSteps.map((step: ToolStepLog, arrayIndex: number) => {
+                                    const stepKey = getStepDomKey(step, arrayIndex);
+                                    const refMapKey = `${selectedTrace.runId}::${stepKey}`;
+                                    const isFocused = highlightedStepKey === stepKey;
                                     return (
                                         <div
-                                            key={`${step.toolCallId}_${step.stepIndex}`}
-                                            class="ag-card"
-                                            style={
+                                            key={refMapKey}
+                                            ref={(el: HTMLDivElement | null) => {
+                                                if (el) {
+                                                    stepCardRefs.current.set(refMapKey, el);
+                                                } else {
+                                                    stepCardRefs.current.delete(refMapKey);
+                                                }
+                                            }}
+                                            class={
                                                 isFocused
-                                                    ? { borderColor: 'var(--primary)' }
-                                                    : undefined
+                                                    ? 'ag-card ag-log-step-card ag-log-step-card-focused'
+                                                    : 'ag-card ag-log-step-card'
                                             }
+                                            data-log-step-card={stepKey}
+                                            data-log-step-index={step.stepIndex}
+                                            data-focused={isFocused ? 'true' : 'false'}
                                         >
                                             <div class="ag-card-header">
                                                 <div class="ag-row-wrap">

@@ -35,8 +35,8 @@ ST-Agentic 通过 `evaluateOptionalEjs()` 集成可选插件 **`ST-Prompt-Templa
 | `placement` | 所在缓存层 | 适用内容 |
 | :--- | :--- | :--- |
 | `prefix` | Layer 0 静态前缀（高命中缓存） | 固定系统指令、输出协议、静态人设与 `{{file::/preset/...}}`；**禁止**塞动态变化内容，否则每次都会破坏前缀缓存 |
-| `tail` | Layer 2 尾部动态槽 | 动态状态提示、场景变量、浮动指令（只读宏与 EJS） |
-| `floating_tail` | Layer 2 极尾锚定（紧贴当前轮末尾） | 需要强遵循的格式约束、最后提醒 |
+| `tail` | 瞬态尾部锚定（紧贴当前轮与工具链末尾） | 需要强遵循的格式约束、最后提醒、场景变量与浮动指令（全表面一致：工具链夹在中间且不固化入 Layer 1 历史） |
+| `floating_tail` | 瞬态尾部锚定（`tail` 的兼容别名） | 与 `tail` 行为相同，保留用于兼容既有预设配置 |
 
 ### `triggers` 作用域过滤标签（留空表示对所有上下文生效）
 - 主生成：`main`、`main_normal`、`main_continue`、`main_regenerate`、`main_swipe`

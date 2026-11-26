@@ -66,6 +66,24 @@ async function settleLayout(frames = 3): Promise<void> {
     }
 }
 
+async function waitForScrollIdle(el: HTMLElement, maxFrames = 60): Promise<void> {
+    let prev = el.scrollTop;
+    let stableFrames = 0;
+    for (let i = 0; i < maxFrames; i += 1) {
+        await nextAnimationFrame();
+        const cur = el.scrollTop;
+        if (Math.abs(cur - prev) < 0.5) {
+            stableFrames += 1;
+            if (stableFrames >= 4) {
+                return;
+            }
+        } else {
+            stableFrames = 0;
+            prev = cur;
+        }
+    }
+}
+
 function isElementVisible(el: Element): boolean {
     const style = window.getComputedStyle(el);
     if (style.display === 'none' || style.visibility === 'hidden') {
@@ -1201,6 +1219,291 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
         const filteredItems = Array.from(shadowRoot.querySelectorAll('.ag-list-item')) as HTMLButtonElement[];
         expect(filteredItems).toHaveLength(1);
         expect(filteredItems[0].textContent).toContain(longBookName);
+    });
+
+    it('collapses tool steps by default in LogsView and auto-scrolls the detail pane to clicked steps on desktop and mobile', async () => {
+        const now = Date.now();
+        const longArgsPayload = Array.from({ length: 8 }, (_, idx) => `line_${idx}: value_${idx}`).join('\n');
+        const longResultPayload = Array.from(
+            { length: 14 },
+            (_, idx) => `${idx + 1}| 详情输出行_${idx + 1}_abcdefghijklmnopqrstuvwxyz_0123456789`,
+        ).join('\n');
+
+        const manySteps = Array.from({ length: 12 }, (_, idx) => ({
+            stepIndex: idx,
+            toolCallId: `call_many_${idx + 1}`,
+            toolName: idx === 7 ? 'search_files' : idx === 11 ? 'write_file' : 'read_file',
+            args: { path: `/lorebooks/entry_${idx + 1}.md`, detail: longArgsPayload },
+            result: `[Step ${idx + 1}]\n${longResultPayload}`,
+            ok: idx !== 5,
+            error: idx === 5 ? 'Simulated tool failure on step #6' : undefined,
+            durationMs: 4 + idx,
+            startedAt: now - (12 - idx) * 100,
+        }));
+
+        const twoSteps = Array.from({ length: 2 }, (_, idx) => ({
+            stepIndex: idx,
+            toolCallId: `call_prev_${idx + 1}`,
+            toolName: idx === 0 ? 'read_variables' : 'patch_variables',
+            args: { path: '/state/variables.json' },
+            result: `prev_result_${idx + 1}`,
+            ok: true,
+            durationMs: 2,
+            startedAt: now - 20000 + idx * 50,
+        }));
+
+        const sampleTraces = [
+            {
+                runId: 'run_many',
+                target: { messageId: 12, swipeId: 0 },
+                phase: 'main_turn' as const,
+                agentProfileId: 'main',
+                agentName: 'Main Narrative',
+                connectionId: 'conn_1',
+                model: 'claude-sonnet-4.5',
+                status: 'completed' as const,
+                startedAt: now - 5000,
+                endedAt: now - 1000,
+                durationMs: 4000,
+                usage: {
+                    inputTokens: 12000,
+                    cachedTokens: 8200,
+                    outputTokens: 600,
+                    totalTokens: 12600,
+                    cacheHitRate: 0.683,
+                },
+                toolSteps: manySteps,
+                outputPreview: '最终生成正文预览。',
+            },
+            {
+                runId: 'run_prev',
+                target: { messageId: 11, swipeId: 0 },
+                phase: 'after_turn' as const,
+                agentProfileId: 'ag_vars',
+                agentName: '变量管家',
+                connectionId: 'conn_1',
+                model: 'gemini-2.5-flash',
+                status: 'completed' as const,
+                startedAt: now - 25000,
+                endedAt: now - 24500,
+                durationMs: 500,
+                usage: {
+                    inputTokens: 4000,
+                    cachedTokens: 3200,
+                    outputTokens: 120,
+                    totalTokens: 4120,
+                    cacheHitRate: 0.8,
+                },
+                toolSteps: twoSteps,
+            },
+        ];
+
+        // 1. Desktop (1280x800)
+        await page.viewport(1280, 800);
+        activeHarness = createHarness({ initialTab: 'logs', initialOpen: true });
+        activeHarness.store.setTraces(sampleTraces);
+        await settleLayout(5);
+
+        const { dialog, shadowRoot } = getShellElements();
+
+        const manyToggle = shadowRoot.querySelector(
+            '[data-log-steps-toggle="run_many"]',
+        ) as HTMLButtonElement | null;
+        const prevToggle = shadowRoot.querySelector(
+            '[data-log-steps-toggle="run_prev"]',
+        ) as HTMLButtonElement | null;
+        expect(manyToggle).toBeTruthy();
+        expect(prevToggle).toBeTruthy();
+        expect(manyToggle!.getAttribute('aria-expanded')).toBe('false');
+        expect(prevToggle!.getAttribute('aria-expanded')).toBe('false');
+        expect(manyToggle!.textContent).toContain('展开 12 个工具调用');
+        expect(manyToggle!.textContent).toContain('1 失败');
+        expect(prevToggle!.textContent).toContain('展开 2 个工具调用');
+        expect(shadowRoot.querySelector('[data-log-steps-list="run_many"]')).toBeNull();
+        expect(shadowRoot.querySelector('[data-log-steps-list="run_prev"]')).toBeNull();
+
+        assertNoHorizontalOverflow(dialog, shadowRoot, 'desktop:logs:collapsed');
+        assertInteractiveTargetsAndTypography(shadowRoot, 'desktop:logs:collapsed');
+
+        // Expand run_many tool steps
+        manyToggle!.click();
+        await settleLayout(4);
+
+        expect(manyToggle!.getAttribute('aria-expanded')).toBe('true');
+        expect(manyToggle!.textContent).toContain('收起工具调用 (12)');
+        const manyStepsList = shadowRoot.querySelector(
+            '[data-log-steps-list="run_many"]',
+        ) as HTMLDivElement | null;
+        expect(manyStepsList).toBeTruthy();
+        expect(manyStepsList!.querySelectorAll('.ag-log-step-item')).toHaveLength(12);
+
+        assertNoHorizontalOverflow(dialog, shadowRoot, 'desktop:logs:expanded');
+        assertInteractiveTargetsAndTypography(shadowRoot, 'desktop:logs:expanded');
+
+        // Click step #10 -> scrolls .ag-split-detail to step #10 card with focused highlight
+        const detailEl = shadowRoot.querySelector('.ag-split-detail') as HTMLDivElement;
+        expect(detailEl).toBeTruthy();
+        expect(detailEl.scrollHeight).toBeGreaterThan(detailEl.clientHeight);
+
+        const step10Btn = manyStepsList!.querySelector(
+            '[data-log-step-index="9"]',
+        ) as HTMLButtonElement;
+        expect(step10Btn).toBeTruthy();
+        step10Btn.click();
+
+        await vi.waitFor(
+            () => {
+                const card10 = shadowRoot.querySelector(
+                    '[data-log-step-card][data-log-step-index="9"]',
+                ) as HTMLDivElement | null;
+                expect(card10).toBeTruthy();
+                expect(card10!.classList.contains('ag-log-step-card-focused')).toBe(true);
+                expect(card10!.getAttribute('data-focused')).toBe('true');
+                expect(detailEl.scrollTop).toBeGreaterThan(0);
+
+                const detailRect = detailEl.getBoundingClientRect();
+                const cardRect = card10!.getBoundingClientRect();
+                expect(cardRect.top).toBeGreaterThanOrEqual(detailRect.top - 2);
+                expect(cardRect.top).toBeLessThan(detailRect.top + detailRect.height / 2);
+            },
+            { timeout: 2500 },
+        );
+
+        // Switch to 'raw' JSON tab, then click step #12 -> switches back to 'steps' & scrolls to step #12
+        const rawRadio = shadowRoot.querySelector(
+            '[role="radiogroup"][aria-label="日志详情视图"] [role="radio"]:nth-child(2)',
+        ) as HTMLButtonElement;
+        expect(rawRadio).toBeTruthy();
+        rawRadio.click();
+        await settleLayout(3);
+
+        const step12Btn = manyStepsList!.querySelector(
+            '[data-log-step-index="11"]',
+        ) as HTMLButtonElement;
+        expect(step12Btn).toBeTruthy();
+        step12Btn.click();
+
+        await vi.waitFor(
+            () => {
+                const card12 = shadowRoot.querySelector(
+                    '[data-log-step-card][data-log-step-index="11"]',
+                ) as HTMLDivElement | null;
+                expect(card12).toBeTruthy();
+                expect(card12!.classList.contains('ag-log-step-card-focused')).toBe(true);
+                expect(detailEl.scrollTop).toBeGreaterThan(0);
+
+                const detailRect = detailEl.getBoundingClientRect();
+                const cardRect = card12!.getBoundingClientRect();
+                expect(cardRect.top).toBeGreaterThanOrEqual(detailRect.top - 2);
+                expect(cardRect.top).toBeLessThan(detailRect.bottom - 24);
+            },
+            { timeout: 2500 },
+        );
+
+        await waitForScrollIdle(detailEl);
+
+        // Manually scroll back to top (after smooth scroll finishes), then re-click step #12 -> scrolls down again
+        detailEl.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
+        await waitForScrollIdle(detailEl);
+        expect(detailEl.scrollTop).toBe(0);
+        step12Btn.click();
+
+        await vi.waitFor(
+            () => {
+                const card12 = shadowRoot.querySelector(
+                    '[data-log-step-card][data-log-step-index="11"]',
+                ) as HTMLDivElement | null;
+                expect(card12).toBeTruthy();
+                expect(detailEl.scrollTop).toBeGreaterThan(0);
+                const detailRect = detailEl.getBoundingClientRect();
+                const cardRect = card12!.getBoundingClientRect();
+                expect(cardRect.top).toBeGreaterThanOrEqual(detailRect.top - 2);
+                expect(cardRect.top).toBeLessThan(detailRect.bottom - 24);
+            },
+            { timeout: 2500 },
+        );
+
+        // Click run header item -> scrolls detail pane back to top
+        const manyRunBtn = shadowRoot.querySelector(
+            '[data-log-run-item="run_many"]',
+        ) as HTMLButtonElement;
+        expect(manyRunBtn).toBeTruthy();
+        manyRunBtn.click();
+
+        await vi.waitFor(
+            () => {
+                expect(detailEl.scrollTop).toBeLessThanOrEqual(2);
+            },
+            { timeout: 2500 },
+        );
+
+        // Collapse run_many again
+        manyToggle!.click();
+        await settleLayout(3);
+        expect(manyToggle!.getAttribute('aria-expanded')).toBe('false');
+        expect(shadowRoot.querySelector('[data-log-steps-list="run_many"]')).toBeNull();
+
+        activeHarness.cleanup();
+        activeHarness = null;
+
+        // 2. Mobile (390x844)
+        await page.viewport(390, 844);
+        activeHarness = createHarness({ initialTab: 'logs', initialOpen: true });
+        activeHarness.store.setTraces(sampleTraces);
+        await settleLayout(5);
+
+        const { dialog: mobileDialog, shadowRoot: mobileShadow } = getShellElements();
+        const mobileToggle = mobileShadow.querySelector(
+            '[data-log-steps-toggle="run_many"]',
+        ) as HTMLButtonElement | null;
+        expect(mobileToggle).toBeTruthy();
+        expect(mobileToggle!.getAttribute('aria-expanded')).toBe('false');
+        expect(mobileShadow.querySelector('[data-log-steps-list="run_many"]')).toBeNull();
+
+        // Tap toggle expands in-place without pushing detail view
+        mobileToggle!.click();
+        await settleLayout(4);
+        expect(mobileToggle!.getAttribute('aria-expanded')).toBe('true');
+        expect(mobileShadow.querySelector('.ag-stack-back-btn')).toBeNull();
+        const mobileStepsList = mobileShadow.querySelector(
+            '[data-log-steps-list="run_many"]',
+        ) as HTMLDivElement | null;
+        expect(mobileStepsList).toBeTruthy();
+
+        assertNoHorizontalOverflow(mobileDialog, mobileShadow, 'mobile:logs:expanded');
+        assertInteractiveTargetsAndTypography(mobileShadow, 'mobile:logs:expanded');
+
+        // Tap step #10 -> pushes into detail view & scrolls .ag-stack-body to step #10
+        const mobileStep10Btn = mobileStepsList!.querySelector(
+            '[data-log-step-index="9"]',
+        ) as HTMLButtonElement;
+        expect(mobileStep10Btn).toBeTruthy();
+        mobileStep10Btn.click();
+        await settleLayout(4);
+
+        const backBtn = mobileShadow.querySelector('.ag-stack-back-btn') as HTMLButtonElement | null;
+        expect(backBtn).toBeTruthy();
+        expect(isElementVisible(backBtn!)).toBe(true);
+
+        const stackBody = mobileShadow.querySelector('.ag-stack-body') as HTMLDivElement;
+        expect(stackBody).toBeTruthy();
+
+        await vi.waitFor(
+            () => {
+                const card10 = mobileShadow.querySelector(
+                    '[data-log-step-card][data-log-step-index="9"]',
+                ) as HTMLDivElement | null;
+                expect(card10).toBeTruthy();
+                expect(card10!.classList.contains('ag-log-step-card-focused')).toBe(true);
+                expect(stackBody.scrollTop).toBeGreaterThan(0);
+
+                const bodyRect = stackBody.getBoundingClientRect();
+                const cardRect = card10!.getBoundingClientRect();
+                expect(cardRect.top).toBeGreaterThanOrEqual(bodyRect.top - 2);
+                expect(cardRect.top).toBeLessThan(bodyRect.bottom - 24);
+            },
+            { timeout: 2500 },
+        );
     });
 
     it('clips long text in <agentic-capsule> badges/tasks and FilesOverridesView list-item badges without horizontal overflow across desktop and mobile', async () => {

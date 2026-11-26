@@ -435,7 +435,12 @@ describe('prompt-block-renderer & config normalization', () => {
         });
         expect(turn1.layer0Messages.some((m) => m.content === 'Init turn 1')).toBe(true);
         expect(turn1.layer0Messages.some((m) => m.role === 'tool' && m.toolName === 'read_file')).toBe(true);
-        expect(turn1.layer2Messages[turn1.layer2Messages.length - 1]).toEqual({
+        expect(turn1.floatingTailMessages[turn1.floatingTailMessages.length - 1]).toEqual({
+            role: 'assistant',
+            content: 'Turn 1:',
+            extraFields: { partial: true },
+        });
+        expect(turn1.request.messages[turn1.request.messages.length - 1]).toEqual({
             role: 'assistant',
             content: 'Turn 1:',
             extraFields: { partial: true },
@@ -452,7 +457,7 @@ describe('prompt-block-renderer & config normalization', () => {
             vars: { turn: 2 },
         });
         expect(turn2.layer0Messages).toEqual(turn1.layer0Messages);
-        expect(turn2.layer2Messages[turn2.layer2Messages.length - 1]).toEqual({
+        expect(turn2.floatingTailMessages[turn2.floatingTailMessages.length - 1]).toEqual({
             role: 'assistant',
             content: 'Turn 2:',
             extraFields: { partial: true },
@@ -473,7 +478,9 @@ describe('prompt-block-renderer & config normalization', () => {
             userInput: 'Manual',
         });
         expect(manualAssembled.layer0Messages.some((m) => m.content === 'Init turn 99')).toBe(true);
-        expect(manualAssembled.layer2Messages[manualAssembled.layer2Messages.length - 1].content).toBe('Turn 99:');
+        expect(
+            manualAssembled.floatingTailMessages[manualAssembled.floatingTailMessages.length - 1].content,
+        ).toBe('Turn 99:');
     });
 
     it('normalizes strictToolLoop, roundMaxRetries, custom role, and preserves export/import compatibility', () => {

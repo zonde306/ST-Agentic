@@ -705,7 +705,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                     {/* Prompt List Card */}
                     <Card
                         title={`提示词 (${promptBlocks.length})`}
-                        subtitle="支持拖拽排序、独立开关与编辑；Prefix 进入 Layer 0 静态前缀缓存，Tail 追加至 Layer 2 当轮尾部"
+                        subtitle="支持拖拽排序、独立开关与编辑；Prefix 进入 Layer 0 静态前缀缓存，Tail 瞬态沉底（工具链夹在中间且不入历史）"
                         actions={
                             <div class="ag-row-wrap">
                                 <Button

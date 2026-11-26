@@ -9,8 +9,8 @@ export const PROMPT_PLACEMENT_OPTIONS: ReadonlyArray<{
     label: string;
 }> = [
     { value: 'prefix', label: 'Layer 0 Prefix (静态前缀缓存)' },
-    { value: 'tail', label: 'Layer 2 Tail (当轮尾部追加 · 固化入库)' },
-    { value: 'floating_tail', label: 'Floating Tail (瞬态沉底 · 上下文与工具链夹中间)' },
+    { value: 'tail', label: 'Tail (瞬态沉底 · 上下文与工具链夹中间)' },
+    { value: 'floating_tail', label: 'Floating Tail (瞬态沉底 · 兼容别名)' },
 ];
 
 /** Map a `PromptBlock['placement']` to its badge tone and short display label. */

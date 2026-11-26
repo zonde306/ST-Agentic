@@ -445,12 +445,14 @@ describe('AgentRunner strictToolLoop, Prefill folding & round auto-retry', () =>
                         ],
                     };
                 },
-                // Round 2: prefill placeholder popped & folded into assistant message; ZERO partial/prefix flags left!
+                // Round 2: prefill placeholder folded into assistant message & ZERO transient flags in history;
+                // floating prefill re-attached cleanly at the very end without leaving partial/prefix mid-history!
                 (req) => {
-                    const hasAnyTransientFlag = req.messages.some(
-                        (m) => m.extraFields?.partial === true || m.extraFields?.prefix === true,
-                    );
-                    expect(hasAnyTransientFlag).toBe(false);
+                    const hasAnyMidHistoryTransientFlag = req.messages
+                        .slice(0, -1)
+                        .some((m) => m.extraFields?.partial === true || m.extraFields?.prefix === true);
+                    expect(hasAnyMidHistoryTransientFlag).toBe(false);
+                    expect(req.messages[req.messages.length - 1].extraFields?.[flagKey]).toBe(true);
 
                     const assistantCallMsg = req.messages.find(
                         (m) => m.role === 'assistant' && Boolean(m.toolCalls?.length),
@@ -492,6 +494,10 @@ describe('AgentRunner strictToolLoop, Prefill folding & round auto-retry', () =>
             });
 
             expect(res.content).toBe(`已完成 ${flagKey} 折叠测试。`);
+            const stored = runner.trajectoryStore.getMessages('main');
+            expect(
+                stored.some((m) => m.extraFields?.partial === true || m.extraFields?.prefix === true),
+            ).toBe(false);
         }
     });
 

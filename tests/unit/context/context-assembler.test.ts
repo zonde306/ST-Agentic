@@ -158,11 +158,15 @@ describe('ContextAssembler', () => {
         expect(resA.stats.layer0EndIndex).toBe(3);
         expect(resA.cacheBreakpoints).toEqual([3]);
 
-        // Layer 2 contains user input + Category ④ dynamic_at_depth reminder + enabled tail block
-        expect(resA.layer2Messages).toHaveLength(2);
+        // Layer 2 contains user input + Category ④ dynamic_at_depth reminder; tail block floats transiently
+        expect(resA.layer2Messages).toHaveLength(1);
         expect(resA.layer2Messages[0].role).toBe('user');
         expect(resA.layer2Messages[0].content).toContain('【实时状态】');
-        expect(resA.layer2Messages[1]).toEqual({ role: 'system', content: '保持段落简洁。' });
+        expect(resA.floatingTailMessages).toEqual([{ role: 'system', content: '保持段落简洁。' }]);
+        expect(resA.request.messages[resA.request.messages.length - 1]).toEqual({
+            role: 'system',
+            content: '保持段落简洁。',
+        });
 
         // Verify seamless compatibility with Wave 1 PayloadCompiler (Anthropic explicit breakpoints)
         const compiler = new PayloadCompiler();
@@ -559,7 +563,7 @@ describe('ContextAssembler', () => {
         );
         expect(turn1.layer0Messages[1].content).toContain('SYS=CORE');
         expect(turn1.layer2Messages[0].content).not.toContain('DYN=');
-        expect(turn1.layer2Messages[1].content).toBe('tail_done');
+        expect(turn1.floatingTailMessages[0].content).toBe('tail_done');
 
         // Turn 2: outlet value changes -> Layer 0 automatically detects dirty fingerprint and recompiles
         const session2 = new LocalPromptInjectionSession();

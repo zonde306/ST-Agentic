@@ -409,10 +409,6 @@ export function formatSideBriefXml(clues: readonly SideClueDoc[]): string {
     return lines.join('\n');
 }
 
-/**
- * Whether `placement: 'tail'` PromptBlocks should float after `inFlightMessages` alongside
- * `floating_tail` (matching Workbench/SideGen behavior) instead of staying inside Layer 2.
- */
 const PRECOLLECT_EXCLUDED_DECORATORS = new Set([
     '@@system',
     '@@trigger',
@@ -506,10 +502,15 @@ function computePrefixDynamicFingerprint(
     return `${injectDigest}|${outletParts.join('\x02')}`;
 }
 
+/**
+ * Whether `placement: 'tail'` PromptBlocks float transiently after `layer2Messages` /
+ * `inFlightMessages` alongside `floating_tail` (unified across main, trigger, subagent,
+ * Workbench, and SideGen so tool chains are sandwiched before Tail and never persisted into Layer 1).
+ */
 export function shouldFloatTailPromptBlocks(
-    context?: PromptTriggerContext,
+    _context?: PromptTriggerContext,
 ): boolean {
-    return context?.kind === 'trigger' || context?.kind === 'subagent';
+    return true;
 }
 
 /**
@@ -519,7 +520,8 @@ export function shouldFloatTailPromptBlocks(
  * - **Layer 1 (Frozen Trajectory)**: immutable finalized turns (`persistent` via `TrajectoryStore`,
  *   or sliding `ephemeralWindowSize` recent turns for `ephemeral` agents).
  * - **Layer 2 (Tail-Only Dynamic Zone)**: current user input + `<turn-brief>` + Category ④ dynamic
- *   reminders + `<lore-hint>` + `tail` `PromptBlock`s.
+ *   reminders + `<lore-hint>` (plus transient `floatingTailMessages` for `tail` / `floating_tail`
+ *   `PromptBlock`s appended after `inFlightMessages` without persisting into Layer 1).
  */
 export class ContextAssembler {
     private readonly defaultSystemBase: string;
