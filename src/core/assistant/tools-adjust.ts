@@ -10,6 +10,7 @@ import {
     countLines,
     scopeToVariablesPath,
     utf8ByteLength,
+    VfsError,
     VfsNotFoundError,
 } from '@/core/vfs';
 import { computeDiffLines } from './approval';
@@ -421,19 +422,56 @@ export function createAdjustTools(): AssistantToolDefinition[] {
             const normalizedPath = assertAllowedAdjustPath(args.path);
             const snapshot = await captureVfsSnapshot(normalizedPath, ctx);
 
-            await ctx.vfs.writeFile(normalizedPath, args.content, {
-                target: ctx.target,
-                staged: false,
-                source: 'assistant:write_file',
-            });
+            try {
+                await ctx.vfs.writeFile(normalizedPath, args.content, {
+                    target: ctx.target,
+                    staged: false,
+                    source: 'assistant:write_file',
+                });
+            } catch (error) {
+                if (error instanceof VfsError) {
+                    return finalizeToolError(error.message, ctx.signal, {
+                        path: normalizedPath,
+                        code: error.code,
+                    });
+                }
+                throw error;
+            }
 
-            const undoId = recordVfsUndo(ctx, 'write_file', snapshot, args.content);
+            let unchanged = false;
+            let overridden: boolean | undefined;
+            if (normalizedPath.startsWith('/lorebooks/')) {
+                const afterStat = await ctx.vfs
+                    .stat(normalizedPath, { target: ctx.target, staged: false })
+                    .catch(() => null);
+                overridden = Boolean(afterStat?.overridden);
+                if (!snapshot.hadOverride && !overridden) {
+                    unchanged = true;
+                } else if (snapshot.hadOverride && overridden) {
+                    const afterRaw = await ctx.vfs
+                        .readFile(normalizedPath, { target: ctx.target, staged: false, raw: true })
+                        .catch(() => null);
+                    if (
+                        afterRaw !== null
+                        && snapshot.previousContent !== null
+                        && afterRaw.replace(/\r\n/g, '\n') === snapshot.previousContent.replace(/\r\n/g, '\n')
+                    ) {
+                        unchanged = true;
+                    }
+                }
+            }
+
+            const undoId = unchanged
+                ? undefined
+                : recordVfsUndo(ctx, 'write_file', snapshot, args.content);
             return finalizeMutationToolResult(
                 {
                     path: normalizedPath,
                     bytes: utf8ByteLength(args.content),
                     totalLines: countLines(args.content),
                     target: ctx.target,
+                    ...(unchanged ? { unchanged: true } : {}),
+                    ...(overridden !== undefined ? { overridden } : {}),
                 },
                 { undoId, fileRefs: [normalizedPath] },
             );
@@ -467,11 +505,21 @@ export function createAdjustTools(): AssistantToolDefinition[] {
             const normalizedPath = assertAllowedAdjustPath(args.path);
             const snapshot = await captureVfsSnapshot(normalizedPath, ctx);
 
-            await ctx.vfs.appendFile(normalizedPath, args.content, {
-                target: ctx.target,
-                staged: false,
-                source: 'assistant:append_file',
-            });
+            try {
+                await ctx.vfs.appendFile(normalizedPath, args.content, {
+                    target: ctx.target,
+                    staged: false,
+                    source: 'assistant:append_file',
+                });
+            } catch (error) {
+                if (error instanceof VfsError) {
+                    return finalizeToolError(error.message, ctx.signal, {
+                        path: normalizedPath,
+                        code: error.code,
+                    });
+                }
+                throw error;
+            }
 
             const afterContent = `${snapshot.previousContent ?? ''}${args.content}`;
             const undoId = recordVfsUndo(ctx, 'append_file', snapshot, afterContent);

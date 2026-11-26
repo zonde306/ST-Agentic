@@ -402,6 +402,57 @@ export function stripFrontmatter(content: string, entry: RawLoreEntry): string {
     return rest;
 }
 
+/** Normalize CRLF/LF line endings for World Info content comparisons. */
+export function normalizeWorldInfoLineEndings(text: string): string {
+    return text.replace(/\r\n/g, '\n');
+}
+
+/** Extract the clean base body (with leading decorators stripped and `@@@` unescaped) for a World Info entry. */
+export function getWorldInfoBaseBody(entry: Pick<RawLoreEntry, 'content' | 'decorators'>): string {
+    return unescapeAt(
+        stripLeadingDecorators(entry.content ?? '', entry.decorators).cleanContent,
+    );
+}
+
+/** Whether `candidateContent` matches the raw or decorator-stripped base content of a World Info entry. */
+export function isSameAsWorldInfoBaseContent(
+    candidateContent: string,
+    entry: Pick<RawLoreEntry, 'content' | 'decorators'>,
+): boolean {
+    const rawEntryContent = normalizeWorldInfoLineEndings(entry.content ?? '');
+    const baseBody = normalizeWorldInfoLineEndings(getWorldInfoBaseBody(entry));
+    const normCandidate = normalizeWorldInfoLineEndings(candidateContent);
+    const unescapedCandidate = normalizeWorldInfoLineEndings(unescapeAt(candidateContent));
+    return (
+        normCandidate === rawEntryContent
+        || unescapedCandidate === rawEntryContent
+        || normCandidate === baseBody
+        || unescapedCandidate === baseBody
+    );
+}
+
+/** Whether `candidateContent` matches the macro/EJS-evaluated rendering of an unmodified base entry. */
+export function matchesRenderedWorldInfoBase(
+    candidateContent: string,
+    renderedBase: string,
+    rawBaseBody: string,
+): boolean {
+    const normCandidate = normalizeWorldInfoLineEndings(candidateContent);
+    const normRendered = normalizeWorldInfoLineEndings(renderedBase);
+    if (normCandidate === normRendered) {
+        return true;
+    }
+    const trimmedCandidate = normCandidate.trim();
+    const trimmedRendered = normRendered.trim();
+    if (trimmedRendered.length > 0 && trimmedCandidate === trimmedRendered) {
+        return true;
+    }
+    if (trimmedRendered.length === 0 && trimmedCandidate.length === 0 && rawBaseBody.trim().length > 0) {
+        return true;
+    }
+    return false;
+}
+
 interface ResolvedLorePath {
     book: string;
     entries: RawLoreEntry[];
@@ -565,12 +616,44 @@ export class WorldInfoMount implements VfsMount {
 
         const { book, entry } = resolved;
         const normalizedEntry: RawLoreEntry = entry.world ? entry : { ...entry, world: book };
-        const body = escapeAt(stripFrontmatter(content, normalizedEntry));
+        const rawBody = stripFrontmatter(content, normalizedEntry);
+        const storedBody = escapeAt(rawBody);
+        const key = worldInfoKey(normalizedEntry.world, normalizedEntry.uid);
+        const canonicalPath = this.entryPath(book, normalizedEntry);
+        const existingOverride = this.readOverrideEntry(normalizedEntry, opts);
+
+        if (isSameAsWorldInfoBaseContent(rawBody, normalizedEntry)) {
+            if (existingOverride) {
+                this.store.erase(
+                    DATA_NAMESPACES.WORLDINFO,
+                    key,
+                    opts.source ?? 'vfs-restore',
+                    { target: opts.target, staged: opts.staged },
+                );
+            }
+            return;
+        }
+
+        if (
+            existingOverride
+            && normalizeWorldInfoLineEndings(existingOverride.content) === normalizeWorldInfoLineEndings(storedBody)
+        ) {
+            return;
+        }
+
+        if (await this.isRenderedOnlyUnmodifiedBase(normalizedEntry, canonicalPath, rawBody, opts)) {
+            throw new VfsError(
+                `Refused to create World Info override for "${canonicalPath}": written content matches the macro/EJS-evaluated rendering of the unmodified base entry with no explicit edit. Read the raw template source and apply only genuine modifications (prefer edit_file).`,
+                'EINVAL',
+                canonicalPath,
+            );
+        }
+
         this.store.set(
             DATA_NAMESPACES.WORLDINFO,
-            worldInfoKey(normalizedEntry.world, normalizedEntry.uid),
+            key,
             opts.source ?? 'vfs',
-            body,
+            storedBody,
             { target: opts.target, staged: opts.staged },
         );
     }
@@ -612,9 +695,45 @@ export class WorldInfoMount implements VfsMount {
         }
 
         const updatedBody = applied.updatedContent;
+        const key = worldInfoKey(normalizedEntry.world, normalizedEntry.uid);
+        const existingOverride = this.readOverrideEntry(normalizedEntry, opts);
+        if (normalizeWorldInfoLineEndings(updatedBody) === normalizeWorldInfoLineEndings(currentBody)) {
+            const unchangedDoc = withFrontmatter(normalizedEntry, currentBody);
+            return {
+                ok: true,
+                path: canonicalPath,
+                message: `No changes applied to ${canonicalPath}`,
+                replacements: 0,
+                changedRanges: [],
+                totalLines: countLines(unchangedDoc),
+                bytes: utf8ByteLength(unchangedDoc),
+            };
+        }
+
+        if (isSameAsWorldInfoBaseContent(updatedBody, normalizedEntry)) {
+            if (existingOverride) {
+                this.store.erase(
+                    DATA_NAMESPACES.WORLDINFO,
+                    key,
+                    opts.source ?? 'vfs-restore',
+                    { target: opts.target, staged: opts.staged },
+                );
+            }
+            const restoredDoc = withFrontmatter(normalizedEntry, updatedBody);
+            return {
+                ok: true,
+                path: canonicalPath,
+                message: `Restored base lorebook content for ${canonicalPath} (override cleared)`,
+                replacements: applied.replacements,
+                changedRanges: applied.changedRanges,
+                totalLines: countLines(restoredDoc),
+                bytes: utf8ByteLength(restoredDoc),
+            };
+        }
+
         this.store.set(
             DATA_NAMESPACES.WORLDINFO,
-            worldInfoKey(normalizedEntry.world, normalizedEntry.uid),
+            key,
             opts.source ?? 'vfs',
             escapeAt(updatedBody),
             { target: opts.target, staged: opts.staged },
@@ -762,6 +881,74 @@ export class WorldInfoMount implements VfsMount {
             return this.store.get(DATA_NAMESPACES.WORLDINFO, key, { target: opts.target });
         }
         return this.store.getPending(DATA_NAMESPACES.WORLDINFO, key, { target: opts?.target });
+    }
+
+    private async isRenderedOnlyUnmodifiedBase(
+        normalizedEntry: RawLoreEntry,
+        canonicalPath: string,
+        candidateBody: string,
+        opts: VfsWriteOptions,
+    ): Promise<boolean> {
+        if (opts.source === 'assistant:undo') {
+            return false;
+        }
+        const baseBody = getWorldInfoBaseBody(normalizedEntry);
+        if (!baseBody.includes('{{') && !baseBody.includes('<%')) {
+            return false;
+        }
+
+        if (baseBody.includes('{{')) {
+            try {
+                const macroOnly = this.bridge.substituteMacros(baseBody);
+                if (matchesRenderedWorldInfoBase(candidateBody, macroOnly, baseBody)) {
+                    return true;
+                }
+            } catch {
+                // Ignore macro evaluation errors during write guard.
+            }
+        }
+
+        if (this.loreReadHook) {
+            try {
+                const rendered = await this.loreReadHook({
+                    world: normalizedEntry.world,
+                    uid: normalizedEntry.uid,
+                    path: canonicalPath,
+                    comment: normalizedEntry.comment ?? '',
+                    target: opts.target,
+                    rawContent: baseBody,
+                    overriddenContent: undefined,
+                    editable: false,
+                    writable: false,
+                    dryRun: true,
+                });
+                if (matchesRenderedWorldInfoBase(candidateBody, rendered, baseBody)) {
+                    return true;
+                }
+            } catch {
+                // Ignore hook evaluation errors during write guard.
+            }
+        }
+
+        if (this.defaultTemplateEvaluator) {
+            try {
+                const rendered = await this.defaultTemplateEvaluator(baseBody, {
+                    target: opts.target,
+                    staged: opts.staged,
+                    path: canonicalPath,
+                    mount: LOREBOOK_MOUNT,
+                    editable: false,
+                    writable: false,
+                });
+                if (matchesRenderedWorldInfoBase(candidateBody, rendered, baseBody)) {
+                    return true;
+                }
+            } catch {
+                // Ignore template evaluation errors during write guard.
+            }
+        }
+
+        return false;
     }
 
     private currentStoredBody(entry: RawLoreEntry, opts?: VfsTargetOptions): string {

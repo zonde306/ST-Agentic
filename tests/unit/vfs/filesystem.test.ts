@@ -683,4 +683,143 @@ describe('VirtualFileSystem', () => {
         expect(await vfs.readFile('/history/chunk-001.md', { target })).toBe('归档：{{user}} <% raw %>');
         expect(await vfs.readFile('/side/notes/clue.md', { target, staged: false })).toContain('线外：{{user}} <% raw %>');
     });
+
+    it('restricts /lorebooks/* worldinfo overrides to genuine modifications and preserves macros/regex on editable reads', async () => {
+        const bridge = new MemoryHostBridge({
+            identity: {
+                userName: '沈默',
+                charName: '林晚',
+                characterAvatar: 'linwan.png',
+                personaAvatar: 'shenmo.png',
+            },
+            lorebooks: {
+                TemplateBook: [
+                    {
+                        world: 'TemplateBook',
+                        uid: 11,
+                        comment: '插画规则',
+                        content:
+                            '@@depth 4\n<%_ if (!vars.inBattle) { _%>\n---\n<插图规则>\n角色：{{char}} / {{user}}\n<%_ } _%>',
+                        keys: ['插图'],
+                        keysecondary: [],
+                        constant: true,
+                        selective: false,
+                        disable: false,
+                        position: 4,
+                        depth: 4,
+                        order: 100,
+                        role: 0,
+                    },
+                ],
+            },
+            ejsEvaluator: async (text, vars) => {
+                if (vars.inBattle) {
+                    return '';
+                }
+                return text
+                    .replace(/<%_\s*if \(!vars\.inBattle\) \{\s*_%>\n?/g, '')
+                    .replace(/\n?<%_\s*\}\s*_%>/g, '');
+            },
+        });
+        bridge.pushMessage({ name: 'User', isUser: true, mes: 'hi' });
+        bridge.pushMessage({ name: 'Assistant', isUser: false, mes: 'hello' });
+        bridge.setVariable('inBattle', false);
+
+        const { LoreReadEvaluator } = await import('@/core/lore');
+        const loreEval = new LoreReadEvaluator(bridge, {
+            applyLoreReadRegex: (text) => text.replace('角色：', 'REGEX_角色：'),
+        });
+        const vfs = new VirtualFileSystem({
+            bridge,
+            loreReadHook: loreEval.toLoreReadHook(),
+        });
+        const target = { messageId: 1, swipeId: 0 };
+        const lorePath = '/lorebooks/TemplateBook/插画规则-11.md';
+
+        // 1. Editable read preserves raw macros, EJS tags, and skips lore_read regex
+        const editableDoc = await vfs.readFile(lorePath, {
+            target,
+            staged: false,
+            editable: true,
+            writable: true,
+        });
+        expect(editableDoc).toContain('{{char}} / {{user}}');
+        expect(editableDoc).toContain('<%_ if (!vars.inBattle) { _%>');
+        expect(editableDoc).not.toContain('REGEX_角色：');
+
+        // Read-only read evaluates macros, EJS, and regex
+        const renderedDoc = await vfs.readFile(lorePath, {
+            target,
+            staged: false,
+            editable: false,
+        });
+        expect(renderedDoc).toContain('REGEX_角色：林晚 / 沈默');
+        expect(renderedDoc).not.toContain('<%_');
+
+        // 2. Writing base-identical (decorator-stripped or full raw) content creates NO override
+        const baseCleanBody =
+            '<%_ if (!vars.inBattle) { _%>\n---\n<插图规则>\n角色：{{char}} / {{user}}\n<%_ } _%>';
+        await vfs.writeFile(lorePath, baseCleanBody, { target, staged: false });
+        expect(vfs.store.get('worldinfo', 'TemplateBook/11', { target })).toBeNull();
+
+        // 3. Writing macro/EJS-evaluated rendering (both pre-regex and post-regex) of unmodified base entry is rejected
+        const renderedOnlyBody = '---\n<插图规则>\n角色：林晚 / 沈默';
+        await expect(
+            vfs.writeFile(lorePath, renderedOnlyBody, { target, staged: false }),
+        ).rejects.toMatchObject({ code: 'EINVAL' });
+        expect(vfs.store.get('worldinfo', 'TemplateBook/11', { target })).toBeNull();
+
+        const renderedWithRegexBody = '---\n<插图规则>\nREGEX_角色：林晚 / 沈默';
+        await expect(
+            vfs.writeFile(lorePath, renderedWithRegexBody, { target, staged: false }),
+        ).rejects.toMatchObject({ code: 'EINVAL' });
+        expect(vfs.store.get('worldinfo', 'TemplateBook/11', { target })).toBeNull();
+
+        // Also reject macro-only rendering before EJS/regex if it matches substituteMacros(baseBody)
+        const macroOnlyRenderedBody =
+            '<%_ if (!vars.inBattle) { _%>\n---\n<插图规则>\n角色：林晚 / 沈默\n<%_ } _%>';
+        await expect(
+            vfs.writeFile(lorePath, macroOnlyRenderedBody, { target, staged: false }),
+        ).rejects.toMatchObject({ code: 'EINVAL' });
+        expect(vfs.store.get('worldinfo', 'TemplateBook/11', { target })).toBeNull();
+
+        // 4. No-op editFile does not create an override
+        const noopEdit = await vfs.editFile(lorePath, '<插图规则>', '<插图规则>', {
+            target,
+            staged: false,
+        });
+        expect(noopEdit.ok).toBe(true);
+        expect(noopEdit.replacements).toBe(0);
+        expect(vfs.store.get('worldinfo', 'TemplateBook/11', { target })).toBeNull();
+
+        // 5. Genuine modification succeeds and creates override
+        await vfs.writeFile(lorePath, '---\n<插图规则>\n角色：林晚 / 沈默\n补充：新增规则', {
+            target,
+            staged: false,
+        });
+        expect(vfs.store.get('worldinfo', 'TemplateBook/11', { target })?.content).toContain(
+            '补充：新增规则',
+        );
+
+        // 6. Writing base-identical content clears existing override
+        await vfs.writeFile(lorePath, baseCleanBody, { target, staged: false });
+        expect(vfs.store.get('worldinfo', 'TemplateBook/11', { target })).toBeNull();
+
+        // 7. Genuine editFile creates override, and editFile back to base clears it
+        const genuineEdit = await vfs.editFile(lorePath, '<插图规则>', '<插图规则-已改>', {
+            target,
+            staged: false,
+        });
+        expect(genuineEdit.ok).toBe(true);
+        expect(vfs.store.get('worldinfo', 'TemplateBook/11', { target })?.content).toContain(
+            '<插图规则-已改>',
+        );
+
+        const revertEdit = await vfs.editFile(lorePath, '<插图规则-已改>', '<插图规则>', {
+            target,
+            staged: false,
+        });
+        expect(revertEdit.ok).toBe(true);
+        expect(vfs.store.get('worldinfo', 'TemplateBook/11', { target })).toBeNull();
+    });
 });

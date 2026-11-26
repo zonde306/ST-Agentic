@@ -912,12 +912,17 @@ export class VirtualFileSystem {
             ...messageVars,
         };
 
+        const editable = Boolean(opts?.editable);
+        const writable = Boolean(opts?.writable);
+
         const macroOverrides: Record<string, string> = {};
-        for (const [k, v] of Object.entries(effectiveVars)) {
-            macroOverrides[`var:${k}`] = stringifyMacroVar(v);
+        if (!editable) {
+            for (const [k, v] of Object.entries(effectiveVars)) {
+                macroOverrides[`var:${k}`] = stringifyMacroVar(v);
+            }
         }
 
-        const workingText = rawText.includes('{{')
+        const workingText = !editable && rawText.includes('{{')
             ? this.bridge.substituteMacros(
                 rawText,
                 Object.keys(macroOverrides).length > 0 ? macroOverrides : undefined,
@@ -928,8 +933,6 @@ export class VirtualFileSystem {
             return workingText;
         }
 
-        const editable = Boolean(opts?.editable);
-        const writable = Boolean(opts?.writable);
         const path = opts?.path ?? '';
         const mount = opts?.mount ?? '';
         const effectiveTarget: MessageTarget | undefined =

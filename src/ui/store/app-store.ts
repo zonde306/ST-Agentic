@@ -238,6 +238,7 @@ export interface FileOverrideItem {
     content: string;
     baseContent?: string;
     overridden: boolean;
+    renderedOnlyOverride?: boolean;
     writable: boolean;
 }
 

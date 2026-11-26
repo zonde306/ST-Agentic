@@ -178,4 +178,17 @@ describe('FilesOverridesView worldinfo filtering', () => {
         );
         expect(fallbackToLatest.map((item) => item.id)).toEqual(['variables:vars', 'output:2#1']);
     });
+
+    it('preserves renderedOnlyOverride flag on worldinfo override items for UI warning and batch cleanup', () => {
+        const renderedOnlyItem = makeItem({
+            id: 'worldinfo:Book/rendered',
+            overridden: true,
+            renderedOnlyOverride: true,
+            content: '---\n<插图规则>\n角色：林晚',
+            baseContent: '<%_ if (true) { _%>\n---\n<插图规则>\n角色：{{char}}\n<%_ } _%>',
+        });
+        const visible = filterVisibleFileOverrideItems([renderedOnlyItem]);
+        expect(visible).toHaveLength(1);
+        expect(visible[0].renderedOnlyOverride).toBe(true);
+    });
 });

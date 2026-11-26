@@ -805,6 +805,53 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
         });
     };
 
+    const worldinfoOverrideItems = useMemo(
+        () => filteredItems.filter((item) => item.category === 'worldinfo' && item.overridden && item.writable),
+        [filteredItems],
+    );
+
+    const handleBatchRestoreWorldInfo = () => {
+        if (worldinfoOverrideItems.length === 0 || saving) {
+            return;
+        }
+        const targets = [...worldinfoOverrideItems];
+        const renderedOnlyCount = targets.filter((item) => item.renderedOnlyOverride).length;
+        store.openModal({
+            kind: 'confirm',
+            title: '确认批量恢复世界书原书',
+            message: `确定清除当前列表中 ${targets.length} 条世界书覆写${
+                renderedOnlyCount > 0 ? `（其中 ${renderedOnlyCount} 条仅包含宏/EJS求值结果）` : ''
+            }并恢复原书内容吗？`,
+            confirmLabel: '批量恢复原书',
+            cancelLabel: '取消',
+            tone: 'danger',
+            onConfirm: async () => {
+                setSaving(true);
+                try {
+                    let cleared = 0;
+                    for (const targetItem of targets) {
+                        await store.services.deleteFileOrOverride({
+                            path: targetItem.path,
+                            namespace: targetItem.namespace,
+                            key: targetItem.key,
+                            target: targetItem.target,
+                            storageScope: targetItem.storageScope,
+                        });
+                        cleared += 1;
+                    }
+                    await loadFiles(scopeByTarget ? effectiveTarget : undefined);
+                    setDetailOpen(false);
+                    store.pushToast(`已批量清除 ${cleared} 条世界书覆写并恢复原书`, 'warning');
+                } catch (error) {
+                    const msg = error instanceof Error ? error.message : String(error);
+                    store.pushToast(`批量恢复失败：${msg}`, 'error');
+                } finally {
+                    setSaving(false);
+                }
+            },
+        });
+    };
+
     const previewResolvedCreate = useMemo(
         () => resolveTargetPathAndScope(createScope, newRelPath, newBranchWide),
         [createScope, newBranchWide, newRelPath],
@@ -923,6 +970,18 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                 >
                     导出包
                 </Button>
+                {worldinfoOverrideItems.length > 0 ? (
+                    <Button
+                        size="sm"
+                        variant="danger"
+                        icon={<IconTrash size={14} />}
+                        loading={saving}
+                        title="批量清除当前列表中的世界书分支覆写并恢复原书"
+                        onClick={handleBatchRestoreWorldInfo}
+                    >
+                        批量恢复 WI 原书 ({worldinfoOverrideItems.length})
+                    </Button>
+                ) : null}
             </div>
 
             {dragActive ? (
@@ -1014,6 +1073,11 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                                                 <Badge tone="primary">定位</Badge>
                                             </span>
                                         ) : null}
+                                        {item.renderedOnlyOverride ? (
+                                            <span style={{ flexShrink: 0 }}>
+                                                <Badge tone="warning">仅宏/EJS渲染</Badge>
+                                            </span>
+                                        ) : null}
                                         <Badge tone={item.overridden ? 'success' : 'neutral'} title={item.layerLabel}>
                                             {item.layerLabel}
                                         </Badge>
@@ -1057,6 +1121,9 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                             <Badge tone={selectedItem.overridden ? 'success' : 'neutral'}>
                                 {selectedItem.overridden ? '已覆写' : '基线原文'}
                             </Badge>
+                            {selectedItem.renderedOnlyOverride ? (
+                                <Badge tone="warning">仅宏/EJS渲染</Badge>
+                            ) : null}
                             {hasUnsavedChanges ? (
                                 <Badge tone="warning">未保存修改</Badge>
                             ) : null}
@@ -1128,6 +1195,14 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                         <Badge tone="neutral">只读层</Badge>
                     ) : null}
                 </div>
+                {selectedItem.renderedOnlyOverride ? (
+                    <div
+                        class="ag-banner ag-banner-warning"
+                        style={{ margin: '0 14px 12px 14px', fontSize: '12px' }}
+                    >
+                        该历史覆写的内容仅等于原书经过宏/EJS求值后的静态快照，没有实质内容改动；继续保留会冻结原书中的动态模板逻辑，建议点击“恢复原书”。
+                    </div>
+                ) : null}
             </div>
 
             {viewMode === 'edit' ? (

@@ -316,21 +316,26 @@ export class LoreReadEvaluator {
             }
         }
 
+        const preserveRawForEdit = Boolean(callOptions?.editable);
         const macroOverrides: Record<string, string> = {};
-        if (callOptions?.vars) {
-            for (const [k, v] of Object.entries(callOptions.vars)) {
-                macroOverrides[`var:${k}`] = stringifyMacroVar(v);
+        if (!preserveRawForEdit) {
+            if (callOptions?.vars) {
+                for (const [k, v] of Object.entries(callOptions.vars)) {
+                    macroOverrides[`var:${k}`] = stringifyMacroVar(v);
+                }
             }
-        }
-        if (callOptions?.macroOverrides) {
-            Object.assign(macroOverrides, callOptions.macroOverrides);
+            if (callOptions?.macroOverrides) {
+                Object.assign(macroOverrides, callOptions.macroOverrides);
+            }
         }
 
         const hasMacroOverrides = Object.keys(macroOverrides).length > 0;
-        let workingText = this.hostBridge.substituteMacros(
-            initialText,
-            hasMacroOverrides ? macroOverrides : undefined,
-        );
+        let workingText = preserveRawForEdit
+            ? initialText
+            : this.hostBridge.substituteMacros(
+                initialText,
+                hasMacroOverrides ? macroOverrides : undefined,
+            );
 
         let ejsEvaluated = false;
         let ejsError: string | undefined;
@@ -393,7 +398,7 @@ export class LoreReadEvaluator {
         }
 
         const regexCallback = callOptions?.applyLoreReadRegex ?? this.options.applyLoreReadRegex;
-        if (regexCallback) {
+        if (regexCallback && !preserveRawForEdit) {
             workingText = await regexCallback(workingText, { world, uid, path });
         }
 

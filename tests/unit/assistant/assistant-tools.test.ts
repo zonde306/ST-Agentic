@@ -1147,5 +1147,72 @@ describe('Assistant 4-Tier Toolsets (TS2.1)', () => {
                 }),
             ).toBe('计划：{{char}} / <%= vars.trust %>');
         });
+
+        it('rejects assistant write_file on /lorebooks/* when content is only macro/EJS rendered output and skips undo on base-identical no-ops', async () => {
+            const { bridge, store, undoStore, ctx, allTools } = setupToolEnv({
+                mode: 'adjust',
+                stAdminEnabled: false,
+            });
+            bridge.lorebooks.set('MainBook', [
+                {
+                    world: 'MainBook',
+                    uid: 22,
+                    comment: 'Illus Rule',
+                    content: '<%_ if (true) { _%>\n---\n角色：{{char}} / {{user}} / <%= vars.trust %>\n<%_ } _%>',
+                    keys: ['插图'],
+                    keysecondary: [],
+                    constant: true,
+                    selective: false,
+                    disable: false,
+                    position: 0,
+                    depth: 4,
+                    order: 20,
+                    role: 0,
+                },
+            ]);
+            bridge.setVariable('trust', 88);
+            bridge.setEjsEvaluator(async (text, vars) =>
+                text
+                    .replace(/<%_\s*if \(true\) \{\s*_%>\n?/g, '')
+                    .replace(/\n?<%_\s*\}\s*_%>/g, '')
+                    .replace(/<%=\s*vars\.trust\s*%>/g, String(vars.trust ?? '')),
+            );
+            const loreEval = new LoreReadEvaluator(bridge);
+            const vfsWithHook = new VirtualFileSystem({
+                bridge,
+                store,
+                loreReadHook: loreEval.toLoreReadHook(),
+            });
+            ctx.vfs = vfsWithHook;
+
+            const writeFile = allTools.get('write_file')!;
+            const lorePath = '/lorebooks/MainBook/Illus-Rule-22.md';
+
+            // 1. Rendered-only write is rejected cleanly with EINVAL and leaves store untouched
+            const renderedWrite = await executeAssistantTool(
+                writeFile,
+                { path: lorePath, content: '---\n角色：林晚 / 调查员 / 88' },
+                ctx,
+            );
+            expect(renderedWrite.ok).toBe(false);
+            expect((renderedWrite.data as { code?: string }).code).toBe('EINVAL');
+            expect(store.get(DATA_NAMESPACES.WORLDINFO, worldInfoKey('MainBook', 22), { target: ctx.target })).toBeNull();
+
+            // 2. Base-identical write produces no override and no spurious UndoRecord
+            const baseWrite = await executeAssistantTool(
+                writeFile,
+                {
+                    path: lorePath,
+                    content: '<%_ if (true) { _%>\n---\n角色：{{char}} / {{user}} / <%= vars.trust %>\n<%_ } _%>',
+                },
+                ctx,
+            );
+            expect(baseWrite.ok).toBe(true);
+            expect((baseWrite.data as { unchanged?: boolean }).unchanged).toBe(true);
+            expect((baseWrite.data as { overridden?: boolean }).overridden).toBe(false);
+            expect(baseWrite.undoId).toBeUndefined();
+            expect(undoStore.list().length).toBe(0);
+            expect(store.get(DATA_NAMESPACES.WORLDINFO, worldInfoKey('MainBook', 22), { target: ctx.target })).toBeNull();
+        });
     });
 });

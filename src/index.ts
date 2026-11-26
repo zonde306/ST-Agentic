@@ -96,9 +96,14 @@ import {
     GLOBAL_VFS_EXTENSION_KEY,
     OUTPUT_FILE_PATH,
     VirtualFileSystem,
+    escapeAt,
+    getWorldInfoBaseBody,
     isChatBaseWorkspacePath,
     isInstructionDocPath,
     isInstructionIndexPath,
+    isSameAsWorldInfoBaseContent,
+    matchesRenderedWorldInfoBase,
+    stripFrontmatter,
     unescapeAt,
 } from '@/core/vfs';
 import type { AgenticAssistantPublicApi, AgenticPublicApi } from '@/globals';
@@ -495,14 +500,53 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
         summaryMode,
     });
 
-    const normalizeLineEndings = (text: string): string => text.replace(/\r\n/g, '\n');
-
-    const isSameAsWorldInfoBase = (overrideContent: string, baseContent: string): boolean => {
-        const normBase = normalizeLineEndings(baseContent);
-        return (
-            normalizeLineEndings(overrideContent) === normBase
-            || normalizeLineEndings(unescapeAt(overrideContent)) === normBase
-        );
+    const isWorldInfoRenderedOnlyOverride = async (
+        candidateContent: string,
+        rawEntry: RawLoreEntry,
+        evalTarget: MessageTarget,
+    ): Promise<boolean> => {
+        const baseBody = getWorldInfoBaseBody(rawEntry);
+        if (!baseBody.includes('{{') && !baseBody.includes('<%')) {
+            return false;
+        }
+        const candidateBody = unescapeAt(candidateContent);
+        if (baseBody.includes('{{')) {
+            try {
+                const macroOnly = bridge.substituteMacros(baseBody);
+                if (matchesRenderedWorldInfoBase(candidateBody, macroOnly, baseBody)) {
+                    return true;
+                }
+            } catch {
+                // Ignore macro evaluation errors while inspecting WI overrides.
+            }
+        }
+        try {
+            const context = {
+                world: rawEntry.world,
+                uid: rawEntry.uid,
+                path: buildLoreVfsPath(rawEntry),
+                comment: rawEntry.comment ?? '',
+                target: evalTarget,
+                rawContent: baseBody,
+                overriddenContent: undefined,
+                editable: false,
+                writable: false,
+                dryRun: true,
+            };
+            const evaluated = await orchestrator.loreReadEvaluator.evaluateFromContext(context);
+            if (matchesRenderedWorldInfoBase(candidateBody, evaluated.text, baseBody)) {
+                return true;
+            }
+            const evaluatedNoRegex = await orchestrator.loreReadEvaluator.evaluateFromContext(context, {
+                applyLoreReadRegex: (text) => text,
+            });
+            if (matchesRenderedWorldInfoBase(candidateBody, evaluatedNoRegex.text, baseBody)) {
+                return true;
+            }
+        } catch {
+            // Ignore EJS evaluation errors while inspecting WI overrides.
+        }
+        return false;
     };
 
     const listFilesAndOverrides = async (targetInput?: MessageTarget): Promise<FileOverrideItem[]> => {
@@ -701,10 +745,19 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                     }
                     seenWiKeys.add(wiKey);
                     const baseContent = rawEntry.content ?? '';
-                    if (isSameAsWorldInfoBase(overrideRow.entry.content, baseContent)) {
+                    if (isSameAsWorldInfoBaseContent(overrideRow.entry.content, rawEntry)) {
                         continue;
                     }
                     const wiPath = buildLoreVfsPath(rawEntry);
+                    const itemTarget =
+                        overrideRow.messageId >= 0
+                            ? { messageId: overrideRow.messageId, swipeId: overrideRow.swipeId }
+                            : target;
+                    const renderedOnlyOverride = await isWorldInfoRenderedOnlyOverride(
+                        overrideRow.entry.content,
+                        rawEntry,
+                        itemTarget,
+                    );
 
                     items.push({
                         id: `worldinfo:${wiKey}`,
@@ -712,10 +765,7 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                         namespace: DATA_NAMESPACES.WORLDINFO,
                         path: wiPath,
                         key: wiKey,
-                        target:
-                            overrideRow.messageId >= 0
-                                ? { messageId: overrideRow.messageId, swipeId: overrideRow.swipeId }
-                                : target,
+                        target: itemTarget,
                         layerLabel: formatLayerLabel(
                             overrideRow.messageId,
                             overrideRow.swipeId,
@@ -726,6 +776,7 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                         baseContent,
                         overridden: true,
                         writable: true,
+                        ...(renderedOnlyOverride ? { renderedOnlyOverride: true } : {}),
                     });
                 }
             }
@@ -1029,6 +1080,91 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             }
 
             const cleanKey = normalizeKeyForNamespace(input.namespace, input.key, normalizedPath);
+            if (input.namespace === DATA_NAMESPACES.WORLDINFO) {
+                const lorebooks = await bridge.listEnabledLorebooks();
+                let matchedEntry: RawLoreEntry | undefined;
+                for (const [worldName, entries] of lorebooks.entries()) {
+                    for (const entry of entries) {
+                        const rawEntry = entry.world ? entry : { ...entry, world: worldName };
+                        if (worldInfoKey(rawEntry.world, rawEntry.uid) === cleanKey) {
+                            matchedEntry = rawEntry;
+                            break;
+                        }
+                    }
+                    if (matchedEntry) {
+                        break;
+                    }
+                }
+
+                if (matchedEntry) {
+                    const cleanBody = stripFrontmatter(input.content, matchedEntry);
+                    if (isSameAsWorldInfoBaseContent(cleanBody, matchedEntry)) {
+                        store.remove(DATA_NAMESPACES.WORLDINFO, cleanKey, target);
+                        if (store.get(DATA_NAMESPACES.WORLDINFO, cleanKey, { target }) !== null) {
+                            store.erase(DATA_NAMESPACES.WORLDINFO, cleanKey, 'ui-restore', { target });
+                        }
+                        await saveMetadata();
+                        return {
+                            id: `${input.namespace}:${cleanKey}`,
+                            category: 'worldinfo',
+                            storageScope: 'chat_branch',
+                            namespace: DATA_NAMESPACES.WORLDINFO,
+                            path: normalizedPath,
+                            key: cleanKey,
+                            target,
+                            layerLabel: formatLayerLabel(target.messageId, target.swipeId),
+                            source: 'ui-edit',
+                            content: cleanBody,
+                            baseContent: matchedEntry.content ?? '',
+                            overridden: false,
+                            writable: true,
+                        };
+                    }
+
+                    if (await isWorldInfoRenderedOnlyOverride(cleanBody, matchedEntry, target)) {
+                        throw new Error(
+                            '写入内容仅与原书宏/EJS求值结果一致，未包含实际修改；若需恢复原书请点击“恢复原书”。',
+                        );
+                    }
+
+                    store.set(
+                        DATA_NAMESPACES.WORLDINFO,
+                        cleanKey,
+                        'ui-edit',
+                        escapeAt(cleanBody),
+                        { target },
+                    );
+                    await saveMetadata();
+
+                    const refreshed = await listFilesAndOverrides(target);
+                    const matched = refreshed.find(
+                        (item) =>
+                            item.namespace === DATA_NAMESPACES.WORLDINFO
+                            && item.key === cleanKey
+                            && item.target.messageId === target.messageId
+                            && item.target.swipeId === target.swipeId,
+                    );
+                    if (matched) {
+                        return matched;
+                    }
+                    return {
+                        id: `${input.namespace}:${cleanKey}`,
+                        category: 'worldinfo',
+                        storageScope: 'chat_branch',
+                        namespace: DATA_NAMESPACES.WORLDINFO,
+                        path: normalizedPath,
+                        key: cleanKey,
+                        target,
+                        layerLabel: formatLayerLabel(target.messageId, target.swipeId),
+                        source: 'ui-edit',
+                        content: escapeAt(cleanBody),
+                        baseContent: matchedEntry.content ?? '',
+                        overridden: true,
+                        writable: true,
+                    };
+                }
+            }
+
             const isBaseScope =
                 input.namespace === DATA_NAMESPACES.FILES
                 && (input.storageScope === 'chat_base' || isChatBaseWorkspacePath(normalizedPath));
@@ -1054,24 +1190,6 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             if (matched) {
                 return matched;
             }
-            let wiBaseContent: string | undefined;
-            let wiMatchesBase = false;
-            if (input.namespace === DATA_NAMESPACES.WORLDINFO) {
-                const lorebooks = await bridge.listEnabledLorebooks();
-                for (const [worldName, entries] of lorebooks.entries()) {
-                    for (const entry of entries) {
-                        const rawEntry = entry.world ? entry : { ...entry, world: worldName };
-                        if (worldInfoKey(rawEntry.world, rawEntry.uid) === cleanKey) {
-                            wiBaseContent = rawEntry.content ?? '';
-                            wiMatchesBase = isSameAsWorldInfoBase(input.content, wiBaseContent);
-                            break;
-                        }
-                    }
-                    if (wiBaseContent !== undefined) {
-                        break;
-                    }
-                }
-            }
             const isSpec = isInstructionIndexPath(`/${cleanKey}`) || isInstructionDocPath(`/${cleanKey}`);
             return {
                 id: `${input.namespace}:${cleanKey}`,
@@ -1093,8 +1211,7 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                     : formatLayerLabel(target.messageId, target.swipeId),
                 source: 'ui-edit',
                 content: input.content,
-                ...(wiBaseContent !== undefined ? { baseContent: wiBaseContent } : {}),
-                overridden: input.namespace === DATA_NAMESPACES.WORLDINFO ? !wiMatchesBase : !isBaseScope,
+                overridden: !isBaseScope,
                 writable: true,
             };
         },
@@ -1191,10 +1308,10 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
 
             const removed = store.remove(input.namespace, cleanKey, target);
             if (
-                input.namespace === DATA_NAMESPACES.FILES
-                && (!removed || store.get(DATA_NAMESPACES.FILES, cleanKey, { target }) !== null)
+                (input.namespace === DATA_NAMESPACES.FILES || input.namespace === DATA_NAMESPACES.WORLDINFO)
+                && (!removed || store.get(input.namespace, cleanKey, { target }) !== null)
             ) {
-                store.erase(DATA_NAMESPACES.FILES, cleanKey, 'ui-delete', { target });
+                store.erase(input.namespace, cleanKey, 'ui-delete', { target });
             }
 
             await saveMetadata();
