@@ -325,7 +325,9 @@ export class StreamRenderer {
                 : ((msg.swipe_info = [{}]) as Array<Record<string, unknown>>);
 
             const targetSwipeId =
-                typeof msg.swipe_id === 'number' ? msg.swipe_id : swipes.length;
+                typeof msg.swipe_id === 'number' && msg.swipe_id >= 0
+                    ? msg.swipe_id
+                    : swipes.length;
             const prevSwipeId =
                 explicitPreviousSwipeId !== undefined
                     ? explicitPreviousSwipeId
@@ -348,6 +350,14 @@ export class StreamRenderer {
                 swipeInfo.push({});
             }
 
+            const msgExtra = ((msg.extra ??= {}) as Record<string, unknown>);
+            delete msgExtra.display_text;
+            delete msgExtra.reasoning;
+            delete msgExtra.reasoning_type;
+            delete msgExtra.reasoning_duration;
+            msgExtra.api = apiTag;
+            msgExtra.model = modelTag;
+
             swipes[targetSwipeId] = '';
             swipeInfo[targetSwipeId] = {
                 send_date: typeof getMessageTimeStamp === 'function' ? getMessageTimeStamp() : Date.now(),
@@ -359,6 +369,16 @@ export class StreamRenderer {
             };
             msg.mes = '';
             msg.swipe_id = targetSwipeId;
+
+            if (typeof updateReasoningUI === 'function') {
+                const mesEl = getMesElement(messageId);
+                if (mesEl) {
+                    (updateReasoningUI as (el: HTMLElement, opts?: { reset?: boolean }) => void)(
+                        mesEl,
+                        { reset: true },
+                    );
+                }
+            }
 
             if (typeof updateMessageBlock === 'function') {
                 const rawMes = msg.mes;
@@ -379,7 +399,7 @@ export class StreamRenderer {
                 }
             }
             if (typeof updateSwipeCounter === 'function') {
-                updateSwipeCounter(messageId);
+                void updateSwipeCounter(messageId);
             }
 
             const renderer = new StreamRenderer(
@@ -727,24 +747,9 @@ export class StreamRenderer {
                 mergedReasoning,
             );
 
-            msg.mes = visibleText;
-            this.commitSwipeAndMetadata(msg, visibleText, reasoningText);
-            this.renderToDom(msg, visibleText, reasoningText, true, true);
-
-            if (typeof syncMesToSwipe === 'function') {
-                syncMesToSwipe();
-            }
-            if (typeof refreshSwipeButtons === 'function') {
-                refreshSwipeButtons();
-            } else if (typeof showSwipeButtons === 'function') {
-                showSwipeButtons();
-            }
-
-            if (typeof saveChatConditional === 'function') {
-                await saveChatConditional();
-            } else {
-                saveChatDebounced();
-            }
+            await this.persistCommittedOutput(msg, visibleText, reasoningText, {
+                showSwipeFallback: true,
+            });
 
             const eventName =
                 this.action === 'continue'
@@ -766,6 +771,7 @@ export class StreamRenderer {
             scrollChatToBottom();
         }
 
+        this.ensureCapsuleMounted();
         this.capsuleEl?.setState({
             status: options.hasBackgroundTasks ? 'background-running' : 'done',
             currentStep: options.hasBackgroundTasks ? 'Background tasks running' : '',
@@ -780,7 +786,7 @@ export class StreamRenderer {
             errorMessage: '',
             onResume: undefined,
         });
-        this.detachStoreListener();
+        this.detachEventListener();
     }
 
     /**
@@ -800,34 +806,16 @@ export class StreamRenderer {
                 options.currentOutput,
                 this.explicitReasoningText,
             );
-            const activeSwipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
-
-            this.commitSwipeAndMetadata(msg, visibleText, reasoningText);
-            if (activeSwipeId === this.target.swipeId) {
-                msg.mes = visibleText;
-                this.renderToDom(msg, visibleText, reasoningText, true, true);
-                if (typeof syncMesToSwipe === 'function') {
-                    syncMesToSwipe();
-                }
-            }
-
-            if (typeof refreshSwipeButtons === 'function') {
-                refreshSwipeButtons();
-            } else if (typeof showSwipeButtons === 'function') {
-                showSwipeButtons();
-            }
-
-            if (typeof saveChatConditional === 'function') {
-                await saveChatConditional();
-            } else {
-                saveChatDebounced();
-            }
+            await this.persistCommittedOutput(msg, visibleText, reasoningText, {
+                showSwipeFallback: true,
+            });
         }
 
         if (typeof scrollChatToBottom === 'function') {
             scrollChatToBottom();
         }
 
+        this.ensureCapsuleMounted();
         this.capsuleEl?.setState({
             status: 'interrupted',
             canResume: true,
@@ -842,8 +830,7 @@ export class StreamRenderer {
             ...(options.cacheHitRate !== undefined ? { cacheHitRate: options.cacheHitRate } : {}),
             ...(options.onResume ? { onResume: options.onResume } : {}),
         });
-        this.eventsUnsubscribe?.();
-        this.eventsUnsubscribe = undefined;
+        this.detachEventListener();
     }
 
     /**
@@ -872,31 +859,14 @@ export class StreamRenderer {
                     combined,
                     this.explicitReasoningText,
                 );
-                msg.mes = visibleText;
-                this.commitSwipeAndMetadata(msg, visibleText, reasoningText);
-                this.renderToDom(msg, visibleText, reasoningText, true, true);
-                if (typeof saveChatConditional === 'function') {
-                    await saveChatConditional();
-                } else {
-                    saveChatDebounced();
-                }
+                await this.persistCommittedOutput(msg, visibleText, reasoningText);
             }
         } else if (hasPartialText && msg) {
             const { visibleText, reasoningText } = splitStreamingReasoning(
                 partialRaw,
                 this.explicitReasoningText,
             );
-            msg.mes = visibleText;
-            this.commitSwipeAndMetadata(msg, visibleText, reasoningText);
-            this.renderToDom(msg, visibleText, reasoningText, true, true);
-            if (typeof syncMesToSwipe === 'function') {
-                syncMesToSwipe();
-            }
-            if (typeof saveChatConditional === 'function') {
-                await saveChatConditional();
-            } else {
-                saveChatDebounced();
-            }
+            await this.persistCommittedOutput(msg, visibleText, reasoningText);
         } else if (this.createdNewMessage) {
             if (Array.isArray(chat) && this.target.messageId === chat.length - 1) {
                 chat.pop();
@@ -912,17 +882,35 @@ export class StreamRenderer {
         } else if (this.action === 'swipe' && msg) {
             this.revertAbortedSwipe(msg);
             if (typeof updateSwipeCounter === 'function') {
-                updateSwipeCounter(this.target.messageId);
+                await updateSwipeCounter(this.target.messageId);
             }
             if (typeof refreshSwipeButtons === 'function') {
-                refreshSwipeButtons();
+                refreshSwipeButtons(true);
             }
+            if (typeof showSwipeButtons === 'function') {
+                showSwipeButtons();
+            }
+            const prevSwipeId = this.previousSwipeId ?? 0;
+            const revertedTarget: MessageTarget = {
+                messageId: this.target.messageId,
+                swipeId: prevSwipeId,
+            };
+            const appStore = this.deps.getAppStore?.();
+            appStore?.setActiveTarget(revertedTarget);
+            this.ensureCapsuleMounted();
+            if (this.capsuleEl && appStore) {
+                this.capsuleDisconnect?.();
+                this.capsuleDisconnect = this.capsuleEl.connectStore(appStore, revertedTarget);
+            }
+            this.detachEventListener();
+            return;
         }
 
         if (typeof showSwipeButtons === 'function') {
             showSwipeButtons();
         }
 
+        this.ensureCapsuleMounted();
         if (this.capsuleEl) {
             if (options.errorMessage) {
                 this.capsuleEl.setState({
@@ -947,7 +935,7 @@ export class StreamRenderer {
                 });
             }
         }
-        this.detachStoreListener();
+        this.detachEventListener();
     }
 
     private getChatMessage(): Record<string, unknown> | undefined {
@@ -1005,11 +993,56 @@ export class StreamRenderer {
         }
     }
 
+    private async persistCommittedOutput(
+        msg: Record<string, unknown>,
+        visibleText: string,
+        reasoningText: string,
+        options?: { showSwipeFallback?: boolean },
+    ): Promise<void> {
+        if (this.action === 'swipe') {
+            msg.swipe_id = this.target.swipeId;
+        }
+        this.commitSwipeAndMetadata(msg, visibleText, reasoningText);
+        const activeSwipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
+        if (activeSwipeId === this.target.swipeId) {
+            msg.mes = visibleText;
+            this.renderToDom(msg, visibleText, reasoningText, true, true);
+            if (typeof syncMesToSwipe === 'function') {
+                syncMesToSwipe(this.target.messageId);
+            }
+        }
+
+        if (typeof updateSwipeCounter === 'function') {
+            await updateSwipeCounter(this.target.messageId);
+        }
+        if (typeof refreshSwipeButtons === 'function') {
+            refreshSwipeButtons(true);
+        } else if (options?.showSwipeFallback && typeof showSwipeButtons === 'function') {
+            showSwipeButtons();
+        }
+
+        if (typeof saveChatConditional === 'function') {
+            await saveChatConditional();
+        } else {
+            saveChatDebounced();
+        }
+    }
+
+    private ensureCapsuleMounted(): void {
+        if (!this.capsuleEl || this.capsuleEl.isConnected === false) {
+            this.mountCapsule();
+        }
+    }
+
+    private detachEventListener(): void {
+        this.eventsUnsubscribe?.();
+        this.eventsUnsubscribe = undefined;
+    }
+
     private detachStoreListener(): void {
         this.capsuleDisconnect?.();
         this.capsuleDisconnect = undefined;
-        this.eventsUnsubscribe?.();
-        this.eventsUnsubscribe = undefined;
+        this.detachEventListener();
     }
 
     private scheduleFlush(): void {
@@ -1048,6 +1081,10 @@ export class StreamRenderer {
     private flushStreamingFrame(): void {
         const msg = this.getChatMessage();
         if (!msg) {
+            return;
+        }
+        const activeSwipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
+        if (activeSwipeId !== this.target.swipeId) {
             return;
         }
         const rawCombined = this.getAccumulatedText();
@@ -1202,7 +1239,7 @@ export class StreamRenderer {
         }
 
         if (typeof syncSwipeToMes === 'function') {
-            syncSwipeToMes();
+            syncSwipeToMes(this.target.messageId, prevSwipeId);
         }
 
         const mesElement = getMesElement(this.target.messageId);

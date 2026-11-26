@@ -1191,6 +1191,13 @@ export class STHostBridge implements HostBridge {
         }
 
         const swipes = Array.isArray(msg.swipes) ? (msg.swipes as unknown[]) : undefined;
+        if (
+            swipes
+            && swipes.length > 0
+            && (target.swipeId < 0 || target.swipeId >= swipes.length)
+        ) {
+            return;
+        }
         const swipeRaw =
             swipes && target.swipeId >= 0 && target.swipeId < swipes.length
                 ? swipes[target.swipeId]

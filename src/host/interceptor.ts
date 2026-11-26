@@ -399,7 +399,7 @@ export function createAgenticInterceptor(
         }
     };
 
-    const interceptor: STGenerateInterceptor = (
+    const interceptor: STGenerateInterceptor = async (
         _chatArg,
         _contextSize,
         abort,
@@ -438,10 +438,9 @@ export function createAgenticInterceptor(
         // Prevent native ST API execution while preserving native chat/DOM state.
         abort(true);
 
-        // Start takeover turn immediately after ST's synchronous Generate() unwinds.
-        setTimeout(() => {
-            void executeTakeoverTurn(action, session);
-        }, 0);
+        // Await takeover turn inside the interceptor so ST's Generate() (and callers such as
+        // swipe()'s endSwipe() and sendTextareaMessage()) stays pending until completion/abort.
+        await executeTakeoverTurn(action, session);
     };
 
     if (registerGlobal) {
