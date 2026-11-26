@@ -1,7 +1,7 @@
 import { matchesPromptTriggers } from '@/core/config';
 import type { PromptBlock, PromptTriggerContext } from '@/core/types';
 
-export type Layer0AutoPromptMacroKey = 'coreManifest' | 'systemRules';
+export type Layer0AutoPromptMacroKey = 'systemBase' | 'coreManifest' | 'systemRules';
 
 export type Layer2AutoPromptMacroKey =
     | 'turnBrief'
@@ -14,6 +14,7 @@ export type Layer2AutoPromptMacroKey =
 export type AutoPromptMacroKey = Layer0AutoPromptMacroKey | Layer2AutoPromptMacroKey;
 
 export const LAYER0_AUTO_PROMPT_KEYS: readonly Layer0AutoPromptMacroKey[] = [
+    'systemBase',
     'coreManifest',
     'systemRules',
 ];
@@ -33,6 +34,7 @@ export const ALL_AUTO_PROMPT_KEYS: readonly AutoPromptMacroKey[] = [
 ];
 
 export const AUTO_PROMPT_MACRO_ALIASES: Readonly<Record<AutoPromptMacroKey, readonly string[]>> = {
+    systemBase: ['systemBase', 'system_base', 'system-base'],
     coreManifest: ['coreManifest', 'core_manifest', 'core-manifest'],
     systemRules: ['systemRules', 'system_rules', 'system-rules'],
     turnBrief: ['turnBrief', 'turn_brief', 'turn-brief'],

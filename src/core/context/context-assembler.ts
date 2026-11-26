@@ -90,6 +90,7 @@ export interface StaticPrefixResult {
     layer0EndIndex: number;
     coreManifest: CoreManifestResult;
     systemRuleCount: number;
+    systemBaseText: string;
     manifestText: string;
     systemRulesXml: string;
 }
@@ -636,11 +637,108 @@ function fillMissingLayer2AutoOverrides(
     return buildAutoPromptMacroOverrides(missing);
 }
 
+function extractRenderedMessagesText(messages: readonly CanonicalMessage[]): string {
+    const parts: string[] = [];
+    for (const msg of messages) {
+        if (typeof msg.content === 'string') {
+            if (msg.content.trim()) {
+                parts.push(msg.content.trim());
+            }
+        } else {
+            for (const part of msg.content) {
+                if (part.type === 'text' && part.text.trim()) {
+                    parts.push(part.text.trim());
+                }
+            }
+        }
+    }
+    return parts.join('\n').trim();
+}
+
+function resolveSystemBaseHandling(params: {
+    promptBlocks?: readonly PromptBlock[];
+    systemBasePrompt?: string;
+    promptTriggerContext?: PromptTriggerContext;
+    defaultSystemBase: string;
+    claimed: ClaimedAutoPromptMacros;
+    hostBridge?: HostBridge;
+    macroOverrides?: Record<string, string>;
+    preRenderedSystemBaseText?: string;
+}): {
+    systemBaseBlock?: PromptBlock;
+    isActiveSystemBaseBlock: boolean;
+    suppressAutoSystemBase: boolean;
+    systemBaseText: string;
+} {
+    const promptBlocks = params.promptBlocks ?? [];
+    const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
+    const isActiveSystemBaseBlock = Boolean(
+        systemBaseBlock
+            && systemBaseBlock.enabled
+            && systemBaseBlock.content.trim().length > 0
+            && matchesPromptTriggers(systemBaseBlock.triggers, params.promptTriggerContext),
+    );
+    const explicitBaseSelfClaims =
+        params.systemBasePrompt !== undefined
+        && extractAutoPromptMacroKeys(params.systemBasePrompt).has('systemBase');
+    const systemBaseBlockSelfClaims =
+        isActiveSystemBaseBlock
+        && extractAutoPromptMacroKeys(systemBaseBlock!.content).has('systemBase');
+
+    let suppressAutoSystemBase = false;
+    if (params.systemBasePrompt !== undefined) {
+        suppressAutoSystemBase = params.claimed.all.has('systemBase') && !explicitBaseSelfClaims;
+    } else if (isActiveSystemBaseBlock) {
+        suppressAutoSystemBase = params.claimed.all.has('systemBase') && !systemBaseBlockSelfClaims;
+    } else {
+        suppressAutoSystemBase = params.claimed.all.has('systemBase');
+    }
+
+    let systemBaseText: string;
+    if (params.systemBasePrompt !== undefined && !explicitBaseSelfClaims) {
+        systemBaseText = substituteText(
+            params.systemBasePrompt,
+            params.hostBridge,
+            params.macroOverrides,
+        ).trim();
+    } else if (
+        isActiveSystemBaseBlock
+        && systemBaseBlock!.role !== 'custom'
+        && !systemBaseBlockSelfClaims
+    ) {
+        systemBaseText =
+            params.preRenderedSystemBaseText !== undefined
+                ? params.preRenderedSystemBaseText.trim()
+                : substituteText(
+                      systemBaseBlock!.content,
+                      params.hostBridge,
+                      params.macroOverrides,
+                  ).trim();
+    } else {
+        systemBaseText = substituteText(
+            params.defaultSystemBase,
+            params.hostBridge,
+            params.macroOverrides,
+        ).trim();
+    }
+
+    return {
+        systemBaseBlock,
+        isActiveSystemBaseBlock,
+        suppressAutoSystemBase,
+        systemBaseText,
+    };
+}
+
 /**
- * Build static Layer 0 auto-prompt macro overrides (`coreManifest`, `systemRules`) and empty
+ * Build static Layer 0 auto-prompt macro overrides (`systemBase`, `coreManifest`, `systemRules`) and empty
  * fallbacks for any unset Layer 2 auto-prompt keys (used on `resumeMessages` pre-render paths).
  */
 export function buildStaticAutoPromptMacroOverrides(params: {
+    agent?: Pick<AgentProfile, 'promptBlocks'>;
+    systemBasePrompt?: string;
+    promptTriggerContext?: PromptTriggerContext;
+    defaultSystemBase?: string;
     characterFields?: Record<string, string>;
     personaDescription?: string;
     loreEntries?: readonly (RawLoreEntry | ClassifiedLoreEntry)[];
@@ -664,9 +762,24 @@ export function buildStaticAutoPromptMacroOverrides(params: {
         macroOverrides: params.macroOverrides,
     });
     const systemRulesXml = formatSystemRulesXml(renderedRules);
+    const claimed = detectClaimedAutoPromptMacros({
+        promptBlocks: params.agent?.promptBlocks,
+        systemBasePrompt: params.systemBasePrompt,
+        promptTriggerContext: params.promptTriggerContext,
+    });
+    const { systemBaseText } = resolveSystemBaseHandling({
+        promptBlocks: params.agent?.promptBlocks,
+        systemBasePrompt: params.systemBasePrompt,
+        promptTriggerContext: params.promptTriggerContext,
+        defaultSystemBase: params.defaultSystemBase ?? createDefaultPromptBlocks()[0].content,
+        claimed,
+        hostBridge: params.hostBridge,
+        macroOverrides: params.macroOverrides,
+    });
     return {
         ...fillMissingLayer2AutoOverrides(params.macroOverrides),
         ...buildAutoPromptMacroOverrides({
+            systemBase: systemBaseText,
             coreManifest: manifestText,
             systemRules: systemRulesXml,
         }),
@@ -1035,7 +1148,8 @@ export class ContextAssembler {
             promptTriggerContext: input.promptTriggerContext,
         });
 
-        // Pre-compute Core Manifest & System Rules so prefix blocks can reference {{coreManifest}} / {{systemRules}}.
+        // Pre-compute System Base, Core Manifest & System Rules so prefix blocks can reference
+        // {{systemBase}} / {{coreManifest}} / {{systemRules}}.
         const { coreManifest, manifestText } = buildFormattedCoreManifest({
             characterFields: input.characterFields,
             classifiedLore: classified,
@@ -1050,61 +1164,79 @@ export class ContextAssembler {
             preRenderedSystemRules: input.preRenderedSystemRules,
         });
         const systemRulesXml = formatSystemRulesXml(renderedRules);
+        const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
+        const preRenderedSystemBaseText =
+            systemBaseBlock && input.preRenderedBlocks?.has(systemBaseBlock.id)
+                ? extractRenderedMessagesText(input.preRenderedBlocks.get(systemBaseBlock.id) ?? [])
+                : undefined;
+        const systemBaseHandling = resolveSystemBaseHandling({
+            promptBlocks,
+            systemBasePrompt: input.systemBasePrompt,
+            promptTriggerContext: input.promptTriggerContext,
+            defaultSystemBase: this.defaultSystemBase,
+            claimed,
+            hostBridge: input.hostBridge,
+            macroOverrides: input.macroOverrides,
+            preRenderedSystemBaseText,
+        });
+        const systemBaseText = systemBaseHandling.systemBaseText;
         const effectivePrefixMacroOverrides: Record<string, string> = {
             ...(input.macroOverrides ?? {}),
             ...buildAutoPromptMacroOverrides({
+                systemBase: systemBaseText,
                 coreManifest: manifestText,
                 systemRules: systemRulesXml,
             }),
         };
 
-        // 1. Decoupled System Base (multi-character / world-simulator safe)
-        const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
-        if (input.systemBasePrompt !== undefined) {
-            const resolvedBase = substituteText(
-                input.systemBasePrompt,
-                input.hostBridge,
-                effectivePrefixMacroOverrides,
-            ).trim();
-            if (resolvedBase) {
-                const baseRole =
-                    systemBaseBlock?.role && systemBaseBlock.role !== 'custom'
-                        ? systemBaseBlock.role
-                        : 'system';
-                layer0Messages.push({
-                    role: baseRole,
-                    content: resolvedBase,
-                });
-            }
-        } else if (systemBaseBlock) {
-            if (
-                systemBaseBlock.enabled
-                && matchesPromptTriggers(systemBaseBlock.triggers, input.promptTriggerContext)
-            ) {
-                if (input.preRenderedBlocks?.has(systemBaseBlock.id)) {
-                    for (const msg of input.preRenderedBlocks.get(systemBaseBlock.id) ?? []) {
-                        layer0Messages.push(canonicalClone(msg));
-                    }
-                } else {
-                    const rendered = renderPromptBlockSync(systemBaseBlock, {
-                        hostBridge: input.hostBridge,
-                        macroOverrides: effectivePrefixMacroOverrides,
-                        precedingMessages: layer0Messages,
+        // 1. Decoupled System Base (multi-character / world-simulator safe; suppressed when taken over via {{systemBase}})
+        if (!systemBaseHandling.suppressAutoSystemBase) {
+            if (input.systemBasePrompt !== undefined) {
+                const resolvedBase = substituteText(
+                    input.systemBasePrompt,
+                    input.hostBridge,
+                    effectivePrefixMacroOverrides,
+                ).trim();
+                if (resolvedBase) {
+                    const baseRole =
+                        systemBaseBlock?.role && systemBaseBlock.role !== 'custom'
+                            ? systemBaseBlock.role
+                            : 'system';
+                    layer0Messages.push({
+                        role: baseRole,
+                        content: resolvedBase,
                     });
-                    layer0Messages.push(...rendered);
                 }
-            }
-        } else {
-            const resolvedBase = substituteText(
-                this.defaultSystemBase,
-                input.hostBridge,
-                effectivePrefixMacroOverrides,
-            ).trim();
-            if (resolvedBase) {
-                layer0Messages.push({
-                    role: 'system',
-                    content: resolvedBase,
-                });
+            } else if (systemBaseBlock) {
+                if (
+                    systemBaseBlock.enabled
+                    && matchesPromptTriggers(systemBaseBlock.triggers, input.promptTriggerContext)
+                ) {
+                    if (input.preRenderedBlocks?.has(systemBaseBlock.id)) {
+                        for (const msg of input.preRenderedBlocks.get(systemBaseBlock.id) ?? []) {
+                            layer0Messages.push(canonicalClone(msg));
+                        }
+                    } else {
+                        const rendered = renderPromptBlockSync(systemBaseBlock, {
+                            hostBridge: input.hostBridge,
+                            macroOverrides: effectivePrefixMacroOverrides,
+                            precedingMessages: layer0Messages,
+                        });
+                        layer0Messages.push(...rendered);
+                    }
+                }
+            } else {
+                const resolvedBase = substituteText(
+                    this.defaultSystemBase,
+                    input.hostBridge,
+                    effectivePrefixMacroOverrides,
+                ).trim();
+                if (resolvedBase) {
+                    layer0Messages.push({
+                        role: 'system',
+                        content: resolvedBase,
+                    });
+                }
             }
         }
 
@@ -1154,6 +1286,7 @@ export class ContextAssembler {
             layer0EndIndex: layer0Messages.length - 1,
             coreManifest,
             systemRuleCount: renderedRules.length,
+            systemBaseText,
             manifestText,
             systemRulesXml,
         };
@@ -1331,6 +1464,7 @@ export class ContextAssembler {
         let layer0EndIndex: number;
         let coreManifest: CoreManifestResult;
         let systemRuleCount: number;
+        let systemBaseText: string;
         let manifestText: string;
         let systemRulesXml: string;
 
@@ -1388,6 +1522,23 @@ export class ContextAssembler {
                       }),
                   )
                 : '';
+            const frozenBaseBlock = (input.agent.promptBlocks ?? []).find(
+                (b) => b.id === 'system_base',
+            );
+            const preRenderedFrozenBaseText =
+                frozenBaseBlock && input.preRenderedBlocks?.has(frozenBaseBlock.id)
+                    ? extractRenderedMessagesText(input.preRenderedBlocks.get(frozenBaseBlock.id) ?? [])
+                    : undefined;
+            systemBaseText = resolveSystemBaseHandling({
+                promptBlocks: input.agent.promptBlocks,
+                systemBasePrompt: input.systemBasePrompt,
+                promptTriggerContext: input.promptTriggerContext,
+                defaultSystemBase: this.defaultSystemBase,
+                claimed,
+                hostBridge,
+                macroOverrides: prefixInputMacroOverrides,
+                preRenderedSystemBaseText: preRenderedFrozenBaseText,
+            }).systemBaseText;
         } else {
             const prefix = this.compileStaticPrefix({
                 agent: input.agent,
@@ -1409,6 +1560,7 @@ export class ContextAssembler {
             layer0EndIndex = prefix.layer0EndIndex;
             coreManifest = prefix.coreManifest;
             systemRuleCount = prefix.systemRuleCount;
+            systemBaseText = prefix.systemBaseText;
             manifestText = prefix.manifestText;
             systemRulesXml = prefix.systemRulesXml;
 
@@ -1444,6 +1596,7 @@ export class ContextAssembler {
         const effectiveMacroOverrides: Record<string, string> = {
             ...prefixInputMacroOverrides,
             ...buildAutoPromptMacroOverrides({
+                systemBase: systemBaseText,
                 coreManifest: manifestText,
                 systemRules: systemRulesXml,
             }),
@@ -1981,6 +2134,16 @@ export class ContextAssembler {
             hollowThreshold: rest.hollowThreshold,
             presetFiles: rest.presetFiles,
         });
+        const systemBaseHandling = resolveSystemBaseHandling({
+            promptBlocks,
+            systemBasePrompt: rest.systemBasePrompt,
+            promptTriggerContext: rest.promptTriggerContext,
+            defaultSystemBase: this.defaultSystemBase,
+            claimed,
+            hostBridge,
+            macroOverrides: combinedMacroOverrides,
+        });
+        let resolvedSystemBaseText = systemBaseHandling.systemBaseText;
 
         const turnBriefXml =
             rest.inFlightMessages === undefined && rest.turnBrief
@@ -2208,6 +2371,7 @@ export class ContextAssembler {
                 const preDynamicOverrides = buildLayer2MacroOverrides(liveVars, {
                     ...combinedMacroOverrides,
                     ...buildAutoPromptMacroOverrides({
+                        systemBase: resolvedSystemBaseText,
                         coreManifest: manifestText,
                         turnBrief: turnBriefXml,
                         sideBrief: sideBriefXml,
@@ -2298,7 +2462,50 @@ export class ContextAssembler {
                     Object.assign(prefixHookCacheKeys, ruleRes.cacheKeys);
                 }
 
+                if (
+                    systemBaseHandling.suppressAutoSystemBase
+                    && systemBaseHandling.isActiveSystemBaseBlock
+                    && systemBaseHandling.systemBaseBlock
+                    && systemBaseHandling.systemBaseBlock.role !== 'custom'
+                ) {
+                    const baseBlock = systemBaseHandling.systemBaseBlock;
+                    if (preRenderedBlocks.has(baseBlock.id)) {
+                        resolvedSystemBaseText = extractRenderedMessagesText(
+                            preRenderedBlocks.get(baseBlock.id) ?? [],
+                        );
+                    } else {
+                        const baseMacroOverrides: Record<string, string> = {
+                            ...combinedMacroOverrides,
+                            ...buildAutoPromptMacroOverrides({
+                                coreManifest: manifestText,
+                                ...(preRenderedSystemRules !== undefined
+                                    ? { systemRules: formatSystemRulesXml(preRenderedSystemRules) }
+                                    : {}),
+                            }),
+                        };
+                        const renderedBase = await prerenderPromptBlocks([baseBlock], {
+                            hostBridge,
+                            macroOverrides: baseMacroOverrides,
+                            vars: liveVars,
+                            injectionSession: session,
+                            ejsSession,
+                            transformSessionId,
+                            transformAgentId: rest.agent.id,
+                            transformPhase,
+                            transformTarget: transformTarget,
+                            transformSessionBag,
+                            transformLayer: 'layer0_prefix',
+                            signal: rest.signal,
+                            onVariablesMutated: applyTurnVarUpdates,
+                        });
+                        resolvedSystemBaseText = extractRenderedMessagesText(
+                            renderedBase.get(baseBlock.id) ?? [],
+                        );
+                    }
+                }
+
                 const prefixAutoOverrides = buildAutoPromptMacroOverrides({
+                    systemBase: resolvedSystemBaseText,
                     coreManifest: manifestText,
                     ...(preRenderedSystemRules !== undefined
                         ? { systemRules: formatSystemRulesXml(preRenderedSystemRules) }
@@ -2330,7 +2537,9 @@ export class ContextAssembler {
                 };
 
                 const prefixBlocksToRender = matchingPrefixBlocks.filter(
-                    (block) => !preRenderedBlocks.has(block.id),
+                    (block) =>
+                        !preRenderedBlocks.has(block.id)
+                        && !(systemBaseHandling.suppressAutoSystemBase && block.id === 'system_base'),
                 );
                 if (prefixBlocksToRender.length > 0) {
                     const renderedPrefix = await prerenderPromptBlocks(prefixBlocksToRender, {
@@ -2412,6 +2621,7 @@ export class ContextAssembler {
                             ? fillMissingLayer2AutoOverrides(rest.macroOverrides)
                             : {}),
                         ...buildAutoPromptMacroOverrides({
+                            systemBase: resolvedSystemBaseText,
                             coreManifest: manifestText,
                             ...(preRenderedSystemRules !== undefined
                                 ? { systemRules: formatSystemRulesXml(preRenderedSystemRules) }
@@ -2487,6 +2697,7 @@ export class ContextAssembler {
                         const sideEffectMacroOverrides: Record<string, string> = {
                             ...combinedMacroOverrides,
                             ...buildAutoPromptMacroOverrides({
+                                systemBase: resolvedSystemBaseText,
                                 coreManifest: manifestText,
                             }),
                         };
@@ -2511,6 +2722,47 @@ export class ContextAssembler {
                     const ruleRes = await renderSystemRulesAsync();
                     preRenderedSystemRules = ruleRes.renderedRules;
                 }
+                if (
+                    claimed.tail.has('systemBase')
+                    && systemBaseHandling.suppressAutoSystemBase
+                    && systemBaseHandling.isActiveSystemBaseBlock
+                    && systemBaseHandling.systemBaseBlock
+                    && systemBaseHandling.systemBaseBlock.role !== 'custom'
+                ) {
+                    const baseBlock = systemBaseHandling.systemBaseBlock;
+                    if (preRenderedBlocks.has(baseBlock.id)) {
+                        resolvedSystemBaseText = extractRenderedMessagesText(
+                            preRenderedBlocks.get(baseBlock.id) ?? [],
+                        );
+                    } else {
+                        const renderedBase = await prerenderPromptBlocks([baseBlock], {
+                            hostBridge,
+                            macroOverrides: {
+                                ...combinedMacroOverrides,
+                                ...buildAutoPromptMacroOverrides({
+                                    coreManifest: manifestText,
+                                    ...(preRenderedSystemRules !== undefined
+                                        ? { systemRules: formatSystemRulesXml(preRenderedSystemRules) }
+                                        : {}),
+                                }),
+                            },
+                            vars: liveVars,
+                            injectionSession: session,
+                            ejsSession,
+                            transformSessionId,
+                            transformAgentId: rest.agent.id,
+                            transformPhase,
+                            transformTarget: transformTarget,
+                            transformSessionBag,
+                            transformLayer: 'layer0_prefix',
+                            signal: rest.signal,
+                            onVariablesMutated: applyTurnVarUpdates,
+                        });
+                        resolvedSystemBaseText = extractRenderedMessagesText(
+                            renderedBase.get(baseBlock.id) ?? [],
+                        );
+                    }
+                }
             }
 
             const systemRulesXml = formatSystemRulesXml(preRenderedSystemRules ?? []);
@@ -2523,6 +2775,7 @@ export class ContextAssembler {
                 ...combinedMacroOverrides,
                 ...(rest.inFlightMessages === undefined
                     ? buildAutoPromptMacroOverrides({
+                          systemBase: resolvedSystemBaseText,
                           coreManifest: manifestText,
                           systemRules: systemRulesXml,
                           turnBrief: turnBriefXml,
@@ -2534,6 +2787,7 @@ export class ContextAssembler {
                     : {
                           ...fillMissingLayer2AutoOverrides(rest.macroOverrides),
                           ...buildAutoPromptMacroOverrides({
+                              systemBase: resolvedSystemBaseText,
                               coreManifest: manifestText,
                               systemRules: systemRulesXml,
                           }),
@@ -2562,6 +2816,7 @@ export class ContextAssembler {
             const fullAutoOverrides =
                 rest.inFlightMessages === undefined
                     ? buildAutoPromptMacroOverrides({
+                          systemBase: resolvedSystemBaseText,
                           coreManifest: manifestText,
                           systemRules: systemRulesXml,
                           turnBrief: turnBriefXml,
@@ -2574,6 +2829,7 @@ export class ContextAssembler {
                     : {
                           ...fillMissingLayer2AutoOverrides(rest.macroOverrides),
                           ...buildAutoPromptMacroOverrides({
+                              systemBase: resolvedSystemBaseText,
                               coreManifest: manifestText,
                               systemRules: systemRulesXml,
                           }),
@@ -2674,6 +2930,18 @@ export class ContextAssembler {
                         dropEmptyTextMessages: promptBlockById.get(blockId)?.role !== 'custom',
                     }),
                 );
+            }
+        }
+        if (resolvedSystemBaseText) {
+            const nextSystemBase = session.applyOutlets(resolvedSystemBaseText).trim();
+            if (nextSystemBase !== resolvedSystemBaseText) {
+                resolvedSystemBaseText = nextSystemBase;
+                fullCombinedMacroOverrides = {
+                    ...fullCombinedMacroOverrides,
+                    ...buildAutoPromptMacroOverrides({
+                        systemBase: resolvedSystemBaseText,
+                    }),
+                };
             }
         }
         if (renderedRuleByKey) {

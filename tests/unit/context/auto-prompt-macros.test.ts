@@ -707,4 +707,297 @@ describe('Auto-injected prompt macros ({{coreManifest}}, {{systemRules}}, Layer 
         expect(noBridgeRes.layer0Messages[0].content).not.toContain('<core-manifest>');
         expect(noBridgeRes.layer0Messages[1].content).toContain('<system-rules>');
     });
+
+    it('takes over DEFAULT_SYSTEM_BASE_PROMPT via {{systemBase}} / {{system_base}} / {{system-base}} when id=system_base is absent and excludes it from Gemini systemInstruction', () => {
+        const bridge = new MemoryHostBridge({
+            identity: hollowChineseCard.identity,
+            characterFields: hollowChineseCard.characterFields,
+            personaDescription: hollowChineseCard.personaDescription,
+            lorebooks: hollowChineseCard.lorebooks as Record<string, RawLoreEntry[]>,
+        });
+        const loreEntries = hollowChineseCard.lorebooks['霜烬纪元'] as RawLoreEntry[];
+        const assembler = new ContextAssembler();
+        const compiler = new PayloadCompiler();
+        const geminiConn = createDefaultConnection({
+            providerFormat: 'gemini',
+            model: 'gemini-2.5-pro',
+        });
+
+        for (const alias of ['{{systemBase}}', '{{system_base}}', '{{system-base}}'] as const) {
+            // Preset has NO id='system_base' block (e.g. replaced by imported preset)
+            const agent = createDefaultMainAgent({
+                promptBlocks: [
+                    {
+                        id: 'imported_user_wrapper',
+                        name: 'Imported User Wrapper',
+                        role: 'user',
+                        placement: 'prefix',
+                        content: `预设接管：\n${alias}\n{{systemRules}}\n{{coreManifest}}`,
+                        enabled: true,
+                    },
+                ],
+            });
+
+            const assembled = assembler.assemble({
+                agent,
+                loreEntries,
+                userInput: '开始行动',
+                hostBridge: bridge,
+            });
+
+            // Only the user wrapper is in Layer 0 — NO default system_base system message!
+            expect(assembled.layer0Messages).toHaveLength(1);
+            expect(assembled.layer0Messages[0].role).toBe('user');
+            const wrapperText = assembled.layer0Messages[0].content as string;
+            expect(wrapperText).toContain('You operate on top of a Virtual File System (VFS)');
+            expect(wrapperText).toContain('<system-rules>');
+            expect(wrapperText).toContain('<core-manifest>');
+
+            const compiled = compiler.compile(assembled.request, geminiConn);
+            expect(compiled.body.systemInstruction).toBeUndefined();
+            const contentsText = JSON.stringify(compiled.body.contents ?? []);
+            expect(contentsText).toContain('You operate on top of a Virtual File System (VFS)');
+        }
+    });
+
+    it('suppresses active id=system_base from Layer 0 system when another block claims {{systemBase}} and expands system_base inline without duplication', () => {
+        const bridge = new MemoryHostBridge({
+            identity: { userName: 'User', charName: 'Char' },
+            characterFields: {
+                description:
+                    'Sufficiently long character description over eighty characters so hollow-card notice is not emitted.',
+            },
+        });
+        const assembler = new ContextAssembler();
+
+        // Case A: system_base exists and is enabled, and a user block claims {{systemBase}}
+        const takeoverAgent = createDefaultMainAgent({
+            promptBlocks: [
+                {
+                    id: 'system_base',
+                    name: 'Custom Base',
+                    role: 'system',
+                    placement: 'prefix',
+                    content: 'CUSTOM_BASE_CONTENT for {{user}}',
+                    enabled: true,
+                },
+                {
+                    id: 'user_takeover',
+                    name: 'User Takeover',
+                    role: 'user',
+                    placement: 'prefix',
+                    content: 'USER_SLOT:\n{{systemBase}}',
+                    enabled: true,
+                },
+            ],
+        });
+
+        const resA = assembler.assemble({
+            agent: takeoverAgent,
+            userInput: 'hi',
+            hostBridge: bridge,
+        });
+        expect(resA.layer0Messages.some((m) => m.role === 'system' && String(m.content).includes('CUSTOM_BASE_CONTENT'))).toBe(false);
+        const userSlot = resA.layer0Messages.find((m) => m.role === 'user');
+        expect(userSlot?.content).toBe('USER_SLOT:\nCUSTOM_BASE_CONTENT for User');
+        expect(countOccurrences(JSON.stringify(resA.layer0Messages), 'CUSTOM_BASE_CONTENT')).toBe(1);
+
+        // Case B: system_base itself references {{systemBase}} (self-claim -> expands DEFAULT_SYSTEM_BASE_PROMPT inline without recursion)
+        const selfClaimAgent = createDefaultMainAgent({
+            promptBlocks: [
+                {
+                    id: 'system_base',
+                    name: 'Self Claim Base',
+                    role: 'system',
+                    placement: 'prefix',
+                    content: 'HEADER\n{{systemBase}}\nFOOTER',
+                    enabled: true,
+                },
+            ],
+        });
+        const resB = assembler.assemble({
+            agent: selfClaimAgent,
+            userInput: 'hi',
+            hostBridge: bridge,
+        });
+        expect(resB.layer0Messages[0].role).toBe('system');
+        expect(resB.layer0Messages[0].content).toMatch(
+            /^HEADER\nYou operate on top of a Virtual File System \(VFS\)[\s\S]*\nFOOTER$/,
+        );
+        expect(countOccurrences(JSON.stringify(resB.layer0Messages), 'You operate on top of a Virtual File System')).toBe(1);
+    });
+
+    it('suppresses system_base across frozen Turn 2 when {{systemBase}} is in tail and invalidates stale Turn 1 prefix when added later', async () => {
+        const bridge = new MemoryHostBridge({
+            identity: hollowChineseCard.identity,
+            characterFields: hollowChineseCard.characterFields,
+            personaDescription: hollowChineseCard.personaDescription,
+            lorebooks: hollowChineseCard.lorebooks as Record<string, RawLoreEntry[]>,
+        });
+        const loreEntries = hollowChineseCard.lorebooks['霜烬纪元'] as RawLoreEntry[];
+        const assembler = new ContextAssembler();
+        const store = new TrajectoryStore();
+
+        const tailTakeoverAgent = createDefaultMainAgent({
+            sessionMode: 'persistent',
+            promptBlocks: [
+                {
+                    id: 'system_base',
+                    name: 'Base',
+                    role: 'system',
+                    placement: 'prefix',
+                    content: 'DEFAULT_BASE_SENTINEL',
+                    enabled: true,
+                },
+                {
+                    id: 'tail_base',
+                    name: 'Tail Base',
+                    role: 'user',
+                    placement: 'tail',
+                    content: '尾部指令：\n{{systemBase}}',
+                    enabled: true,
+                },
+            ],
+        });
+
+        const turn1 = await assembler.assembleWithHost({
+            agent: tailTakeoverAgent,
+            trajectoryStore: store,
+            hostBridge: bridge,
+            loreEntries,
+            userInput: '第一回合',
+        });
+        expect(turn1.layer0Messages.some((m) => String(m.content).includes('DEFAULT_BASE_SENTINEL'))).toBe(false);
+        expect(turn1.floatingTailMessages[0]).toEqual({
+            role: 'user',
+            content: '尾部指令：\nDEFAULT_BASE_SENTINEL',
+        });
+
+        assembler.finalizeTurn({
+            trajectoryStore: store,
+            agentId: tailTakeoverAgent.id,
+            target: { messageId: 1, swipeId: 0 },
+            turnMessages: turn1.layer2Messages,
+            finalAssistantMessage: { role: 'assistant', content: '好。' },
+        });
+
+        const turn2 = await assembler.assembleWithHost({
+            agent: tailTakeoverAgent,
+            trajectoryStore: store,
+            hostBridge: bridge,
+            loreEntries,
+            userInput: '第二回合',
+        });
+        expect(turn2.layer0Messages.some((m) => String(m.content).includes('DEFAULT_BASE_SENTINEL'))).toBe(false);
+        expect(turn2.floatingTailMessages[0]).toEqual({
+            role: 'user',
+            content: '尾部指令：\nDEFAULT_BASE_SENTINEL',
+        });
+
+        // Invalidation check: Turn 1 without {{systemBase}}, then Turn 2 adds {{systemBase}} into tail
+        const store2 = new TrajectoryStore();
+        const plainAgent = createDefaultMainAgent({
+            sessionMode: 'persistent',
+            promptBlocks: [
+                {
+                    id: 'only_prefix',
+                    name: 'Only Prefix',
+                    role: 'user',
+                    placement: 'prefix',
+                    content: 'Prefix Note',
+                    enabled: true,
+                },
+            ],
+        });
+        const t1 = assembler.assemble({
+            agent: plainAgent,
+            trajectoryStore: store2,
+            hostBridge: bridge,
+            loreEntries,
+            userInput: '一',
+        });
+        expect(t1.layer0Messages.some((m) => String(m.content).includes('You operate on top of a Virtual File System'))).toBe(true);
+
+        const updatedAgent = createDefaultMainAgent({
+            sessionMode: 'persistent',
+            promptBlocks: [
+                ...plainAgent.promptBlocks,
+                {
+                    id: 'tail_takeover',
+                    name: 'Tail Takeover',
+                    role: 'user',
+                    placement: 'tail',
+                    content: '{{systemBase}}',
+                    enabled: true,
+                },
+            ],
+        });
+        const t2 = assembler.assemble({
+            agent: updatedAgent,
+            trajectoryStore: store2,
+            hostBridge: bridge,
+            loreEntries,
+            userInput: '二',
+        });
+        expect(t2.layer0Messages.some((m) => String(m.content).includes('You operate on top of a Virtual File System'))).toBe(false);
+        expect(t2.floatingTailMessages[0].content).toContain('You operate on top of a Virtual File System');
+    });
+
+    it('does not suppress default systemBase when block referencing {{systemBase}} is disabled or trigger-mismatched', () => {
+        const bridge = new MemoryHostBridge({
+            identity: { userName: 'User', charName: 'Char' },
+            characterFields: {
+                description:
+                    'Sufficiently long character description over eighty characters so hollow-card notice is not emitted.',
+            },
+        });
+        const assembler = new ContextAssembler();
+        const agent = createDefaultMainAgent({
+            promptBlocks: [
+                {
+                    id: 'disabled_base_macro',
+                    name: 'Disabled',
+                    role: 'user',
+                    placement: 'prefix',
+                    content: '{{systemBase}}',
+                    enabled: false,
+                },
+                {
+                    id: 'trigger_base_macro',
+                    name: 'Trigger Scoped',
+                    role: 'user',
+                    placement: 'prefix',
+                    content: 'TRIGGER_BASE:\n{{systemBase}}',
+                    enabled: true,
+                    triggers: ['trigger'],
+                },
+            ],
+        });
+
+        const mainRun = assembler.assemble({
+            agent,
+            userInput: '主线',
+            promptTriggerContext: { kind: 'main', action: 'normal' },
+            hostBridge: bridge,
+        });
+        expect(
+            mainRun.layer0Messages.some(
+                (m) => m.role === 'system' && String(m.content).includes('You operate on top of a Virtual File System'),
+            ),
+        ).toBe(true);
+
+        const triggerRun = assembler.assemble({
+            agent,
+            userInput: '触发',
+            promptTriggerContext: { kind: 'trigger', phase: 'after_turn' },
+            hostBridge: bridge,
+        });
+        expect(
+            triggerRun.layer0Messages.some(
+                (m) => m.role === 'system' && String(m.content).includes('You operate on top of a Virtual File System'),
+            ),
+        ).toBe(false);
+        const triggerUser = triggerRun.layer0Messages.find((m) => String(m.content).includes('TRIGGER_BASE:'));
+        expect(triggerUser?.content).toContain('You operate on top of a Virtual File System');
+    });
 });

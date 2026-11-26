@@ -1653,6 +1653,9 @@ export class AgentRunner {
             let preRenderedBlocks: Map<string, CanonicalMessage[]> | undefined;
             if (input.resumeMessages !== undefined) {
                 const resumeAutoMacroOverrides = buildStaticAutoPromptMacroOverrides({
+                    agent: effectiveAgent,
+                    systemBasePrompt: input.systemBasePrompt,
+                    promptTriggerContext,
                     characterFields,
                     personaDescription,
                     loreEntries,
