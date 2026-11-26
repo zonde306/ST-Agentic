@@ -34,6 +34,7 @@ import type {
     SideClueDoc,
     SideSessionInfo,
     ThemeMode,
+    ToolStepLog,
     UndoRecord,
     WICategory,
 } from '@/core/types';
@@ -1277,6 +1278,57 @@ export class AppStore {
     private handleGenerationEvent(event: GenerationEventPayload): void {
         if (event.kind === 'trace_recorded' && event.trace) {
             this.upsertTrace(event.trace);
+            return;
+        }
+        if ((event.kind === 'tool_started' || event.kind === 'tool_completed') && event.toolStep) {
+            const idx = this.findMatchingTraceIndex(event);
+            if (idx < 0) {
+                return;
+            }
+            const existing = this.state.traces[idx];
+            const incomingStep: ToolStepLog = {
+                ...event.toolStep,
+                status:
+                    event.toolStep.status
+                    ?? (event.kind === 'tool_started'
+                        ? 'running'
+                        : event.toolStep.ok
+                            ? 'completed'
+                            : 'error'),
+            };
+            const existingStepIdx = existing.toolSteps.findIndex(
+                (step) =>
+                    step.stepIndex === incomingStep.stepIndex
+                    && step.toolCallId === incomingStep.toolCallId,
+            );
+            if (existingStepIdx >= 0) {
+                const prevStep = existing.toolSteps[existingStepIdx];
+                if (
+                    prevStep.status === incomingStep.status
+                    && prevStep.ok === incomingStep.ok
+                    && prevStep.result === incomingStep.result
+                    && prevStep.error === incomingStep.error
+                    && prevStep.durationMs === incomingStep.durationMs
+                ) {
+                    return;
+                }
+            }
+            const nextSteps = [...existing.toolSteps];
+            if (existingStepIdx >= 0) {
+                nextSteps[existingStepIdx] = incomingStep;
+            } else {
+                nextSteps.push(incomingStep);
+            }
+            const nextTraces = [...this.state.traces];
+            nextTraces[idx] = {
+                ...existing,
+                durationMs: Math.max(
+                    existing.durationMs,
+                    Math.max(0, (event.timestamp || Date.now()) - existing.startedAt),
+                ),
+                toolSteps: nextSteps,
+            };
+            this.setState({ traces: nextTraces });
             return;
         }
         if (event.kind === 'background_task_updated' && event.task) {

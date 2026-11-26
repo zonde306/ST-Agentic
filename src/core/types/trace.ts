@@ -9,6 +9,8 @@ export interface TokenUsage {
     cacheHitRate?: number;
 }
 
+export type ToolStepStatus = 'running' | 'completed' | 'error';
+
 export interface ToolStepLog {
     stepIndex: number;
     toolCallId: string;
@@ -16,6 +18,7 @@ export interface ToolStepLog {
     args: Record<string, unknown> | string;
     result: string;
     ok: boolean;
+    status?: ToolStepStatus;
     error?: string;
     durationMs: number;
     startedAt: number;

@@ -4,6 +4,7 @@ import type {
     CanonicalToolCall,
     PipelinePhase,
     ToolStepLog,
+    ToolStepStatus,
 } from '@/core/types';
 import {
     Badge,
@@ -71,6 +72,7 @@ function extractToolCallsFromTrace(trace: AgentRunTrace): {
         toolName: string;
         args: Record<string, unknown> | string;
         ok: boolean;
+        status?: ToolStepStatus;
     }>;
 } {
     const fromMessages: Array<{ messageIndex: number; toolCalls: CanonicalToolCall[] }> = [];
@@ -90,9 +92,14 @@ function extractToolCallsFromTrace(trace: AgentRunTrace): {
         toolName: step.toolName,
         args: step.args,
         ok: step.ok,
+        ...(step.status ? { status: step.status } : {}),
     }));
 
     return { fromMessages, fromSteps };
+}
+
+function isStepRunning(step: ToolStepLog): boolean {
+    return step.status === 'running';
 }
 
 function getStepDomKey(step: ToolStepLog, arrayIndex: number): string {
@@ -800,12 +807,23 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                                         #{step.stepIndex + 1} {step.toolName}
                                                     </span>
                                                     <span class="ag-log-step-meta">
-                                                        <Badge tone={step.ok ? 'success' : 'error'}>
-                                                            {step.ok ? 'OK' : 'ERR'}
-                                                        </Badge>
-                                                        <span class="ag-log-step-duration">
-                                                            {formatDurationMs(step.durationMs)}
-                                                        </span>
+                                                        {isStepRunning(step) ? (
+                                                            <>
+                                                                <Badge tone="primary">运行中</Badge>
+                                                                <span class="ag-log-step-duration">
+                                                                    执行中
+                                                                </span>
+                                                            </>
+                                                        ) : (
+                                                            <>
+                                                                <Badge tone={step.ok ? 'success' : 'error'}>
+                                                                    {step.ok ? 'OK' : 'ERR'}
+                                                                </Badge>
+                                                                <span class="ag-log-step-duration">
+                                                                    {formatDurationMs(step.durationMs)}
+                                                                </span>
+                                                            </>
+                                                        )}
                                                     </span>
                                                 </button>
                                             );
@@ -1155,13 +1173,16 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                 <div class="ag-banner ag-banner-neutral">
                                     {isScriptTrace
                                         ? '纯脚本触发器运行（无 LLM 生成步骤）。'
-                                        : '本轮运行未调用工具（纯文本推理/输出）。'}
+                                        : selectedTrace.status === 'running'
+                                            ? '运行中，正在等待模型响应或工具调用...'
+                                            : '本轮运行未调用工具（纯文本推理/输出）。'}
                                 </div>
                             ) : (
                                 selectedTrace.toolSteps.map((step: ToolStepLog, arrayIndex: number) => {
                                     const stepKey = getStepDomKey(step, arrayIndex);
                                     const refMapKey = `${selectedTrace.runId}::${stepKey}`;
                                     const isFocused = highlightedStepKey === stepKey;
+                                    const stepRunning = isStepRunning(step);
                                     return (
                                         <div
                                             key={refMapKey}
@@ -1183,7 +1204,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                         >
                                             <div class="ag-card-header">
                                                 <div class="ag-row-wrap">
-                                                    <Badge tone={step.ok ? 'success' : 'error'}>
+                                                    <Badge tone={stepRunning ? 'primary' : step.ok ? 'success' : 'error'}>
                                                         Step #{step.stepIndex + 1}
                                                     </Badge>
                                                     <span class="ag-mono" style={{ fontWeight: 700 }}>
@@ -1200,14 +1221,21 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                                     </span>
                                                 </div>
                                                 <div class="ag-row">
-                                                    <Badge tone={step.ok ? 'success' : 'error'}>
-                                                        {step.ok ? (
-                                                            <IconCheck size={12} />
-                                                        ) : (
-                                                            <IconAlertTriangle size={12} />
-                                                        )}
-                                                        <span>{step.ok ? '成功' : '失败'}</span>
-                                                    </Badge>
+                                                    {stepRunning ? (
+                                                        <Badge tone="primary">
+                                                            <IconRefresh size={12} />
+                                                            <span>执行中</span>
+                                                        </Badge>
+                                                    ) : (
+                                                        <Badge tone={step.ok ? 'success' : 'error'}>
+                                                            {step.ok ? (
+                                                                <IconCheck size={12} />
+                                                            ) : (
+                                                                <IconAlertTriangle size={12} />
+                                                            )}
+                                                            <span>{step.ok ? '成功' : '失败'}</span>
+                                                        </Badge>
+                                                    )}
                                                     <span
                                                         class="ag-mono"
                                                         style={{
@@ -1215,7 +1243,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                                             color: 'var(--muted-foreground)',
                                                         }}
                                                     >
-                                                        {formatDurationMs(step.durationMs)}
+                                                        {stepRunning ? '进行中...' : formatDurationMs(step.durationMs)}
                                                     </span>
                                                 </div>
                                             </div>
@@ -1269,7 +1297,9 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                                             复制返回
                                                         </Button>
                                                     </div>
-                                                    <pre class="ag-pre">{step.result || '(空)'}</pre>
+                                                    <pre class="ag-pre">
+                                                        {step.result || (stepRunning ? '工具执行中，等待返回结果...' : '(空)')}
+                                                    </pre>
                                                 </div>
 
                                                 {step.error ? (

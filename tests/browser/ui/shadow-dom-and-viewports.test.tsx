@@ -1,7 +1,7 @@
 import { render } from 'preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { page, userEvent } from 'vitest/browser';
-import type { ConsoleTabId } from '@/core/types';
+import type { ConsoleTabId, GenerationEventPayload } from '@/core/types';
 import { buildWorldInfoTriggerRuleId } from '@/core/triggers';
 import { registerAssistantView } from '@/ui/assistant';
 import {
@@ -2057,5 +2057,154 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
             expect(unrecoveredBtn!.textContent).toContain('重试此触发器');
             expect(unrecoveredBtn!.classList.contains('ag-btn-primary')).toBe(true);
         }
+    });
+
+    it('updates LogsView in real time for running traces and in-flight tool steps without manual refresh', async () => {
+        await page.viewport(1280, 800);
+        const listeners = new Set<(event: GenerationEventPayload) => void>();
+        const services: AgenticUIServices = {
+            ...createMockUIServices(),
+            subscribeEvents: (listener) => {
+                listeners.add(listener);
+                return () => listeners.delete(listener);
+            },
+        };
+        const emit = (event: GenerationEventPayload) => {
+            for (const listener of listeners) {
+                listener(event);
+            }
+        };
+
+        activeHarness = createHarness({ initialTab: 'logs', initialOpen: true, services });
+        activeHarness.store.setTraces([]);
+        await settleLayout(5);
+
+        const { shadowRoot } = getShellElements();
+        const startedAt = Date.now();
+        const baseTrace = {
+            runId: 'run_live_draw_2',
+            target: { messageId: 2, swipeId: 0 },
+            phase: 'after_turn' as const,
+            agentProfileId: 'ag_draw',
+            agentName: '生图调用',
+            triggerId: 'tr_draw_2',
+            triggerLabel: '生图调用',
+            lorebookNames: ['ComfyUI生图'],
+            connectionId: 'conn_gemini',
+            model: 'gemini-4-hydrogen',
+            status: 'running' as const,
+            startedAt,
+            durationMs: 0,
+            usage: { inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheHitRate: 0 },
+            toolSteps: [],
+        };
+
+        // 1. Initial running trace with 0 steps shows waiting message, not "本轮运行未调用工具"
+        emit({
+            kind: 'trace_recorded',
+            target: baseTrace.target,
+            timestamp: startedAt,
+            phase: 'after_turn',
+            runId: baseTrace.runId,
+            agentProfileId: baseTrace.agentProfileId,
+            trace: baseTrace,
+        });
+        await settleLayout(5);
+
+        expect(shadowRoot.textContent).toContain('运行中，正在等待模型响应或工具调用...');
+        expect(shadowRoot.textContent).not.toContain('本轮运行未调用工具');
+
+        // 2. Tool starts -> trace_recorded + tool_started updates UI immediately without clicking refresh
+        const runningStep = {
+            stepIndex: 0,
+            toolCallId: 'call_comfy_live_1',
+            toolName: 'comfyui_generate',
+            args: { prompt: 'cyber_alley' },
+            result: '',
+            ok: true,
+            status: 'running' as const,
+            durationMs: 0,
+            startedAt: startedAt + 500,
+        };
+        emit({
+            kind: 'trace_recorded',
+            target: baseTrace.target,
+            timestamp: startedAt + 500,
+            phase: 'after_turn',
+            runId: baseTrace.runId,
+            agentProfileId: baseTrace.agentProfileId,
+            trace: {
+                ...baseTrace,
+                durationMs: 500,
+                usage: { inputTokens: 1200, cachedTokens: 800, outputTokens: 35, cacheHitRate: 800 / 1200 },
+                toolSteps: [runningStep],
+            },
+        });
+        await settleLayout(5);
+
+        const stepCard = shadowRoot.querySelector('[data-log-step-index="0"]') as HTMLElement | null;
+        expect(stepCard).toBeTruthy();
+        expect(stepCard!.textContent).toContain('comfyui_generate');
+        expect(stepCard!.textContent).toContain('执行中');
+        expect(stepCard!.textContent).toContain('进行中...');
+        expect(stepCard!.textContent).toContain('工具执行中，等待返回结果...');
+        expect(stepCard!.textContent).toContain('cyber_alley');
+
+        // Expand left tree to verify running badge in step branch
+        const runItem = shadowRoot.querySelector(
+            '[data-log-run-item="run_live_draw_2"]',
+        ) as HTMLButtonElement | null;
+        expect(runItem).toBeTruthy();
+        runItem!.click();
+        await settleLayout(5);
+        const stepTreeBtn = shadowRoot.querySelector('[data-log-step-index="0"].ag-log-step-item') as HTMLElement | null;
+        expect(stepTreeBtn).toBeTruthy();
+        expect(stepTreeBtn!.textContent).toContain('运行中');
+
+        // 3. Tool completes via tool_completed event (and second tool starts via tool_started)
+        emit({
+            kind: 'tool_completed',
+            target: baseTrace.target,
+            timestamp: startedAt + 2500,
+            phase: 'after_turn',
+            runId: baseTrace.runId,
+            agentProfileId: baseTrace.agentProfileId,
+            toolStep: {
+                ...runningStep,
+                result: '{"ok":true,"url":"/img/cyber.png"}',
+                ok: true,
+                status: 'completed',
+                durationMs: 2000,
+            },
+        });
+        emit({
+            kind: 'tool_started',
+            target: baseTrace.target,
+            timestamp: startedAt + 2600,
+            phase: 'after_turn',
+            runId: baseTrace.runId,
+            agentProfileId: baseTrace.agentProfileId,
+            toolStep: {
+                stepIndex: 1,
+                toolCallId: 'call_write_vars_2',
+                toolName: 'patch_variables',
+                args: { lastImage: '/img/cyber.png' },
+                result: '',
+                ok: true,
+                status: 'running',
+                durationMs: 0,
+                startedAt: startedAt + 2600,
+            },
+        });
+        await settleLayout(5);
+
+        const updatedCard0 = shadowRoot.querySelector('[data-log-step-index="0"].ag-log-step-card') as HTMLElement | null;
+        const card1 = shadowRoot.querySelector('[data-log-step-index="1"].ag-log-step-card') as HTMLElement | null;
+        expect(updatedCard0).toBeTruthy();
+        expect(updatedCard0!.textContent).toContain('成功');
+        expect(updatedCard0!.textContent).toContain('/img/cyber.png');
+        expect(card1).toBeTruthy();
+        expect(card1!.textContent).toContain('patch_variables');
+        expect(card1!.textContent).toContain('执行中');
     });
 });

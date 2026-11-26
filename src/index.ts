@@ -2484,7 +2484,7 @@ jQuery(async () => {
         // Persist persistent agent trajectories and interrupted checkpoints whenever turn/trace events fire.
         traceLogger.subscribe((event) => {
             if (
-                (event.kind === 'trace_recorded'
+                ((event.kind === 'trace_recorded' && event.trace?.status !== 'running')
                     || event.kind === 'turn_interrupted'
                     || event.kind === 'turn_completed')
                 && (trajectoryStore.listAgentIds().length > 0

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
 import {
     createDefaultConnection,
     createDefaultMainAgent,
@@ -1367,5 +1368,123 @@ describe('AgentRunner & TraceLogger', () => {
 
         expect(observedToolsByBook.other).toEqual(['read_file']);
         expect(otherBookResult.content).toBe('other done');
+    });
+
+    it('publishes live running traces and toolSteps while tools are still executing', async () => {
+        const { bridge, settings, traceLogger } = makeTestSetup({
+            stream: false,
+            enabledTools: ['slow_tool_1', 'slow_tool_2'],
+        });
+
+        const tool1Started = new DeferredGate();
+        const releaseTool1 = new DeferredGate();
+        const tool2Started = new DeferredGate();
+        const releaseTool2 = new DeferredGate();
+
+        const slowTool1 = {
+            name: 'slow_tool_1',
+            description: 'First slow tool',
+            parameters: z.object({ prompt: z.string() }),
+            execute: async (args: { prompt: string }) => {
+                tool1Started.resolve();
+                await releaseTool1.promise;
+                return `tool1_ok:${args.prompt}`;
+            },
+        };
+        const slowTool2 = {
+            name: 'slow_tool_2',
+            description: 'Second slow tool',
+            parameters: z.object({ tag: z.string() }),
+            execute: async (args: { tag: string }) => {
+                tool2Started.resolve();
+                await releaseTool2.promise;
+                return `tool2_ok:${args.tag}`;
+            },
+        };
+
+        const transport = new ScriptedLLMTransport([
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'call_slow_1',
+                        name: 'slow_tool_1',
+                        arguments: JSON.stringify({ prompt: 'step1' }),
+                    },
+                    {
+                        id: 'call_slow_2',
+                        name: 'slow_tool_2',
+                        arguments: JSON.stringify({ tag: 'step2' }),
+                    },
+                ],
+                usage: { inputTokens: 100, cachedTokens: 60, outputTokens: 25 },
+            },
+            {
+                content: 'all tools done',
+                toolCalls: [],
+                usage: { inputTokens: 180, cachedTokens: 100, outputTokens: 15 },
+            },
+        ]);
+
+        const events: GenerationEventPayload[] = [];
+        traceLogger.subscribe((ev) => events.push(ev));
+
+        const runner = new AgentRunner({
+            bridge,
+            transport,
+            settings,
+            traceLogger,
+        });
+
+        const runPromise = runner.run({
+            agent: 'main',
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'after_turn',
+            userInput: '生图调用',
+            extraTools: [slowTool1, slowTool2],
+        });
+
+        await tool1Started.promise;
+
+        const duringTool1 = traceLogger.listTraces();
+        expect(duringTool1).toHaveLength(1);
+        expect(duringTool1[0].status).toBe('running');
+        expect(duringTool1[0].usage.inputTokens).toBe(100);
+        expect(duringTool1[0].requestSnapshot?.messages.length).toBeGreaterThan(0);
+        expect(duringTool1[0].toolSteps).toHaveLength(1);
+        expect(duringTool1[0].toolSteps[0].toolName).toBe('slow_tool_1');
+        expect(duringTool1[0].toolSteps[0].status).toBe('running');
+        expect(duringTool1[0].toolSteps[0].args).toEqual({ prompt: 'step1' });
+        expect(
+            events.some(
+                (ev) =>
+                    ev.kind === 'trace_recorded'
+                    && ev.trace?.status === 'running'
+                    && ev.trace.toolSteps[0]?.status === 'running',
+            ),
+        ).toBe(true);
+
+        releaseTool1.resolve();
+        await tool2Started.promise;
+
+        const duringTool2 = traceLogger.listTraces();
+        expect(duringTool2).toHaveLength(1);
+        expect(duringTool2[0].status).toBe('running');
+        expect(duringTool2[0].toolSteps).toHaveLength(2);
+        expect(duringTool2[0].toolSteps[0].status).toBe('completed');
+        expect(duringTool2[0].toolSteps[0].ok).toBe(true);
+        expect(duringTool2[0].toolSteps[0].result).toBe('tool1_ok:step1');
+        expect(duringTool2[0].toolSteps[1].toolName).toBe('slow_tool_2');
+        expect(duringTool2[0].toolSteps[1].status).toBe('running');
+
+        releaseTool2.resolve();
+        const result = await runPromise;
+        expect(result.content).toBe('all tools done');
+
+        const afterFinish = traceLogger.listTraces();
+        expect(afterFinish).toHaveLength(1);
+        expect(afterFinish[0].status).toBe('completed');
+        expect(afterFinish[0].toolSteps).toHaveLength(2);
+        expect(afterFinish[0].toolSteps.every((step) => step.status === 'completed')).toBe(true);
     });
 });

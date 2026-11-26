@@ -1329,6 +1329,8 @@ export class AgentRunner {
         let lastRequestSnapshot: AgentRunTrace['requestSnapshot'] | undefined;
         let lastContent = '';
         let lastReasoning = '';
+        let lastOutputPreview = '';
+        let activeToolStep: ToolStepLog | null = null;
         let roundsCompleted = 0;
 
         const traceTriggerMeta = {
@@ -1336,6 +1338,32 @@ export class AgentRunner {
             ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
             ...(input.triggerSource ? { triggerSource: input.triggerSource } : {}),
             ...(normalizedLorebookNames.length > 0 ? { lorebookNames: normalizedLorebookNames } : {}),
+        };
+
+        const publishRunningTrace = (now = Date.now()): void => {
+            const liveSteps = activeToolStep ? [...toolSteps, activeToolStep] : toolSteps;
+            const previewSource = lastOutputPreview || lastContent || lastReasoning;
+            this.traceLogger.recordTrace(
+                {
+                    runId,
+                    target: { ...target },
+                    phase: input.phase,
+                    agentProfileId: agent.id,
+                    agentName: agent.name,
+                    ...traceTriggerMeta,
+                    connectionId: connection.id,
+                    model: connection.model,
+                    status: 'running',
+                    startedAt,
+                    durationMs: Math.max(0, now - startedAt),
+                    usage: { ...cumulativeUsage },
+                    toolSteps: canonicalClone(liveSteps),
+                    ...buildTraceRetryFields(),
+                    ...(previewSource ? { outputPreview: previewSource.slice(0, 240) } : {}),
+                    ...(lastRequestSnapshot ? { requestSnapshot: lastRequestSnapshot } : {}),
+                },
+                true,
+            );
         };
 
         this.traceLogger.emit({
@@ -1347,25 +1375,7 @@ export class AgentRunner {
             agentProfileId: agent.id,
         });
 
-        this.traceLogger.recordTrace(
-            {
-                runId,
-                target: { ...target },
-                phase: input.phase,
-                agentProfileId: agent.id,
-                agentName: agent.name,
-                ...traceTriggerMeta,
-                connectionId: connection.id,
-                model: connection.model,
-                status: 'running',
-                startedAt,
-                durationMs: 0,
-                usage: { ...cumulativeUsage },
-                toolSteps: [],
-                ...buildTraceRetryFields(),
-            },
-            false,
-        );
+        publishRunningTrace(startedAt);
 
         const canEditFiles = canonicalTools.some((tool) => tool.name === 'edit_file');
         const toolCtx = createToolExecutionContext({
@@ -1399,6 +1409,7 @@ export class AgentRunner {
             ? new IncrementalOutputStreamExtractor({
                 initialOutput,
                 onPreview: (fullText) => {
+                    lastOutputPreview = fullText;
                     this.traceLogger.emit({
                         kind: 'output_preview',
                         target: { ...target },
@@ -2363,6 +2374,7 @@ export class AgentRunner {
                             ? { cacheBreakpoints: [...llmRequest.cacheBreakpoints] }
                             : {}),
                     };
+                    publishRunningTrace();
 
                     const onToolCallDelta =
                         extractor || finishExtractor
@@ -2722,28 +2734,11 @@ export class AgentRunner {
                             };
                             retryEvents.push(retryEntry);
 
-                            this.traceLogger.recordTrace(
-                                {
-                                    runId,
-                                    target: { ...target },
-                                    phase: input.phase,
-                                    agentProfileId: agent.id,
-                                    agentName: agent.name,
-                                    ...traceTriggerMeta,
-                                    connectionId: connection.id,
-                                    model: connection.model,
-                                    status: 'running',
-                                    startedAt,
-                                    durationMs: Math.max(0, retryTimestamp - startedAt),
-                                    usage: cumulativeUsage,
-                                    toolSteps: canonicalClone(toolSteps),
-                                    ...buildTraceRetryFields(),
-                                },
-                                false,
-                            );
+                            publishRunningTrace(retryTimestamp);
 
                             if (extractor) {
                                 const committedOutput = await readCurrentOutputSafe();
+                                lastOutputPreview = committedOutput;
                                 extractor.resetRound(committedOutput);
                                 this.traceLogger.emit({
                                     kind: 'output_preview',
@@ -3101,53 +3096,105 @@ export class AgentRunner {
                         args: parsedArgs,
                         result: '',
                         ok: true,
+                        status: 'running',
                         durationMs: 0,
                         startedAt: stepStartedAt,
                     };
 
-                    this.traceLogger.emit({
-                        kind: 'tool_started',
-                        target: { ...target },
-                        timestamp: stepStartedAt,
-                        phase: input.phase,
-                        runId,
-                        agentProfileId: agent.id,
-                        toolStep: canonicalClone(startedStep),
-                    });
-                    input.onToolStart?.(startedStep);
-
                     let execResult: Awaited<ReturnType<ToolRegistry['executeToolCall']>>;
                     let duplicateReadWarning: string | undefined;
 
-                    if (strictToolLoop && toolCall.name === FINISH_TURN_TOOL_NAME) {
-                        if (hasOtherToolsInRound) {
-                            let errorMsg =
-                                'Other tools ran in this round. Review their outputs first, then call finish_turn in the next round.';
-                            if (finishTurnMode === 'main_output') {
-                                const currentOut = await readCurrentOutputSafe();
-                                if (currentOut.trim().length === 0) {
-                                    errorMsg = EMPTY_OUTPUT_FINISH_ERROR;
+                    try {
+                        activeToolStep = startedStep;
+                        publishRunningTrace(stepStartedAt);
+
+                        this.traceLogger.emit({
+                            kind: 'tool_started',
+                            target: { ...target },
+                            timestamp: stepStartedAt,
+                            phase: input.phase,
+                            runId,
+                            agentProfileId: agent.id,
+                            toolStep: canonicalClone(startedStep),
+                        });
+                        input.onToolStart?.(startedStep);
+
+                        if (strictToolLoop && toolCall.name === FINISH_TURN_TOOL_NAME) {
+                            if (hasOtherToolsInRound) {
+                                let errorMsg =
+                                    'Other tools ran in this round. Review their outputs first, then call finish_turn in the next round.';
+                                if (finishTurnMode === 'main_output') {
+                                    const currentOut = await readCurrentOutputSafe();
+                                    if (currentOut.trim().length === 0) {
+                                        errorMsg = EMPTY_OUTPUT_FINISH_ERROR;
+                                    }
                                 }
-                            }
-                            execResult = {
-                                ok: false,
-                                toolName: toolCall.name,
-                                output: JSON.stringify({
+                                execResult = {
                                     ok: false,
-                                    ...(errorMsg !== EMPTY_OUTPUT_FINISH_ERROR
-                                        ? { deferred: true }
-                                        : {}),
+                                    toolName: toolCall.name,
+                                    output: JSON.stringify({
+                                        ok: false,
+                                        ...(errorMsg !== EMPTY_OUTPUT_FINISH_ERROR
+                                            ? { deferred: true }
+                                            : {}),
+                                        error: errorMsg,
+                                    }),
                                     error: errorMsg,
-                                }),
-                                error: errorMsg,
-                                durationMs: Math.max(0, Date.now() - stepStartedAt),
-                            };
-                        } else if (finishTurnSpec) {
-                            const parsedFinish = parseFinishTurnArgs(
-                                toolCall.arguments,
-                                finishTurnSpec.definition.parameters,
-                            );
-                            if (!parsedFinish.ok) {
+                                    durationMs: Math.max(0, Date.now() - stepStartedAt),
+                                };
+                            } else if (finishTurnSpec) {
+                                const parsedFinish = parseFinishTurnArgs(
+                                    toolCall.arguments,
+                                    finishTurnSpec.definition.parameters,
+                                );
+                                if (!parsedFinish.ok) {
+                                    execResult = await registry.executeToolCall(
+                                        toolCall.name,
+                                        toolCall.arguments,
+                                        toolCtx,
+                                        {
+                                            toolCallId: toolCall.id,
+                                            spillStore: registry.getSpillStore() ?? this.spillStore,
+                                            scopeId: `${agent.id}:${target.messageId}#${target.swipeId}`,
+                                        },
+                                    );
+                                } else if (turnFinishFixFeedback) {
+                                    execResult = {
+                                        ok: false,
+                                        toolName: toolCall.name,
+                                        output: JSON.stringify({
+                                            ok: false,
+                                            error: turnFinishFixFeedback,
+                                        }),
+                                        error: turnFinishFixFeedback,
+                                        durationMs: Math.max(0, Date.now() - stepStartedAt),
+                                    };
+                                } else if (finishTurnMode === 'main_output') {
+                                    execResult = {
+                                        ok: false,
+                                        toolName: toolCall.name,
+                                        output: JSON.stringify({
+                                            ok: false,
+                                            error: EMPTY_OUTPUT_FINISH_ERROR,
+                                        }),
+                                        error: EMPTY_OUTPUT_FINISH_ERROR,
+                                        durationMs: Math.max(0, Date.now() - stepStartedAt),
+                                    };
+                                } else {
+                                    const sideEffectErr =
+                                        'Target path(s) have not been inspected or updated yet. Call tools first before calling finish_turn.';
+                                    execResult = {
+                                        ok: false,
+                                        toolName: toolCall.name,
+                                        output: JSON.stringify({
+                                            ok: false,
+                                            error: sideEffectErr,
+                                        }),
+                                        error: sideEffectErr,
+                                        durationMs: Math.max(0, Date.now() - stepStartedAt),
+                                    };
+                                }
+                            } else {
                                 execResult = await registry.executeToolCall(
                                     toolCall.name,
                                     toolCall.arguments,
@@ -3158,184 +3205,141 @@ export class AgentRunner {
                                         scopeId: `${agent.id}:${target.messageId}#${target.swipeId}`,
                                     },
                                 );
-                            } else if (turnFinishFixFeedback) {
-                                execResult = {
-                                    ok: false,
-                                    toolName: toolCall.name,
-                                    output: JSON.stringify({
-                                        ok: false,
-                                        error: turnFinishFixFeedback,
-                                    }),
-                                    error: turnFinishFixFeedback,
-                                    durationMs: Math.max(0, Date.now() - stepStartedAt),
-                                };
-                            } else if (finishTurnMode === 'main_output') {
-                                execResult = {
-                                    ok: false,
-                                    toolName: toolCall.name,
-                                    output: JSON.stringify({
-                                        ok: false,
-                                        error: EMPTY_OUTPUT_FINISH_ERROR,
-                                    }),
-                                    error: EMPTY_OUTPUT_FINISH_ERROR,
-                                    durationMs: Math.max(0, Date.now() - stepStartedAt),
-                                };
-                            } else {
-                                const sideEffectErr =
-                                    'Target path(s) have not been inspected or updated yet. Call tools first before calling finish_turn.';
-                                execResult = {
-                                    ok: false,
-                                    toolName: toolCall.name,
-                                    output: JSON.stringify({
-                                        ok: false,
-                                        error: sideEffectErr,
-                                    }),
-                                    error: sideEffectErr,
-                                    durationMs: Math.max(0, Date.now() - stepStartedAt),
-                                };
                             }
                         } else {
-                            execResult = await registry.executeToolCall(
-                                toolCall.name,
-                                toolCall.arguments,
-                                toolCtx,
-                                {
-                                    toolCallId: toolCall.id,
-                                    spillStore: registry.getSpillStore() ?? this.spillStore,
-                                    scopeId: `${agent.id}:${target.messageId}#${target.swipeId}`,
-                                },
+                            roundNonFinishCount += 1;
+                            const mutationDirective = pendingMutationDirectives.get(toolCall.id);
+                            const shouldRejectWrite = Boolean(
+                                mutationDirective
+                                && mutationDirective.result.action === 'fix'
+                                && mutationDirective.result.rejectWrite
+                                && outputFixAttempts < maxOutputFixAttempts,
                             );
-                        }
-                    } else {
-                        roundNonFinishCount += 1;
-                        const mutationDirective = pendingMutationDirectives.get(toolCall.id);
-                        const shouldRejectWrite = Boolean(
-                            mutationDirective
-                            && mutationDirective.result.action === 'fix'
-                            && mutationDirective.result.rejectWrite
-                            && outputFixAttempts < maxOutputFixAttempts,
-                        );
-                        if (shouldRejectWrite && mutationDirective) {
-                            outputFixAttempts += 1;
-                            mutationDirective.fixCounted = true;
-                            const rejectMsg = formatOutputFixFeedback(
-                                mutationDirective.result.fixMessage
-                                    ?? 'Output validation rejected this write.',
-                                {
-                                    stage: 'output_mutation',
-                                    operation: mutationDirective.operation,
-                                    rejectWrite: true,
-                                    requestedBy: mutationDirective.result.requestedBy,
-                                },
-                            );
-                            execResult = {
-                                ok: false,
-                                toolName: toolCall.name,
-                                output: JSON.stringify({
-                                    ok: false,
-                                    rejected: true,
-                                    path: OUTPUT_FILE_PATH,
-                                    error: rejectMsg,
-                                }),
-                                error: rejectMsg,
-                                durationMs: Math.max(0, Date.now() - stepStartedAt),
-                            };
-                        } else {
-                            execResult = await registry.executeToolCall(
-                                toolCall.name,
-                                toolCall.arguments,
-                                toolCtx,
-                                {
-                                    toolCallId: toolCall.id,
-                                    spillStore: registry.getSpillStore() ?? this.spillStore,
-                                    scopeId: `${agent.id}:${target.messageId}#${target.swipeId}`,
-                                },
-                            );
-                        }
-
-                        if (execResult.ok && mutationDirective) {
-                            if (mutationDirective.result.changed) {
-                                await this.vfs.writeFile(
-                                    OUTPUT_FILE_PATH,
-                                    mutationDirective.result.text,
-                                    {
-                                        target,
-                                        staged,
-                                        source: 'agentic_output_process',
-                                    },
-                                );
-                                if (
-                                    mutationDirective.operation === 'append_reply_view'
-                                    || mutationDirective.operation === 'replace_reply_view'
-                                ) {
-                                    await this.bridge.refreshMessageView({ ...target });
-                                }
-                            }
-                            if (
-                                mutationDirective.result.action === 'fix'
-                                && !mutationDirective.result.rejectWrite
-                                && !mutationDirective.fixCounted
-                                && outputFixAttempts < maxOutputFixAttempts
-                            ) {
+                            if (shouldRejectWrite && mutationDirective) {
                                 outputFixAttempts += 1;
                                 mutationDirective.fixCounted = true;
-                                const softFixMsg = formatOutputFixFeedback(
+                                const rejectMsg = formatOutputFixFeedback(
                                     mutationDirective.result.fixMessage
-                                        ?? 'Output validation requested a revision.',
+                                        ?? 'Output validation rejected this write.',
                                     {
                                         stage: 'output_mutation',
                                         operation: mutationDirective.operation,
-                                        rejectWrite: false,
+                                        rejectWrite: true,
                                         requestedBy: mutationDirective.result.requestedBy,
                                     },
                                 );
                                 execResult = {
-                                    ...execResult,
-                                    output: attachValidationWarningToToolOutput(
-                                        execResult.output,
-                                        softFixMsg,
-                                    ),
+                                    ok: false,
+                                    toolName: toolCall.name,
+                                    output: JSON.stringify({
+                                        ok: false,
+                                        rejected: true,
+                                        path: OUTPUT_FILE_PATH,
+                                        error: rejectMsg,
+                                    }),
+                                    error: rejectMsg,
+                                    durationMs: Math.max(0, Date.now() - stepStartedAt),
                                 };
-                            }
-                        }
-
-                        if (
-                            extractor
-                            && execResult.ok
-                            && isOutputMutationToolCall(toolCall.name, parsedArgs)
-                        ) {
-                            const currentOut = await readCurrentOutputSafe();
-                            extractor.markToolExecuted(currentOut);
-                        }
-
-                        if (!READ_ONLY_TOOL_NAMES.has(toolCall.name) && execResult.ok) {
-                            hasWriteToolExecuted = true;
-                            roundHadSuccessfulWrite = true;
-                        }
-
-                        if (strictToolLoop) {
-                            if (READ_ONLY_TOOL_NAMES.has(toolCall.name)) {
-                                const signature = buildToolCallSignature(
+                            } else {
+                                execResult = await registry.executeToolCall(
                                     toolCall.name,
                                     toolCall.arguments,
+                                    toolCtx,
+                                    {
+                                        toolCallId: toolCall.id,
+                                        spillStore: registry.getSpillStore() ?? this.spillStore,
+                                        scopeId: `${agent.id}:${target.messageId}#${target.swipeId}`,
+                                    },
                                 );
-                                const seenCount = (readSignatureCounts.get(signature) ?? 0) + 1;
-                                readSignatureCounts.set(signature, seenCount);
-                                if (seenCount >= 2) {
-                                    blockedReadTools.add(toolCall.name);
-                                    duplicateReadWarning =
-                                        `Repeated identical read-only call "${toolCall.name}" (${seenCount}x). Do not re-read the same data; proceed with writing or calling finish_turn.`;
+                            }
+
+                            if (execResult.ok && mutationDirective) {
+                                if (mutationDirective.result.changed) {
+                                    await this.vfs.writeFile(
+                                        OUTPUT_FILE_PATH,
+                                        mutationDirective.result.text,
+                                        {
+                                            target,
+                                            staged,
+                                            source: 'agentic_output_process',
+                                        },
+                                    );
+                                    if (
+                                        mutationDirective.operation === 'append_reply_view'
+                                        || mutationDirective.operation === 'replace_reply_view'
+                                    ) {
+                                        await this.bridge.refreshMessageView({ ...target });
+                                    }
+                                }
+                                if (
+                                    mutationDirective.result.action === 'fix'
+                                    && !mutationDirective.result.rejectWrite
+                                    && !mutationDirective.fixCounted
+                                    && outputFixAttempts < maxOutputFixAttempts
+                                ) {
+                                    outputFixAttempts += 1;
+                                    mutationDirective.fixCounted = true;
+                                    const softFixMsg = formatOutputFixFeedback(
+                                        mutationDirective.result.fixMessage
+                                            ?? 'Output validation requested a revision.',
+                                        {
+                                            stage: 'output_mutation',
+                                            operation: mutationDirective.operation,
+                                            rejectWrite: false,
+                                            requestedBy: mutationDirective.result.requestedBy,
+                                        },
+                                    );
+                                    execResult = {
+                                        ...execResult,
+                                        output: attachValidationWarningToToolOutput(
+                                            execResult.output,
+                                            softFixMsg,
+                                        ),
+                                    };
+                                }
+                            }
+
+                            if (
+                                extractor
+                                && execResult.ok
+                                && isOutputMutationToolCall(toolCall.name, parsedArgs)
+                            ) {
+                                const currentOut = await readCurrentOutputSafe();
+                                extractor.markToolExecuted(currentOut);
+                            }
+
+                            if (!READ_ONLY_TOOL_NAMES.has(toolCall.name) && execResult.ok) {
+                                hasWriteToolExecuted = true;
+                                roundHadSuccessfulWrite = true;
+                            }
+
+                            if (strictToolLoop) {
+                                if (READ_ONLY_TOOL_NAMES.has(toolCall.name)) {
+                                    const signature = buildToolCallSignature(
+                                        toolCall.name,
+                                        toolCall.arguments,
+                                    );
+                                    const seenCount = (readSignatureCounts.get(signature) ?? 0) + 1;
+                                    readSignatureCounts.set(signature, seenCount);
+                                    if (seenCount >= 2) {
+                                        blockedReadTools.add(toolCall.name);
+                                        duplicateReadWarning =
+                                            `Repeated identical read-only call "${toolCall.name}" (${seenCount}x). Do not re-read the same data; proceed with writing or calling finish_turn.`;
+                                    } else {
+                                        roundAllDuplicateReadOnly = false;
+                                    }
                                 } else {
                                     roundAllDuplicateReadOnly = false;
                                 }
-                            } else {
-                                roundAllDuplicateReadOnly = false;
                             }
                         }
+
+                        throwIfAborted(signal);
+                    } finally {
+                        activeToolStep = null;
                     }
 
-                    throwIfAborted(signal);
-
+                    const stepCompletedAt = Date.now();
                     const completedStep: ToolStepLog = {
                         stepIndex,
                         toolCallId: toolCall.id,
@@ -3343,16 +3347,19 @@ export class AgentRunner {
                         args: parsedArgs,
                         result: execResult.output,
                         ok: execResult.ok,
+                        status: execResult.ok ? 'completed' : 'error',
                         ...(execResult.error !== undefined ? { error: execResult.error } : {}),
                         durationMs: execResult.durationMs,
                         startedAt: stepStartedAt,
                     };
                     toolSteps.push(completedStep);
 
+                    publishRunningTrace(stepCompletedAt);
+
                     this.traceLogger.emit({
                         kind: 'tool_completed',
                         target: { ...target },
-                        timestamp: Date.now(),
+                        timestamp: stepCompletedAt,
                         phase: input.phase,
                         runId,
                         agentProfileId: agent.id,
