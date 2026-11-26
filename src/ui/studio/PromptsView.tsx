@@ -1237,7 +1237,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                     <div class="ag-field-hint">
                         可用自动注入定位宏（引用后将取消对应的默认 System Instruction / Layer 2 尾部自动注入，改为在此处精确展开；Prefix 请放置静态宏，动态宏请放置于 Tail）：
                         {' '}
-                        <code>{'{{systemBase}}'}</code>、<code>{'{{coreManifest}}'}</code>、<code>{'{{systemRules}}'}</code>、
+                        <code>{'{{systemBase}}'}</code>、<code>{'{{assistantSystemPrompt}}'}</code>、<code>{'{{coreManifest}}'}</code>、<code>{'{{systemRules}}'}</code>、
                         <code>{'{{turnBrief}}'}</code>、<code>{'{{sideBrief}}'}</code>、
                         <code>{'{{workspaceNotice}}'}</code>、<code>{'{{dynamicReminders}}'}</code>、
                         <code>{'{{loreHint}}'}</code>、<code>{'{{sideHint}}'}</code>

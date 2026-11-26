@@ -15,7 +15,11 @@ import type {
     PromptBlock,
 } from '@/core/types';
 import { canonicalClone, canonicalStringify } from '@/core/utils';
-import { substituteAutoPromptMacrosFallback } from './auto-prompt-macros';
+import {
+    extractAutoPromptMacroKeys,
+    omitAutoPromptMacroOverrides,
+    substituteAutoPromptMacrosFallback,
+} from './auto-prompt-macros';
 
 export interface PromptBlockRenderSyncOptions {
     hostBridge?: Pick<HostBridge, 'substituteMacros'>;
@@ -305,8 +309,19 @@ async function evaluateStringLeafAsync(
     messageRole?: PromptTransformRole,
     messageName?: string,
 ): Promise<string> {
+    const claimedAutoPrompts =
+        evalTransform
+        && options.macroOverrides
+        && (options.hostBridge?.transformPromptText || options.hostBridge?.evaluateOptionalEjs)
+            ? extractAutoPromptMacroKeys(raw)
+            : undefined;
+    const effectiveMacroOverrides =
+        claimedAutoPrompts && claimedAutoPrompts.size > 0
+            ? omitAutoPromptMacroOverrides(options.macroOverrides)
+            : options.macroOverrides;
+
     const beforeMacroSnap = readMetadataVariablesSnapshot(options.hostBridge);
-    let text = applyMacros(raw, options.hostBridge, options.macroOverrides);
+    let text = applyMacros(raw, options.hostBridge, effectiveMacroOverrides);
     const afterMacroSnap = readMetadataVariablesSnapshot(options.hostBridge);
 
     const macroDelta: Record<string, unknown> = {};
@@ -386,6 +401,13 @@ async function evaluateStringLeafAsync(
             Object.assign(ejsEnv, ejsDelta);
             options.onVariablesMutated?.(ejsDelta);
         }
+    }
+    if (claimedAutoPrompts && claimedAutoPrompts.size > 0) {
+        text = substituteAutoPromptMacrosFallback(
+            text,
+            options.macroOverrides,
+            claimedAutoPrompts,
+        );
     }
     return text;
 }

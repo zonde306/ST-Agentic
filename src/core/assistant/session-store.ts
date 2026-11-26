@@ -1349,11 +1349,12 @@ export class AssistantSessionStore {
         forceRecompile: boolean = false,
         extraPrefixMessages: readonly CanonicalMessage[] = [],
         prefixFingerprint?: string,
+        omitSystemMessage: boolean = false,
     ): FrozenStaticPrefix {
         const threadId = toAssistantThreadId(sessionId);
         const existing = this.trajectoryStore.getFrozenPrefix(threadId);
         const desiredMessages: CanonicalMessage[] = [
-            { role: 'system', content: systemPrompt },
+            ...(omitSystemMessage ? [] : [{ role: 'system' as const, content: systemPrompt }]),
             ...extraPrefixMessages.map((msg) => canonicalClone(msg)),
         ];
         const desiredTools = canonicalClone([...tools]);
@@ -1371,7 +1372,7 @@ export class AssistantSessionStore {
         const nextPrefix: FrozenStaticPrefix = {
             messages: desiredMessages,
             tools: desiredTools,
-            layer0EndIndex: Math.max(0, desiredMessages.length - 1),
+            layer0EndIndex: desiredMessages.length > 0 ? desiredMessages.length - 1 : -1,
             ...(prefixFingerprint !== undefined ? { prefixFingerprint } : {}),
         };
         this.trajectoryStore.setFrozenPrefix(nextPrefix, threadId);
@@ -1392,6 +1393,7 @@ export class AssistantSessionStore {
             extraPrefixMessages?: readonly CanonicalMessage[];
             tailMessages?: readonly CanonicalMessage[];
             prefixFingerprint?: string;
+            omitSystemMessage?: boolean;
         },
     ): AssistantRequestAssembly {
         const threadId = toAssistantThreadId(sessionId);
@@ -1402,6 +1404,7 @@ export class AssistantSessionStore {
             false,
             options?.extraPrefixMessages ?? [],
             options?.prefixFingerprint,
+            Boolean(options?.omitSystemMessage),
         );
         const layer0 = canonicalClone([...frozen.messages]);
         const layer1 = canonicalClone([...this.trajectoryStore.getMessages(threadId)]);

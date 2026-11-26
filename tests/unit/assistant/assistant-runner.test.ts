@@ -6,9 +6,9 @@ import {
     REDACTED_PLACEHOLDER,
     toAssistantThreadId,
 } from '@/core/assistant';
-import { createDefaultSettings } from '@/core/config';
+import { createDefaultConnection, createDefaultSettings } from '@/core/config';
 import { TrajectoryStore } from '@/core/context';
-import { LLMTransportError } from '@/core/llm';
+import { LLMTransportError, PayloadCompiler } from '@/core/llm';
 import { TraceLogger } from '@/core/logger';
 import type { AssistantRetryStatus } from '@/core/types';
 import { AppStore, type AssistantRuntimeBridge } from '@/ui/store/app-store';
@@ -1674,6 +1674,140 @@ describe('AssistantRunner & AssistantSessionStore (TS2.1)', () => {
         const committed = trajectoryStore.getMessages(toAssistantThreadId(session.id));
         expect(committed.some((m) => m.role === 'tool' && m.toolCallId === 'call_flush_1')).toBe(
             true,
+        );
+    });
+
+    it('takes over Off-Mainline Assistant system prompt via {{assistantSystemPrompt}} / {{systemBase}} without EJS errors or Gemini systemInstruction leakage', async () => {
+        const bridge = createOffMainlineTestBridge();
+        bridge.extensionCapabilities = {
+            tavernHelperScripts: false,
+            tavernHelperAudio: false,
+            ejsTemplate: true,
+        };
+        bridge.evaluateOptionalEjs = async (text) => {
+            if (text.includes('<%')) {
+                throw new Error(`Unexpected EJS compilation on literal <%: ${text}`);
+            }
+            return text;
+        };
+
+        const transport = new ScriptedLLMTransport([
+            { content: '第一轮完成' },
+            { content: '第二轮复用完成' },
+            { content: '切换模式后完成' },
+        ]);
+        const trajectoryStore = new TrajectoryStore();
+        const traceLogger = new TraceLogger();
+        const settings = createDefaultSettings();
+        settings.presets.default.agents.main.promptBlocks = [
+            {
+                id: 'asst_user_prefix',
+                name: 'Assistant User Slot',
+                role: 'user',
+                placement: 'prefix',
+                content: '助手指令接管：\n{{assistantSystemPrompt}}\n别名：{{assistant-system-prompt}}',
+                enabled: true,
+                triggers: ['assistant'],
+            },
+        ];
+
+        const runner = new AssistantRunner({
+            bridge,
+            transport,
+            trajectoryStore,
+            traceLogger,
+            settings,
+        });
+
+        const session = await runner.createSession({
+            title: '助手系统词接管测试',
+            mode: 'chat',
+        });
+
+        // Turn 1: built-in Off-Mainline Assistant prompt is NOT emitted as role='system', expands inside user block,
+        // and literal `<% ... %>` inside buildAssistantSystemPrompt() never triggers evaluateOptionalEjs
+        await runner.sendPrompt(session.id, '帮我检查现状');
+        const req1 = transport.requests[0]!;
+        expect(req1.messages.some((m) => m.role === 'system')).toBe(false);
+        expect(req1.messages[0].role).toBe('user');
+        expect(req1.messages[0].content).toContain(
+            'You are the ST-Agentic Off-Mainline Assistant operating outside the mainline RP context',
+        );
+        expect(req1.messages[0].content).toContain('Current capability mode: chat.');
+
+        const compiler = new PayloadCompiler();
+        const compiled = compiler.compile(
+            req1,
+            createDefaultConnection({ providerFormat: 'gemini', model: 'gemini-2.5-pro' }),
+        );
+        expect(compiled.body.systemInstruction).toBeUndefined();
+        expect(JSON.stringify(compiled.body.contents)).toContain(
+            'You are the ST-Agentic Off-Mainline Assistant',
+        );
+
+        // Turn 2: frozen prefix reuse MUST NOT slice off messages[0] when system prompt was omitted
+        await runner.sendPrompt(session.id, '继续分析');
+        const req2 = transport.requests[1]!;
+        expect(req2.messages.some((m) => m.role === 'system')).toBe(false);
+        expect(req2.messages[0].role).toBe('user');
+        expect(req2.messages[0].content).toContain('Current capability mode: chat.');
+
+        // Mode switch (chat -> adjust) invalidates frozen prefix and updates expanded prompt
+        await runner.updateSessionConfig(session.id, { mode: 'adjust' });
+        await runner.sendPrompt(session.id, '现在进入调整模式');
+        const req3 = transport.requests[2]!;
+        expect(req3.messages.some((m) => m.role === 'system')).toBe(false);
+        expect(req3.messages[0].content).toContain('Current capability mode: adjust.');
+    });
+
+    it('supports {{systemBase}} / {{assistantSystemPrompt}} in assistant tail blocks across frozen turns and invalidates stale prefix', async () => {
+        const { settings, transport, runner } = createRunnerHarness([
+            { content: '第一轮无接管' },
+            { content: '第二轮尾部接管' },
+            { content: '第三轮继续尾部接管' },
+        ]);
+
+        const session = await runner.createSession({
+            title: '尾部接管测试',
+            mode: 'chat',
+        });
+
+        // Turn 1: no takeover macro -> auto system prompt present
+        await runner.sendPrompt(session.id, '回合一');
+        expect(transport.requests[0]!.messages[0].role).toBe('system');
+        expect(transport.requests[0]!.messages[0].content).toContain(
+            'You are the ST-Agentic Off-Mainline Assistant',
+        );
+
+        // Add tail block with {{systemBase}} -> stale Turn 1 frozen prefix MUST be invalidated
+        settings.presets.default.agents.main.promptBlocks = [
+            {
+                id: 'asst_tail_takeover',
+                name: 'Assistant Tail Takeover',
+                role: 'user',
+                placement: 'tail',
+                content: '尾部接管：\n{{systemBase}}',
+                enabled: true,
+                triggers: ['assistant'],
+            },
+        ];
+
+        await runner.sendPrompt(session.id, '回合二');
+        const req2 = transport.requests[1]!;
+        expect(req2.messages.some((m) => m.role === 'system')).toBe(false);
+        const tailMsg2 = req2.messages[req2.messages.length - 1]!;
+        expect(tailMsg2.role).toBe('user');
+        expect(tailMsg2.content).toContain(
+            'You are the ST-Agentic Off-Mainline Assistant',
+        );
+
+        await runner.sendPrompt(session.id, '回合三');
+        const req3 = transport.requests[2]!;
+        expect(req3.messages.some((m) => m.role === 'system')).toBe(false);
+        const tailMsg3 = req3.messages[req3.messages.length - 1]!;
+        expect(tailMsg3.role).toBe('user');
+        expect(tailMsg3.content).toContain(
+            'You are the ST-Agentic Off-Mainline Assistant',
         );
     });
 });

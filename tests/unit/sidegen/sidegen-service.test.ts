@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createDefaultConnection } from '@/core/config';
+import { createDefaultConnection, createDefaultSettings } from '@/core/config';
 import { TrajectoryStore } from '@/core/context';
 import {
     AGENTIC_SIDE_SESSIONS_KEY,
@@ -696,5 +696,57 @@ describe('SideGenService — AbortSignal & Stale Race Write Protection', () => {
 
         await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
         expect(await service.listSessions()).toEqual([]);
+    });
+
+    it('takes over SideGen systemPrompt via {{systemBase}} in sidegen-triggered blocks for runOnce and persistent sessions', async () => {
+        const bridge = createOffMainlineTestBridge();
+        const settings = createDefaultSettings();
+        settings.presets.default.agents.main.promptBlocks = [
+            {
+                id: 'sidegen_user_base',
+                name: 'SideGen User Base',
+                role: 'user',
+                placement: 'prefix',
+                content: '线外接管：{{systemBase}}',
+                enabled: true,
+                triggers: ['sidegen'],
+            },
+        ];
+
+        const transport = new ScriptedLLMTransport([
+            { content: 'once ok' },
+            { content: 'session ok' },
+        ]);
+        const service = new SideGenService({
+            bridge,
+            transport,
+            getSettings: () => settings,
+            now: createDeterministicClock(),
+        });
+
+        await service.runOnce({
+            systemPrompt: '你是线外观察员。',
+            prompt: '汇报情况',
+        });
+        const onceReq = transport.requests[0]!;
+        expect(onceReq.messages.some((m) => m.role === 'system')).toBe(false);
+        expect(onceReq.messages[0]).toEqual({
+            role: 'user',
+            content: '线外接管：你是线外观察员。',
+        });
+
+        await service.createSession({
+            id: 'phone:takeover',
+            title: '线外接管会话',
+            scope: 'branch',
+            systemPrompt: '你是线外联络员。',
+        });
+        await service.send('phone:takeover', '收到请回答');
+        const sendReq = transport.requests[1]!;
+        expect(sendReq.messages.some((m) => m.role === 'system')).toBe(false);
+        expect(sendReq.messages[0]).toEqual({
+            role: 'user',
+            content: '线外接管：你是线外联络员。',
+        });
     });
 });

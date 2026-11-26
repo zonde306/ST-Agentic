@@ -23,8 +23,10 @@ import {
     type Layer1TurnGroup,
     TrajectoryStore,
     applyIngestRegexText,
+    buildAutoPromptMacroOverrides,
     buildSideGenMacroOverrides,
     estimateRequestTokens,
+    extractAutoPromptMacroKeys,
     groupLayer1Turns,
     renderPromptBlocks,
 } from '@/core/context';
@@ -616,9 +618,10 @@ export class SideGenService implements ToolSideGenApi {
                 currentPrompt: ingestedPrompt,
                 generationType: 'quiet',
                 connection,
+                systemPrompt: opts.systemPrompt ?? '',
             });
             const baseMessages: CanonicalMessage[] = [];
-            if (opts.systemPrompt && opts.systemPrompt.trim()) {
+            if (!presetPrompts.suppressAutoSystemPrompt && opts.systemPrompt && opts.systemPrompt.trim()) {
                 baseMessages.push({
                     role: 'system',
                     content: opts.systemPrompt.trim(),
@@ -725,8 +728,12 @@ export class SideGenService implements ToolSideGenApi {
             historyMessages: [],
             generationType: 'normal',
             connection,
+            systemPrompt,
         });
-        const layer0Messages = this.buildLayer0Messages(systemPrompt, presetPrompts.prefixMessages);
+        const layer0Messages = this.buildLayer0Messages(
+            presetPrompts.suppressAutoSystemPrompt ? '' : systemPrompt,
+            presetPrompts.prefixMessages,
+        );
         const initialTools = connection?.strictToolLoop
             ? [canonicalClone(FINISH_TURN_TOOL_SCHEMA)]
             : [];
@@ -801,10 +808,11 @@ export class SideGenService implements ToolSideGenApi {
                 currentPrompt: ingestedPrompt,
                 generationType: 'normal',
                 connection,
+                systemPrompt: session.systemPrompt,
             });
             const layer0Messages = await this.ensureFrozenLayer0(
                 threadId,
-                session.systemPrompt,
+                presetPrompts.suppressAutoSystemPrompt ? '' : session.systemPrompt,
                 presetPrompts.prefixMessages,
                 startAnchor,
                 connection,
@@ -1733,14 +1741,16 @@ export class SideGenService implements ToolSideGenApi {
             currentPrompt?: string;
             generationType?: 'normal' | 'quiet';
             connection?: ApiConnection;
+            systemPrompt?: string;
         },
     ): Promise<{
         prefixMessages: CanonicalMessage[];
         tailMessages: CanonicalMessage[];
+        suppressAutoSystemPrompt: boolean;
     }> {
         const settings = this.getSettingsFn?.();
         if (!settings) {
-            return { prefixMessages: [], tailMessages: [] };
+            return { prefixMessages: [], tailMessages: [], suppressAutoSystemPrompt: false };
         }
         const preset = resolveActivePreset(settings);
         const selected = selectPresetBlocksForContext(
@@ -1748,15 +1758,22 @@ export class SideGenService implements ToolSideGenApi {
             { kind: 'sidegen', mode },
             { requireExplicit: true },
         );
+        let suppressAutoSystemPrompt = false;
+        for (const block of [...selected.prefix, ...selected.tail]) {
+            if (extractAutoPromptMacroKeys(block.content).has('systemBase')) {
+                suppressAutoSystemPrompt = true;
+                break;
+            }
+        }
 
         const needPrefix = !options?.skipPrefix && selected.prefix.length > 0;
         const needTail = !options?.skipTail && selected.tail.length > 0;
         if (!needPrefix && !needTail) {
-            return { prefixMessages: [], tailMessages: [] };
+            return { prefixMessages: [], tailMessages: [], suppressAutoSystemPrompt };
         }
 
         const vars = this.readVarsObject(anchor);
-        const macroOverrides = buildSideGenMacroOverrides({
+        const baseMacroOverrides = buildSideGenMacroOverrides({
             mode,
             historyMessages: options?.historyMessages,
             currentPrompt: options?.currentPrompt,
@@ -1765,6 +1782,15 @@ export class SideGenService implements ToolSideGenApi {
             connection: options?.connection,
             vars,
         });
+        const macroOverrides: Record<string, string> =
+            options?.systemPrompt !== undefined
+                ? {
+                      ...baseMacroOverrides,
+                      ...buildAutoPromptMacroOverrides({
+                          systemBase: options.systemPrompt,
+                      }),
+                  }
+                : baseMacroOverrides;
         const prefixMessages = needPrefix
             ? await renderPromptBlocks(selected.prefix, {
                   hostBridge: this.bridge,
@@ -1788,7 +1814,7 @@ export class SideGenService implements ToolSideGenApi {
               })
             : [];
 
-        return { prefixMessages, tailMessages };
+        return { prefixMessages, tailMessages, suppressAutoSystemPrompt };
     }
 
     private async ensureFrozenLayer0(
@@ -1802,16 +1828,26 @@ export class SideGenService implements ToolSideGenApi {
         if (existing) {
             return existing.messages;
         }
-        const resolvedExtra =
-            extraPrefixMessages
-            ?? (
-                await this.resolvePresetPromptMessages(
-                    'session',
-                    anchor ?? this.resolveCurrentAnchor(),
-                    { skipTail: true, historyMessages: [], generationType: 'normal', connection },
-                )
-            ).prefixMessages;
-        const layer0Messages = this.buildLayer0Messages(systemPrompt, resolvedExtra);
+        let resolvedSystemPrompt = systemPrompt;
+        let resolvedExtra = extraPrefixMessages;
+        if (resolvedExtra === undefined) {
+            const presetPrompts = await this.resolvePresetPromptMessages(
+                'session',
+                anchor ?? this.resolveCurrentAnchor(),
+                {
+                    skipTail: true,
+                    historyMessages: [],
+                    generationType: 'normal',
+                    connection,
+                    systemPrompt,
+                },
+            );
+            resolvedExtra = presetPrompts.prefixMessages;
+            if (presetPrompts.suppressAutoSystemPrompt) {
+                resolvedSystemPrompt = '';
+            }
+        }
+        const layer0Messages = this.buildLayer0Messages(resolvedSystemPrompt, resolvedExtra);
         this.trajectoryStore.ensureThread(threadId);
         this.trajectoryStore.setFrozenPrefix(
             {

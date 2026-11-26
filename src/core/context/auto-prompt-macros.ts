@@ -11,7 +11,12 @@ export type Layer2AutoPromptMacroKey =
     | 'loreHint'
     | 'sideHint';
 
-export type AutoPromptMacroKey = Layer0AutoPromptMacroKey | Layer2AutoPromptMacroKey;
+export type OffMainlineAutoPromptMacroKey = 'assistantSystemPrompt';
+
+export type AutoPromptMacroKey =
+    | Layer0AutoPromptMacroKey
+    | Layer2AutoPromptMacroKey
+    | OffMainlineAutoPromptMacroKey;
 
 export const LAYER0_AUTO_PROMPT_KEYS: readonly Layer0AutoPromptMacroKey[] = [
     'systemBase',
@@ -28,9 +33,14 @@ export const LAYER2_AUTO_PROMPT_KEYS: readonly Layer2AutoPromptMacroKey[] = [
     'sideHint',
 ];
 
+export const OFF_MAINLINE_AUTO_PROMPT_KEYS: readonly OffMainlineAutoPromptMacroKey[] = [
+    'assistantSystemPrompt',
+];
+
 export const ALL_AUTO_PROMPT_KEYS: readonly AutoPromptMacroKey[] = [
     ...LAYER0_AUTO_PROMPT_KEYS,
     ...LAYER2_AUTO_PROMPT_KEYS,
+    ...OFF_MAINLINE_AUTO_PROMPT_KEYS,
 ];
 
 export const AUTO_PROMPT_MACRO_ALIASES: Readonly<Record<AutoPromptMacroKey, readonly string[]>> = {
@@ -43,6 +53,11 @@ export const AUTO_PROMPT_MACRO_ALIASES: Readonly<Record<AutoPromptMacroKey, read
     dynamicReminders: ['dynamicReminders', 'dynamic_reminders', 'dynamic-reminders'],
     loreHint: ['loreHint', 'lore_hint', 'lore-hint'],
     sideHint: ['sideHint', 'side_hint', 'side-hint'],
+    assistantSystemPrompt: [
+        'assistantSystemPrompt',
+        'assistant_system_prompt',
+        'assistant-system-prompt',
+    ],
 };
 
 const ALIAS_LOWER_TO_KEY = new Map<string, AutoPromptMacroKey>();
@@ -185,12 +200,33 @@ export function hasAutoPromptMacroOverride(
 }
 
 /**
- * Single-pass fallback substitution for auto-prompt macros when `hostBridge` is omitted.
+ * Return a shallow copy of `overrides` omitting all auto-prompt macro aliases (case-insensitive)
+ * so auto-prompt tokens can stay unexpanded across EJS evaluation and expand verbatim afterwards.
+ */
+export function omitAutoPromptMacroOverrides(
+    overrides?: Record<string, string>,
+): Record<string, string> | undefined {
+    if (!overrides) {
+        return undefined;
+    }
+    const filtered: Record<string, string> = {};
+    for (const [key, val] of Object.entries(overrides)) {
+        if (!AUTO_PROMPT_MACRO_ALIAS_LOWER_SET.has(key.toLowerCase())) {
+            filtered[key] = val;
+        }
+    }
+    return filtered;
+}
+
+/**
+ * Single-pass fallback substitution for auto-prompt macros when `hostBridge` is omitted
+ * or when expanding deferred auto-prompt macros verbatim after EJS/transform hooks.
  * Leaves all non-auto-prompt tokens (`{{user}}`, `{{char}}`, etc.) intact.
  */
 export function substituteAutoPromptMacrosFallback(
     text: string,
     overrides?: Record<string, string>,
+    allowedKeys?: ReadonlySet<AutoPromptMacroKey>,
 ): string {
     if (!text || !text.includes('{{') || !overrides) {
         return text;
@@ -199,7 +235,7 @@ export function substituteAutoPromptMacrosFallback(
     const resolvedByKey = new Map<AutoPromptMacroKey, string>();
     for (const [rawKey, val] of Object.entries(overrides)) {
         const canonical = ALIAS_LOWER_TO_KEY.get(rawKey.toLowerCase());
-        if (canonical && typeof val === 'string') {
+        if (canonical && (!allowedKeys || allowedKeys.has(canonical)) && typeof val === 'string') {
             resolvedByKey.set(canonical, val);
         }
     }

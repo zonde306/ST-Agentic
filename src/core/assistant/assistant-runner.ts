@@ -22,7 +22,9 @@ import {
 } from '@/core/config';
 import {
     buildAssistantMacroOverrides,
+    buildAutoPromptMacroOverrides,
     estimateMessageTokens,
+    extractAutoPromptMacroKeys,
     isSpillPath,
     renderPromptBlocks,
     renderPromptBlockSync,
@@ -79,6 +81,7 @@ import type {
     MessageTarget,
     PendingApproval,
     Preset,
+    PromptBlock,
     RawLoreEntry,
     Settings,
     TavernHelperScriptScope,
@@ -2216,8 +2219,9 @@ export class AssistantRunner {
                 : baseCanonicalTools;
 
             const threadId = toAssistantThreadId(sessionId);
-            const prefixFingerprint = this.computePresetPrefixFingerprint(currentSession);
+            const prefixFingerprint = this.computePresetPrefixFingerprint(currentSession, systemPrompt);
             const existingFrozenPrefix = this.trajectoryStore.getFrozenPrefix(threadId);
+            const presetPromptsPrecheck = this.computePresetTakeover(currentSession);
             const hasCommittedHistory = this.trajectoryStore.getMessageCount(threadId) > 0;
             const canReuseFrozenPrefix =
                 (Boolean(resume) || hasCommittedHistory)
@@ -2226,6 +2230,7 @@ export class AssistantRunner {
                     systemPrompt,
                     canonicalTools,
                     prefixFingerprint,
+                    presetPromptsPrecheck,
                 );
             const presetPrompts = await this.resolvePresetPromptMessages(currentSession, target, {
                 skipPrefix: canReuseFrozenPrefix,
@@ -2234,9 +2239,15 @@ export class AssistantRunner {
                 generationType: config.generationType ?? (resume ? 'continue' : 'normal'),
                 connection,
                 budget,
+                systemPrompt,
             });
+            const suppressAutoSystemPrompt = presetPrompts.suppressAutoSystemPrompt;
             const effectivePrefixMessages: CanonicalMessage[] = canReuseFrozenPrefix
-                ? canonicalClone(existingFrozenPrefix!.messages.slice(1))
+                ? canonicalClone([
+                      ...(suppressAutoSystemPrompt
+                          ? existingFrozenPrefix!.messages
+                          : existingFrozenPrefix!.messages.slice(1)),
+                  ])
                 : presetPrompts.prefixMessages;
             const activeTailMessages: CanonicalMessage[] = canonicalClone(
                 presetPrompts.tailMessages,
@@ -2254,6 +2265,7 @@ export class AssistantRunner {
                         extraPrefixMessages: effectivePrefixMessages,
                         tailMessages: activeTailMessages,
                         prefixFingerprint,
+                        omitSystemMessage: suppressAutoSystemPrompt,
                     },
                 );
 
@@ -3689,13 +3701,15 @@ export class AssistantRunner {
 
         try {
             const threadId = toAssistantThreadId(existing.sessionId);
-            const prefixFingerprint = this.computePresetPrefixFingerprint(session);
+            const prefixFingerprint = this.computePresetPrefixFingerprint(session, systemPrompt);
             const existingFrozenPrefix = this.trajectoryStore.getFrozenPrefix(threadId);
+            const suppressAutoPrecheck = this.computePresetTakeover(session);
             const canReuseFrozenPrefix = this.isMatchingFrozenPrefix(
                 existingFrozenPrefix,
                 systemPrompt,
                 canonicalTools,
                 prefixFingerprint,
+                suppressAutoPrecheck,
             );
             const presetPrompts = await this.resolvePresetPromptMessages(session, target, {
                 skipPrefix: canReuseFrozenPrefix,
@@ -3703,9 +3717,15 @@ export class AssistantRunner {
                 generationType: 'normal',
                 connection,
                 budget: this.resolveSessionContextBudget(session),
+                systemPrompt,
             });
+            const suppressAutoSystemPrompt = presetPrompts.suppressAutoSystemPrompt;
             const effectivePrefixMessages: CanonicalMessage[] = canReuseFrozenPrefix
-                ? canonicalClone(existingFrozenPrefix!.messages.slice(1))
+                ? canonicalClone([
+                      ...(suppressAutoSystemPrompt
+                          ? existingFrozenPrefix!.messages
+                          : existingFrozenPrefix!.messages.slice(1)),
+                  ])
                 : presetPrompts.prefixMessages;
             const assembled = this.sessionStore.buildRequestMessages(
                 existing.sessionId,
@@ -3716,6 +3736,7 @@ export class AssistantRunner {
                     extraPrefixMessages: effectivePrefixMessages,
                     tailMessages: presetPrompts.tailMessages,
                     prefixFingerprint,
+                    omitSystemMessage: suppressAutoSystemPrompt,
                 },
             );
             const useStream = connection.stream ?? this.defaultStream;
@@ -3961,7 +3982,20 @@ export class AssistantRunner {
         return {};
     }
 
-    private computePresetPrefixFingerprint(session: AssistantSession): string {
+    private hasAssistantSystemPromptTakeover(selected: {
+        prefix: readonly PromptBlock[];
+        tail: readonly PromptBlock[];
+    }): boolean {
+        for (const block of [...selected.prefix, ...selected.tail]) {
+            const keys = extractAutoPromptMacroKeys(block.content);
+            if (keys.has('assistantSystemPrompt') || keys.has('systemBase')) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private computePresetTakeover(session: AssistantSession): boolean {
         const preset = resolveActivePreset(this.settingsProvider());
         const selected = selectPresetBlocksForContext(
             preset,
@@ -3972,6 +4006,24 @@ export class AssistantRunner {
             },
             { requireExplicit: true },
         );
+        return this.hasAssistantSystemPromptTakeover(selected);
+    }
+
+    private computePresetPrefixFingerprint(
+        session: AssistantSession,
+        systemPrompt?: string,
+    ): string {
+        const preset = resolveActivePreset(this.settingsProvider());
+        const selected = selectPresetBlocksForContext(
+            preset,
+            {
+                kind: 'assistant',
+                mode: session.mode,
+                stAdminEnabled: session.stAdminEnabled,
+            },
+            { requireExplicit: true },
+        );
+        const suppressAutoSystemPrompt = this.hasAssistantSystemPromptTakeover(selected);
         return canonicalStringify({
             presetId: preset.id,
             agentId: preset.mainAgentId,
@@ -3981,6 +4033,9 @@ export class AssistantRunner {
                 placement: block.placement,
                 content: block.content,
             })),
+            ...(suppressAutoSystemPrompt
+                ? { suppressAutoSystemPrompt: true, systemPrompt: systemPrompt ?? '' }
+                : {}),
         });
     }
 
@@ -3989,10 +4044,19 @@ export class AssistantRunner {
         systemPrompt: string,
         canonicalTools: readonly CanonicalToolSchema[],
         prefixFingerprint: string,
+        suppressAutoSystemPrompt: boolean = false,
     ): boolean {
+        if (!frozen) {
+            return false;
+        }
+        if (suppressAutoSystemPrompt) {
+            return Boolean(
+                frozen.prefixFingerprint === prefixFingerprint
+                && canonicalStringify(frozen.tools) === canonicalStringify(canonicalTools),
+            );
+        }
         return Boolean(
-            frozen
-            && frozen.messages[0]?.role === 'system'
+            frozen.messages[0]?.role === 'system'
             && frozen.messages[0]?.content === systemPrompt
             && frozen.prefixFingerprint === prefixFingerprint
             && canonicalStringify(frozen.tools) === canonicalStringify(canonicalTools),
@@ -4009,10 +4073,12 @@ export class AssistantRunner {
             generationType?: SurfaceGenerationType;
             connection?: ApiConnection;
             budget?: EffectiveContextBudget;
+            systemPrompt?: string;
         },
     ): Promise<{
         prefixMessages: CanonicalMessage[];
         tailMessages: CanonicalMessage[];
+        suppressAutoSystemPrompt: boolean;
     }> {
         const preset = resolveActivePreset(this.settingsProvider());
         const selected = selectPresetBlocksForContext(
@@ -4024,15 +4090,16 @@ export class AssistantRunner {
             },
             { requireExplicit: true },
         );
+        const suppressAutoSystemPrompt = this.hasAssistantSystemPromptTakeover(selected);
 
         const needPrefix = !options?.skipPrefix && selected.prefix.length > 0;
         const needTail = selected.tail.length > 0;
         if (!needPrefix && !needTail) {
-            return { prefixMessages: [], tailMessages: [] };
+            return { prefixMessages: [], tailMessages: [], suppressAutoSystemPrompt };
         }
 
         const vars = await this.readPromptRenderVars(target);
-        const macroOverrides = buildAssistantMacroOverrides({
+        const baseMacroOverrides = buildAssistantMacroOverrides({
             session,
             bridge: this.bridge,
             excludeMessageId: options?.excludeMessageId,
@@ -4042,6 +4109,16 @@ export class AssistantRunner {
             budget: options?.budget,
             vars,
         });
+        const macroOverrides: Record<string, string> =
+            options?.systemPrompt !== undefined
+                ? {
+                      ...baseMacroOverrides,
+                      ...buildAutoPromptMacroOverrides({
+                          systemBase: options.systemPrompt,
+                          assistantSystemPrompt: options.systemPrompt,
+                      }),
+                  }
+                : baseMacroOverrides;
         const prefixMessages = needPrefix
             ? await renderPromptBlocks(selected.prefix, {
                   hostBridge: this.bridge,
@@ -4065,7 +4142,7 @@ export class AssistantRunner {
               })
             : [];
 
-        return { prefixMessages, tailMessages };
+        return { prefixMessages, tailMessages, suppressAutoSystemPrompt };
     }
 
     private resolvePresetPromptMessagesSync(
@@ -4073,10 +4150,12 @@ export class AssistantRunner {
         options?: {
             connection?: ApiConnection;
             budget?: EffectiveContextBudget;
+            systemPrompt?: string;
         },
     ): {
         prefixMessages: CanonicalMessage[];
         tailMessages: CanonicalMessage[];
+        suppressAutoSystemPrompt: boolean;
     } {
         const preset = resolveActivePreset(this.settingsProvider());
         const selected = selectPresetBlocksForContext(
@@ -4088,13 +4167,24 @@ export class AssistantRunner {
             },
             { requireExplicit: true },
         );
+        const suppressAutoSystemPrompt = this.hasAssistantSystemPromptTakeover(selected);
 
-        const macroOverrides = buildAssistantMacroOverrides({
+        const baseMacroOverrides = buildAssistantMacroOverrides({
             session,
             bridge: this.bridge,
             connection: options?.connection,
             budget: options?.budget,
         });
+        const macroOverrides: Record<string, string> =
+            options?.systemPrompt !== undefined
+                ? {
+                      ...baseMacroOverrides,
+                      ...buildAutoPromptMacroOverrides({
+                          systemBase: options.systemPrompt,
+                          assistantSystemPrompt: options.systemPrompt,
+                      }),
+                  }
+                : baseMacroOverrides;
 
         const toMessages = (
             blocks: readonly (typeof selected.prefix)[number][],
@@ -4114,6 +4204,7 @@ export class AssistantRunner {
         return {
             prefixMessages: toMessages(selected.prefix),
             tailMessages: toMessages(selected.tail),
+            suppressAutoSystemPrompt,
         };
     }
 
@@ -4213,9 +4304,18 @@ export class AssistantRunner {
         );
         const baseTools = toCanonicalAssistantToolSchemas(allowedToolDefs);
         const tools = connection.strictToolLoop ? appendFinishTurnTool(baseTools) : baseTools;
-        const prefixFingerprint = this.computePresetPrefixFingerprint(session);
+        const prefixFingerprint = this.computePresetPrefixFingerprint(session, systemPrompt);
+        const suppressAutoSystemPrompt = this.computePresetTakeover(session);
         const frozen = this.trajectoryStore.getFrozenPrefix(threadId);
-        if (this.isMatchingFrozenPrefix(frozen, systemPrompt, tools, prefixFingerprint)) {
+        if (
+            this.isMatchingFrozenPrefix(
+                frozen,
+                systemPrompt,
+                tools,
+                prefixFingerprint,
+                suppressAutoSystemPrompt,
+            )
+        ) {
             return {
                 layer0: canonicalClone([...frozen!.messages]),
                 tools: canonicalClone([...frozen!.tools]),
@@ -4224,9 +4324,12 @@ export class AssistantRunner {
         const presetPrompts = this.resolvePresetPromptMessagesSync(session, {
             connection,
             budget: this.resolveSessionContextBudget(session),
+            systemPrompt,
         });
         const layer0: CanonicalMessage[] = [
-            { role: 'system', content: systemPrompt },
+            ...(presetPrompts.suppressAutoSystemPrompt
+                ? []
+                : [{ role: 'system' as const, content: systemPrompt }]),
             ...presetPrompts.prefixMessages,
         ];
         return { layer0, tools };

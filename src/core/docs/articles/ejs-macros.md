@@ -68,7 +68,8 @@ ST-Agentic 通过 `evaluateOptionalEjs()` 集成可选插件 **`ST-Prompt-Templa
 
 | 宏（及别名） | 对应自动注入内容 | 推荐 `placement`（KV 缓存建议） |
 | :--- | :--- | :--- |
-| `{{systemBase}}` / `{{system_base}}` / `{{system-base}}` | 内置 VFS 与输出协议基础指令（`DEFAULT_SYSTEM_BASE_PROMPT` 或启用中的 `system_base` 积木；引用后可将其从 Layer 0 `system` / Gemini `systemInstruction` 移至任意预设积木，即使已删除 `system_base` 条目也不会强行兜底注入到顶层系统指令） | `prefix`（静态前缀） |
+| `{{systemBase}}` / `{{system_base}}` / `{{system-base}}` | 内置 VFS 与输出协议基础指令（`DEFAULT_SYSTEM_BASE_PROMPT` 或启用中的 `system_base` 积木；引用后可将其从 Layer 0 `system` / Gemini `systemInstruction` 移至任意预设积木，即使已删除 `system_base` 条目也不会强行兜底注入到顶层系统指令；同时支持接管 SideGen 与助手工作台系统提示词） | `prefix`（静态前缀） |
+| `{{assistantSystemPrompt}}` / `{{assistant_system_prompt}}` / `{{assistant-system-prompt}}` | 助手工作台内置系统提示词（`You are the ST-Agentic Off-Mainline Assistant...`；在匹配 `assistant*` 触发条件的积木中引用后，自动取消 Layer 0 `system` / Gemini `systemInstruction` 注入，改为在指定积木位置展开） | `prefix`（静态前缀） |
 | `{{coreManifest}}` / `{{core_manifest}}` / `{{core-manifest}}` | `<core-manifest>`（空壳卡提示、`/character/*`、`/persona/description.md`、Category ② 常驻世界书与 `/preset/*` 索引） | `prefix`（静态前缀） |
 | `{{systemRules}}` / `{{system_rules}}` / `{{system-rules}}` | `<system-rules>`（Category ① `@@system` 系统规则汇总；无规则时展开为空） | `prefix`（静态前缀） |
 | `{{turnBrief}}` / `{{turn_brief}}` / `{{turn-brief}}` | `<turn-brief>`（`before_turn` 触发器回合简报） | `tail` |
