@@ -336,4 +336,87 @@ describe('src/core/migration', () => {
             createEmbeddedFilesPayload({ 'huge.txt': 'x'.repeat(300 * 1024) }),
         ).toThrow(/limit/i);
     });
+
+    it('does not misclassify ST-Agentic prompt packs, presets, or PromptBlock lists as ST OpenAI presets', () => {
+        expect(
+            isSillyTavernOpenAIPreset({
+                format: 'st-agentic-prompts',
+                version: 1,
+                presetName: 'My Preset',
+                agentId: 'main',
+                prompts: [
+                    {
+                        id: 'tail_custom',
+                        name: 'Tail Custom',
+                        role: 'custom',
+                        placement: 'tail',
+                        content: '{"role":"assistant","content":"prefill","partial":true}',
+                        enabled: true,
+                        triggers: ['main', 'trigger_after'],
+                    },
+                ],
+            }),
+        ).toBe(false);
+
+        expect(
+            isSillyTavernOpenAIPreset({
+                format: 'st-agentic-prompt',
+                version: 1,
+                prompt: {
+                    id: 'single',
+                    name: 'Single',
+                    role: 'custom',
+                    placement: 'floating_tail',
+                    content: '{"role":"user","content":"hi"}',
+                    enabled: true,
+                    triggers: ['main_normal'],
+                },
+            }),
+        ).toBe(false);
+
+        expect(
+            isSillyTavernOpenAIPreset({
+                format: 'st-agentic-preset',
+                version: 1,
+                preset: {
+                    id: 'p1',
+                    name: 'P1',
+                    mainAgentId: 'main',
+                    agents: { main: { id: 'main', promptBlocks: [] } },
+                },
+            }),
+        ).toBe(false);
+
+        expect(
+            isSillyTavernOpenAIPreset({
+                prompts: [
+                    {
+                        id: 'bare_block',
+                        name: 'Bare',
+                        role: 'custom',
+                        placement: 'tail',
+                        content: '{"role":"user","content":"hi"}',
+                        triggers: ['main'],
+                    },
+                ],
+            }),
+        ).toBe(false);
+
+        // Genuine ST OpenAI presets (with or without chat_completion_source) still match
+        expect(
+            isSillyTavernOpenAIPreset({
+                prompts: [
+                    {
+                        identifier: 'custom-rule',
+                        name: 'Custom Rule',
+                        role: 'system',
+                        content: 'Be concise.',
+                        injection_position: 1,
+                        injection_depth: 0,
+                        injection_trigger: ['normal'],
+                    },
+                ],
+            }),
+        ).toBe(true);
+    });
 });

@@ -871,4 +871,283 @@ describe('ContextAssembler', () => {
             '<think>推理</think>码头夜色渐深。',
         );
     });
+
+    it('invalidates legacy/stale frozenPrefix when prompt blocks or tools change and preserves Gemini leading systemInstruction', async () => {
+        const bridge = new MemoryHostBridge({
+            identity: { userName: '莫布', charName: '猫猫' },
+            characterFields: { description: '这是一个测试用的足够长角色设定文本，用于避免触发空壳卡片提示，确保结构清晰。'.repeat(2) },
+        });
+        const store = new TrajectoryStore();
+        const assembler = new ContextAssembler();
+
+        // Seed a legacy frozenPrefix without `v2:` prefixFingerprint whose Slot 0 is a stale `tool` message
+        store.setFrozenPrefix(
+            {
+                tools: [],
+                messages: [
+                    {
+                        role: 'tool',
+                        toolCallId: 'call_legacy_00',
+                        toolName: 'context',
+                        content: '{"哈基米会使用reply工具回复"}',
+                    },
+                ],
+                layer0EndIndex: 0,
+            },
+            'main',
+        );
+
+        const agent = createDefaultMainAgent({
+            sessionMode: 'persistent',
+            promptBlocks: [
+                {
+                    id: 'system_base',
+                    name: '思考控制',
+                    role: 'system',
+                    placement: 'prefix',
+                    content: 'SPECIAL INSTRUCTION: think silently.',
+                    enabled: true,
+                },
+                {
+                    id: 'user_intro',
+                    name: '开始前段',
+                    role: 'user',
+                    placement: 'prefix',
+                    content: '请开始互动。',
+                    enabled: true,
+                },
+            ],
+        });
+
+        const turn1 = await assembler.assembleWithHost({
+            agent,
+            hostBridge: bridge,
+            trajectoryStore: store,
+            userInput: '你好',
+        });
+
+        // Stale legacy frozenPrefix must be invalidated & replaced with current prompt blocks
+        expect(turn1.layer0Messages.some((m) => String(m.content).includes('reply工具'))).toBe(false);
+        expect(turn1.layer0Messages[0]).toEqual({
+            role: 'system',
+            content: 'SPECIAL INSTRUCTION: think silently.',
+        });
+        expect(turn1.layer0Messages[1].role).toBe('system'); // <core-manifest>
+        expect(turn1.layer0Messages[2]).toEqual({ role: 'user', content: '请开始互动。' });
+
+        // Gemini PayloadCompiler puts leading system messages into systemInstruction
+        const compiler = new PayloadCompiler();
+        const geminiConn = createDefaultConnection({
+            providerFormat: 'gemini',
+            model: 'gemini-2.5-pro',
+            promptPostProcessing: 'none',
+        });
+        const compiled = compiler.compile(turn1.request, geminiConn);
+        const sysParts = (compiled.body.systemInstruction as { parts?: Array<{ text?: string }> })?.parts ?? [];
+        expect(sysParts.map((p) => p.text)).toContain('SPECIAL INSTRUCTION: think silently.');
+        expect((compiled.body.contents as Array<{ parts: Array<{ functionResponse?: unknown }> }>)[0].parts[0].functionResponse).toBeUndefined();
+
+        // Turn 2 with identical preset keeps frozenPrefix intact
+        const turn2 = await assembler.assembleWithHost({
+            agent,
+            hostBridge: bridge,
+            trajectoryStore: store,
+            userInput: '继续',
+        });
+        expect(turn2.layer0Messages).toEqual(turn1.layer0Messages);
+
+        // Editing a prefix block automatically invalidates frozenPrefix
+        const editedAgent = createDefaultMainAgent({
+            sessionMode: 'persistent',
+            promptBlocks: [
+                {
+                    ...agent.promptBlocks[0],
+                    content: 'SPECIAL INSTRUCTION: think deeply.',
+                },
+                agent.promptBlocks[1],
+            ],
+        });
+        const turn3 = await assembler.assembleWithHost({
+            agent: editedAgent,
+            hostBridge: bridge,
+            trajectoryStore: store,
+            userInput: '再继续',
+        });
+        expect(turn3.layer0Messages[0].content).toBe('SPECIAL INSTRUCTION: think deeply.');
+    });
+
+    it('propagates prefix setvar + addvar across blocks and frozen turns into tail getvar', async () => {
+        const bridge = new MemoryHostBridge({
+            identity: { userName: '莫布', charName: '猫猫' },
+            characterFields: { description: '这是一个足够长的测试角色设定描述，用来确保核心清单结构稳定。'.repeat(2) },
+        });
+        // Pre-seed stale variable in metadata to verify prefix setvar/addvar overrides it cleanly
+        bridge.setVariable('角色表现', 'STALE_OLD');
+
+        const store = new TrajectoryStore();
+        const assembler = new ContextAssembler();
+
+        const buildAgent = (opt2Enabled: boolean) =>
+            createDefaultMainAgent({
+                sessionMode: 'persistent',
+                promptBlocks: [
+                    {
+                        id: 'thinking',
+                        name: '思考控制',
+                        role: 'system',
+                        placement: 'prefix',
+                        content: 'SPECIAL INSTRUCTION\n{{setvar::角色表现::}}',
+                        enabled: true,
+                    },
+                    {
+                        id: 'opt_1',
+                        name: '选项1',
+                        role: 'user',
+                        placement: 'prefix',
+                        content: '{{addvar::角色表现::情绪平淡\n}}',
+                        enabled: true,
+                    },
+                    {
+                        id: 'opt_2',
+                        name: '选项2',
+                        role: 'user',
+                        placement: 'prefix',
+                        content: '{{addvar::角色表现::活人感加强\n}}',
+                        enabled: opt2Enabled,
+                    },
+                    {
+                        id: 'tail_custom',
+                        name: '后段',
+                        role: 'custom',
+                        placement: 'tail',
+                        content: JSON.stringify([
+                            { role: 'user', content: '角色表现={{getvar::角色表现}}' },
+                        ]),
+                        enabled: true,
+                    },
+                ],
+            });
+
+        const agentBoth = buildAgent(true);
+
+        // Turn 1: fresh compile with stale rest.vars passed in (simulating /state/variables.json snapshot)
+        const turn1 = await assembler.assembleWithHost({
+            agent: agentBoth,
+            hostBridge: bridge,
+            trajectoryStore: store,
+            userInput: '第一轮',
+            vars: { 角色表现: '' },
+        });
+        const tail1 = turn1.floatingTailMessages[turn1.floatingTailMessages.length - 1];
+        expect(tail1.content).toBe('角色表现=情绪平淡\n活人感加强\n');
+
+        // Turn 2: frozenPrefix hits, even if chat variable was wiped externally, side-effect replay updates tail without mutating Layer 0
+        bridge.setVariable('角色表现', 'CORRUPTED_BETWEEN_TURNS');
+        const turn2 = await assembler.assembleWithHost({
+            agent: agentBoth,
+            hostBridge: bridge,
+            trajectoryStore: store,
+            userInput: '第二轮',
+            vars: { 角色表现: 'CORRUPTED_BETWEEN_TURNS' },
+        });
+        expect(turn2.layer0Messages).toEqual(turn1.layer0Messages);
+        const tail2 = turn2.floatingTailMessages[turn2.floatingTailMessages.length - 1];
+        expect(tail2.content).toBe('角色表现=情绪平淡\n活人感加强\n');
+
+        // Turn 3: toggling opt_2 off invalidates frozenPrefix and tail reflects only opt_1
+        const turn3 = await assembler.assembleWithHost({
+            agent: buildAgent(false),
+            hostBridge: bridge,
+            trajectoryStore: store,
+            userInput: '第三轮',
+            vars: { 角色表现: '' },
+        });
+        const tail3 = turn3.floatingTailMessages[turn3.floatingTailMessages.length - 1];
+        expect(tail3.content).toBe('角色表现=情绪平淡\n');
+    });
+
+    it('replays EJS prefix side effects (injectPrompt + variable updates) across frozen turns into tail', async () => {
+        const sharedEjsState = {
+            cacheVars: {} as Record<string, unknown>,
+            styleNotes: [] as string[],
+        };
+        const bridge = new MemoryHostBridge({
+            identity: { userName: '莫布', charName: '猫猫' },
+            characterFields: { description: '足够长的角色描述文本，用于稳定测试 Layer 0 Core Manifest 输出。'.repeat(2) },
+            ejsEvaluator: async (text, vars, opts) => {
+                const session = opts?.injectionSession;
+                const ejsSession = opts?.ejsSession;
+                if (text.includes('__PREFIX_EJS_1__')) {
+                    if (ejsSession) {
+                        ejsSession.hostContext ??= { variables: { ...sharedEjsState.cacheVars } };
+                        (ejsSession.hostContext.variables as Record<string, unknown>).mood = 'calm';
+                        ejsSession.lastEjsVarUpdates = { mood: 'calm' };
+                    }
+                    session?.injectPrompt('Style', '文风:日常写实', 10, 0, 's1');
+                    return '';
+                }
+                if (text.includes('__TAIL_EJS__')) {
+                    const injected = session?.getPromptsInjected('Style') ?? '';
+                    const moodFromSession =
+                        (ejsSession?.hostContext?.variables as Record<string, unknown> | undefined)?.mood
+                        ?? vars.mood
+                        ?? '';
+                    return `STYLE=[${injected}]|MOOD=[${String(moodFromSession)}]|VAR=[${String(vars.mood ?? '')}]`;
+                }
+                return text;
+            },
+        });
+
+        const store = new TrajectoryStore();
+        const assembler = new ContextAssembler();
+        const agent = createDefaultMainAgent({
+            sessionMode: 'persistent',
+            promptBlocks: [
+                {
+                    id: 'system_base',
+                    name: 'Base',
+                    role: 'system',
+                    placement: 'prefix',
+                    content: 'Static System Base',
+                    enabled: true,
+                },
+                {
+                    id: 'prefix_ejs_injector',
+                    name: 'Prefix EJS',
+                    role: 'user',
+                    placement: 'prefix',
+                    content: '<% injectPrompt("Style", "文风:日常写实"); setvar("mood", "calm"); /* __PREFIX_EJS_1__ */ %>',
+                    enabled: true,
+                },
+                {
+                    id: 'tail_ejs_reader',
+                    name: 'Tail EJS',
+                    role: 'custom',
+                    placement: 'tail',
+                    content: JSON.stringify([{ role: 'user', content: '<% __TAIL_EJS__ %>' }]),
+                    enabled: true,
+                },
+            ],
+        });
+
+        const turn1 = await assembler.assembleWithHost({
+            agent,
+            hostBridge: bridge,
+            trajectoryStore: store,
+            injectionSession: new LocalPromptInjectionSession(),
+            userInput: 'Turn 1',
+        });
+        expect(turn1.floatingTailMessages[0].content).toBe('STYLE=[文风:日常写实]|MOOD=[calm]|VAR=[calm]');
+
+        // Turn 2: frozenPrefix hits, yet prefix_ejs_injector replays its side effects for Turn 2's fresh injectionSession & ejsSession
+        const turn2 = await assembler.assembleWithHost({
+            agent,
+            hostBridge: bridge,
+            trajectoryStore: store,
+            injectionSession: new LocalPromptInjectionSession(),
+            userInput: 'Turn 2',
+        });
+        expect(turn2.layer0Messages).toEqual(turn1.layer0Messages);
+        expect(turn2.floatingTailMessages[0].content).toBe('STYLE=[文风:日常写实]|MOOD=[calm]|VAR=[calm]');
+    });
 });

@@ -111,6 +111,52 @@ function buildVarsView(
     return view;
 }
 
+const EJS_RESERVED_CONTEXT_KEYS = new Set([
+    'vars',
+    'variables',
+    'injectionSession',
+    'injectPrompt',
+    'getPromptsInjected',
+    'hasPromptsInjected',
+    'SillyTavern',
+]);
+
+function isPlainObjectRecord(value: unknown): value is Record<string, unknown> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return false;
+    }
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+}
+
+function serializeVarDigest(value: unknown): string {
+    if (value === undefined) {
+        return 'u';
+    }
+    if (value === null) {
+        return 'n';
+    }
+    if (typeof value === 'string') {
+        return `s:${value}`;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+        return `p:${String(value)}`;
+    }
+    try {
+        return `j:${JSON.stringify(value)}`;
+    } catch {
+        return `x:${String(value)}`;
+    }
+}
+
+function snapshotShallowRecord(obj: Record<string, unknown>): Map<string, string> {
+    const snap = new Map<string, string>();
+    for (const [key, value] of Object.entries(obj)) {
+        snap.set(key, serializeVarDigest(value));
+    }
+    return snap;
+}
+
 /**
  * Evaluate optional `<% ... %>` EJS template tags when `globalThis.EjsTemplate` is installed.
  *
@@ -142,6 +188,12 @@ export async function evaluateOptionalEjs(
     const safeVars: Record<string, unknown> =
         vars && typeof vars === 'object' && !Array.isArray(vars) ? vars : {};
 
+    const ejsSession = options?.ejsSession;
+    const pendingUpdates = ejsSession?.pendingMacroVarUpdates;
+    const mergedSafeVars: Record<string, unknown> = pendingUpdates
+        ? { ...safeVars, ...pendingUpdates }
+        : safeVars;
+
     const extraWithoutVars: Record<string, unknown> = {};
     if (extraHelpers) {
         for (const [key, value] of Object.entries(extraHelpers)) {
@@ -150,7 +202,7 @@ export async function evaluateOptionalEjs(
             }
         }
     }
-    const varsView = buildVarsView(safeVars, extraHelpers?.vars);
+    const varsView = buildVarsView(mergedSafeVars, extraHelpers?.vars);
 
     const session = options?.injectionSession;
     if (session && typeof ejs.createInjectionSession !== 'function' && containsInjectPromptUsage(text)) {
@@ -160,26 +212,57 @@ export async function evaluateOptionalEjs(
         );
     }
 
-    const mergedEnv: Record<string, unknown> = {
-        ...safeVars,
-        ...extraWithoutVars,
-        vars: varsView,
-        ...(session ? { injectionSession: session } : {}),
-    };
-
     let ctx: Record<string, unknown>;
-    if (typeof ejs.prepareContext === 'function') {
-        const prepared = await ejs.prepareContext(mergedEnv);
-        ctx = prepared && typeof prepared === 'object' ? prepared : { ...mergedEnv };
-        for (const [key, value] of Object.entries(mergedEnv)) {
-            if (key !== 'injectionSession' && !(key in ctx)) {
-                ctx[key] = value;
-            }
+    if (ejsSession?.hostContext) {
+        // Reuse the prepared context strictly in-place to preserve EjsTemplate `this` bindings,
+        // `scope: 'cache'` variables, and cross-block `define()` definitions.
+        ctx = ejsSession.hostContext;
+        if (pendingUpdates && Object.keys(pendingUpdates).length > 0 && isPlainObjectRecord(ctx.variables)) {
+            Object.assign(ctx.variables, pendingUpdates);
+        }
+        if (ejsSession) {
+            ejsSession.pendingMacroVarUpdates = undefined;
         }
         Object.assign(ctx, extraWithoutVars);
         ctx.vars = varsView;
+        for (const [key, value] of Object.entries(mergedSafeVars)) {
+            if (EJS_RESERVED_CONTEXT_KEYS.has(key) || typeof ctx[key] === 'function') {
+                continue;
+            }
+            ctx[key] = value;
+        }
+        if (session) {
+            ctx.injectionSession = session;
+        }
     } else {
-        ctx = mergedEnv;
+        const mergedEnv: Record<string, unknown> = {
+            ...mergedSafeVars,
+            ...extraWithoutVars,
+            vars: varsView,
+            ...(session ? { injectionSession: session } : {}),
+        };
+
+        if (typeof ejs.prepareContext === 'function') {
+            const prepared = await ejs.prepareContext(mergedEnv);
+            ctx = prepared && typeof prepared === 'object' ? prepared : { ...mergedEnv };
+            for (const [key, value] of Object.entries(mergedEnv)) {
+                if (key !== 'injectionSession' && !(key in ctx)) {
+                    ctx[key] = value;
+                }
+            }
+            Object.assign(ctx, extraWithoutVars);
+            ctx.vars = varsView;
+        } else {
+            ctx = mergedEnv;
+        }
+
+        if (pendingUpdates && Object.keys(pendingUpdates).length > 0 && isPlainObjectRecord(ctx.variables)) {
+            Object.assign(ctx.variables, pendingUpdates);
+        }
+        if (ejsSession) {
+            ejsSession.pendingMacroVarUpdates = undefined;
+            ejsSession.hostContext = ctx;
+        }
     }
 
     if (session) {
@@ -188,7 +271,28 @@ export async function evaluateOptionalEjs(
         ctx.hasPromptsInjected = session.hasPromptsInjected.bind(session);
     }
 
+    const preEvalVarSnapshot =
+        ejsSession && isPlainObjectRecord(ctx.variables)
+            ? snapshotShallowRecord(ctx.variables)
+            : null;
+
     const evaluated = await ejs.evalTemplate(templateCode, ctx);
+
+    if (ejsSession && preEvalVarSnapshot && isPlainObjectRecord(ctx.variables)) {
+        const changed: Record<string, unknown> = {};
+        let hasChanges = false;
+        for (const [key, value] of Object.entries(ctx.variables)) {
+            const nextDigest = serializeVarDigest(value);
+            if (!preEvalVarSnapshot.has(key) || preEvalVarSnapshot.get(key) !== nextDigest) {
+                changed[key] = value;
+                hasChanges = true;
+            }
+        }
+        ejsSession.lastEjsVarUpdates = hasChanges ? changed : undefined;
+    } else if (ejsSession) {
+        ejsSession.lastEjsVarUpdates = undefined;
+    }
+
     if (evaluated === undefined || evaluated === null) {
         return '';
     }

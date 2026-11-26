@@ -65,9 +65,19 @@ export interface DeletedChatMessageSnapshot {
     rawMessage?: Record<string, unknown>;
 }
 
+export interface EjsRenderSession {
+    /** Opaque host-owned prepared EJS context reused in-place across blocks within a single turn. */
+    hostContext?: Record<string, unknown>;
+    /** Variable updates written by ST macros since the last EJS call, synced into `hostContext.variables`. */
+    pendingMacroVarUpdates?: Record<string, unknown>;
+    /** Variable updates written into `hostContext.variables` during the latest EJS evaluation. */
+    lastEjsVarUpdates?: Record<string, unknown>;
+}
+
 export interface EjsEvaluateOptions {
     injectionSession?: PromptInjectionSession;
     isPrivate?: boolean;
+    ejsSession?: EjsRenderSession;
 }
 
 export interface EjsFeaturesSnapshot {

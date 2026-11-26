@@ -1,13 +1,19 @@
 import {
+    buildPresetFromPromptsImport,
     DEFAULT_MAIN_AGENT_TOOLS,
     createDefaultConnection,
     createDefaultMainAgent,
     createDefaultPreset,
     createDefaultSettings,
     exportPreset,
+    importConnections,
+    importSettings,
     normalizePreset,
     normalizeSettings,
+    validateConnectionsImport,
     validatePresetImport,
+    validatePromptsImport,
+    validateSettingsImport,
 } from '@/core/config';
 import {
     importSillyTavernOpenAIPreset,
@@ -1679,16 +1685,6 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
         },
 
         async importPresetOrConfig(rawJson: unknown, importOptions?: { presetName?: string }): Promise<ImportPresetResult> {
-            const presetValidation = validatePresetImport(rawJson);
-            if (presetValidation.ok) {
-                const imported = presetValidation.data.presets[0];
-                return {
-                    preset: normalizePreset(imported, imported.id),
-                    connection: presetValidation.data.connection,
-                    message: `已导入 ST-Agentic 预设「${imported.name}」`,
-                };
-            }
-
             if (isLegacyCustomGenerationData(rawJson)) {
                 if (
                     rawJson
@@ -1723,6 +1719,56 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
                     preset,
                     report,
                     message: `已从旧版 ST-CustomGeneration 预设迁移「${preset.name}」`,
+                };
+            }
+
+            const presetValidation = validatePresetImport(rawJson);
+            if (presetValidation.ok) {
+                const imported = presetValidation.data.presets[0];
+                const resolvedName = importOptions?.presetName?.trim() || imported.name;
+                return {
+                    preset: normalizePreset({ ...imported, name: resolvedName }, imported.id),
+                    connection: presetValidation.data.connection,
+                    message: `已导入 ST-Agentic 预设「${resolvedName}」`,
+                };
+            }
+
+            if (validateSettingsImport(rawJson).ok) {
+                const full = importSettings(rawJson);
+                return {
+                    settings: full,
+                    preset: full.presets[full.currentPresetId],
+                    message: '已导入完整 Agentic 配置',
+                };
+            }
+
+            if (validateConnectionsImport(rawJson).ok) {
+                const imported = importConnections(rawJson);
+                const nextConnections = {
+                    ...settingsSnapshot.connections,
+                    ...imported.connections,
+                };
+                return {
+                    settings: {
+                        ...settingsSnapshot,
+                        connections: nextConnections,
+                        currentConnectionId:
+                            imported.currentConnectionId in nextConnections
+                                ? imported.currentConnectionId
+                                : settingsSnapshot.currentConnectionId,
+                    },
+                    message: `已导入 ${Object.keys(imported.connections).length} 条 API 连接配置`,
+                };
+            }
+
+            const promptsValidation = validatePromptsImport(rawJson);
+            if (promptsValidation.ok) {
+                const preset = buildPresetFromPromptsImport(promptsValidation.data, {
+                    presetName: importOptions?.presetName,
+                });
+                return {
+                    preset,
+                    message: `已导入 ST-Agentic 提示词预设「${preset.name}」`,
                 };
             }
 

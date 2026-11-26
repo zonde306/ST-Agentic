@@ -655,6 +655,41 @@ export class MemoryHostBridge implements HostBridge {
 
         const variables = this.getMetadataVariables();
         const globalVariables = this.getMetadataGlobalVariables();
+        const inlineMutatedLocal = new Set<string>();
+        const inlineMutatedGlobal = new Set<string>();
+        const applyAddVar = (store: Record<string, unknown>, varName: string, rawAdd: string): unknown => {
+            const rawExisting = store[varName];
+            const existingStr = typeof rawExisting === 'string' ? rawExisting : stringifyVariable(rawExisting);
+            const normalizedCurrent =
+                existingStr.trim() === '' || Number.isNaN(Number(existingStr))
+                    ? (existingStr || 0)
+                    : Number(existingStr);
+            if (typeof rawExisting === 'string') {
+                try {
+                    const parsed = JSON.parse(rawExisting) as unknown;
+                    if (Array.isArray(parsed)) {
+                        parsed.push(rawAdd);
+                        const serialized = JSON.stringify(parsed);
+                        store[varName] = serialized;
+                        return serialized;
+                    }
+                } catch {
+                    // ignore non-array JSON
+                }
+            }
+            const increment = Number(rawAdd);
+            if (Number.isNaN(increment) || Number.isNaN(Number(normalizedCurrent))) {
+                const nextStr = String(normalizedCurrent || '') + rawAdd;
+                store[varName] = nextStr;
+                return nextStr;
+            }
+            const nextNum = Number(normalizedCurrent) + increment;
+            if (Number.isNaN(nextNum)) {
+                return '';
+            }
+            store[varName] = nextNum;
+            return nextNum;
+        };
         const overrideMap = new Map<string, string>();
         const outletMap = new Map<string, string>();
         let hasOutletTable = false;
@@ -713,7 +748,9 @@ export class MemoryHostBridge implements HostBridge {
         }
 
         return text.replace(/\{\{([^{}]+)\}\}/g, (match, rawInner: string) => {
-            const trimmed = rawInner.trim();
+            const leadingTrimmed = rawInner.trimStart();
+            const lowerLeading = leadingTrimmed.toLowerCase();
+            const trimmed = leadingTrimmed.trim();
             const lower = trimmed.toLowerCase();
 
             if (lower.startsWith('outlet::')) {
@@ -724,20 +761,125 @@ export class MemoryHostBridge implements HostBridge {
                 return match;
             }
 
+            if (lowerLeading.startsWith('setvar::')) {
+                const rest = leadingTrimmed.slice('setvar::'.length);
+                const sepIdx = rest.indexOf('::');
+                if (sepIdx >= 0) {
+                    const varName = rest.slice(0, sepIdx).trim();
+                    const varVal = rest.slice(sepIdx + 2);
+                    if (varName) {
+                        variables[varName] = varVal;
+                        inlineMutatedLocal.add(varName);
+                    }
+                }
+                return '';
+            }
+
+            if (lowerLeading.startsWith('addvar::')) {
+                const rest = leadingTrimmed.slice('addvar::'.length);
+                const sepIdx = rest.indexOf('::');
+                if (sepIdx >= 0) {
+                    const varName = rest.slice(0, sepIdx).trim();
+                    const addVal = rest.slice(sepIdx + 2);
+                    if (varName) {
+                        applyAddVar(variables, varName, addVal);
+                        inlineMutatedLocal.add(varName);
+                    }
+                }
+                return '';
+            }
+
+            if (lower.startsWith('incvar::')) {
+                const varName = trimmed.slice('incvar::'.length).trim();
+                if (varName) {
+                    const nextVal = applyAddVar(variables, varName, '1');
+                    inlineMutatedLocal.add(varName);
+                    return stringifyVariable(nextVal);
+                }
+                return '';
+            }
+
+            if (lower.startsWith('decvar::')) {
+                const varName = trimmed.slice('decvar::'.length).trim();
+                if (varName) {
+                    const nextVal = applyAddVar(variables, varName, '-1');
+                    inlineMutatedLocal.add(varName);
+                    return stringifyVariable(nextVal);
+                }
+                return '';
+            }
+
+            if (lowerLeading.startsWith('setglobalvar::')) {
+                const rest = leadingTrimmed.slice('setglobalvar::'.length);
+                const sepIdx = rest.indexOf('::');
+                if (sepIdx >= 0) {
+                    const varName = rest.slice(0, sepIdx).trim();
+                    const varVal = rest.slice(sepIdx + 2);
+                    if (varName) {
+                        const globals = this.getMetadataGlobalVariables(true);
+                        globals[varName] = varVal;
+                        inlineMutatedGlobal.add(varName);
+                    }
+                }
+                return '';
+            }
+
+            if (lowerLeading.startsWith('addglobalvar::')) {
+                const rest = leadingTrimmed.slice('addglobalvar::'.length);
+                const sepIdx = rest.indexOf('::');
+                if (sepIdx >= 0) {
+                    const varName = rest.slice(0, sepIdx).trim();
+                    const addVal = rest.slice(sepIdx + 2);
+                    if (varName) {
+                        const globals = this.getMetadataGlobalVariables(true);
+                        applyAddVar(globals, varName, addVal);
+                        inlineMutatedGlobal.add(varName);
+                    }
+                }
+                return '';
+            }
+
+            if (lower.startsWith('incglobalvar::')) {
+                const varName = trimmed.slice('incglobalvar::'.length).trim();
+                if (varName) {
+                    const globals = this.getMetadataGlobalVariables(true);
+                    const nextVal = applyAddVar(globals, varName, '1');
+                    inlineMutatedGlobal.add(varName);
+                    return stringifyVariable(nextVal);
+                }
+                return '';
+            }
+
+            if (lower.startsWith('decglobalvar::')) {
+                const varName = trimmed.slice('decglobalvar::'.length).trim();
+                if (varName) {
+                    const globals = this.getMetadataGlobalVariables(true);
+                    const nextVal = applyAddVar(globals, varName, '-1');
+                    inlineMutatedGlobal.add(varName);
+                    return stringifyVariable(nextVal);
+                }
+                return '';
+            }
+
             if (lower.startsWith('getvar::')) {
                 const varName = trimmed.slice('getvar::'.length).trim();
-                if (overrides && Object.hasOwn(overrides, varName)) {
-                    return overrides[varName];
-                }
-                if (overrides && Object.hasOwn(overrides, `var:${varName}`)) {
-                    return overrides[`var:${varName}`];
+                if (!inlineMutatedLocal.has(varName)) {
+                    if (overrides && Object.hasOwn(overrides, varName)) {
+                        return overrides[varName];
+                    }
+                    if (overrides && Object.hasOwn(overrides, `var:${varName}`)) {
+                        return overrides[`var:${varName}`];
+                    }
                 }
                 return stringifyVariable(variables[varName]);
             }
 
             if (lower.startsWith('getglobalvar::')) {
                 const varName = trimmed.slice('getglobalvar::'.length).trim();
-                return stringifyVariable(globalVariables[varName]);
+                const globals = inlineMutatedGlobal.has(varName)
+                    ? this.getMetadataGlobalVariables()
+                    : globalVariables;
+                return stringifyVariable(globals[varName]);
             }
 
             if (overrideMap.has(lower)) {

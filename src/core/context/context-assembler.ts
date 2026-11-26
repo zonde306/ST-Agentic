@@ -1,4 +1,4 @@
-import type { HostBridge, LLMRequest, PromptInjectionSession } from '@/core/bridge';
+import type { EjsRenderSession, HostBridge, LLMRequest, PromptInjectionSession } from '@/core/bridge';
 import {
     DEFAULT_MAIN_AGENT_ID,
     createDefaultPromptBlocks,
@@ -44,7 +44,7 @@ import type {
     SideClueRadarScanResult,
     WICategory,
 } from '@/core/types';
-import { canonicalClone, stripJsonSchemaMeta } from '@/core/utils';
+import { canonicalClone, canonicalStringify, stripJsonSchemaMeta } from '@/core/utils';
 import { prerenderPromptBlocks, renderPromptBlockSync } from './prompt-block-renderer';
 import {
     LocalPromptInjectionSession,
@@ -53,7 +53,7 @@ import {
     extractReferencedInjectKeys,
     extractReferencedOutletKeys,
 } from './prompt-injection-session';
-import { TrajectoryStore } from './trajectory-store';
+import { type FrozenStaticPrefix, TrajectoryStore } from './trajectory-store';
 import { estimateRequestTokens, groupLayer1Turns } from './watermark-compactor';
 
 export interface StaticPrefixResult {
@@ -619,6 +619,126 @@ function computePrefixDynamicFingerprint(
     return `${injectDigest}|${outletParts.join('\x02')}`;
 }
 
+const PREFIX_MACRO_SIDE_EFFECT_RE =
+    /\{\{\s*(?:(?:set|add|inc|dec)(?:global)?var\s*:{1,2}|[.$][a-zA-Z_][\w-]*\s*(?:\+\+|--|[+?-]?=|\|\|=))/i;
+const PREFIX_EJS_SIDE_EFFECT_RE =
+    /\b(?:setvar|setLocalVar|setGlobalVar|setMessageVar|incvar|incLocalVar|incGlobalVar|incMessageVar|decvar|decLocalVar|decGlobalVar|decMessageVar|delvar|delLocalVar|delGlobalVar|delMessageVar|insvar|insertLocalVar|insertGlobalVar|insertMessageVar|patchVariables|injectPrompt|define)\s*\(/;
+
+function hashString64Hex(input: string): string {
+    let h1 = 0x811c9dc5;
+    let h2 = 0x9e3779b9;
+    for (let i = 0; i < input.length; i += 1) {
+        const code = input.charCodeAt(i);
+        h1 ^= code;
+        h1 = Math.imul(h1, 0x01000193) >>> 0;
+        h2 ^= code;
+        h2 = Math.imul(h2, 0x85ebca6b) >>> 0;
+    }
+    const lenHex = input.length.toString(16);
+    return `${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}_${lenHex}`;
+}
+
+/**
+ * Compute deterministic `v2:` fingerprint over Layer 0 static configuration
+ * (`systemBasePrompt`, `system_base`, matching `prefix` blocks, canonicalized `tools`, sorted `presetFiles` keys).
+ * Excludes runtime variables so normal turns retain 100% KV Cache invariance.
+ */
+export function computeLayer0StaticFingerprint(input: {
+    agent: Pick<AgentProfile, 'promptBlocks'>;
+    tools?: readonly CanonicalToolSchema[];
+    presetFiles?: Record<string, string>;
+    systemBasePrompt?: string;
+    promptTriggerContext?: PromptTriggerContext;
+}): string {
+    const promptBlocks = input.agent.promptBlocks ?? [];
+    const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
+    let systemBaseSpec: unknown;
+    if (input.systemBasePrompt !== undefined) {
+        systemBaseSpec = { mode: 'explicit', text: input.systemBasePrompt };
+    } else if (systemBaseBlock) {
+        const active =
+            systemBaseBlock.enabled
+            && systemBaseBlock.content.trim().length > 0
+            && matchesPromptTriggers(systemBaseBlock.triggers, input.promptTriggerContext);
+        systemBaseSpec = active
+            ? {
+                  mode: 'block',
+                  id: systemBaseBlock.id,
+                  role: systemBaseBlock.role,
+                  content: systemBaseBlock.content,
+              }
+            : { mode: 'disabled' };
+    } else {
+        systemBaseSpec = { mode: 'default' };
+    }
+
+    const prefixBlocks = promptBlocks
+        .filter(
+            (b) =>
+                b.enabled
+                && b.placement === 'prefix'
+                && b.id !== 'system_base'
+                && b.content.trim().length > 0
+                && matchesPromptTriggers(b.triggers, input.promptTriggerContext),
+        )
+        .map((b) => ({
+            id: b.id,
+            role: b.role,
+            content: b.content,
+        }));
+
+    const presetFileNames = Object.keys(input.presetFiles ?? {})
+        .map((name) => name.replace(/^\/+/, ''))
+        .filter(Boolean)
+        .sort(compareCodeUnits);
+
+    const canonicalTools = canonicalizeTools(input.tools);
+    const digestSource = canonicalStringify({
+        systemBaseSpec,
+        prefixBlocks,
+        tools: canonicalTools,
+        presetFileNames,
+    });
+    return `v2:${hashString64Hex(digestSource)}`;
+}
+
+/**
+ * Check whether a persisted `FrozenStaticPrefix` matches the active `v2:` static fingerprint
+ * (and optional dynamic `getPromptsInjected` / `{{outlet::...}}` fingerprint).
+ * Legacy frozen prefixes lacking a `v2:` fingerprint are treated as stale and invalidated.
+ */
+export function doesFrozenPrefixMatch(
+    frozen: FrozenStaticPrefix | null,
+    staticFingerprint: string,
+    dynamicFingerprint?: string,
+): boolean {
+    if (!frozen || typeof frozen.prefixFingerprint !== 'string' || !frozen.prefixFingerprint.startsWith('v2:')) {
+        return false;
+    }
+    if (dynamicFingerprint !== undefined) {
+        return frozen.prefixFingerprint === `${staticFingerprint}|${dynamicFingerprint}`;
+    }
+    return (
+        frozen.prefixFingerprint === staticFingerprint
+        || frozen.prefixFingerprint.startsWith(`${staticFingerprint}|`)
+    );
+}
+
+/**
+ * Detect whether a `prefix` PromptBlock contains macro or EJS side effects
+ * (`setvar`/`addvar`/`incvar`/`decvar`/`injectPrompt`/`define` etc.) that must still
+ * execute when `frozenPrefix` hits so `tail` receives fresh per-turn state.
+ */
+export function hasPrefixSideEffect(content: string): boolean {
+    if (!content) {
+        return false;
+    }
+    if (PREFIX_MACRO_SIDE_EFFECT_RE.test(content)) {
+        return true;
+    }
+    return content.includes('<%') && PREFIX_EJS_SIDE_EFFECT_RE.test(content);
+}
+
 /**
  * Whether `placement: 'tail'` PromptBlocks float transiently after `layer2Messages` /
  * `inFlightMessages` alongside `floating_tail` (unified across main, trigger, subagent,
@@ -847,9 +967,24 @@ export class ContextAssembler {
             && input.promptTriggerContext !== undefined
             && input.promptTriggerContext.kind !== 'main'
             && hasTriggerScopedBlocks;
-        const existingFrozen =
+        const staticFingerprint = computeLayer0StaticFingerprint({
+            agent: input.agent,
+            tools: input.tools,
+            presetFiles: input.presetFiles,
+            systemBasePrompt: input.systemBasePrompt,
+            promptTriggerContext: input.promptTriggerContext,
+        });
+        const expectedFingerprint = input.prefixFingerprint ?? staticFingerprint;
+        const rawFrozen =
             isPersistent && !input.forceRecompilePrefix && !isNonMainTriggerRun
                 ? input.trajectoryStore?.getFrozenPrefix(input.agent.id) ?? null
+                : null;
+        const existingFrozen =
+            rawFrozen
+            && (input.prefixFingerprint !== undefined
+                ? rawFrozen.prefixFingerprint === input.prefixFingerprint
+                : doesFrozenPrefixMatch(rawFrozen, staticFingerprint))
+                ? rawFrozen
                 : null;
 
         if (existingFrozen) {
@@ -896,9 +1031,7 @@ export class ContextAssembler {
                         tools,
                         messages: layer0Messages,
                         layer0EndIndex,
-                        ...(input.prefixFingerprint !== undefined
-                            ? { prefixFingerprint: input.prefixFingerprint }
-                            : {}),
+                        prefixFingerprint: expectedFingerprint,
                     },
                     input.agent.id,
                 );
@@ -1086,6 +1219,64 @@ export class ContextAssembler {
             ...extractMetadataVarsFallback(hostBridge),
             ...(rest.vars ?? {}),
         };
+        const liveVars: Record<string, unknown> = { ...effectiveVars };
+        const mutatedTurnVars: Record<string, unknown> = {};
+        const ejsSession: EjsRenderSession = {};
+        const applyTurnVarUpdates = (updates: Record<string, unknown>): void => {
+            for (const [k, v] of Object.entries(updates)) {
+                liveVars[k] = v;
+                mutatedTurnVars[k] = v;
+            }
+        };
+        const syncMetadataVarDiff = (beforeVars: Record<string, unknown>): void => {
+            const afterVars = extractMetadataVarsFallback(hostBridge);
+            const delta: Record<string, unknown> = {};
+            let changed = false;
+            for (const [k, v] of Object.entries(afterVars)) {
+                if (!Object.hasOwn(beforeVars, k) || canonicalStringify(beforeVars[k]) !== canonicalStringify(v)) {
+                    delta[k] = v;
+                    changed = true;
+                }
+            }
+            if (changed) {
+                applyTurnVarUpdates(delta);
+                ejsSession.pendingMacroVarUpdates = {
+                    ...(ejsSession.pendingMacroVarUpdates ?? {}),
+                    ...delta,
+                };
+            }
+        };
+        const evalEjsWithTurnSync = async (
+            text: string,
+            varsSnapshot: Record<string, unknown>,
+            evalOpts: { isPrivate?: boolean } = {},
+        ): Promise<string> => {
+            if (!hostBridge.evaluateOptionalEjs || !text.includes('<%')) {
+                return text;
+            }
+            const preSnap = extractMetadataVarsFallback(hostBridge);
+            const out = await hostBridge.evaluateOptionalEjs(text, varsSnapshot, {
+                injectionSession: session,
+                ejsSession,
+                ...(evalOpts.isPrivate ? { isPrivate: true } : {}),
+            });
+            const postSnap = extractMetadataVarsFallback(hostBridge);
+            const delta: Record<string, unknown> = {};
+            for (const [k, v] of Object.entries(postSnap)) {
+                if (!Object.hasOwn(preSnap, k) || canonicalStringify(preSnap[k]) !== canonicalStringify(v)) {
+                    delta[k] = v;
+                }
+            }
+            if (ejsSession.lastEjsVarUpdates) {
+                Object.assign(delta, ejsSession.lastEjsVarUpdates);
+                ejsSession.lastEjsVarUpdates = undefined;
+            }
+            if (Object.keys(delta).length > 0) {
+                applyTurnVarUpdates(delta);
+            }
+            return out;
+        };
+
         const invertEnabled = Boolean(hostBridge.getEjsFeatures?.()?.invertEnabled);
         const classified = classifyAllEntries(loreEntries, rest.wiRouterOverrides);
         const keywordHaystack = userText
@@ -1157,20 +1348,26 @@ export class ContextAssembler {
                     || a.entry.uid - b.entry.uid,
             );
 
-            const preCollectMacroOverrides = buildLayer2MacroOverrides(effectiveVars, rest.macroOverrides);
             for (const item of preCollectCandidates) {
                 const ifConds = extractIfConditions(item.decorators);
-                const passed = await evaluateIfConditions(ifConds, hostBridge, effectiveVars, {
+                const passed = await evaluateIfConditions(ifConds, hostBridge, liveVars, {
                     injectionSession: session,
                 });
                 if (!passed) {
                     continue;
                 }
-                const substituted = hostBridge.substituteMacros(item.cleanContent, preCollectMacroOverrides);
+                const preMacroVars = extractMetadataVarsFallback(hostBridge);
+                const itemOverrides = buildLayer2MacroOverrides(
+                    Object.keys(mutatedTurnVars).length > 0
+                        ? { ...(rest.vars ?? {}), ...mutatedTurnVars }
+                        : rest.vars,
+                    rest.macroOverrides,
+                );
+                const substituted = hostBridge.substituteMacros(item.cleanContent, itemOverrides);
+                syncMetadataVarDiff(preMacroVars);
                 if (hostBridge.evaluateOptionalEjs && substituted.includes('<%')) {
                     try {
-                        await hostBridge.evaluateOptionalEjs(substituted, effectiveVars, {
-                            injectionSession: session,
+                        await evalEjsWithTurnSync(substituted, liveVars, {
                             ...(hasPrivateDecorator(item.decorators) ? { isPrivate: true } : {}),
                         });
                     } catch {
@@ -1334,19 +1531,29 @@ export class ContextAssembler {
             }
         }
 
+        const staticPrefixFingerprint = computeLayer0StaticFingerprint({
+            agent: rest.agent,
+            tools: rest.tools,
+            presetFiles: rest.presetFiles,
+            systemBasePrompt: rest.systemBasePrompt,
+            promptTriggerContext: rest.promptTriggerContext,
+        });
         const prefixDeps = resolvePrefixDynamicDeps(matchingPrefixBlocks);
-        const initialPrefixFingerprint = computePrefixDynamicFingerprint(
+        const initialDynamicFingerprint = computePrefixDynamicFingerprint(
             prefixDeps,
             session,
             outletMacroOverrides,
         );
-        const dynamicPrefixChanged =
-            Boolean(existingFrozen)
-            && prefixDeps.hasAnyDynamicDeps
-            && existingFrozen?.prefixFingerprint !== initialPrefixFingerprint;
+        const frozenMatches = doesFrozenPrefixMatch(
+            existingFrozen,
+            staticPrefixFingerprint,
+            initialDynamicFingerprint,
+        );
 
-        const effectiveForceRecompilePrefix = Boolean(rest.forceRecompilePrefix) || dynamicPrefixChanged;
-        const willUseFrozenPrefix = Boolean(existingFrozen) && !effectiveForceRecompilePrefix;
+        const effectiveForceRecompilePrefix =
+            Boolean(rest.forceRecompilePrefix) || (Boolean(existingFrozen) && !frozenMatches);
+        const willUseFrozenPrefix =
+            Boolean(existingFrozen) && frozenMatches && !rest.forceRecompilePrefix;
 
         // Step D: Phase 1 — Render blocks & inline lore with forceOutlet=true
         const newlyRenderedPrefixIds: string[] = [];
@@ -1369,8 +1576,10 @@ export class ContextAssembler {
                     const renderedPrefix = await prerenderPromptBlocks(prefixBlocksToRender, {
                         hostBridge,
                         macroOverrides: combinedMacroOverrides,
-                        vars: rest.vars,
+                        vars: liveVars,
                         injectionSession: session,
+                        ejsSession,
+                        onVariablesMutated: applyTurnVarUpdates,
                     });
                     for (const [blockId, messages] of renderedPrefix.entries()) {
                         preRenderedBlocks.set(blockId, messages);
@@ -1391,17 +1600,18 @@ export class ContextAssembler {
                     const renderedRulesList: string[] = [];
                     for (const item of systemRuleEntries) {
                         const ifConds = extractIfConditions(item.decorators);
-                        const passed = await evaluateIfConditions(ifConds, hostBridge, effectiveVars, {
+                        const passed = await evaluateIfConditions(ifConds, hostBridge, liveVars, {
                             injectionSession: session,
                         });
                         if (!passed) {
                             continue;
                         }
+                        const preMacroVars = extractMetadataVarsFallback(hostBridge);
                         let text = substituteText(item.cleanContent, hostBridge, combinedMacroOverrides);
+                        syncMetadataVarDiff(preMacroVars);
                         if (hostBridge.evaluateOptionalEjs && text.includes('<%')) {
                             try {
-                                text = await hostBridge.evaluateOptionalEjs(text, effectiveVars, {
-                                    injectionSession: session,
+                                text = await evalEjsWithTurnSync(text, liveVars, {
                                     ...(hasPrivateDecorator(item.decorators) ? { isPrivate: true } : {}),
                                 });
                             } catch {
@@ -1417,10 +1627,28 @@ export class ContextAssembler {
                     }
                     preRenderedSystemRules = renderedRulesList;
                 }
+            } else if (rest.inFlightMessages === undefined) {
+                const sideEffectPrefixBlocks = matchingPrefixBlocks.filter((block) =>
+                    hasPrefixSideEffect(block.content),
+                );
+                if (sideEffectPrefixBlocks.length > 0) {
+                    await prerenderPromptBlocks(sideEffectPrefixBlocks, {
+                        hostBridge,
+                        macroOverrides: combinedMacroOverrides,
+                        vars: liveVars,
+                        injectionSession: session,
+                        ejsSession,
+                        onVariablesMutated: applyTurnVarUpdates,
+                    });
+                }
             }
 
             const floatTailBlocks = shouldFloatTailPromptBlocks(rest.promptTriggerContext);
-            const layer2MacroOverrides = buildLayer2MacroOverrides(rest.vars, combinedMacroOverrides);
+            const layer2Vars =
+                Object.keys(mutatedTurnVars).length > 0
+                    ? { ...(rest.vars ?? {}), ...mutatedTurnVars }
+                    : rest.vars;
+            const layer2MacroOverrides = buildLayer2MacroOverrides(layer2Vars, combinedMacroOverrides);
 
             if (rest.inFlightMessages === undefined && rest.includeCategory4DynamicEntries !== false && preRenderedDynamicReminders === undefined) {
                 const dynamicEntries = classified
@@ -1440,17 +1668,18 @@ export class ContextAssembler {
                 const renderedReminders: string[] = [];
                 for (const item of dynamicEntries) {
                     const ifConds = extractIfConditions(item.decorators);
-                    const passed = await evaluateIfConditions(ifConds, hostBridge, effectiveVars, {
+                    const passed = await evaluateIfConditions(ifConds, hostBridge, liveVars, {
                         injectionSession: session,
                     });
                     if (!passed) {
                         continue;
                     }
+                    const preMacroVars = extractMetadataVarsFallback(hostBridge);
                     let text = substituteText(item.cleanContent, hostBridge, layer2MacroOverrides);
+                    syncMetadataVarDiff(preMacroVars);
                     if (hostBridge.evaluateOptionalEjs && text.includes('<%')) {
                         try {
-                            text = await hostBridge.evaluateOptionalEjs(text, effectiveVars, {
-                                injectionSession: session,
+                            text = await evalEjsWithTurnSync(text, liveVars, {
                                 ...(hasPrivateDecorator(item.decorators) ? { isPrivate: true } : {}),
                             });
                         } catch {
@@ -1478,8 +1707,10 @@ export class ContextAssembler {
                     const renderedTail = await prerenderPromptBlocks(tailBlocksToRender, {
                         hostBridge,
                         macroOverrides: layer2MacroOverrides,
-                        vars: rest.vars,
+                        vars: liveVars,
                         injectionSession: session,
+                        ejsSession,
+                        onVariablesMutated: applyTurnVarUpdates,
                     });
                     for (const [blockId, messages] of renderedTail.entries()) {
                         preRenderedBlocks.set(blockId, messages);
@@ -1497,11 +1728,21 @@ export class ContextAssembler {
                     && !preRenderedBlocks.has(b.id),
             );
             if (floatingBlocksToRender.length > 0) {
+                const latestLayer2Vars =
+                    Object.keys(mutatedTurnVars).length > 0
+                        ? { ...(rest.vars ?? {}), ...mutatedTurnVars }
+                        : rest.vars;
+                const latestLayer2MacroOverrides = buildLayer2MacroOverrides(
+                    latestLayer2Vars,
+                    combinedMacroOverrides,
+                );
                 const renderedFloating = await prerenderPromptBlocks(floatingBlocksToRender, {
                     hostBridge,
-                    macroOverrides: layer2MacroOverrides,
-                    vars: rest.vars,
+                    macroOverrides: latestLayer2MacroOverrides,
+                    vars: liveVars,
                     injectionSession: session,
+                    ejsSession,
+                    onVariablesMutated: applyTurnVarUpdates,
                 });
                 for (const [blockId, messages] of renderedFloating.entries()) {
                     preRenderedBlocks.set(blockId, messages);
@@ -1536,14 +1777,19 @@ export class ContextAssembler {
                 .filter(Boolean);
         }
 
-        const finalPrefixFingerprint = computePrefixDynamicFingerprint(
+        const finalDynamicFingerprint = computePrefixDynamicFingerprint(
             prefixDeps,
             session,
             outletMacroOverrides,
         );
+        const finalPrefixFingerprint =
+            finalDynamicFingerprint !== undefined
+                ? `${staticPrefixFingerprint}|${finalDynamicFingerprint}`
+                : staticPrefixFingerprint;
 
         return this.assemble({
             ...rest,
+            vars: liveVars,
             forceRecompilePrefix: effectiveForceRecompilePrefix,
             loreEntries,
             loreHint,
@@ -1553,7 +1799,7 @@ export class ContextAssembler {
             preRenderedBlocks,
             ...(preRenderedSystemRules !== undefined ? { preRenderedSystemRules } : {}),
             ...(preRenderedDynamicReminders !== undefined ? { preRenderedDynamicReminders } : {}),
-            ...(finalPrefixFingerprint !== undefined ? { prefixFingerprint: finalPrefixFingerprint } : {}),
+            prefixFingerprint: finalPrefixFingerprint,
             macroOverrides: combinedMacroOverrides,
             hostBridge,
         });

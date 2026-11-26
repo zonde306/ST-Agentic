@@ -1,13 +1,22 @@
-import type { ApiConnection, Preset, Settings } from '../types';
+import type { ApiConnection, Preset, PromptBlock, Settings } from '../types';
+import {
+    createDefaultMainAgent,
+    createDefaultPreset,
+    DEFAULT_MAIN_AGENT_ID,
+} from './defaults';
 import {
     isPlainRecord,
     normalizeConnection,
     normalizeConnectionsMap,
     normalizePreset,
+    normalizePromptBlock,
     normalizeSettings,
+    sanitizeName,
 } from './normalize';
 
 export const EXPORT_FORMAT_PRESET = 'st-agentic-preset';
+export const EXPORT_FORMAT_PROMPT = 'st-agentic-prompt';
+export const EXPORT_FORMAT_PROMPTS = 'st-agentic-prompts';
 export const EXPORT_FORMAT_CONNECTIONS = 'st-agentic-connections';
 export const EXPORT_FORMAT_SETTINGS = 'st-agentic-settings';
 export const EXPORT_SCHEMA_VERSION = 1 as const;
@@ -17,6 +26,20 @@ export interface ExportedPresetPayload {
     version: typeof EXPORT_SCHEMA_VERSION;
     preset: Preset;
     connection?: ApiConnection;
+}
+
+export interface ExportedPromptPayload {
+    format: typeof EXPORT_FORMAT_PROMPT;
+    version: typeof EXPORT_SCHEMA_VERSION;
+    prompt: PromptBlock;
+}
+
+export interface ExportedPromptsPayload {
+    format: typeof EXPORT_FORMAT_PROMPTS;
+    version: typeof EXPORT_SCHEMA_VERSION;
+    presetName?: string;
+    agentId?: string;
+    prompts: PromptBlock[];
 }
 
 export interface ExportedConnectionsPayload {
@@ -282,4 +305,92 @@ export function importSettings(raw: unknown): Settings {
         throw new Error(res.error);
     }
     return res.data;
+}
+
+export interface ImportedPromptsData {
+    prompts: PromptBlock[];
+    presetName?: string;
+    agentId?: string;
+}
+
+/**
+ * Validate and normalize an imported `st-agentic-prompts` or `st-agentic-prompt` payload,
+ * preserving `placement`, `role: 'custom'`, and `triggers` losslessly.
+ */
+export function validatePromptsImport(
+    raw: unknown,
+): ImportValidationResult<ImportedPromptsData> {
+    if (!isPlainRecord(raw)) {
+        return { ok: false, error: 'Invalid prompts import: expected a JSON object.' };
+    }
+
+    if (raw.format === EXPORT_FORMAT_PROMPTS) {
+        if (!Array.isArray(raw.prompts)) {
+            return { ok: false, error: 'Invalid prompts import: prompts array is required.' };
+        }
+        const prompts = raw.prompts
+            .filter(isPlainRecord)
+            .map((item, idx) =>
+                normalizePromptBlock(item, `imported_${idx + 1}`, `Prompt ${idx + 1}`),
+            );
+        if (prompts.length === 0) {
+            return { ok: false, error: 'Invalid prompts import: no valid prompt blocks found.' };
+        }
+        const presetName =
+            typeof raw.presetName === 'string' && raw.presetName.trim()
+                ? raw.presetName.trim()
+                : undefined;
+        const agentId =
+            typeof raw.agentId === 'string' && raw.agentId.trim()
+                ? raw.agentId.trim()
+                : undefined;
+        return {
+            ok: true,
+            data: {
+                prompts,
+                ...(presetName ? { presetName } : {}),
+                ...(agentId ? { agentId } : {}),
+            },
+        };
+    }
+
+    if (raw.format === EXPORT_FORMAT_PROMPT) {
+        if (!isPlainRecord(raw.prompt)) {
+            return { ok: false, error: 'Invalid prompt import: prompt object is required.' };
+        }
+        const prompt = normalizePromptBlock(raw.prompt, 'imported_1', 'Imported Prompt');
+        return {
+            ok: true,
+            data: {
+                prompts: [prompt],
+            },
+        };
+    }
+
+    return { ok: false, error: 'Invalid prompts import: unsupported format.' };
+}
+
+/**
+ * Construct a normalized `Preset` from validated `st-agentic-prompts` / `st-agentic-prompt` data.
+ */
+export function buildPresetFromPromptsImport(
+    data: ImportedPromptsData,
+    options: { presetName?: string; presetId?: string } = {},
+): Preset {
+    const presetName = sanitizeName(options.presetName ?? data.presetName, 'Imported Prompts');
+    const presetId = sanitizeName(options.presetId ?? presetName, 'imported_prompts');
+    const agentId = sanitizeName(data.agentId, DEFAULT_MAIN_AGENT_ID);
+    const mainAgent = createDefaultMainAgent({
+        id: agentId,
+        promptBlocks: data.prompts,
+    });
+    return normalizePreset(
+        createDefaultPreset({
+            id: presetId,
+            name: presetName,
+            mainAgentId: agentId,
+            agents: { [agentId]: mainAgent },
+        }),
+        presetId,
+    );
 }

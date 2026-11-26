@@ -1,10 +1,14 @@
 import type { TargetedEvent } from 'preact';
 import { useMemo, useRef, useState } from 'preact/hooks';
 import {
+    EXPORT_FORMAT_PRESET,
+    EXPORT_FORMAT_PROMPT,
+    EXPORT_FORMAT_PROMPTS,
     getPromptTriggerDisplay,
     isPlainRecord,
     normalizePromptBlock,
     resolveActivePreset,
+    validatePromptsImport,
 } from '@/core/config';
 import { validateCustomPromptBlock } from '@/core/context';
 import {
@@ -157,13 +161,41 @@ function hasTrailingSystemInPrefix(blocks: readonly PromptBlock[]): boolean {
     return false;
 }
 
-interface ParsedPromptImport {
+export interface ParsedPromptImport {
     blocks: PromptBlock[];
     skippedCount: number;
     note?: string;
 }
 
-function parseImportedPromptBlocks(raw: unknown): ParsedPromptImport {
+function extractPresetPromptBlocks(presetObj: Record<string, unknown>): ParsedPromptImport | null {
+    if (!isPlainRecord(presetObj.agents)) {
+        return null;
+    }
+    const agents = presetObj.agents;
+    const mainId = typeof presetObj.mainAgentId === 'string' ? presetObj.mainAgentId : '';
+    const mainCandidate = mainId ? agents[mainId] : undefined;
+    const targetAgent: Record<string, unknown> | null = isPlainRecord(mainCandidate)
+        ? mainCandidate
+        : (Object.values(agents).find(isPlainRecord) ?? null);
+    if (!targetAgent || !Array.isArray(targetAgent.promptBlocks)) {
+        return null;
+    }
+    const blocks = targetAgent.promptBlocks
+        .filter(isPlainRecord)
+        .map((item, idx) =>
+            normalizePromptBlock(item, `imported_${idx + 1}`, `提示词 ${idx + 1}`),
+        );
+    if (blocks.length === 0) {
+        return null;
+    }
+    return {
+        blocks,
+        skippedCount: 0,
+        note: `已从 ST-Agentic 预设提取 ${blocks.length} 条提示词`,
+    };
+}
+
+export function parseImportedPromptBlocks(raw: unknown): ParsedPromptImport {
     if (Array.isArray(raw)) {
         const blocks = raw
             .filter(isPlainRecord)
@@ -178,6 +210,32 @@ function parseImportedPromptBlocks(raw: unknown): ParsedPromptImport {
 
     if (!isPlainRecord(raw)) {
         throw new Error('JSON 根节点必须是提示词数组或对象');
+    }
+
+    if (raw.format === EXPORT_FORMAT_PROMPTS || raw.format === EXPORT_FORMAT_PROMPT) {
+        const res = validatePromptsImport(raw);
+        if (!res.ok) {
+            throw new Error(res.error);
+        }
+        return {
+            blocks: res.data.prompts,
+            skippedCount: 0,
+            note: `已从 ST-Agentic 提示词包提取 ${res.data.prompts.length} 条提示词`,
+        };
+    }
+
+    if ((raw.format === EXPORT_FORMAT_PRESET || raw.format === undefined) && isPlainRecord(raw.preset)) {
+        const extracted = extractPresetPromptBlocks(raw.preset);
+        if (extracted) {
+            return extracted;
+        }
+    }
+
+    if (isPlainRecord(raw.agents) && typeof raw.mainAgentId === 'string') {
+        const extracted = extractPresetPromptBlocks(raw);
+        if (extracted) {
+            return extracted;
+        }
     }
 
     if (isSillyTavernOpenAIPreset(raw)) {
@@ -198,33 +256,6 @@ function parseImportedPromptBlocks(raw: unknown): ParsedPromptImport {
                     ? `已从 ST 预设提取 ${blocks.length} 条提示词（自动跳过 ${skippedCount} 条内置槽位或 @D>=1 深度注入以保持缓存安全）`
                     : `已从 ST 预设提取 ${blocks.length} 条提示词`,
         };
-    }
-
-    if (
-        raw.format === 'st-agentic-preset'
-        && isPlainRecord(raw.preset)
-        && isPlainRecord(raw.preset.agents)
-    ) {
-        const mainId =
-            typeof raw.preset.mainAgentId === 'string' ? raw.preset.mainAgentId : '';
-        const targetAgent =
-            (mainId && isPlainRecord(raw.preset.agents[mainId])
-                ? raw.preset.agents[mainId]
-                : Object.values(raw.preset.agents).find(isPlainRecord)) ?? null;
-        if (targetAgent && Array.isArray(targetAgent.promptBlocks)) {
-            const blocks = targetAgent.promptBlocks
-                .filter(isPlainRecord)
-                .map((item, idx) =>
-                    normalizePromptBlock(item, `imported_${idx + 1}`, `提示词 ${idx + 1}`),
-                );
-            if (blocks.length > 0) {
-                return {
-                    blocks,
-                    skippedCount: 0,
-                    note: `已从 ST-Agentic 预设提取 ${blocks.length} 条提示词`,
-                };
-            }
-        }
     }
 
     if (Array.isArray(raw.prompts)) {
@@ -614,7 +645,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
         if (exportBlock) {
             return JSON.stringify(
                 {
-                    format: 'st-agentic-prompt',
+                    format: EXPORT_FORMAT_PROMPT,
                     version: 1,
                     prompt: exportBlock,
                 },
@@ -624,7 +655,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
         }
         return JSON.stringify(
             {
-                format: 'st-agentic-prompts',
+                format: EXPORT_FORMAT_PROMPTS,
                 version: 1,
                 presetName: activePreset.name,
                 agentId: activeAgent?.id ?? '',

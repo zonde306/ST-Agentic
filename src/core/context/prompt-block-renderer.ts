@@ -1,4 +1,4 @@
-import type { HostBridge, PromptInjectionSession } from '@/core/bridge';
+import type { EjsRenderSession, HostBridge, PromptInjectionSession } from '@/core/bridge';
 import type {
     CanonicalContentPart,
     CanonicalMessage,
@@ -18,11 +18,16 @@ export interface PromptBlockRenderSyncOptions {
 }
 
 export interface PromptBlockRenderOptions extends PromptBlockRenderSyncOptions {
-    hostBridge?: Pick<HostBridge, 'substituteMacros' | 'evaluateOptionalEjs'>;
+    hostBridge?: Pick<HostBridge, 'substituteMacros' | 'evaluateOptionalEjs'>
+        & Partial<Pick<HostBridge, 'getMetadata'>>;
     /** Variables exposed to `hostBridge.evaluateOptionalEjs(text, vars)`. */
     vars?: Record<string, unknown>;
     /** Isolated per-turn `injectPrompt` / `getPromptsInjected` session. */
     injectionSession?: PromptInjectionSession;
+    /** Turn-scoped shared EJS context & variable sync session. */
+    ejsSession?: EjsRenderSession;
+    /** Optional callback invoked whenever macro or EJS evaluation mutates variables. */
+    onVariablesMutated?: (updates: Record<string, unknown>) => void;
 }
 
 export type CustomPromptBlockMode = 'json' | 'ejs_template' | 'empty' | 'invalid';
@@ -154,6 +159,63 @@ function applyMacros(
     return hostBridge.substituteMacros(text, macroOverrides);
 }
 
+const LOCAL_DOUBLE_COLON_MUTATION_RE = /\{\{\s*(?:set|add|inc|dec)var\s*::\s*([^:}]+?)(?:\s*::|\s*\}\})/gi;
+const LOCAL_SINGLE_COLON_MUTATION_RE = /\{\{\s*(?:set|add|inc|dec)var\s*:\s*([^:}]+?)(?:\s*:|\s*\}\})/gi;
+const LOCAL_SHORTHAND_MUTATION_RE = /\{\{\s*\.([a-zA-Z_][\w-]*)\s*(?:\+\+|--|[+?-]?=|\|\|=)/g;
+
+/** Extract local variable names mutated by ST macros (`setvar`/`addvar`/`incvar`/`decvar`/`.var=`). */
+export function extractMutatedLocalVarNames(text: string): string[] {
+    if (!text || !text.includes('{{')) {
+        return [];
+    }
+    const seen = new Set<string>();
+    const collect = (re: RegExp) => {
+        re.lastIndex = 0;
+        let match: RegExpExecArray | null;
+        while ((match = re.exec(text)) !== null) {
+            const name = match[1]?.trim();
+            if (name) {
+                seen.add(name);
+            }
+        }
+    };
+    collect(LOCAL_DOUBLE_COLON_MUTATION_RE);
+    collect(LOCAL_SINGLE_COLON_MUTATION_RE);
+    collect(LOCAL_SHORTHAND_MUTATION_RE);
+    return Array.from(seen);
+}
+
+/** Stringify a variable value consistently with `buildLayer2MacroOverrides` (`var:<k>`). */
+export function stringifyMacroVarValue(value: unknown): string {
+    if (value === undefined || value === null) {
+        return '';
+    }
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+        return String(value);
+    }
+    return JSON.stringify(value);
+}
+
+function readMetadataVariablesSnapshot(
+    hostBridge?: Partial<Pick<HostBridge, 'getMetadata'>>,
+): Map<string, { value: unknown; digest: string }> {
+    const snap = new Map<string, { value: unknown; digest: string }>();
+    const raw = hostBridge?.getMetadata?.()?.variables;
+    if (!isPlainRecord(raw)) {
+        return snap;
+    }
+    for (const [key, val] of Object.entries(raw)) {
+        let digest: string;
+        try {
+            digest = canonicalStringify(val) ?? 'undefined';
+        } catch {
+            digest = String(val);
+        }
+        snap.set(key, { value: val, digest });
+    }
+    return snap;
+}
+
 function buildEjsEnv(vars?: Record<string, unknown>): Record<string, unknown> {
     const base: Record<string, unknown> = vars ? { ...vars } : {};
     if (typeof base.json !== 'function') {
@@ -169,18 +231,65 @@ async function evaluateStringLeafAsync(
     evalEjs: boolean,
     ejsEnv: Record<string, unknown>,
 ): Promise<string> {
+    const beforeMacroSnap = readMetadataVariablesSnapshot(options.hostBridge);
     let text = applyMacros(raw, options.hostBridge, options.macroOverrides);
+    const afterMacroSnap = readMetadataVariablesSnapshot(options.hostBridge);
+
+    const macroDelta: Record<string, unknown> = {};
+    for (const [key, entry] of afterMacroSnap.entries()) {
+        const prev = beforeMacroSnap.get(key);
+        if (!prev || prev.digest !== entry.digest) {
+            macroDelta[key] = entry.value;
+        }
+    }
+    for (const mutatedKey of extractMutatedLocalVarNames(raw)) {
+        if (!Object.hasOwn(macroDelta, mutatedKey) && afterMacroSnap.has(mutatedKey)) {
+            macroDelta[mutatedKey] = afterMacroSnap.get(mutatedKey)!.value;
+        }
+    }
+    if (Object.keys(macroDelta).length > 0) {
+        Object.assign(ejsEnv, macroDelta);
+        if (options.ejsSession) {
+            options.ejsSession.pendingMacroVarUpdates = {
+                ...(options.ejsSession.pendingMacroVarUpdates ?? {}),
+                ...macroDelta,
+            };
+        }
+        options.onVariablesMutated?.(macroDelta);
+    }
+
     if (evalEjs && options.hostBridge?.evaluateOptionalEjs && text.includes('<%')) {
+        const preEjsSnap = readMetadataVariablesSnapshot(options.hostBridge);
         try {
             text = await options.hostBridge.evaluateOptionalEjs(
                 text,
                 ejsEnv,
-                options.injectionSession
-                    ? { injectionSession: options.injectionSession }
-                    : undefined,
+                {
+                    ...(options.injectionSession
+                        ? { injectionSession: options.injectionSession }
+                        : {}),
+                    ...(options.ejsSession ? { ejsSession: options.ejsSession } : {}),
+                },
             );
         } catch (err) {
             options.onError?.(err instanceof Error ? err : new Error(String(err)), block);
+        }
+
+        const postEjsSnap = readMetadataVariablesSnapshot(options.hostBridge);
+        const ejsDelta: Record<string, unknown> = {};
+        for (const [key, entry] of postEjsSnap.entries()) {
+            const prev = preEjsSnap.get(key);
+            if (!prev || prev.digest !== entry.digest) {
+                ejsDelta[key] = entry.value;
+            }
+        }
+        if (options.ejsSession?.lastEjsVarUpdates) {
+            Object.assign(ejsDelta, options.ejsSession.lastEjsVarUpdates);
+            options.ejsSession.lastEjsVarUpdates = undefined;
+        }
+        if (Object.keys(ejsDelta).length > 0) {
+            Object.assign(ejsEnv, ejsDelta);
+            options.onVariablesMutated?.(ejsDelta);
         }
     }
     return text;
@@ -861,23 +970,34 @@ export async function renderPromptBlock(
         return [];
     }
 
-    const ejsEnv = buildEjsEnv(options.vars);
+    const liveBlockVars: Record<string, unknown> = options.vars ? { ...options.vars } : {};
+    const liveBlockMacroOverrides = options.macroOverrides
+        ? { ...options.macroOverrides }
+        : undefined;
+    const ejsEnv = buildEjsEnv(liveBlockVars);
+    const effectiveOptions: PromptBlockRenderOptions = {
+        ...options,
+        vars: liveBlockVars,
+        ...(liveBlockMacroOverrides ? { macroOverrides: liveBlockMacroOverrides } : {}),
+        onVariablesMutated: (updates) => {
+            Object.assign(liveBlockVars, updates);
+            if (liveBlockMacroOverrides) {
+                for (const [k, v] of Object.entries(updates)) {
+                    liveBlockMacroOverrides[`var:${k}`] = stringifyMacroVarValue(v);
+                }
+            }
+            options.onVariablesMutated?.(updates);
+        },
+    };
 
     if (block.role !== 'custom') {
-        let text = applyMacros(block.content, options.hostBridge, options.macroOverrides);
-        if (options.hostBridge?.evaluateOptionalEjs && text.includes('<%')) {
-            try {
-                text = await options.hostBridge.evaluateOptionalEjs(
-                    text,
-                    ejsEnv,
-                    options.injectionSession
-                        ? { injectionSession: options.injectionSession }
-                        : undefined,
-                );
-            } catch (err) {
-                options.onError?.(err instanceof Error ? err : new Error(String(err)), block);
-            }
-        }
+        const text = await evaluateStringLeafAsync(
+            block.content,
+            block,
+            effectiveOptions,
+            true,
+            ejsEnv,
+        );
         const trimmed = text.trim();
         return trimmed ? [{ role: block.role, content: trimmed }] : [];
     }
@@ -897,26 +1017,49 @@ export async function renderPromptBlock(
         const evaluatedItems: unknown[] = [];
         for (const item of rawList) {
             evaluatedItems.push(
-                await evaluateCustomTreeAsync(item, 'message', block, options, true, ejsEnv),
+                await evaluateCustomTreeAsync(item, 'message', block, effectiveOptions, true, ejsEnv),
             );
         }
-        return normalizeCustomMessages(evaluatedItems, block.id, options.precedingMessages);
+        return normalizeCustomMessages(evaluatedItems, block.id, effectiveOptions.precedingMessages);
     }
 
     // Track B: Outer EJS control-flow template generating JSON
-    if (trimmed.includes('<%') && options.hostBridge?.evaluateOptionalEjs) {
+    if (trimmed.includes('<%') && effectiveOptions.hostBridge?.evaluateOptionalEjs) {
+        const preEjsSnap = readMetadataVariablesSnapshot(effectiveOptions.hostBridge);
         let evaluated: string;
         try {
-            evaluated = await options.hostBridge.evaluateOptionalEjs(
+            evaluated = await effectiveOptions.hostBridge.evaluateOptionalEjs(
                 trimmed,
                 ejsEnv,
-                options.injectionSession
-                    ? { injectionSession: options.injectionSession }
-                    : undefined,
+                {
+                    ...(effectiveOptions.injectionSession
+                        ? { injectionSession: effectiveOptions.injectionSession }
+                        : {}),
+                    ...(effectiveOptions.ejsSession
+                        ? { ejsSession: effectiveOptions.ejsSession }
+                        : {}),
+                },
             );
         } catch (err) {
-            options.onError?.(err instanceof Error ? err : new Error(String(err)), block);
+            effectiveOptions.onError?.(err instanceof Error ? err : new Error(String(err)), block);
             return [];
+        }
+
+        const postEjsSnap = readMetadataVariablesSnapshot(effectiveOptions.hostBridge);
+        const ejsDelta: Record<string, unknown> = {};
+        for (const [key, entry] of postEjsSnap.entries()) {
+            const prev = preEjsSnap.get(key);
+            if (!prev || prev.digest !== entry.digest) {
+                ejsDelta[key] = entry.value;
+            }
+        }
+        if (effectiveOptions.ejsSession?.lastEjsVarUpdates) {
+            Object.assign(ejsDelta, effectiveOptions.ejsSession.lastEjsVarUpdates);
+            effectiveOptions.ejsSession.lastEjsVarUpdates = undefined;
+        }
+        if (Object.keys(ejsDelta).length > 0) {
+            Object.assign(ejsEnv, ejsDelta);
+            effectiveOptions.onVariablesMutated?.(ejsDelta);
         }
 
         const evalTrimmed = evaluated.trim();
@@ -926,7 +1069,7 @@ export async function renderPromptBlock(
 
         const trackB = tryParseJsonRoot(evalTrimmed);
         if (!trackB.ok) {
-            options.onError?.(trackB.error, block);
+            effectiveOptions.onError?.(trackB.error, block);
             return [];
         }
 
@@ -938,14 +1081,35 @@ export async function renderPromptBlock(
         const evaluatedItems: unknown[] = [];
         for (const item of rawList) {
             evaluatedItems.push(
-                await evaluateCustomTreeAsync(item, 'message', block, options, false, ejsEnv),
+                await evaluateCustomTreeAsync(item, 'message', block, effectiveOptions, false, ejsEnv),
             );
         }
-        return normalizeCustomMessages(evaluatedItems, block.id, options.precedingMessages);
+        return normalizeCustomMessages(evaluatedItems, block.id, effectiveOptions.precedingMessages);
     }
 
-    options.onError?.(trackA.error, block);
+    effectiveOptions.onError?.(trackA.error, block);
     return [];
+}
+
+function createChainedRenderOptions(
+    options: PromptBlockRenderOptions,
+): PromptBlockRenderOptions {
+    const liveVars: Record<string, unknown> = options.vars ? { ...options.vars } : {};
+    const liveMacroOverrides = options.macroOverrides ? { ...options.macroOverrides } : undefined;
+    return {
+        ...options,
+        vars: liveVars,
+        ...(liveMacroOverrides ? { macroOverrides: liveMacroOverrides } : {}),
+        onVariablesMutated: (updates) => {
+            Object.assign(liveVars, updates);
+            if (liveMacroOverrides) {
+                for (const [k, v] of Object.entries(updates)) {
+                    liveMacroOverrides[`var:${k}`] = stringifyMacroVarValue(v);
+                }
+            }
+            options.onVariablesMutated?.(updates);
+        },
+    };
 }
 
 /**
@@ -958,10 +1122,11 @@ export async function renderPromptBlocks(
 ): Promise<CanonicalMessage[]> {
     const allMessages: CanonicalMessage[] = [];
     const preceding: CanonicalMessage[] = [...(options.precedingMessages ?? [])];
+    const chainedOptions = createChainedRenderOptions(options);
 
     for (const block of blocks) {
         const rendered = await renderPromptBlock(block, {
-            ...options,
+            ...chainedOptions,
             precedingMessages: preceding,
         });
         for (const msg of rendered) {
@@ -983,10 +1148,11 @@ export async function prerenderPromptBlocks(
 ): Promise<Map<string, CanonicalMessage[]>> {
     const result = new Map<string, CanonicalMessage[]>();
     const preceding: CanonicalMessage[] = [...(options.precedingMessages ?? [])];
+    const chainedOptions = createChainedRenderOptions(options);
 
     for (const block of blocks) {
         const rendered = await renderPromptBlock(block, {
-            ...options,
+            ...chainedOptions,
             precedingMessages: preceding,
         });
         result.set(block.id, rendered);

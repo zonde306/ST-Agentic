@@ -477,6 +477,12 @@ export function normalizeTriggerRule(input: unknown, fallbackId = 'trigger_1'): 
     if (typeof raw.decorator === 'string' && raw.decorator.trim()) {
         rule.decorator = raw.decorator.trim();
     }
+    if (Array.isArray(raw.ifConditions)) {
+        const ifConditions = normalizeStringArray(raw.ifConditions);
+        if (ifConditions.length > 0) {
+            rule.ifConditions = ifConditions;
+        }
+    }
     if (typeof raw.scriptCode === 'string') {
         rule.scriptCode = raw.scriptCode;
     }

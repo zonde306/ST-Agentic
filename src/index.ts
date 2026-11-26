@@ -7,6 +7,7 @@ import {
 } from '@/core/assistant';
 import type { ToolSideGenApi } from '@/core/bridge';
 import {
+    buildPresetFromPromptsImport,
     createDefaultSettings,
     DEFAULT_FILE_MAP_SIZE_LIMIT,
     exportPreset,
@@ -18,6 +19,7 @@ import {
     validateConnectionsImport,
     validatePresetFileName,
     validatePresetImport,
+    validatePromptsImport,
     validateSettingsImport,
 } from '@/core/config';
 import {
@@ -1449,27 +1451,6 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
         ): Promise<ImportPresetResult> {
             const prevSettings = getSettings();
 
-            if (isSillyTavernOpenAIPreset(rawJson)) {
-                const imported = importSillyTavernOpenAIPreset(rawJson, {
-                    presetName: options?.presetName,
-                });
-                const nextSettings = setSettings({
-                    ...prevSettings,
-                    presets: {
-                        ...prevSettings.presets,
-                        [imported.preset.id]: imported.preset,
-                    },
-                    currentPresetId: imported.preset.id,
-                });
-                await syncTools();
-                return {
-                    settings: nextSettings,
-                    preset: imported.preset,
-                    report: imported.report,
-                    message: `已导入 SillyTavern OpenAI 预设：${imported.preset.name}`,
-                };
-            }
-
             if (isLegacyCustomGenerationData(rawJson)) {
                 const migrated = migrateFromCustomGeneration(rawJson);
                 const mergedPresets = {
@@ -1493,17 +1474,6 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                     preset: importedPreset,
                     report: migrated.report,
                     message: `已迁移导入 CustomGeneration 配置（预设 ${Object.keys(migrated.settings.presets).length} 个）`,
-                };
-            }
-
-            if (validateSettingsImport(rawJson).ok) {
-                const full = importSettings(rawJson);
-                const nextSettings = setSettings(full);
-                await syncTools();
-                return {
-                    settings: nextSettings,
-                    preset: resolveActivePreset(nextSettings),
-                    message: '已导入完整 Agentic 配置。',
                 };
             }
 
@@ -1542,6 +1512,17 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                 };
             }
 
+            if (validateSettingsImport(rawJson).ok) {
+                const full = importSettings(rawJson);
+                const nextSettings = setSettings(full);
+                await syncTools();
+                return {
+                    settings: nextSettings,
+                    preset: resolveActivePreset(nextSettings),
+                    message: '已导入完整 Agentic 配置。',
+                };
+            }
+
             if (validateConnectionsImport(rawJson).ok) {
                 const imported = importConnections(rawJson);
                 const nextConnections = { ...prevSettings.connections };
@@ -1563,6 +1544,57 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
                 return {
                     settings: nextSettings,
                     message: `已导入 ${Object.keys(imported.connections).length} 条 API 连接配置。`,
+                };
+            }
+
+            const promptsValidation = validatePromptsImport(rawJson);
+            if (promptsValidation.ok) {
+                const built = buildPresetFromPromptsImport(promptsValidation.data, {
+                    presetName: options?.presetName,
+                });
+                let uniqueId = built.id;
+                if (uniqueId in prevSettings.presets) {
+                    let suffix = 2;
+                    while (`${built.id}_${suffix}` in prevSettings.presets) {
+                        suffix += 1;
+                    }
+                    uniqueId = `${built.id}_${suffix}`;
+                }
+                const presetCopy: Preset = { ...built, id: uniqueId };
+                const nextSettings = setSettings({
+                    ...prevSettings,
+                    presets: {
+                        ...prevSettings.presets,
+                        [presetCopy.id]: presetCopy,
+                    },
+                    currentPresetId: presetCopy.id,
+                });
+                await syncTools();
+                return {
+                    settings: nextSettings,
+                    preset: presetCopy,
+                    message: `已导入 ST-Agentic 提示词预设：${presetCopy.name}`,
+                };
+            }
+
+            if (isSillyTavernOpenAIPreset(rawJson)) {
+                const imported = importSillyTavernOpenAIPreset(rawJson, {
+                    presetName: options?.presetName,
+                });
+                const nextSettings = setSettings({
+                    ...prevSettings,
+                    presets: {
+                        ...prevSettings.presets,
+                        [imported.preset.id]: imported.preset,
+                    },
+                    currentPresetId: imported.preset.id,
+                });
+                await syncTools();
+                return {
+                    settings: nextSettings,
+                    preset: imported.preset,
+                    report: imported.report,
+                    message: `已导入 SillyTavern OpenAI 预设：${imported.preset.name}`,
                 };
             }
 

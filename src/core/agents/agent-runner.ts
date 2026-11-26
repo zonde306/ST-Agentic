@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type {
+    EjsRenderSession,
     HostBridge,
     LLMRequest,
     LLMStreamChunk,
@@ -21,8 +22,10 @@ import {
     buildLayer2MacroOverrides,
     buildMainSurfaceMacroOverrides,
     buildWorkspaceNotices,
+    computeLayer0StaticFingerprint,
     ContextAssembler,
     DEFAULT_FOLD_THRESHOLD_CHARS,
+    doesFrozenPrefixMatch,
     estimateMessageTokens,
     estimateRequestTokens,
     prerenderPromptBlocks,
@@ -1505,14 +1508,32 @@ export class AgentRunner {
                 && promptTriggerContext !== undefined
                 && promptTriggerContext.kind !== 'main'
                 && hasTriggerScopedBlocks;
+            const staticPrefixFp = computeLayer0StaticFingerprint({
+                agent: effectiveAgent,
+                tools: canonicalTools,
+                presetFiles: preset.files,
+                systemBasePrompt: input.systemBasePrompt,
+                promptTriggerContext,
+            });
             const willUseFrozenPrefix =
                 isPersistent
                 && !input.forceRecompilePrefix
                 && !isNonMainTriggerRun
-                && Boolean(this.trajectoryStore.getFrozenPrefix(effectiveAgent.id));
+                && doesFrozenPrefixMatch(
+                    this.trajectoryStore.getFrozenPrefix(effectiveAgent.id),
+                    staticPrefixFp,
+                );
 
             let preRenderedBlocks: Map<string, CanonicalMessage[]> | undefined;
             if (input.resumeMessages !== undefined) {
+                const resumeEjsSession: EjsRenderSession = {};
+                const rawMetaVars = this.bridge.getMetadata()?.variables;
+                const resumeVars: Record<string, unknown> = {
+                    ...(rawMetaVars && typeof rawMetaVars === 'object' && !Array.isArray(rawMetaVars)
+                        ? (rawMetaVars as Record<string, unknown>)
+                        : {}),
+                    ...workingVars,
+                };
                 if (input.injectionSession) {
                     input.injectionSession.setForceOutlet(true);
                 }
@@ -1544,8 +1565,12 @@ export class AgentRunner {
                             preRenderedBlocks = await prerenderPromptBlocks(prefixBlocksToRender, {
                                 hostBridge: this.bridge,
                                 macroOverrides: preRenderMacroOverrides,
-                                vars: workingVars,
+                                vars: resumeVars,
                                 injectionSession: input.injectionSession,
+                                ejsSession: resumeEjsSession,
+                                onVariablesMutated: (updates) => {
+                                    Object.assign(resumeVars, updates);
+                                },
                             });
                             throwIfAborted(signal);
                         }
@@ -1564,8 +1589,12 @@ export class AgentRunner {
                         const renderedFloating = await prerenderPromptBlocks(floatingTailBlocksToRender, {
                             hostBridge: this.bridge,
                             macroOverrides: preRenderMacroOverrides,
-                            vars: workingVars,
+                            vars: resumeVars,
                             injectionSession: input.injectionSession,
+                            ejsSession: resumeEjsSession,
+                            onVariablesMutated: (updates) => {
+                                Object.assign(resumeVars, updates);
+                            },
                         });
                         throwIfAborted(signal);
                         if (!preRenderedBlocks) {

@@ -40,6 +40,19 @@ const ST_REGEX_PLACEMENT = {
     WORLD_INFO: 5,
 } as const;
 
+function isAgenticPromptBlockLike(item: unknown): boolean {
+    if (!isPlainRecord(item)) {
+        return false;
+    }
+    return (
+        (typeof item.placement === 'string'
+            || item.role === 'custom'
+            || Array.isArray(item.triggers))
+        && item.injection_position === undefined
+        && item.identifier === undefined
+    );
+}
+
 /**
  * Heuristic check for a SillyTavern OpenAI/Chat-Completion preset JSON object.
  */
@@ -47,10 +60,31 @@ export function isSillyTavernOpenAIPreset(raw: unknown): boolean {
     if (!isPlainRecord(raw)) {
         return false;
     }
-    return (
-        typeof raw.chat_completion_source === 'string'
-        || (Array.isArray(raw.prompts) && !Array.isArray(raw.regexs) && !isPlainRecord(raw.templates))
-    );
+    if (typeof raw.format === 'string' && raw.format.startsWith('st-agentic-')) {
+        return false;
+    }
+    if (
+        (isPlainRecord(raw.connections) && typeof raw.runMode === 'string')
+        || (isPlainRecord(raw.agents) && typeof raw.mainAgentId === 'string')
+    ) {
+        return false;
+    }
+    if (typeof raw.chat_completion_source === 'string') {
+        return true;
+    }
+    if (
+        Array.isArray(raw.prompts)
+        && !Array.isArray(raw.regexs)
+        && !isPlainRecord(raw.templates)
+    ) {
+        if (!Array.isArray(raw.prompt_order) && raw.prompts.length > 0) {
+            if (raw.prompts.some(isAgenticPromptBlockLike)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 function parseOptionalYamlRecord(

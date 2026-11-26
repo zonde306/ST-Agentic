@@ -76,6 +76,39 @@ const OUTLET_MACRO_PATTERN = /\{\{\s*outlet::([^}]+?)\s*\}\}/gi;
 const FILE_MACRO_PATTERN = /\{\{file::([^}]+)\}\}/gi;
 const SINGLE_MACRO_TOKEN_PATTERN = /\{\{([^{}]+)\}\}/g;
 const PRE_SUBSTITUTE_OVERRIDE_KEYS = new Set(['lastgenerationtype']);
+const INLINE_DOUBLE_COLON_MUTATION_RE = /\{\{\s*(?:set|add|inc|dec)var\s*::\s*([^:}]+?)(?:\s*::|\s*\}\})/gi;
+const INLINE_SINGLE_COLON_MUTATION_RE = /\{\{\s*(?:set|add|inc|dec)var\s*:\s*([^:}]+?)(?:\s*:|\s*\}\})/gi;
+const INLINE_SHORTHAND_MUTATION_RE = /\{\{\s*\.([a-zA-Z_][\w-]*)\s*(?:\+\+|--|[+?-]?=|\|\|=)/g;
+
+function extractInlineMutatedVarNames(text: string): Set<string> {
+    const names = new Set<string>();
+    if (!text || !text.includes('{{')) {
+        return names;
+    }
+    INLINE_DOUBLE_COLON_MUTATION_RE.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = INLINE_DOUBLE_COLON_MUTATION_RE.exec(text)) !== null) {
+        const name = match[1]?.trim();
+        if (name) {
+            names.add(name);
+        }
+    }
+    INLINE_SINGLE_COLON_MUTATION_RE.lastIndex = 0;
+    while ((match = INLINE_SINGLE_COLON_MUTATION_RE.exec(text)) !== null) {
+        const name = match[1]?.trim();
+        if (name) {
+            names.add(name);
+        }
+    }
+    INLINE_SHORTHAND_MUTATION_RE.lastIndex = 0;
+    while ((match = INLINE_SHORTHAND_MUTATION_RE.exec(text)) !== null) {
+        const name = match[1]?.trim();
+        if (name) {
+            names.add(name);
+        }
+    }
+    return names;
+}
 
 const CHARACTER_NON_SETTING_KEYS = new Set(['name', 'avatar']);
 
@@ -1057,8 +1090,12 @@ export class STHostBridge implements HostBridge {
             }
 
             if (varOverrides.size > 0) {
+                const inlineMutated = extractInlineMutatedVarNames(working);
                 working = working.replace(GETVAR_MACRO_PATTERN, (full, rawVarName: string) => {
                     const name = rawVarName.trim();
+                    if (inlineMutated.has(name)) {
+                        return full;
+                    }
                     return varOverrides.has(name) ? (varOverrides.get(name) ?? '') : full;
                 });
             }

@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+    buildPresetFromPromptsImport,
     createDefaultConnection,
     createDefaultMainAgent,
     createDefaultPreset,
     createDefaultSettings,
+    EXPORT_FORMAT_PROMPT,
+    EXPORT_FORMAT_PROMPTS,
     exportConnections,
     exportPreset,
     exportSettings,
@@ -18,8 +21,11 @@ import {
     resolveConnection,
     validateConnectionsImport,
     validatePresetImport,
+    validatePromptsImport,
     validateSettingsImport,
 } from '@/core/config';
+import { parseImportedPromptBlocks } from '@/ui/studio/PromptsView';
+import stOpenAiPreset from '../../fixtures/st-openai-preset.json';
 
 describe('src/core/config defaults, normalization, and secret-free exports', () => {
     it('creates sensible defaults including persistent main agent tools, permissions, watermark, and PromptBlocks', () => {
@@ -209,5 +215,149 @@ describe('src/core/config defaults, normalization, and secret-free exports', () 
         expect(validatePresetImport({ format: 'wrong-format', preset }).ok).toBe(false);
         expect(validateConnectionsImport({ connections: {} }).ok).toBe(false);
         expect(validateSettingsImport({ foo: 'bar' }).ok).toBe(false);
+    });
+
+    it('preserves tail/floating_tail placement, custom role, prompt triggers, and rule ifConditions across export/import round-trips', () => {
+        const preset = createDefaultPreset({
+            id: 'roundtrip_preset',
+            name: 'Roundtrip Preset',
+            mainAgentId: 'main',
+            agents: {
+                main: createDefaultMainAgent({
+                    id: 'main',
+                    promptBlocks: [
+                        {
+                            id: 'sys_prefix',
+                            name: 'System Prefix',
+                            role: 'system',
+                            placement: 'prefix',
+                            content: 'Base system rules.',
+                            enabled: true,
+                        },
+                        {
+                            id: 'tail_custom',
+                            name: 'Tail Custom JSON',
+                            role: 'custom',
+                            placement: 'tail',
+                            content: '{"role":"assistant","content":"prefill","partial":true}',
+                            enabled: true,
+                            triggers: ['main', 'trigger_after', 'trigger_rule:r1'],
+                        },
+                        {
+                            id: 'floating_tail_block',
+                            name: 'Floating Tail Reminder',
+                            role: 'user',
+                            placement: 'floating_tail',
+                            content: 'Stay in character.',
+                            enabled: false,
+                            triggers: ['main_continue', 'sidegen'],
+                        },
+                    ],
+                }),
+            },
+            triggers: [
+                {
+                    id: 'r1',
+                    label: 'Post Turn Rule',
+                    source: 'preset',
+                    phase: 'after_turn',
+                    order: 1,
+                    barrier: 'turn',
+                    agentProfileId: 'main',
+                    kind: 'agent',
+                    condition: { type: 'always' },
+                    instructionTemplate: 'Sync state.',
+                    ifConditions: ['vars.allowSync', 'vars.sceneActive'],
+                    enabled: true,
+                },
+            ],
+        });
+
+        const exportedJson = JSON.stringify(exportPreset(preset));
+        const reimported = importPreset(JSON.parse(exportedJson));
+        expect(reimported.presets).toHaveLength(1);
+        const restored = reimported.presets[0];
+
+        expect(restored.triggers[0]?.ifConditions).toEqual(['vars.allowSync', 'vars.sceneActive']);
+
+        const blocks = restored.agents.main.promptBlocks;
+        expect(blocks).toHaveLength(3);
+        expect(blocks[1]).toMatchObject({
+            id: 'tail_custom',
+            role: 'custom',
+            placement: 'tail',
+            triggers: ['main', 'trigger_after', 'trigger_rule:r1'],
+            enabled: true,
+        });
+        expect(blocks[2]).toMatchObject({
+            id: 'floating_tail_block',
+            role: 'user',
+            placement: 'floating_tail',
+            triggers: ['main_continue', 'sidegen'],
+            enabled: false,
+        });
+
+        // Prompt-pack export (`st-agentic-prompts`) & single-prompt (`st-agentic-prompt`) round-trip
+        const promptsPayload = {
+            format: EXPORT_FORMAT_PROMPTS,
+            version: 1,
+            presetName: 'Exported Prompts Preset',
+            agentId: 'main',
+            prompts: blocks,
+        };
+        const promptsValidation = validatePromptsImport(promptsPayload);
+        expect(promptsValidation.ok).toBe(true);
+        if (promptsValidation.ok) {
+            const builtPreset = buildPresetFromPromptsImport(promptsValidation.data);
+            expect(builtPreset.name).toBe('Exported Prompts Preset');
+            expect(builtPreset.agents.main.promptBlocks[1]).toMatchObject({
+                role: 'custom',
+                placement: 'tail',
+                triggers: ['main', 'trigger_after', 'trigger_rule:r1'],
+            });
+            expect(builtPreset.agents.main.promptBlocks[2]).toMatchObject({
+                role: 'user',
+                placement: 'floating_tail',
+                triggers: ['main_continue', 'sidegen'],
+                enabled: false,
+            });
+        }
+
+        const singlePromptValidation = validatePromptsImport({
+            format: EXPORT_FORMAT_PROMPT,
+            version: 1,
+            prompt: blocks[1],
+        });
+        expect(singlePromptValidation.ok).toBe(true);
+        if (singlePromptValidation.ok) {
+            expect(singlePromptValidation.data.prompts[0]).toMatchObject({
+                id: 'tail_custom',
+                role: 'custom',
+                placement: 'tail',
+                triggers: ['main', 'trigger_after', 'trigger_rule:r1'],
+            });
+        }
+
+        // PromptsView.parseImportedPromptBlocks must keep ST-Agentic fields & still migrate ST OpenAI presets
+        const parsedFromPromptsPack = parseImportedPromptBlocks(promptsPayload);
+        expect(parsedFromPromptsPack.skippedCount).toBe(0);
+        expect(parsedFromPromptsPack.blocks[1]).toMatchObject({
+            id: 'tail_custom',
+            role: 'custom',
+            placement: 'tail',
+            triggers: ['main', 'trigger_after', 'trigger_rule:r1'],
+        });
+        expect(parsedFromPromptsPack.blocks[2]).toMatchObject({
+            id: 'floating_tail_block',
+            role: 'user',
+            placement: 'floating_tail',
+            triggers: ['main_continue', 'sidegen'],
+            enabled: false,
+        });
+
+        const parsedFromStPreset = parseImportedPromptBlocks(stOpenAiPreset);
+        expect(parsedFromStPreset.blocks.length).toBe(2);
+        expect(parsedFromStPreset.blocks[0].placement).toBe('prefix');
+        expect(parsedFromStPreset.blocks[1].placement).toBe('tail');
     });
 });
