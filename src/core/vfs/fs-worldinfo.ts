@@ -528,12 +528,23 @@ export class WorldInfoMount implements VfsMount {
                 world: normalizedEntry.world,
                 uid: normalizedEntry.uid,
                 path: canonicalPath,
+                comment: normalizedEntry.comment ?? '',
                 target: opts.target,
                 rawContent,
                 overriddenContent,
+                ...(opts.editable !== undefined ? { editable: opts.editable } : {}),
+                ...(opts.writable !== undefined ? { writable: opts.writable } : {}),
+                ...(opts.transformSessionId !== undefined ? { sessionId: opts.transformSessionId } : {}),
+                ...(opts.transformAgentId !== undefined ? { agentId: opts.transformAgentId } : {}),
+                ...(opts.transformPhase !== undefined ? { phase: opts.transformPhase } : {}),
+                ...(opts.transformSessionBag !== undefined ? { sessionBag: opts.transformSessionBag } : {}),
             });
         } else if (this.defaultTemplateEvaluator) {
-            body = await this.defaultTemplateEvaluator(overriddenContent ?? rawContent, opts);
+            body = await this.defaultTemplateEvaluator(overriddenContent ?? rawContent, {
+                ...opts,
+                path: canonicalPath,
+                mount: LOREBOOK_MOUNT,
+            });
         } else {
             body = overriddenContent ?? rawContent;
         }
@@ -843,7 +854,13 @@ export class SkillsMount implements VfsMount {
         }
         let body = entry.body;
         if (!opts.raw && this.templateEvaluator) {
-            body = await this.templateEvaluator(body, opts);
+            body = await this.templateEvaluator(body, {
+                ...opts,
+                path: `/${SKILLS_MOUNT}/${relPath}`,
+                mount: SKILLS_MOUNT,
+                editable: false,
+                writable: false,
+            });
         }
         return sliceLines(`${entry.frontmatter}\n\n${body}`, opts.startLine, opts.endLine);
     }

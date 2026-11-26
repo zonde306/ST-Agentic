@@ -13,6 +13,15 @@ import type {
 } from '../context/prompt-injection-session';
 export type { PromptInjectionSession, SerializedPromptInjected };
 import type { HostAdminBridge, HostAuthorBridge } from './host-admin-bridge';
+import type {
+    PromptTransformInput,
+    PromptTransformResult,
+    PromptTransformTurnLifecyclePayload,
+} from './prompt-transform';
+import type {
+    OutputProcessInput,
+    OutputProcessResult,
+} from './output-process';
 
 export interface HostIdentity {
     userName: string;
@@ -151,6 +160,10 @@ export interface HostBridge {
         vars: Record<string, unknown>,
         options?: EjsEvaluateOptions,
     ): Promise<string>;
+    transformPromptText?(input: PromptTransformInput): Promise<PromptTransformResult>;
+    processOutputText?(input: OutputProcessInput): Promise<OutputProcessResult>;
+    notifyPromptTransformTurnStart?(payload: PromptTransformTurnLifecyclePayload): Promise<void>;
+    notifyPromptTransformTurnEnd?(payload: PromptTransformTurnLifecyclePayload): Promise<void>;
     createPromptInjectionSession?(initialSnapshot?: SerializedPromptInjected): {
         session: PromptInjectionSession;
         mode: 'native' | 'fallback';

@@ -5,6 +5,7 @@ import {
     lintWorldInfoContent,
 } from '@/core/assistant';
 import { buildWorkspaceNotices } from '@/core/context';
+import { PROMPT_TRANSFORM_EVENTS } from '@/core/bridge';
 import {
     BUILTIN_DOCS,
     clearExternalDocs,
@@ -28,7 +29,7 @@ describe('Built-in /docs/ VFS mount & authoring docs', () => {
     afterEach(() => {
         clearExternalDocs();
     });
-    it('mounts all 8 built-in reference docs read-only at /docs/ and isolates them from default root search', async () => {
+    it('mounts all 9 built-in reference docs read-only at /docs/ and isolates them from default root search', async () => {
         const bridge = new MemoryHostBridge();
         const vfs = new VirtualFileSystem({ bridge });
 
@@ -43,7 +44,7 @@ describe('Built-in /docs/ VFS mount & authoring docs', () => {
         });
 
         const docEntries = await vfs.listDir('/docs');
-        expect(docEntries).toHaveLength(8);
+        expect(docEntries).toHaveLength(9);
         expect(docEntries.every((entry) => entry.writable === false && entry.size > 0)).toBe(true);
         expect(docEntries.map((entry) => entry.name)).toEqual(
             BUILTIN_DOCS.map((doc) => doc.fileName).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
@@ -84,8 +85,9 @@ describe('Built-in /docs/ VFS mount & authoring docs', () => {
         expect(scopedGrepHits.some((hit) => hit.path === '/docs/status-ui.md')).toBe(true);
 
         const globbed = await vfs.globFiles('/docs/*.md');
-        expect(globbed).toHaveLength(8);
+        expect(globbed).toHaveLength(9);
         expect(globbed).toContain('/docs/status-ui.md');
+        expect(globbed).toContain('/docs/event-hooks.md');
 
         // Mainline workspace notices never emit /docs/*
         const notices = await buildWorkspaceNotices({
@@ -124,6 +126,23 @@ describe('Built-in /docs/ VFS mount & authoring docs', () => {
         const agenticConfigDoc = getBuiltinDoc('agentic-config.md')?.content ?? '';
         for (const toolName of FULL_AGENTIC_CONFIG_TOOLS) {
             expect(agenticConfigDoc).toContain(toolName);
+        }
+
+        const eventHooksDoc = getBuiltinDoc('event-hooks.md')?.content ?? '';
+        for (const eventName of Object.values(PROMPT_TRANSFORM_EVENTS)) {
+            expect(eventHooksDoc).toContain(eventName);
+        }
+        for (const token of [
+            'messageId',
+            'swipeId',
+            'editable',
+            'cache.disable',
+            'requestFix',
+            'rejectWrite',
+            'plain_finish',
+            'eventOn',
+        ]) {
+            expect(eventHooksDoc).toContain(token);
         }
     });
 
@@ -171,6 +190,7 @@ describe('Built-in /docs/ VFS mount & authoring docs', () => {
         expect(sysText).toContain('/docs/triggers.md');
         expect(sysText).toContain('/docs/ejs-reference.md');
         expect(sysText).toContain('/docs/status-ui.md');
+        expect(sysText).toContain('/docs/event-hooks.md');
         expect(sysText).not.toContain('External Extension Docs');
     });
 

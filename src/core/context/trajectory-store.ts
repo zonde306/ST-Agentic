@@ -23,6 +23,11 @@ export interface FrozenStaticPrefix {
     messages: readonly CanonicalMessage[];
     layer0EndIndex: number;
     prefixFingerprint?: string;
+    cachedPrefixBlocks?: Readonly<Record<string, readonly CanonicalMessage[]>>;
+    cachedSystemRules?: Readonly<Record<string, string>>;
+    nonCacheablePrefixBlockIds?: readonly string[];
+    nonCacheableSystemRuleKeys?: readonly string[];
+    prefixHookCacheKeys?: Readonly<Record<string, string>>;
 }
 
 /** Causal branch checkpoint bound to a `(messageId, swipeId)` coordinate. */
@@ -69,6 +74,11 @@ export interface SerializedAgentTrajectory {
         messages: CanonicalMessage[];
         layer0EndIndex: number;
         prefixFingerprint?: string;
+        cachedPrefixBlocks?: Record<string, CanonicalMessage[]>;
+        cachedSystemRules?: Record<string, string>;
+        nonCacheablePrefixBlockIds?: string[];
+        nonCacheableSystemRuleKeys?: string[];
+        prefixHookCacheKeys?: Record<string, string>;
     } | null;
 }
 
@@ -129,6 +139,21 @@ export function freezeStaticPrefix(prefix: FrozenStaticPrefix): FrozenStaticPref
         layer0EndIndex: prefix.layer0EndIndex,
         ...(typeof prefix.prefixFingerprint === 'string'
             ? { prefixFingerprint: prefix.prefixFingerprint }
+            : {}),
+        ...(prefix.cachedPrefixBlocks
+            ? { cachedPrefixBlocks: canonicalClone(prefix.cachedPrefixBlocks) }
+            : {}),
+        ...(prefix.cachedSystemRules
+            ? { cachedSystemRules: { ...prefix.cachedSystemRules } }
+            : {}),
+        ...(prefix.nonCacheablePrefixBlockIds?.length
+            ? { nonCacheablePrefixBlockIds: [...prefix.nonCacheablePrefixBlockIds] }
+            : {}),
+        ...(prefix.nonCacheableSystemRuleKeys?.length
+            ? { nonCacheableSystemRuleKeys: [...prefix.nonCacheableSystemRuleKeys] }
+            : {}),
+        ...(prefix.prefixHookCacheKeys && Object.keys(prefix.prefixHookCacheKeys).length > 0
+            ? { prefixHookCacheKeys: { ...prefix.prefixHookCacheKeys } }
             : {}),
     });
 }
@@ -1046,6 +1071,26 @@ function serializeThread(state: InternalTrajectoryState): SerializedAgentTraject
                 ...(typeof state.frozenPrefix.prefixFingerprint === 'string'
                     ? { prefixFingerprint: state.frozenPrefix.prefixFingerprint }
                     : {}),
+                ...(state.frozenPrefix.cachedPrefixBlocks
+                    ? {
+                          cachedPrefixBlocks: canonicalClone(
+                              state.frozenPrefix.cachedPrefixBlocks,
+                          ) as Record<string, CanonicalMessage[]>,
+                      }
+                    : {}),
+                ...(state.frozenPrefix.cachedSystemRules
+                    ? { cachedSystemRules: { ...state.frozenPrefix.cachedSystemRules } }
+                    : {}),
+                ...(state.frozenPrefix.nonCacheablePrefixBlockIds?.length
+                    ? { nonCacheablePrefixBlockIds: [...state.frozenPrefix.nonCacheablePrefixBlockIds] }
+                    : {}),
+                ...(state.frozenPrefix.nonCacheableSystemRuleKeys?.length
+                    ? { nonCacheableSystemRuleKeys: [...state.frozenPrefix.nonCacheableSystemRuleKeys] }
+                    : {}),
+                ...(state.frozenPrefix.prefixHookCacheKeys
+                    && Object.keys(state.frozenPrefix.prefixHookCacheKeys).length > 0
+                    ? { prefixHookCacheKeys: { ...state.frozenPrefix.prefixHookCacheKeys } }
+                    : {}),
             }
             : null,
     };
@@ -1135,6 +1180,21 @@ function deserializeThread(agentId: string, raw: SerializedAgentTrajectory): Int
                 : -1,
             ...(typeof raw.frozenPrefix.prefixFingerprint === 'string'
                 ? { prefixFingerprint: raw.frozenPrefix.prefixFingerprint }
+                : {}),
+            ...(raw.frozenPrefix.cachedPrefixBlocks && typeof raw.frozenPrefix.cachedPrefixBlocks === 'object'
+                ? { cachedPrefixBlocks: raw.frozenPrefix.cachedPrefixBlocks }
+                : {}),
+            ...(raw.frozenPrefix.cachedSystemRules && typeof raw.frozenPrefix.cachedSystemRules === 'object'
+                ? { cachedSystemRules: raw.frozenPrefix.cachedSystemRules }
+                : {}),
+            ...(Array.isArray(raw.frozenPrefix.nonCacheablePrefixBlockIds)
+                ? { nonCacheablePrefixBlockIds: raw.frozenPrefix.nonCacheablePrefixBlockIds }
+                : {}),
+            ...(Array.isArray(raw.frozenPrefix.nonCacheableSystemRuleKeys)
+                ? { nonCacheableSystemRuleKeys: raw.frozenPrefix.nonCacheableSystemRuleKeys }
+                : {}),
+            ...(raw.frozenPrefix.prefixHookCacheKeys && typeof raw.frozenPrefix.prefixHookCacheKeys === 'object'
+                ? { prefixHookCacheKeys: raw.frozenPrefix.prefixHookCacheKeys }
                 : {}),
         });
     }

@@ -1,19 +1,36 @@
-import type {
-    CreateChatMessageInput,
-    CreateChatMessageOptions,
-    DeleteChatMessageOptions,
-    DeletedChatMessageSnapshot,
-    EjsEvaluateOptions,
-    EjsFeaturesSnapshot,
-    HostAdminBridge,
-    HostAuthorBridge,
-    HostBridge,
-    HostIdentity,
-    ListPresetsOptions,
-    PromptInjectionSession,
-    ReadHostSettingsOptions,
-    SerializedPromptInjected,
-    WriteChatMessageOptions,
+import {
+    type CreateChatMessageInput,
+    type CreateChatMessageOptions,
+    type DeleteChatMessageOptions,
+    type DeletedChatMessageSnapshot,
+    type EjsEvaluateOptions,
+    type EjsFeaturesSnapshot,
+    type HostAdminBridge,
+    type HostAuthorBridge,
+    type HostBridge,
+    type HostIdentity,
+    type ListPresetsOptions,
+    type OutputProcessInput,
+    type OutputProcessListener,
+    type OutputProcessPayload,
+    type OutputProcessResult,
+    type PromptInjectionSession,
+    type PromptTransformErrorEntry,
+    type PromptTransformInput,
+    type PromptTransformListener,
+    type PromptTransformPayload,
+    type PromptTransformResult,
+    type PromptTransformTurnLifecycleListener,
+    type PromptTransformTurnLifecyclePayload,
+    type ReadHostSettingsOptions,
+    type SerializedPromptInjected,
+    type WriteChatMessageOptions,
+    createEjsPromptTransformListener,
+    createNoopOutputProcessResult,
+    createOutputProcessPayload,
+    createPromptTransformPayload,
+    finalizeOutputProcessPayload,
+    finalizePromptTransformPayload,
 } from '@/core/bridge';
 import { LocalPromptInjectionSession, utf8ByteLength } from '@/core/context';
 import type {
@@ -174,7 +191,15 @@ export class MemoryHostBridge implements HostBridge {
     public compatWarnings: Array<{ code: string; message: string }> = [];
     public ejsFeatures: EjsFeaturesSnapshot | null;
     public injectionSessionMode: 'native' | 'fallback';
+    public promptTransformPayloads: PromptTransformPayload[] = [];
+    public outputProcessPayloads: OutputProcessPayload[] = [];
     private reportedCompatCodes = new Set<string>();
+    private promptTransformListeners: PromptTransformListener[] = [];
+    private promptTransformTurnStartListeners: PromptTransformTurnLifecycleListener[] = [];
+    private promptTransformTurnEndListeners: PromptTransformTurnLifecycleListener[] = [];
+    private outputProcessListeners: OutputProcessListener[] = [];
+    private promptTransformDepth = 0;
+    private outputProcessDepth = 0;
 
     public evaluateOptionalEjs?: (
         text: string,
@@ -1059,6 +1084,136 @@ export class MemoryHostBridge implements HostBridge {
                 : text;
             return fn(code, vars, options);
         };
+    }
+
+    onPromptTransform(listener: PromptTransformListener): () => void {
+        if (!this.promptTransformListeners.includes(listener)) {
+            this.promptTransformListeners.push(listener);
+        }
+        return () => this.offPromptTransform(listener);
+    }
+
+    offPromptTransform(listener: PromptTransformListener): void {
+        const idx = this.promptTransformListeners.indexOf(listener);
+        if (idx >= 0) {
+            this.promptTransformListeners.splice(idx, 1);
+        }
+    }
+
+    onPromptTransformTurnStart(listener: PromptTransformTurnLifecycleListener): () => void {
+        if (!this.promptTransformTurnStartListeners.includes(listener)) {
+            this.promptTransformTurnStartListeners.push(listener);
+        }
+        return () => {
+            const idx = this.promptTransformTurnStartListeners.indexOf(listener);
+            if (idx >= 0) {
+                this.promptTransformTurnStartListeners.splice(idx, 1);
+            }
+        };
+    }
+
+    onPromptTransformTurnEnd(listener: PromptTransformTurnLifecycleListener): () => void {
+        if (!this.promptTransformTurnEndListeners.includes(listener)) {
+            this.promptTransformTurnEndListeners.push(listener);
+        }
+        return () => {
+            const idx = this.promptTransformTurnEndListeners.indexOf(listener);
+            if (idx >= 0) {
+                this.promptTransformTurnEndListeners.splice(idx, 1);
+            }
+        };
+    }
+
+    async transformPromptText(input: PromptTransformInput): Promise<PromptTransformResult> {
+        if (this.promptTransformDepth >= 8) {
+            return {
+                text: input.text,
+                changed: false,
+                cacheable: false,
+                cacheKeys: {},
+                cacheDisableReasons: ['reentrancy_limit'],
+                handledSyntaxes: new Set<string>(),
+                errors: [],
+            };
+        }
+
+        const payload = createPromptTransformPayload(input);
+        this.promptTransformPayloads.push(payload);
+        this.promptTransformDepth += 1;
+        try {
+            for (const listener of [...this.promptTransformListeners]) {
+                try {
+                    await listener(payload);
+                } catch (err) {
+                    payload.reportError(err);
+                }
+            }
+            if (this.evaluateOptionalEjs) {
+                const builtinEjs = createEjsPromptTransformListener(this.evaluateOptionalEjs);
+                await builtinEjs(payload);
+            }
+        } finally {
+            this.promptTransformDepth -= 1;
+        }
+        return finalizePromptTransformPayload(payload, input.text);
+    }
+
+    onOutputProcess(listener: OutputProcessListener): () => void {
+        if (!this.outputProcessListeners.includes(listener)) {
+            this.outputProcessListeners.push(listener);
+        }
+        return () => this.offOutputProcess(listener);
+    }
+
+    offOutputProcess(listener: OutputProcessListener): void {
+        const idx = this.outputProcessListeners.indexOf(listener);
+        if (idx >= 0) {
+            this.outputProcessListeners.splice(idx, 1);
+        }
+    }
+
+    async processOutputText(input: OutputProcessInput): Promise<OutputProcessResult> {
+        if (this.outputProcessListeners.length === 0) {
+            return createNoopOutputProcessResult(input.text);
+        }
+        if (this.outputProcessDepth >= 8) {
+            return createNoopOutputProcessResult(input.text);
+        }
+
+        const payload = createOutputProcessPayload(input);
+        this.outputProcessPayloads.push(payload);
+        this.outputProcessDepth += 1;
+        const errors: PromptTransformErrorEntry[] = [];
+        try {
+            for (const listener of [...this.outputProcessListeners]) {
+                try {
+                    await listener(payload);
+                } catch (err) {
+                    errors.push({
+                        error: err instanceof Error ? err : new Error(String(err)),
+                    });
+                }
+            }
+        } finally {
+            this.outputProcessDepth -= 1;
+        }
+        return finalizeOutputProcessPayload(payload, input.text, errors);
+    }
+
+    async notifyPromptTransformTurnStart(
+        payload: PromptTransformTurnLifecyclePayload,
+    ): Promise<void> {
+        for (const listener of [...this.promptTransformTurnStartListeners]) {
+            await listener(payload);
+        }
+    }
+
+    async notifyPromptTransformTurnEnd(
+        payload: PromptTransformTurnLifecyclePayload,
+    ): Promise<void> {
+        for (const listener of [...this.promptTransformTurnEndListeners]) {
+            await listener(payload);
+        }
     }
 
     createPromptInjectionSession(initialSnapshot?: SerializedPromptInjected): {

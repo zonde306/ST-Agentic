@@ -16,11 +16,13 @@ describe('round retry primitives (errors.ts & retry.ts)', () => {
             EMPTY_RESPONSE: 'EMPTY_RESPONSE',
             TOOL_CHOICE_VIOLATION: 'TOOL_CHOICE_VIOLATION',
             MALFORMED_TOOL_CALL: 'MALFORMED_TOOL_CALL',
+            OUTPUT_VALIDATION_RETRY: 'OUTPUT_VALIDATION_RETRY',
         });
 
         expect(isRoundRetryErrorCode('EMPTY_RESPONSE')).toBe(true);
         expect(isRoundRetryErrorCode('TOOL_CHOICE_VIOLATION')).toBe(true);
         expect(isRoundRetryErrorCode('MALFORMED_TOOL_CALL')).toBe(true);
+        expect(isRoundRetryErrorCode('OUTPUT_VALIDATION_RETRY')).toBe(true);
         expect(isRoundRetryErrorCode('OTHER')).toBe(false);
 
         for (const code of Object.values(ROUND_RETRY_ERROR_CODES)) {

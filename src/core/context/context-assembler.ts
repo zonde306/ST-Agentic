@@ -1,4 +1,16 @@
-import type { EjsRenderSession, HostBridge, LLMRequest, PromptInjectionSession } from '@/core/bridge';
+import {
+    type EjsRenderSession,
+    type HostBridge,
+    type LLMRequest,
+    type PromptInjectionSession,
+    type PromptTransformLayer,
+    type PromptTransformLoreMeta,
+    type PromptTransformResult,
+    type PromptTransformRole,
+    type PromptTransformSource,
+    createNoopPromptTransformResult,
+    runPromptTransform,
+} from '@/core/bridge';
 import {
     DEFAULT_MAIN_AGENT_ID,
     createDefaultPromptBlocks,
@@ -57,7 +69,11 @@ import {
     hasAutoPromptMacroOverride,
     substituteAutoPromptMacrosFallback,
 } from './auto-prompt-macros';
-import { prerenderPromptBlocks, renderPromptBlockSync } from './prompt-block-renderer';
+import {
+    type PromptBlockTransformMeta,
+    prerenderPromptBlocks,
+    renderPromptBlockSync,
+} from './prompt-block-renderer';
 import {
     LocalPromptInjectionSession,
     applyOutletsToCanonicalMessages,
@@ -109,6 +125,10 @@ export interface AssembledContext {
     preRenderedSystemRules?: readonly string[];
     /** Effective macro overrides (including turn-scoped `outlet:*` entries) produced during `assembleWithHost()`. */
     effectiveMacroOverrides?: Record<string, string>;
+    /** Floating tail block IDs marked non-cacheable by prompt transform hooks. */
+    nonCacheableFloatingBlockIds?: readonly string[];
+    /** Ephemeral chat history messages after prompt transform hooks (reused across in-flight rounds). */
+    transformedRecentChatMessages?: readonly (CanonicalMessage | ChatMessageSnapshot)[];
 }
 
 export interface SideClueProvider {
@@ -140,6 +160,16 @@ export interface ContextAssembleInput {
     preRenderedDynamicReminders?: readonly string[];
     /** Optional Layer 0 dynamic dependency fingerprint for `prefix` `getPromptsInjected` / `{{outlet::...}}`. */
     prefixFingerprint?: string;
+    /** Cached per-block Layer 0 prefix messages for selective hook re-evaluation. */
+    cachedPrefixBlocks?: Readonly<Record<string, readonly CanonicalMessage[]>>;
+    /** Cached per-rule Category ① `system_rule` strings keyed by `${world}\0${uid}`. */
+    cachedSystemRules?: Readonly<Record<string, string>>;
+    /** Layer 0 prefix block IDs marked non-cacheable by prompt transform hooks. */
+    nonCacheablePrefixBlockIds?: readonly string[];
+    /** Category ① `system_rule` keys marked non-cacheable by prompt transform hooks. */
+    nonCacheableSystemRuleKeys?: readonly string[];
+    /** Sorted hook cache keys aggregated across Layer 0 prefix transforms. */
+    prefixHookCacheKeys?: Readonly<Record<string, string>>;
 
     // Layer 1 inputs
     trajectoryStore?: TrajectoryStore;
@@ -186,6 +216,25 @@ export interface AssembleWithHostInput extends Omit<ContextAssembleInput, 'hostB
     runTailRadar?: boolean;
     /** Optional isolated `PromptInjectionSession` shared with `before_turn` triggers. */
     injectionSession?: PromptInjectionSession;
+    /** Turn-scoped session ID propagated to prompt transform hooks. */
+    transformSessionId?: string;
+    /** Pipeline phase propagated to prompt transform hooks. */
+    transformPhase?: string;
+    /** Shared per-turn state bag propagated across prompt transform hooks. */
+    transformSessionBag?: Record<string, unknown>;
+    /** Capability predicate for `TailRadar` (`meta.editable`). */
+    canEditPath?: (path: string) => boolean;
+    /** Capability predicate for `TailRadar` (`meta.writable`). */
+    canWritePath?: (path: string) => boolean;
+    /** Override whether `userInput` represents a host chat message. */
+    userInputIsChatMessage?: boolean;
+    /** Explicit host chat message metadata for `userInput`. */
+    userMessageMeta?: {
+        messageId: number;
+        swipeId: number;
+        name?: string;
+        isUser?: boolean;
+    };
 }
 
 export interface FinalizeTurnInput {
@@ -1370,6 +1419,22 @@ export class ContextAssembler {
                         messages: layer0Messages,
                         layer0EndIndex,
                         prefixFingerprint: expectedFingerprint,
+                        ...(input.cachedPrefixBlocks
+                            ? { cachedPrefixBlocks: input.cachedPrefixBlocks }
+                            : {}),
+                        ...(input.cachedSystemRules
+                            ? { cachedSystemRules: input.cachedSystemRules }
+                            : {}),
+                        ...(input.nonCacheablePrefixBlockIds?.length
+                            ? { nonCacheablePrefixBlockIds: input.nonCacheablePrefixBlockIds }
+                            : {}),
+                        ...(input.nonCacheableSystemRuleKeys?.length
+                            ? { nonCacheableSystemRuleKeys: input.nonCacheableSystemRuleKeys }
+                            : {}),
+                        ...(input.prefixHookCacheKeys
+                            && Object.keys(input.prefixHookCacheKeys).length > 0
+                            ? { prefixHookCacheKeys: input.prefixHookCacheKeys }
+                            : {}),
                     },
                     input.agent.id,
                 );
@@ -1477,8 +1542,39 @@ export class ContextAssembler {
             target,
             runTailRadar = true,
             injectionSession,
+            transformSessionId: providedTransformSessionId,
+            transformPhase: providedTransformPhase,
+            transformSessionBag: providedTransformSessionBag,
+            canEditPath,
+            canWritePath,
+            userInputIsChatMessage,
+            userMessageMeta,
             ...rest
         } = input;
+
+        const transformSessionId =
+            providedTransformSessionId
+            ?? `turn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const transformSessionBag = providedTransformSessionBag ?? {};
+        const transformPhase =
+            providedTransformPhase
+            ?? (rest.promptTriggerContext && 'phase' in rest.promptTriggerContext
+                ? rest.promptTriggerContext.phase
+                : undefined)
+            ?? 'main_turn';
+        const transformTarget: MessageTarget | undefined =
+            target
+            ?? (() => {
+                const chatList = hostBridge.getChat();
+                if (chatList.length === 0) {
+                    return undefined;
+                }
+                const lastIdx = chatList.length - 1;
+                return {
+                    messageId: lastIdx,
+                    swipeId: chatList[lastIdx]?.swipeId ?? 0,
+                };
+            })();
 
         let loreEntries = rest.loreEntries;
         if (!loreEntries) {
@@ -1543,19 +1639,52 @@ export class ContextAssembler {
                 };
             }
         };
-        const evalEjsWithTurnSync = async (
+        const transformTextWithTurnSync = async (
             text: string,
             varsSnapshot: Record<string, unknown>,
-            evalOpts: { isPrivate?: boolean } = {},
-        ): Promise<string> => {
-            if (!hostBridge.evaluateOptionalEjs || !text.includes('<%')) {
-                return text;
+            opts: {
+                source: PromptTransformSource;
+                layer: PromptTransformLayer;
+                role?: PromptTransformRole;
+                dryRun?: boolean;
+                isPrivate?: boolean;
+                lore?: PromptTransformLoreMeta;
+                isChatMessage?: boolean;
+                messageId?: number;
+                swipeId?: number;
+                name?: string;
+                isUser?: boolean;
+            },
+        ): Promise<PromptTransformResult> => {
+            if (!hostBridge.transformPromptText && !hostBridge.evaluateOptionalEjs) {
+                return createNoopPromptTransformResult(text);
             }
             const preSnap = extractMetadataVarsFallback(hostBridge);
-            const out = await hostBridge.evaluateOptionalEjs(text, varsSnapshot, {
-                injectionSession: session,
-                ejsSession,
-                ...(evalOpts.isPrivate ? { isPrivate: true } : {}),
+            const result = await runPromptTransform(hostBridge, {
+                text,
+                source: opts.source,
+                layer: opts.layer,
+                ...(opts.role !== undefined ? { role: opts.role } : {}),
+                dryRun: Boolean(opts.dryRun),
+                meta: {
+                    sessionId: transformSessionId,
+                    agentId: rest.agent.id,
+                    phase: transformPhase,
+                    ...(transformTarget ? { target: transformTarget } : {}),
+                    isChatMessage: Boolean(opts.isChatMessage),
+                    ...(opts.messageId !== undefined ? { messageId: opts.messageId } : {}),
+                    ...(opts.swipeId !== undefined ? { swipeId: opts.swipeId } : {}),
+                    ...(opts.name !== undefined ? { name: opts.name } : {}),
+                    ...(opts.isUser !== undefined ? { isUser: opts.isUser } : {}),
+                    ...(opts.lore ? { lore: opts.lore } : {}),
+                    vars: varsSnapshot,
+                    ...(opts.isPrivate ? { isPrivate: true } : {}),
+                    injectionSession: session,
+                    ejsSession,
+                },
+                sessionBag: transformSessionBag,
+                ...(rest.signal ? { signal: rest.signal } : {}),
+                onError: 'fallback',
             });
             const postSnap = extractMetadataVarsFallback(hostBridge);
             const delta: Record<string, unknown> = {};
@@ -1571,9 +1700,27 @@ export class ContextAssembler {
             if (Object.keys(delta).length > 0) {
                 applyTurnVarUpdates(delta);
             }
-            return out;
+            return result;
         };
 
+        await hostBridge.notifyPromptTransformTurnStart?.({
+            version: 1,
+            sessionId: transformSessionId,
+            agentId: rest.agent.id,
+            phase: transformPhase,
+            ...(transformTarget
+                ? {
+                      target: transformTarget,
+                      messageId: transformTarget.messageId,
+                      swipeId: transformTarget.swipeId,
+                  }
+                : {}),
+            vars: liveVars,
+            sessionBag: transformSessionBag,
+            ...(rest.signal ? { signal: rest.signal } : {}),
+        });
+
+        try {
         const invertEnabled = Boolean(hostBridge.getEjsFeatures?.()?.invertEnabled);
         const classified = classifyAllEntries(loreEntries, rest.wiRouterOverrides);
         const keywordHaystack = userText
@@ -1662,14 +1809,18 @@ export class ContextAssembler {
                 );
                 const substituted = hostBridge.substituteMacros(item.cleanContent, itemOverrides);
                 syncMetadataVarDiff(preMacroVars);
-                if (hostBridge.evaluateOptionalEjs && substituted.includes('<%')) {
-                    try {
-                        await evalEjsWithTurnSync(substituted, liveVars, {
-                            ...(hasPrivateDecorator(item.decorators) ? { isPrivate: true } : {}),
-                        });
-                    } catch {
-                        // Non-fatal in pre-collection pass
-                    }
+                if (hostBridge.transformPromptText || (hostBridge.evaluateOptionalEjs && substituted.includes('<%'))) {
+                    await transformTextWithTurnSync(substituted, liveVars, {
+                        source: 'lore_precollect',
+                        layer: 'trigger',
+                        isPrivate: hasPrivateDecorator(item.decorators),
+                        lore: {
+                            world: item.entry.world,
+                            uid: item.entry.uid,
+                            comment: item.entry.comment ?? '',
+                            overridden: false,
+                        },
+                    });
                 }
             }
         }
@@ -1691,6 +1842,12 @@ export class ContextAssembler {
                 vars: rest.vars,
                 macroOverrides: rest.macroOverrides,
                 injectionSession: session,
+                canEditPath,
+                canWritePath,
+                sessionId: transformSessionId,
+                agentId: rest.agent.id,
+                phase: transformPhase,
+                sessionBag: transformSessionBag,
             });
         }
 
@@ -1782,6 +1939,11 @@ export class ContextAssembler {
                         vars: effectiveVars,
                         macroOverrides: baseMacroOverrides,
                         injectionSession: session,
+                        source: 'lore_outlet',
+                        sessionId: transformSessionId,
+                        agentId: rest.agent.id,
+                        phase: transformPhase,
+                        sessionBag: transformSessionBag,
                     });
                     if (evaluated.conditionSkipped || !evaluated.text.trim()) {
                         continue;
@@ -1886,45 +2048,100 @@ export class ContextAssembler {
             ? [...rest.preRenderedDynamicReminders]
             : undefined;
 
-        const renderSystemRulesAsync = async (): Promise<string[]> => {
-            const systemRuleEntries = classified
-                .filter((item) => item.category === 'system_rule' && !item.entry.disable)
-                .sort(
-                    (a, b) =>
-                        b.entry.order - a.entry.order
-                        || a.entry.depth - b.entry.depth
-                        || compareCodeUnits(a.entry.world, b.entry.world)
-                        || a.entry.uid - b.entry.uid,
-                );
+        const systemRuleEntries = classified
+            .filter((item) => item.category === 'system_rule' && !item.entry.disable)
+            .sort(
+                (a, b) =>
+                    b.entry.order - a.entry.order
+                    || a.entry.depth - b.entry.depth
+                    || compareCodeUnits(a.entry.world, b.entry.world)
+                    || a.entry.uid - b.entry.uid,
+            );
+        const systemRuleCacheKey = (item: ClassifiedLoreEntry): string =>
+            `${item.entry.world}\0${item.entry.uid}`;
+
+        const renderSystemRulesAsync = async (ruleOpts?: {
+            onlyKeys?: ReadonlySet<string>;
+            cachedByKey?: Readonly<Record<string, string>>;
+            applyOutlets?: boolean;
+        }): Promise<{
+            renderedRules: string[];
+            ruleTextByKey: Record<string, string>;
+            nonCacheableKeys: string[];
+            cacheKeys: Record<string, string>;
+            changed: boolean;
+        }> => {
             const renderedRulesList: string[] = [];
+            const ruleTextByKey: Record<string, string> = {};
+            const nonCacheableKeys: string[] = [];
+            const cacheKeys: Record<string, string> = {};
+            let changed = false;
+
             for (const item of systemRuleEntries) {
+                const key = systemRuleCacheKey(item);
+                if (ruleOpts?.onlyKeys && !ruleOpts.onlyKeys.has(key)) {
+                    const cachedRule = ruleOpts.cachedByKey?.[key] ?? '';
+                    ruleTextByKey[key] = cachedRule;
+                    if (cachedRule) {
+                        renderedRulesList.push(cachedRule);
+                    }
+                    continue;
+                }
+
                 const ifConds = extractIfConditions(item.decorators);
                 const passed = await evaluateIfConditions(ifConds, hostBridge, liveVars, {
                     injectionSession: session,
                 });
                 if (!passed) {
+                    ruleTextByKey[key] = '';
+                    if (ruleOpts?.cachedByKey && (ruleOpts.cachedByKey[key] ?? '') !== '') {
+                        changed = true;
+                    }
                     continue;
                 }
                 const preMacroVars = extractMetadataVarsFallback(hostBridge);
                 let text = substituteText(item.cleanContent, hostBridge, combinedMacroOverrides);
                 syncMetadataVarDiff(preMacroVars);
-                if (hostBridge.evaluateOptionalEjs && text.includes('<%')) {
-                    try {
-                        text = await evalEjsWithTurnSync(text, liveVars, {
-                            ...(hasPrivateDecorator(item.decorators) ? { isPrivate: true } : {}),
-                        });
-                    } catch {
-                        // Keep macro-substituted fallback text
+                if (hostBridge.transformPromptText || (hostBridge.evaluateOptionalEjs && text.includes('<%'))) {
+                    const res = await transformTextWithTurnSync(text, liveVars, {
+                        source: 'system_rule',
+                        layer: 'layer0_prefix',
+                        role: 'system',
+                        isPrivate: hasPrivateDecorator(item.decorators),
+                        lore: {
+                            world: item.entry.world,
+                            uid: item.entry.uid,
+                            comment: item.entry.comment ?? '',
+                            overridden: Boolean(item.overridden),
+                        },
+                    });
+                    text = res.text;
+                    if (!res.cacheable) {
+                        nonCacheableKeys.push(key);
                     }
+                    Object.assign(cacheKeys, res.cacheKeys);
                 }
                 const trimmed = text.trim();
-                if (!trimmed) {
-                    continue;
-                }
                 const title = item.entry.comment?.trim();
-                renderedRulesList.push(title ? `### ${title}\n${trimmed}` : trimmed);
+                let formatted = trimmed ? (title ? `### ${title}\n${trimmed}` : trimmed) : '';
+                if (ruleOpts?.applyOutlets && formatted) {
+                    formatted = session.applyOutlets(formatted).trim();
+                }
+                ruleTextByKey[key] = formatted;
+                if (ruleOpts?.cachedByKey && formatted !== (ruleOpts.cachedByKey[key] ?? '')) {
+                    changed = true;
+                }
+                if (formatted) {
+                    renderedRulesList.push(formatted);
+                }
             }
-            return renderedRulesList;
+            return {
+                renderedRules: renderedRulesList,
+                ruleTextByKey,
+                nonCacheableKeys,
+                cacheKeys,
+                changed,
+            };
         };
 
         const renderDynamicRemindersAsync = async (
@@ -1957,14 +2174,20 @@ export class ContextAssembler {
                 const preMacroVars = extractMetadataVarsFallback(hostBridge);
                 let text = substituteText(item.cleanContent, hostBridge, overridesSnapshot);
                 syncMetadataVarDiff(preMacroVars);
-                if (hostBridge.evaluateOptionalEjs && text.includes('<%')) {
-                    try {
-                        text = await evalEjsWithTurnSync(text, varsSnapshot, {
-                            ...(hasPrivateDecorator(item.decorators) ? { isPrivate: true } : {}),
-                        });
-                    } catch {
-                        // Keep macro-substituted fallback text
-                    }
+                if (hostBridge.transformPromptText || (hostBridge.evaluateOptionalEjs && text.includes('<%'))) {
+                    const res = await transformTextWithTurnSync(text, varsSnapshot, {
+                        source: 'dynamic_reminder',
+                        layer: 'layer2_tail',
+                        role: 'user',
+                        isPrivate: hasPrivateDecorator(item.decorators),
+                        lore: {
+                            world: item.entry.world,
+                            uid: item.entry.uid,
+                            comment: item.entry.comment ?? '',
+                            overridden: Boolean(item.overridden),
+                        },
+                    });
+                    text = res.text;
                 }
                 const trimmed = text.trim();
                 if (trimmed) {
@@ -2042,23 +2265,37 @@ export class ContextAssembler {
             initialDynamicFingerprint,
         );
 
-        const effectiveForceRecompilePrefix =
+        let effectiveForceRecompilePrefix =
             Boolean(rest.forceRecompilePrefix) || (Boolean(existingFrozen) && !frozenMatches);
-        const willUseFrozenPrefix =
+        const initialWillUseFrozenPrefix =
             Boolean(existingFrozen) && frozenMatches && !rest.forceRecompilePrefix;
 
         // Step D: Phase 1 — Render blocks & inline lore with forceOutlet=true
         const newlyRenderedPrefixIds: string[] = [];
         const newlyRenderedTailIds: string[] = [];
         const newlyRenderedFloatingIds: string[] = [];
+        const prefixBlockMetas = new Map<string, PromptBlockTransformMeta>();
+        const floatingBlockMetas = new Map<string, PromptBlockTransformMeta>();
+
+        let renderedRuleByKey: Record<string, string> | undefined;
+        let nonCacheableSystemRuleKeys: string[] = [];
+        const prefixHookCacheKeys: Record<string, string> = {};
+        let selectiveFrozenHit = false;
+        let selectivePrefixReevaluated = false;
+        let selectiveRulesChanged = false;
+        let selectivePrefixIdsToReeval = new Set<string>();
 
         let fullCombinedMacroOverrides: Record<string, string> = { ...combinedMacroOverrides };
 
         session.setForceOutlet(true);
         try {
-            if (!willUseFrozenPrefix) {
+            if (!initialWillUseFrozenPrefix) {
                 if (claimed.prefix.has('systemRules') && preRenderedSystemRules === undefined) {
-                    preRenderedSystemRules = await renderSystemRulesAsync();
+                    const ruleRes = await renderSystemRulesAsync();
+                    preRenderedSystemRules = ruleRes.renderedRules;
+                    renderedRuleByKey = ruleRes.ruleTextByKey;
+                    nonCacheableSystemRuleKeys = ruleRes.nonCacheableKeys;
+                    Object.assign(prefixHookCacheKeys, ruleRes.cacheKeys);
                 }
 
                 const prefixAutoOverrides = buildAutoPromptMacroOverrides({
@@ -2102,6 +2339,16 @@ export class ContextAssembler {
                         vars: liveVars,
                         injectionSession: session,
                         ejsSession,
+                        transformSessionId,
+                        transformAgentId: rest.agent.id,
+                        transformPhase,
+                        transformTarget: transformTarget,
+                        transformSessionBag,
+                        transformLayer: 'layer0_prefix',
+                        signal: rest.signal,
+                        onTransformMeta: (meta) => {
+                            prefixBlockMetas.set(meta.blockId, meta);
+                        },
                         onVariablesMutated: applyTurnVarUpdates,
                     });
                     for (const [blockId, messages] of renderedPrefix.entries()) {
@@ -2111,12 +2358,130 @@ export class ContextAssembler {
                 }
 
                 if (preRenderedSystemRules === undefined) {
-                    preRenderedSystemRules = await renderSystemRulesAsync();
+                    const ruleRes = await renderSystemRulesAsync();
+                    preRenderedSystemRules = ruleRes.renderedRules;
+                    renderedRuleByKey = ruleRes.ruleTextByKey;
+                    if (!claimed.tail.has('systemRules')) {
+                        nonCacheableSystemRuleKeys = ruleRes.nonCacheableKeys;
+                        Object.assign(prefixHookCacheKeys, ruleRes.cacheKeys);
+                    }
                 }
             } else {
+                const existingNonCacheableBlockIds = existingFrozen?.nonCacheablePrefixBlockIds ?? [];
+                const existingNonCacheableRuleKeys = existingFrozen?.nonCacheableSystemRuleKeys ?? [];
+                const hasSelectiveNonCacheablePrefix =
+                    existingNonCacheableBlockIds.length > 0 || existingNonCacheableRuleKeys.length > 0;
+
+                if (hasSelectiveNonCacheablePrefix && existingFrozen) {
+                    selectivePrefixReevaluated = true;
+                    const cachedRulesMap = existingFrozen.cachedSystemRules ?? {};
+                    if (existingNonCacheableRuleKeys.length > 0 && preRenderedSystemRules === undefined) {
+                        const ruleRes = await renderSystemRulesAsync({
+                            onlyKeys: new Set(existingNonCacheableRuleKeys),
+                            cachedByKey: cachedRulesMap,
+                        });
+                        preRenderedSystemRules = ruleRes.renderedRules;
+                        renderedRuleByKey = ruleRes.ruleTextByKey;
+                        nonCacheableSystemRuleKeys = ruleRes.nonCacheableKeys;
+                        Object.assign(prefixHookCacheKeys, ruleRes.cacheKeys);
+                        selectiveRulesChanged = ruleRes.changed;
+                    } else if (preRenderedSystemRules === undefined && existingFrozen.cachedSystemRules) {
+                        const cachedList: string[] = [];
+                        renderedRuleByKey = { ...existingFrozen.cachedSystemRules };
+                        for (const item of systemRuleEntries) {
+                            const txt = existingFrozen.cachedSystemRules[systemRuleCacheKey(item)] ?? '';
+                            if (txt) {
+                                cachedList.push(txt);
+                            }
+                        }
+                        preRenderedSystemRules = cachedList;
+                    }
+
+                    selectivePrefixIdsToReeval = new Set(existingNonCacheableBlockIds);
+                    if (selectiveRulesChanged) {
+                        for (const block of matchingPrefixBlocks) {
+                            if (extractAutoPromptMacroKeys(block.content).has('systemRules')) {
+                                selectivePrefixIdsToReeval.add(block.id);
+                            }
+                        }
+                    }
+
+                    const selectivePrefixOverrides: Record<string, string> = {
+                        ...combinedMacroOverrides,
+                        ...(rest.inFlightMessages !== undefined
+                            ? fillMissingLayer2AutoOverrides(rest.macroOverrides)
+                            : {}),
+                        ...buildAutoPromptMacroOverrides({
+                            coreManifest: manifestText,
+                            ...(preRenderedSystemRules !== undefined
+                                ? { systemRules: formatSystemRulesXml(preRenderedSystemRules) }
+                                : {}),
+                            ...(rest.inFlightMessages === undefined
+                                ? {
+                                      turnBrief: turnBriefXml,
+                                      sideBrief: sideBriefXml,
+                                      workspaceNotice: workspaceNoticeXml,
+                                      loreHint: loreHintXml,
+                                      sideHint: sideHintXml,
+                                      ...(preRenderedDynamicReminders !== undefined || rest.dynamicReminders
+                                          ? {
+                                                dynamicReminders: formatDynamicRemindersXml([
+                                                    ...(preRenderedDynamicReminders ?? []),
+                                                    ...(rest.dynamicReminders ?? []),
+                                                ]),
+                                            }
+                                          : {}),
+                                  }
+                                : {}),
+                        }),
+                    };
+
+                    for (const block of matchingPrefixBlocks) {
+                        if (!selectivePrefixIdsToReeval.has(block.id) && !preRenderedBlocks.has(block.id)) {
+                            const cachedMsgs = existingFrozen.cachedPrefixBlocks?.[block.id];
+                            if (cachedMsgs) {
+                                preRenderedBlocks.set(
+                                    block.id,
+                                    canonicalClone(cachedMsgs) as CanonicalMessage[],
+                                );
+                            }
+                        }
+                    }
+
+                    const prefixBlocksToReeval = matchingPrefixBlocks.filter(
+                        (block) => selectivePrefixIdsToReeval.has(block.id) && !preRenderedBlocks.has(block.id),
+                    );
+                    if (prefixBlocksToReeval.length > 0) {
+                        const renderedPrefix = await prerenderPromptBlocks(prefixBlocksToReeval, {
+                            hostBridge,
+                            macroOverrides: selectivePrefixOverrides,
+                            vars: liveVars,
+                            injectionSession: session,
+                            ejsSession,
+                            transformSessionId,
+                            transformAgentId: rest.agent.id,
+                            transformPhase,
+                            transformTarget: transformTarget,
+                            transformSessionBag,
+                            transformLayer: 'layer0_prefix',
+                            signal: rest.signal,
+                            onTransformMeta: (meta) => {
+                                prefixBlockMetas.set(meta.blockId, meta);
+                            },
+                            onVariablesMutated: applyTurnVarUpdates,
+                        });
+                        for (const [blockId, messages] of renderedPrefix.entries()) {
+                            preRenderedBlocks.set(blockId, messages);
+                            newlyRenderedPrefixIds.push(blockId);
+                        }
+                    }
+                }
+
                 if (rest.inFlightMessages === undefined) {
-                    const sideEffectPrefixBlocks = matchingPrefixBlocks.filter((block) =>
-                        hasPrefixSideEffect(block.content),
+                    const sideEffectPrefixBlocks = matchingPrefixBlocks.filter(
+                        (block) =>
+                            !selectivePrefixIdsToReeval.has(block.id)
+                            && hasPrefixSideEffect(block.content),
                     );
                     if (sideEffectPrefixBlocks.length > 0) {
                         const sideEffectMacroOverrides: Record<string, string> = {
@@ -2131,12 +2496,20 @@ export class ContextAssembler {
                             vars: liveVars,
                             injectionSession: session,
                             ejsSession,
+                            transformSessionId,
+                            transformAgentId: rest.agent.id,
+                            transformPhase,
+                            transformTarget: transformTarget,
+                            transformSessionBag,
+                            transformLayer: 'layer0_prefix',
+                            signal: rest.signal,
                             onVariablesMutated: applyTurnVarUpdates,
                         });
                     }
                 }
                 if (claimed.tail.has('systemRules') && preRenderedSystemRules === undefined) {
-                    preRenderedSystemRules = await renderSystemRulesAsync();
+                    const ruleRes = await renderSystemRulesAsync();
+                    preRenderedSystemRules = ruleRes.renderedRules;
                 }
             }
 
@@ -2230,6 +2603,13 @@ export class ContextAssembler {
                         vars: liveVars,
                         injectionSession: session,
                         ejsSession,
+                        transformSessionId,
+                        transformAgentId: rest.agent.id,
+                        transformPhase,
+                        transformTarget: transformTarget,
+                        transformSessionBag,
+                        transformLayer: 'layer2_tail',
+                        signal: rest.signal,
                         onVariablesMutated: applyTurnVarUpdates,
                     });
                     for (const [blockId, messages] of renderedTail.entries()) {
@@ -2262,6 +2642,16 @@ export class ContextAssembler {
                     vars: liveVars,
                     injectionSession: session,
                     ejsSession,
+                    transformSessionId,
+                    transformAgentId: rest.agent.id,
+                    transformPhase,
+                    transformTarget: transformTarget,
+                    transformSessionBag,
+                    transformLayer: 'layer2_floating',
+                    signal: rest.signal,
+                    onTransformMeta: (meta) => {
+                        floatingBlockMetas.set(meta.blockId, meta);
+                    },
                     onVariablesMutated: applyTurnVarUpdates,
                 });
                 for (const [blockId, messages] of renderedFloating.entries()) {
@@ -2286,7 +2676,25 @@ export class ContextAssembler {
                 );
             }
         }
-        if (preRenderedSystemRules) {
+        if (renderedRuleByKey) {
+            const outletAppliedRules: string[] = [];
+            for (const item of systemRuleEntries) {
+                const key = systemRuleCacheKey(item);
+                const rawRule = renderedRuleByKey[key] ?? '';
+                const nextRule = rawRule ? session.applyOutlets(rawRule).trim() : '';
+                renderedRuleByKey[key] = nextRule;
+                if (nextRule) {
+                    outletAppliedRules.push(nextRule);
+                }
+            }
+            preRenderedSystemRules = outletAppliedRules;
+            fullCombinedMacroOverrides = {
+                ...fullCombinedMacroOverrides,
+                ...buildAutoPromptMacroOverrides({
+                    systemRules: formatSystemRulesXml(preRenderedSystemRules),
+                }),
+            };
+        } else if (preRenderedSystemRules) {
             preRenderedSystemRules = preRenderedSystemRules
                 .map((rule) => session.applyOutlets(rule).trim())
                 .filter(Boolean);
@@ -2314,6 +2722,201 @@ export class ContextAssembler {
             }
         }
 
+        if (selectivePrefixReevaluated && existingFrozen) {
+            const cachedRulesMap = existingFrozen.cachedSystemRules ?? {};
+            if (renderedRuleByKey) {
+                for (const key of existingFrozen.nonCacheableSystemRuleKeys ?? []) {
+                    if ((renderedRuleByKey[key] ?? '') !== (cachedRulesMap[key] ?? '')) {
+                        selectiveRulesChanged = true;
+                        break;
+                    }
+                }
+            }
+            let selectiveBlocksChanged = false;
+            for (const blockId of newlyRenderedPrefixIds) {
+                const nextMsgs = preRenderedBlocks.get(blockId) ?? [];
+                const prevMsgs = existingFrozen.cachedPrefixBlocks?.[blockId];
+                if (!prevMsgs || canonicalStringify(nextMsgs) !== canonicalStringify(prevMsgs)) {
+                    selectiveBlocksChanged = true;
+                    break;
+                }
+            }
+            if (selectiveRulesChanged || selectiveBlocksChanged) {
+                effectiveForceRecompilePrefix = true;
+            } else {
+                selectiveFrozenHit = true;
+                effectiveForceRecompilePrefix = false;
+            }
+        }
+
+        let cachedPrefixBlocksForStore: Record<string, CanonicalMessage[]> | undefined;
+        let cachedSystemRulesForStore: Record<string, string> | undefined;
+        let nonCacheablePrefixBlockIdsForStore: string[] | undefined;
+        let nonCacheableSystemRuleKeysForStore: string[] | undefined;
+        let prefixHookCacheKeysForStore: Record<string, string> | undefined;
+
+        if (!initialWillUseFrozenPrefix || (selectivePrefixReevaluated && !selectiveFrozenHit)) {
+            const nextCachedBlocks: Record<string, CanonicalMessage[]> = {};
+            const nextNonCacheableBlocks: string[] = [];
+            const prevNonCacheableBlockSet = new Set(existingFrozen?.nonCacheablePrefixBlockIds ?? []);
+            const nextHookKeys: Record<string, string> = { ...prefixHookCacheKeys };
+
+            for (const block of matchingPrefixBlocks) {
+                const msgs = preRenderedBlocks.get(block.id);
+                if (msgs) {
+                    nextCachedBlocks[block.id] = canonicalClone(msgs) as CanonicalMessage[];
+                }
+                const meta = prefixBlockMetas.get(block.id);
+                if (meta) {
+                    if (!meta.cacheable) {
+                        nextNonCacheableBlocks.push(block.id);
+                    }
+                    Object.assign(nextHookKeys, meta.cacheKeys);
+                } else if (selectivePrefixReevaluated && prevNonCacheableBlockSet.has(block.id)) {
+                    nextNonCacheableBlocks.push(block.id);
+                }
+            }
+
+            cachedPrefixBlocksForStore = nextCachedBlocks;
+            cachedSystemRulesForStore = renderedRuleByKey;
+            nonCacheablePrefixBlockIdsForStore = nextNonCacheableBlocks;
+            nonCacheableSystemRuleKeysForStore = nonCacheableSystemRuleKeys;
+            prefixHookCacheKeysForStore = nextHookKeys;
+        }
+
+        const nonCacheableFloatingBlockIds = Array.from(floatingBlockMetas.values())
+            .filter((meta) => !meta.cacheable)
+            .map((meta) => meta.blockId);
+
+        let effectiveUserInput = rest.userInput;
+        if (
+            rest.inFlightMessages === undefined
+            && rest.userInput !== undefined
+            && hostBridge.transformPromptText
+        ) {
+            const isChatMessage =
+                userInputIsChatMessage
+                ?? (rest.promptTriggerContext === undefined || rest.promptTriggerContext.kind === 'main');
+
+            let userMeta: { messageId?: number; swipeId?: number; name?: string; isUser?: boolean } = {};
+            if (isChatMessage) {
+                if (userMessageMeta) {
+                    userMeta = {
+                        messageId: userMessageMeta.messageId,
+                        swipeId: userMessageMeta.swipeId,
+                        name: rest.userName ?? userMessageMeta.name ?? hostBridge.getActiveIdentity().userName,
+                        isUser: userMessageMeta.isUser ?? true,
+                    };
+                } else {
+                    const chatList = hostBridge.getChat();
+                    let matchedUserMsg: ChatMessageSnapshot | undefined;
+                    if (
+                        target
+                        && target.messageId >= 0
+                        && target.messageId < chatList.length
+                        && chatList[target.messageId]?.isUser
+                    ) {
+                        matchedUserMsg = chatList[target.messageId];
+                    } else {
+                        const startIdx = target
+                            ? Math.min(chatList.length - 1, target.messageId - 1)
+                            : chatList.length - 1;
+                        for (let idx = startIdx; idx >= 0; idx -= 1) {
+                            const item = chatList[idx];
+                            if (item && !item.isSystem) {
+                                if (item.isUser) {
+                                    matchedUserMsg = item;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    userMeta = {
+                        ...(matchedUserMsg
+                            ? { messageId: matchedUserMsg.id, swipeId: matchedUserMsg.swipeId }
+                            : {}),
+                        name:
+                            rest.userName
+                            ?? matchedUserMsg?.name
+                            ?? hostBridge.getActiveIdentity().userName,
+                        isUser: true,
+                    };
+                }
+            }
+
+            if (typeof rest.userInput === 'string') {
+                const res = await transformTextWithTurnSync(rest.userInput, liveVars, {
+                    source: 'user_input',
+                    layer: 'layer2_tail',
+                    role: 'user',
+                    isChatMessage,
+                    ...userMeta,
+                });
+                effectiveUserInput = res.text;
+            } else if (Array.isArray(rest.userInput)) {
+                const nextParts: CanonicalContentPart[] = [];
+                for (const part of rest.userInput) {
+                    if (part.type === 'text') {
+                        const res = await transformTextWithTurnSync(part.text, liveVars, {
+                            source: 'user_input',
+                            layer: 'layer2_tail',
+                            role: 'user',
+                            isChatMessage,
+                            ...userMeta,
+                        });
+                        nextParts.push({ ...part, text: res.text });
+                    } else {
+                        nextParts.push({ ...part });
+                    }
+                }
+                effectiveUserInput = nextParts;
+            }
+        }
+
+        let effectiveRecentChatMessages = rest.recentChatMessages;
+        let transformedRecentChatMessages: (CanonicalMessage | ChatMessageSnapshot)[] | undefined;
+        if (
+            rest.inFlightMessages === undefined
+            && rest.agent.sessionMode !== 'persistent'
+            && rest.recentChatMessages?.length
+            && hostBridge.transformPromptText
+        ) {
+            const windowSize = Math.max(0, rest.agent.ephemeralWindowSize ?? 6);
+            if (windowSize > 0) {
+                const windowIndices = selectEphemeralWindowSnapshotIndices(
+                    rest.recentChatMessages,
+                    windowSize,
+                );
+                if (windowIndices.size > 0) {
+                    const nextHistory: (CanonicalMessage | ChatMessageSnapshot)[] = [];
+                    for (let idx = 0; idx < rest.recentChatMessages.length; idx += 1) {
+                        const item = rest.recentChatMessages[idx];
+                        if (windowIndices.has(idx) && isChatMessageSnapshot(item) && !item.isSystem) {
+                            const role: PromptTransformRole = item.isUser ? 'user' : 'assistant';
+                            const res = await transformTextWithTurnSync(item.mes ?? '', liveVars, {
+                                source: 'chat_message',
+                                layer: 'layer1_ephemeral',
+                                role,
+                                isChatMessage: true,
+                                messageId: item.id,
+                                swipeId: item.swipeId,
+                                name: item.name,
+                                isUser: item.isUser,
+                            });
+                            nextHistory.push({
+                                ...canonicalClone(item),
+                                mes: res.text,
+                            });
+                        } else {
+                            nextHistory.push(canonicalClone(item));
+                        }
+                    }
+                    effectiveRecentChatMessages = nextHistory;
+                    transformedRecentChatMessages = nextHistory;
+                }
+            }
+        }
+
         const finalDynamicFingerprint = computePrefixDynamicFingerprint(
             prefixDeps,
             session,
@@ -2327,8 +2930,12 @@ export class ContextAssembler {
                 ? `${staticPrefixFingerprint}|${finalDynamicFingerprint}`
                 : staticPrefixFingerprint;
 
-        return this.assemble({
+        const assembled = this.assemble({
             ...rest,
+            ...(effectiveUserInput !== undefined ? { userInput: effectiveUserInput } : {}),
+            ...(effectiveRecentChatMessages !== undefined
+                ? { recentChatMessages: effectiveRecentChatMessages }
+                : {}),
             vars: liveVars,
             forceRecompilePrefix: effectiveForceRecompilePrefix,
             loreEntries,
@@ -2340,9 +2947,52 @@ export class ContextAssembler {
             ...(preRenderedSystemRules !== undefined ? { preRenderedSystemRules } : {}),
             ...(preRenderedDynamicReminders !== undefined ? { preRenderedDynamicReminders } : {}),
             prefixFingerprint: finalPrefixFingerprint,
+            ...(cachedPrefixBlocksForStore !== undefined
+                ? { cachedPrefixBlocks: cachedPrefixBlocksForStore }
+                : {}),
+            ...(cachedSystemRulesForStore !== undefined
+                ? { cachedSystemRules: cachedSystemRulesForStore }
+                : {}),
+            ...(nonCacheablePrefixBlockIdsForStore !== undefined
+                ? { nonCacheablePrefixBlockIds: nonCacheablePrefixBlockIdsForStore }
+                : {}),
+            ...(nonCacheableSystemRuleKeysForStore !== undefined
+                ? { nonCacheableSystemRuleKeys: nonCacheableSystemRuleKeysForStore }
+                : {}),
+            ...(prefixHookCacheKeysForStore !== undefined
+                ? { prefixHookCacheKeys: prefixHookCacheKeysForStore }
+                : {}),
             macroOverrides: fullCombinedMacroOverrides,
             hostBridge,
         });
+
+        return {
+            ...assembled,
+            ...(nonCacheableFloatingBlockIds.length > 0
+                ? { nonCacheableFloatingBlockIds }
+                : {}),
+            ...(transformedRecentChatMessages !== undefined
+                ? { transformedRecentChatMessages }
+                : {}),
+        };
+        } finally {
+            await hostBridge.notifyPromptTransformTurnEnd?.({
+                version: 1,
+                sessionId: transformSessionId,
+                agentId: rest.agent.id,
+                phase: transformPhase,
+                ...(transformTarget
+                    ? {
+                          target: transformTarget,
+                          messageId: transformTarget.messageId,
+                          swipeId: transformTarget.swipeId,
+                      }
+                    : {}),
+                vars: liveVars,
+                sessionBag: transformSessionBag,
+                ...(rest.signal ? { signal: rest.signal } : {}),
+            });
+        }
     }
 
     /**
@@ -2527,6 +3177,45 @@ export class ContextAssembler {
 
         return points;
     }
+}
+
+function selectEphemeralWindowSnapshotIndices(
+    rawMessages: readonly (CanonicalMessage | ChatMessageSnapshot)[],
+    windowSize: number,
+): Set<number> {
+    if (windowSize <= 0 || rawMessages.length === 0) {
+        return new Set<number>();
+    }
+    const turns: number[][] = [];
+    let currentTurn: number[] = [];
+    for (let idx = 0; idx < rawMessages.length; idx += 1) {
+        const item = rawMessages[idx];
+        const isSys = isChatMessageSnapshot(item)
+            ? Boolean(item.isSystem)
+            : item.role === 'system';
+        if (isSys) {
+            continue;
+        }
+        const role = isChatMessageSnapshot(item)
+            ? (item.isUser ? 'user' : 'assistant')
+            : item.role;
+        if (role === 'user' && currentTurn.length > 0) {
+            turns.push(currentTurn);
+            currentTurn = [idx];
+        } else {
+            currentTurn.push(idx);
+        }
+    }
+    if (currentTurn.length > 0) {
+        turns.push(currentTurn);
+    }
+    const selected = new Set<number>();
+    for (const turn of turns.slice(-windowSize)) {
+        for (const idx of turn) {
+            selected.add(idx);
+        }
+    }
+    return selected;
 }
 
 function extractUserTextForRadar(

@@ -63,6 +63,9 @@ export interface CreateToolContextOptions {
     target: MessageTarget;
     signal?: AbortSignal;
     permissions?: ScopedPermissions;
+    canEditFiles?: boolean;
+    agentId?: string;
+    phase?: string;
     readSet?: Map<string, string>;
     spillStore?: ToolSpillStoreApi;
     staged?: boolean;
@@ -133,6 +136,9 @@ export function createToolExecutionContext(
         target,
         signal,
         permissions,
+        ...(options.canEditFiles !== undefined ? { canEditFiles: options.canEditFiles } : {}),
+        ...(options.agentId !== undefined ? { agentId: options.agentId } : {}),
+        ...(options.phase !== undefined ? { phase: options.phase } : {}),
         ...(options.readSet ? { readSet: options.readSet } : {}),
         ...(options.spillStore ? { spillStore: options.spillStore } : {}),
     };

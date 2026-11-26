@@ -33,20 +33,32 @@ import {
     world_info,
 } from '@st/scripts/world-info.js';
 
-import type {
-    CreateChatMessageInput,
-    CreateChatMessageOptions,
-    DeleteChatMessageOptions,
-    DeletedChatMessageSnapshot,
-    EjsEvaluateOptions,
-    EjsFeaturesSnapshot,
-    HostAdminBridge,
-    HostAuthorBridge,
-    HostBridge,
-    HostIdentity,
-    PromptInjectionSession,
-    SerializedPromptInjected,
-    WriteChatMessageOptions,
+import {
+    type CreateChatMessageInput,
+    type CreateChatMessageOptions,
+    type DeleteChatMessageOptions,
+    type DeletedChatMessageSnapshot,
+    type EjsEvaluateOptions,
+    type EjsFeaturesSnapshot,
+    type HostAdminBridge,
+    type HostAuthorBridge,
+    type HostBridge,
+    type HostIdentity,
+    type OutputProcessInput,
+    type OutputProcessResult,
+    PROMPT_TRANSFORM_EVENTS,
+    type PromptInjectionSession,
+    type PromptTransformInput,
+    type PromptTransformResult,
+    type PromptTransformTurnLifecyclePayload,
+    type SerializedPromptInjected,
+    type WriteChatMessageOptions,
+    createNoopOutputProcessResult,
+    createNoopPromptTransformResult,
+    createOutputProcessPayload,
+    createPromptTransformPayload,
+    finalizeOutputProcessPayload,
+    finalizePromptTransformPayload,
 } from '@/core/bridge';
 import { resolveActivePreset } from '@/core/config';
 import { AUTO_PROMPT_MACRO_ALIAS_LOWER_SET } from '@/core/context';
@@ -383,6 +395,8 @@ export class STHostBridge implements HostBridge {
     private resolveFileMacroSyncFn?: (path: string) => string;
     private onAgenticSettingsReloadFn?: () => Promise<void> | void;
     private cachedLorebooks = new Map<string, RawLoreEntry[]>();
+    private promptTransformDepth = 0;
+    private outputProcessDepth = 0;
 
     evaluateOptionalEjs?: EvaluateOptionalEjsHook;
     createPromptInjectionSession?: CreatePromptInjectionSessionHook;
@@ -1440,6 +1454,148 @@ export class STHostBridge implements HostBridge {
         if (typeof eventSource?.emit === 'function') {
             void eventSource.emit(event, payload);
         }
+    }
+
+    private hasHostEventListeners(eventName: string): boolean {
+        if (typeof eventSource?.emit !== 'function') {
+            return false;
+        }
+        const eventsMap = (eventSource as { events?: Record<string, unknown> }).events;
+        if (!eventsMap || typeof eventsMap !== 'object') {
+            return true;
+        }
+        const listeners = eventsMap[eventName];
+        return Array.isArray(listeners) && listeners.length > 0;
+    }
+
+    private resolveLatestChatTarget(): MessageTarget | undefined {
+        const chatList = this.getChat();
+        if (chatList.length === 0) {
+            return undefined;
+        }
+        const lastIdx = chatList.length - 1;
+        return {
+            messageId: lastIdx,
+            swipeId: chatList[lastIdx]?.swipeId ?? 0,
+        };
+    }
+
+    async transformPromptText(input: PromptTransformInput): Promise<PromptTransformResult> {
+        if (!this.hasHostEventListeners(PROMPT_TRANSFORM_EVENTS.TRANSFORM)) {
+            return createNoopPromptTransformResult(input.text);
+        }
+        if (this.promptTransformDepth >= 8) {
+            return {
+                text: input.text,
+                changed: false,
+                cacheable: false,
+                cacheKeys: {},
+                cacheDisableReasons: ['reentrancy_limit'],
+                handledSyntaxes: new Set<string>(),
+                errors: [],
+            };
+        }
+
+        const fallbackTarget =
+            input.meta.target === undefined && input.meta.messageId === undefined
+                ? this.resolveLatestChatTarget()
+                : undefined;
+        const normalizedInput: PromptTransformInput = fallbackTarget
+            ? {
+                  ...input,
+                  meta: {
+                      ...input.meta,
+                      target: fallbackTarget,
+                      messageId: fallbackTarget.messageId,
+                      swipeId: fallbackTarget.swipeId,
+                  },
+              }
+            : input;
+
+        const payload = createPromptTransformPayload(normalizedInput);
+        this.promptTransformDepth += 1;
+        try {
+            await eventSource.emit(PROMPT_TRANSFORM_EVENTS.TRANSFORM, payload);
+        } finally {
+            this.promptTransformDepth -= 1;
+        }
+        return finalizePromptTransformPayload(payload, input.text);
+    }
+
+    async processOutputText(input: OutputProcessInput): Promise<OutputProcessResult> {
+        if (!this.hasHostEventListeners(PROMPT_TRANSFORM_EVENTS.OUTPUT_PROCESS)) {
+            return createNoopOutputProcessResult(input.text);
+        }
+        if (this.outputProcessDepth >= 8) {
+            return createNoopOutputProcessResult(input.text);
+        }
+
+        const fallbackTarget =
+            input.meta.target === undefined && input.meta.messageId === undefined
+                ? this.resolveLatestChatTarget()
+                : undefined;
+        const normalizedInput: OutputProcessInput = fallbackTarget
+            ? {
+                  ...input,
+                  meta: {
+                      ...input.meta,
+                      target: fallbackTarget,
+                      messageId: fallbackTarget.messageId,
+                      swipeId: fallbackTarget.swipeId,
+                  },
+              }
+            : input;
+
+        const payload = createOutputProcessPayload(normalizedInput);
+        this.outputProcessDepth += 1;
+        try {
+            await eventSource.emit(PROMPT_TRANSFORM_EVENTS.OUTPUT_PROCESS, payload);
+        } finally {
+            this.outputProcessDepth -= 1;
+        }
+        return finalizeOutputProcessPayload(payload, input.text);
+    }
+
+    async notifyPromptTransformTurnStart(
+        payload: PromptTransformTurnLifecyclePayload,
+    ): Promise<void> {
+        if (!this.hasHostEventListeners(PROMPT_TRANSFORM_EVENTS.TURN_START)) {
+            return;
+        }
+        const fallbackTarget =
+            payload.target === undefined && payload.messageId === undefined
+                ? this.resolveLatestChatTarget()
+                : undefined;
+        const target = payload.target ?? fallbackTarget;
+        const resolvedMessageId = payload.messageId ?? target?.messageId;
+        const resolvedSwipeId = payload.swipeId ?? target?.swipeId;
+        await eventSource.emit(PROMPT_TRANSFORM_EVENTS.TURN_START, {
+            ...payload,
+            ...(target ? { target } : {}),
+            ...(resolvedMessageId !== undefined ? { messageId: resolvedMessageId } : {}),
+            ...(resolvedSwipeId !== undefined ? { swipeId: resolvedSwipeId } : {}),
+        });
+    }
+
+    async notifyPromptTransformTurnEnd(
+        payload: PromptTransformTurnLifecyclePayload,
+    ): Promise<void> {
+        if (!this.hasHostEventListeners(PROMPT_TRANSFORM_EVENTS.TURN_END)) {
+            return;
+        }
+        const fallbackTarget =
+            payload.target === undefined && payload.messageId === undefined
+                ? this.resolveLatestChatTarget()
+                : undefined;
+        const target = payload.target ?? fallbackTarget;
+        const resolvedMessageId = payload.messageId ?? target?.messageId;
+        const resolvedSwipeId = payload.swipeId ?? target?.swipeId;
+        await eventSource.emit(PROMPT_TRANSFORM_EVENTS.TURN_END, {
+            ...payload,
+            ...(target ? { target } : {}),
+            ...(resolvedMessageId !== undefined ? { messageId: resolvedMessageId } : {}),
+            ...(resolvedSwipeId !== undefined ? { swipeId: resolvedSwipeId } : {}),
+        });
     }
 
     private getActiveCharacter(): Record<string, unknown> | undefined {

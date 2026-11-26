@@ -1,9 +1,17 @@
-import type { EjsRenderSession, HostBridge, PromptInjectionSession } from '@/core/bridge';
+import {
+    type EjsRenderSession,
+    type HostBridge,
+    type PromptInjectionSession,
+    type PromptTransformLayer,
+    type PromptTransformRole,
+    runPromptTransform,
+} from '@/core/bridge';
 import type {
     CanonicalContentPart,
     CanonicalMessage,
     CanonicalRole,
     CanonicalToolCall,
+    MessageTarget,
     PromptBlock,
 } from '@/core/types';
 import { canonicalClone, canonicalStringify } from '@/core/utils';
@@ -18,9 +26,16 @@ export interface PromptBlockRenderSyncOptions {
     onError?: (error: Error, block: PromptBlock) => void;
 }
 
+export interface PromptBlockTransformMeta {
+    blockId: string;
+    cacheable: boolean;
+    cacheKeys: Readonly<Record<string, string>>;
+    cacheDisableReasons: readonly string[];
+}
+
 export interface PromptBlockRenderOptions extends PromptBlockRenderSyncOptions {
-    hostBridge?: Pick<HostBridge, 'substituteMacros' | 'evaluateOptionalEjs'>
-        & Partial<Pick<HostBridge, 'getMetadata'>>;
+    hostBridge?: Pick<HostBridge, 'substituteMacros'>
+        & Partial<Pick<HostBridge, 'evaluateOptionalEjs' | 'transformPromptText' | 'getMetadata'>>;
     /** Variables exposed to `hostBridge.evaluateOptionalEjs(text, vars)`. */
     vars?: Record<string, unknown>;
     /** Isolated per-turn `injectPrompt` / `getPromptsInjected` session. */
@@ -29,6 +44,14 @@ export interface PromptBlockRenderOptions extends PromptBlockRenderSyncOptions {
     ejsSession?: EjsRenderSession;
     /** Optional callback invoked whenever macro or EJS evaluation mutates variables. */
     onVariablesMutated?: (updates: Record<string, unknown>) => void;
+    transformSessionId?: string;
+    transformAgentId?: string;
+    transformPhase?: string;
+    transformTarget?: MessageTarget;
+    transformSessionBag?: Record<string, unknown>;
+    transformLayer?: PromptTransformLayer;
+    signal?: AbortSignal;
+    onTransformMeta?: (meta: PromptBlockTransformMeta) => void;
 }
 
 export type CustomPromptBlockMode = 'json' | 'ejs_template' | 'empty' | 'invalid';
@@ -228,12 +251,59 @@ function buildEjsEnv(vars?: Record<string, unknown>): Record<string, unknown> {
     return base;
 }
 
+interface BlockTransformTracker {
+    cacheable: boolean;
+    cacheKeys: Record<string, string>;
+    cacheDisableReasons: string[];
+}
+
+function resolveBlockTransformLayer(
+    block: PromptBlock,
+    explicitLayer?: PromptTransformLayer,
+): PromptTransformLayer {
+    if (explicitLayer) {
+        return explicitLayer;
+    }
+    if (block.placement === 'floating_tail') {
+        return 'layer2_floating';
+    }
+    if (block.placement === 'tail') {
+        return 'layer2_tail';
+    }
+    return 'layer0_prefix';
+}
+
+function recordBlockTransformResult(
+    tracker: BlockTransformTracker | undefined,
+    result: {
+        cacheable: boolean;
+        cacheKeys: Readonly<Record<string, string>>;
+        cacheDisableReasons: readonly string[];
+    },
+): void {
+    if (!tracker) {
+        return;
+    }
+    if (!result.cacheable) {
+        tracker.cacheable = false;
+    }
+    for (const [k, v] of Object.entries(result.cacheKeys)) {
+        tracker.cacheKeys[k] = v;
+    }
+    for (const reason of result.cacheDisableReasons) {
+        tracker.cacheDisableReasons.push(reason);
+    }
+}
+
 async function evaluateStringLeafAsync(
     raw: string,
     block: PromptBlock,
     options: PromptBlockRenderOptions,
-    evalEjs: boolean,
+    evalTransform: boolean,
     ejsEnv: Record<string, unknown>,
+    tracker?: BlockTransformTracker,
+    messageRole?: PromptTransformRole,
+    messageName?: string,
 ): Promise<string> {
     const beforeMacroSnap = readMetadataVariablesSnapshot(options.hostBridge);
     let text = applyMacros(raw, options.hostBridge, options.macroOverrides);
@@ -262,21 +332,42 @@ async function evaluateStringLeafAsync(
         options.onVariablesMutated?.(macroDelta);
     }
 
-    if (evalEjs && options.hostBridge?.evaluateOptionalEjs && text.includes('<%')) {
+    const hasHookOrEjs = Boolean(
+        options.hostBridge?.transformPromptText || options.hostBridge?.evaluateOptionalEjs,
+    );
+    if (evalTransform && hasHookOrEjs) {
         const preEjsSnap = readMetadataVariablesSnapshot(options.hostBridge);
-        try {
-            text = await options.hostBridge.evaluateOptionalEjs(
-                text,
-                ejsEnv,
-                {
-                    ...(options.injectionSession
-                        ? { injectionSession: options.injectionSession }
-                        : {}),
-                    ...(options.ejsSession ? { ejsSession: options.ejsSession } : {}),
-                },
-            );
-        } catch (err) {
-            options.onError?.(err instanceof Error ? err : new Error(String(err)), block);
+        const role: PromptTransformRole | undefined =
+            block.role !== 'custom' ? block.role : messageRole;
+        const result = await runPromptTransform(options.hostBridge, {
+            text,
+            source: 'prompt_block',
+            layer: resolveBlockTransformLayer(block, options.transformLayer),
+            ...(role !== undefined ? { role } : {}),
+            dryRun: false,
+            meta: {
+                sessionId: options.transformSessionId ?? `block_${block.id}`,
+                ...(options.transformAgentId ? { agentId: options.transformAgentId } : {}),
+                ...(options.transformPhase ? { phase: options.transformPhase } : {}),
+                ...(options.transformTarget ? { target: options.transformTarget } : {}),
+                isChatMessage: false,
+                ...(messageName ? { name: messageName } : {}),
+                blockId: block.id,
+                blockName: block.name,
+                placement: block.placement,
+                vars: ejsEnv,
+                ...(options.injectionSession ? { injectionSession: options.injectionSession } : {}),
+                ...(options.ejsSession ? { ejsSession: options.ejsSession } : {}),
+            },
+            ...(options.transformSessionBag ? { sessionBag: options.transformSessionBag } : {}),
+            ...(options.signal ? { signal: options.signal } : {}),
+            onError: 'fallback',
+        });
+
+        text = result.text;
+        recordBlockTransformResult(tracker, result);
+        for (const errEntry of result.errors) {
+            options.onError?.(errEntry.error, block);
         }
 
         const postEjsSnap = readMetadataVariablesSnapshot(options.hostBridge);
@@ -308,27 +399,64 @@ function evaluateStringLeafSync(
 
 type TreeWalkScope = 'message' | 'tool_call' | 'tool_call_function' | 'general';
 
+function isNonTextContentPart(item: unknown): boolean {
+    return isPlainRecord(item) && typeof item.type === 'string' && item.type !== 'text';
+}
+
 async function evaluateCustomTreeAsync(
     value: unknown,
     scope: TreeWalkScope,
     block: PromptBlock,
     options: PromptBlockRenderOptions,
-    evalEjs: boolean,
+    evalTransform: boolean,
     ejsEnv: Record<string, unknown>,
+    tracker?: BlockTransformTracker,
+    messageRole?: PromptTransformRole,
+    messageName?: string,
 ): Promise<unknown> {
     if (typeof value === 'string') {
-        return evaluateStringLeafAsync(value, block, options, evalEjs, ejsEnv);
+        return evaluateStringLeafAsync(
+            value,
+            block,
+            options,
+            evalTransform,
+            ejsEnv,
+            tracker,
+            messageRole,
+            messageName,
+        );
     }
     if (Array.isArray(value)) {
         const out: unknown[] = [];
         for (const item of value) {
-            out.push(await evaluateCustomTreeAsync(item, scope, block, options, evalEjs, ejsEnv));
+            const itemEvalTransform =
+                evalTransform && !isNonTextContentPart(item);
+            out.push(
+                await evaluateCustomTreeAsync(
+                    item,
+                    scope,
+                    block,
+                    options,
+                    itemEvalTransform,
+                    ejsEnv,
+                    tracker,
+                    messageRole,
+                    messageName,
+                ),
+            );
         }
         return out;
     }
     if (!isPlainRecord(value)) {
         return value;
     }
+
+    const nextRole =
+        scope === 'message' ? (normalizeCustomRole(value.role) ?? messageRole) : messageRole;
+    const nextName =
+        scope === 'message' && typeof value.name === 'string' && value.name.trim().length > 0
+            ? value.name.trim()
+            : messageName;
 
     const out: Record<string, unknown> = {};
     for (const key of Object.keys(value)) {
@@ -341,7 +469,17 @@ async function evaluateCustomTreeAsync(
             const evaluatedCalls: unknown[] = [];
             for (const tc of child) {
                 evaluatedCalls.push(
-                    await evaluateCustomTreeAsync(tc, 'tool_call', block, options, evalEjs, ejsEnv),
+                    await evaluateCustomTreeAsync(
+                        tc,
+                        'tool_call',
+                        block,
+                        options,
+                        evalTransform,
+                        ejsEnv,
+                        tracker,
+                        nextRole,
+                        nextName,
+                    ),
                 );
             }
             out[key] = evaluatedCalls;
@@ -354,18 +492,45 @@ async function evaluateCustomTreeAsync(
                 'tool_call_function',
                 block,
                 options,
-                evalEjs,
+                evalTransform,
                 ejsEnv,
+                tracker,
+                nextRole,
+                nextName,
             );
             continue;
         }
 
         if ((scope === 'tool_call' || scope === 'tool_call_function') && key === 'arguments') {
-            out[key] = await evaluateToolArgumentsAsync(child, block, options, evalEjs, ejsEnv);
+            out[key] = await evaluateToolArgumentsAsync(
+                child,
+                block,
+                options,
+                evalTransform,
+                ejsEnv,
+                tracker,
+                nextRole,
+                nextName,
+            );
             continue;
         }
 
-        out[key] = await evaluateCustomTreeAsync(child, 'general', block, options, evalEjs, ejsEnv);
+        const keyEvalTransform =
+            evalTransform
+            && !(scope === 'message' && key === 'role')
+            && !(scope === 'tool_call' && (key === 'id' || key === 'type'));
+
+        out[key] = await evaluateCustomTreeAsync(
+            child,
+            'general',
+            block,
+            options,
+            keyEvalTransform,
+            ejsEnv,
+            tracker,
+            nextRole,
+            nextName,
+        );
     }
     return out;
 }
@@ -374,8 +539,11 @@ async function evaluateToolArgumentsAsync(
     rawArgs: unknown,
     block: PromptBlock,
     options: PromptBlockRenderOptions,
-    evalEjs: boolean,
+    evalTransform: boolean,
     ejsEnv: Record<string, unknown>,
+    tracker?: BlockTransformTracker,
+    messageRole?: PromptTransformRole,
+    messageName?: string,
 ): Promise<unknown> {
     if (typeof rawArgs === 'string') {
         const trimmed = rawArgs.trim();
@@ -388,8 +556,11 @@ async function evaluateToolArgumentsAsync(
                         'general',
                         block,
                         options,
-                        evalEjs,
+                        evalTransform,
                         ejsEnv,
+                        tracker,
+                        messageRole,
+                        messageName,
                     );
                     return canonicalStringify(sanitizeExtraValue(evaluatedObj));
                 }
@@ -397,7 +568,16 @@ async function evaluateToolArgumentsAsync(
                 // Fall through to plain string leaf evaluation when raw string is not valid JSON yet
             }
         }
-        const evaluatedStr = await evaluateStringLeafAsync(rawArgs, block, options, evalEjs, ejsEnv);
+        const evaluatedStr = await evaluateStringLeafAsync(
+            rawArgs,
+            block,
+            options,
+            evalTransform,
+            ejsEnv,
+            tracker,
+            messageRole,
+            messageName,
+        );
         const afterTrimmed = evaluatedStr.trim();
         if (afterTrimmed.startsWith('{') && afterTrimmed.endsWith('}')) {
             try {
@@ -412,7 +592,17 @@ async function evaluateToolArgumentsAsync(
         return evaluatedStr;
     }
 
-    return evaluateCustomTreeAsync(rawArgs, 'general', block, options, evalEjs, ejsEnv);
+    return evaluateCustomTreeAsync(
+        rawArgs,
+        'general',
+        block,
+        options,
+        evalTransform,
+        ejsEnv,
+        tracker,
+        messageRole,
+        messageName,
+    );
 }
 
 function evaluateCustomTreeSync(
@@ -974,6 +1164,20 @@ export async function renderPromptBlock(
         return [];
     }
 
+    const tracker: BlockTransformTracker = {
+        cacheable: true,
+        cacheKeys: {},
+        cacheDisableReasons: [],
+    };
+    const emitMeta = () => {
+        options.onTransformMeta?.({
+            blockId: block.id,
+            cacheable: tracker.cacheable,
+            cacheKeys: tracker.cacheKeys,
+            cacheDisableReasons: tracker.cacheDisableReasons,
+        });
+    };
+
     const liveBlockVars: Record<string, unknown> = options.vars ? { ...options.vars } : {};
     const liveBlockMacroOverrides = options.macroOverrides
         ? { ...options.macroOverrides }
@@ -1001,13 +1205,16 @@ export async function renderPromptBlock(
             effectiveOptions,
             true,
             ejsEnv,
+            tracker,
         );
+        emitMeta();
         const trimmed = text.trim();
         return trimmed ? [{ role: block.role, content: trimmed }] : [];
     }
 
     const trimmed = block.content.trim();
     if (!trimmed) {
+        emitMeta();
         return [];
     }
 
@@ -1016,36 +1223,73 @@ export async function renderPromptBlock(
     if (trackA.ok) {
         const rawList = extractRawMessageList(trackA.value);
         if (!rawList || rawList.length === 0) {
+            emitMeta();
             return [];
         }
         const evaluatedItems: unknown[] = [];
         for (const item of rawList) {
             evaluatedItems.push(
-                await evaluateCustomTreeAsync(item, 'message', block, effectiveOptions, true, ejsEnv),
+                await evaluateCustomTreeAsync(
+                    item,
+                    'message',
+                    block,
+                    effectiveOptions,
+                    true,
+                    ejsEnv,
+                    tracker,
+                ),
             );
         }
+        emitMeta();
         return normalizeCustomMessages(evaluatedItems, block.id, effectiveOptions.precedingMessages);
     }
 
-    // Track B: Outer EJS control-flow template generating JSON
-    if (trimmed.includes('<%') && effectiveOptions.hostBridge?.evaluateOptionalEjs) {
+    // Track B: Outer EJS / custom syntax control-flow template generating JSON
+    const hasHookOrEjs = Boolean(
+        effectiveOptions.hostBridge?.transformPromptText
+        || (trimmed.includes('<%') && effectiveOptions.hostBridge?.evaluateOptionalEjs),
+    );
+    if (hasHookOrEjs) {
         const preEjsSnap = readMetadataVariablesSnapshot(effectiveOptions.hostBridge);
-        let evaluated: string;
-        try {
-            evaluated = await effectiveOptions.hostBridge.evaluateOptionalEjs(
-                trimmed,
-                ejsEnv,
-                {
-                    ...(effectiveOptions.injectionSession
-                        ? { injectionSession: effectiveOptions.injectionSession }
-                        : {}),
-                    ...(effectiveOptions.ejsSession
-                        ? { ejsSession: effectiveOptions.ejsSession }
-                        : {}),
-                },
-            );
-        } catch (err) {
-            effectiveOptions.onError?.(err instanceof Error ? err : new Error(String(err)), block);
+        const result = await runPromptTransform(effectiveOptions.hostBridge, {
+            text: trimmed,
+            source: 'prompt_block',
+            layer: resolveBlockTransformLayer(block, effectiveOptions.transformLayer),
+            dryRun: false,
+            meta: {
+                sessionId: effectiveOptions.transformSessionId ?? `block_${block.id}`,
+                ...(effectiveOptions.transformAgentId
+                    ? { agentId: effectiveOptions.transformAgentId }
+                    : {}),
+                ...(effectiveOptions.transformPhase
+                    ? { phase: effectiveOptions.transformPhase }
+                    : {}),
+                ...(effectiveOptions.transformTarget
+                    ? { target: effectiveOptions.transformTarget }
+                    : {}),
+                isChatMessage: false,
+                blockId: block.id,
+                blockName: block.name,
+                placement: block.placement,
+                vars: ejsEnv,
+                ...(effectiveOptions.injectionSession
+                    ? { injectionSession: effectiveOptions.injectionSession }
+                    : {}),
+                ...(effectiveOptions.ejsSession ? { ejsSession: effectiveOptions.ejsSession } : {}),
+            },
+            ...(effectiveOptions.transformSessionBag
+                ? { sessionBag: effectiveOptions.transformSessionBag }
+                : {}),
+            ...(effectiveOptions.signal ? { signal: effectiveOptions.signal } : {}),
+            onError: 'fallback',
+        });
+
+        recordBlockTransformResult(tracker, result);
+        if (result.errors.length > 0) {
+            for (const errEntry of result.errors) {
+                effectiveOptions.onError?.(errEntry.error, block);
+            }
+            emitMeta();
             return [];
         }
 
@@ -1066,32 +1310,45 @@ export async function renderPromptBlock(
             effectiveOptions.onVariablesMutated?.(ejsDelta);
         }
 
-        const evalTrimmed = evaluated.trim();
+        const evalTrimmed = result.text.trim();
         if (!evalTrimmed) {
+            emitMeta();
             return [];
         }
 
         const trackB = tryParseJsonRoot(evalTrimmed);
         if (!trackB.ok) {
-            effectiveOptions.onError?.(trackB.error, block);
+            effectiveOptions.onError?.(result.changed ? trackB.error : trackA.error, block);
+            emitMeta();
             return [];
         }
 
         const rawList = extractRawMessageList(trackB.value);
         if (!rawList || rawList.length === 0) {
+            emitMeta();
             return [];
         }
 
         const evaluatedItems: unknown[] = [];
         for (const item of rawList) {
             evaluatedItems.push(
-                await evaluateCustomTreeAsync(item, 'message', block, effectiveOptions, false, ejsEnv),
+                await evaluateCustomTreeAsync(
+                    item,
+                    'message',
+                    block,
+                    effectiveOptions,
+                    false,
+                    ejsEnv,
+                    tracker,
+                ),
             );
         }
+        emitMeta();
         return normalizeCustomMessages(evaluatedItems, block.id, effectiveOptions.precedingMessages);
     }
 
     effectiveOptions.onError?.(trackA.error, block);
+    emitMeta();
     return [];
 }
 

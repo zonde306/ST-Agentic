@@ -10,7 +10,7 @@ import type {
     CreateAssistantSessionOptions,
     UndoRevertResult,
 } from '@/core/assistant';
-import type { ToolSideGenApi } from '@/core/bridge';
+import type { PROMPT_TRANSFORM_EVENTS, ToolSideGenApi } from '@/core/bridge';
 import type { AgenticDocsPublicApi, ExternalDocRegistration } from '@/core/docs';
 import type { TraceLogger } from '@/core/logger';
 import type { ChatDataStore } from '@/core/store';
@@ -66,6 +66,7 @@ export interface AgenticAssistantPublicApi {
 /** Public runtime scripting API exposed on `globalThis.Agentic`. */
 export interface AgenticPublicApi {
     readonly version: string;
+    readonly events: typeof PROMPT_TRANSFORM_EVENTS;
     getSettings(): Settings;
     openConsole(tab?: ConsoleTabId, deepLink?: DeepLinkState): void;
     closeConsole(): void;

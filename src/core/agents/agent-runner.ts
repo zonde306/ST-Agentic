@@ -6,9 +6,17 @@ import type {
     LLMStreamChunk,
     LLMToolChoice,
     LLMTransport,
+    OutputProcessOperation,
+    OutputProcessResult,
     PromptInjectionSession,
+    ToolEditOperation,
     ToolExecutionContext,
     ToolSideGenApi,
+} from '@/core/bridge';
+import {
+    DEFAULT_MAX_OUTPUT_FIX_ATTEMPTS,
+    formatOutputFixFeedback,
+    runOutputProcess,
 } from '@/core/bridge';
 import {
     createDefaultMainAgent,
@@ -98,7 +106,12 @@ import type {
     WICategory,
 } from '@/core/types';
 import { canonicalClone, canonicalStringify, normalizeVfsPath } from '@/core/utils';
-import { OUTPUT_FILE_PATH, VirtualFileSystem } from '@/core/vfs';
+import {
+    applyTextEdits,
+    OUTPUT_FILE_PATH,
+    resolveEditOperations,
+    VirtualFileSystem,
+} from '@/core/vfs';
 import {
     FinishTurnStreamExtractor,
     IncrementalOutputStreamExtractor,
@@ -647,12 +660,119 @@ function isLikelyRefusalText(text: string): boolean {
 
 function formatRoundRetryReason(error: unknown): string {
     if (error instanceof LLMTransportError && error.code) {
+        if (
+            error.code === ROUND_RETRY_ERROR_CODES.OUTPUT_VALIDATION_RETRY
+            && error.message.trim()
+        ) {
+            return `${error.code}: ${error.message.trim()}`;
+        }
         return error.code;
     }
     if (error instanceof Error && error.message.trim()) {
         return error.message.trim();
     }
     return String(error);
+}
+
+function simulateOutputMutationCandidate(
+    toolCallName: string,
+    parsedArgs: Record<string, unknown> | string,
+    existingOutput: string,
+): { operation: OutputProcessOperation; candidateText: string } | null {
+    if (typeof parsedArgs !== 'object' || parsedArgs === null) {
+        return null;
+    }
+    if (toolCallName === 'write_file' && typeof parsedArgs.content === 'string') {
+        return {
+            operation: 'write_file',
+            candidateText: parsedArgs.content,
+        };
+    }
+    if (toolCallName === 'append_file' && typeof parsedArgs.content === 'string') {
+        return {
+            operation: 'append_file',
+            candidateText: `${existingOutput}${parsedArgs.content}`,
+        };
+    }
+    if (toolCallName === 'replace_reply_view' && typeof parsedArgs.text === 'string') {
+        return {
+            operation: 'replace_reply_view',
+            candidateText: parsedArgs.text,
+        };
+    }
+    if (toolCallName === 'append_reply_view' && typeof parsedArgs.text === 'string') {
+        const text = parsedArgs.text;
+        const candidateText = !existingOutput
+            ? text
+            : existingOutput.endsWith('\n') || text.startsWith('\n')
+                ? `${existingOutput}${text}`
+                : `${existingOutput}\n${text}`;
+        return {
+            operation: 'append_reply_view',
+            candidateText,
+        };
+    }
+    if (toolCallName === 'edit_file') {
+        const rawEdits = Array.isArray(parsedArgs.edits) ? parsedArgs.edits : undefined;
+        const mappedEdits: ToolEditOperation[] | undefined = rawEdits
+            ? rawEdits
+                .filter((item): item is Record<string, unknown> =>
+                    Boolean(item && typeof item === 'object'))
+                .map((op) => ({
+                    search: typeof op.search === 'string' ? op.search : '',
+                    replace: typeof op.replace === 'string' ? op.replace : '',
+                    ...(typeof op.start_line === 'number' ? { startLine: op.start_line } : {}),
+                    ...(typeof op.end_line === 'number' ? { endLine: op.end_line } : {}),
+                    ...(typeof op.replace_all === 'boolean' ? { replaceAll: op.replace_all } : {}),
+                }))
+            : undefined;
+        const ops = mappedEdits && mappedEdits.length > 0
+            ? mappedEdits
+            : typeof parsedArgs.search === 'string' && typeof parsedArgs.replace === 'string'
+                ? resolveEditOperations(parsedArgs.search, parsedArgs.replace, {
+                    ...(typeof parsedArgs.start_line === 'number'
+                        ? { startLine: parsedArgs.start_line }
+                        : {}),
+                    ...(typeof parsedArgs.end_line === 'number'
+                        ? { endLine: parsedArgs.end_line }
+                        : {}),
+                    ...(typeof parsedArgs.replace_all === 'boolean'
+                        ? { replaceAll: parsedArgs.replace_all }
+                        : {}),
+                })
+                : [];
+        if (ops.length === 0) {
+            return null;
+        }
+        const preview = applyTextEdits({
+            path: OUTPUT_FILE_PATH,
+            content: existingOutput,
+            edits: ops,
+        });
+        if (!preview.ok || preview.updatedContent === undefined) {
+            return null;
+        }
+        return {
+            operation: 'edit_file',
+            candidateText: preview.updatedContent,
+        };
+    }
+    return null;
+}
+
+function attachValidationWarningToToolOutput(output: string, warning: string): string {
+    try {
+        const parsed = JSON.parse(output) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return JSON.stringify({
+                ...(parsed as Record<string, unknown>),
+                validationWarning: warning,
+            });
+        }
+    } catch {
+        // Fallback to text append if tool output is not a JSON object.
+    }
+    return `${output}\n${warning}`;
 }
 
 function isOutputMutationToolCall(
@@ -1246,6 +1366,7 @@ export class AgentRunner {
             false,
         );
 
+        const canEditFiles = canonicalTools.some((tool) => tool.name === 'edit_file');
         const toolCtx = createToolExecutionContext({
             bridge: this.bridge,
             vfs: this.vfs,
@@ -1254,12 +1375,20 @@ export class AgentRunner {
             target,
             signal,
             permissions,
+            canEditFiles,
+            agentId: effectiveAgent.id,
+            phase: input.phase,
             readSet: effectiveReadSet,
             spillStore: registry.getSpillStore() ?? this.spillStore,
             staged,
             source: `agent:${agent.id}`,
             getVariableSchema: input.getVariableSchema,
         });
+        const toolGuard = toolCtx.fs as { canWrite?: (path: string) => boolean };
+        const canWritePath = (path: string): boolean =>
+            typeof toolGuard.canWrite === 'function' ? toolGuard.canWrite(path) : false;
+        const canEditPath = (path: string): boolean => canEditFiles && canWritePath(path);
+        const transformSessionBag: Record<string, unknown> = {};
 
         const loreOverrides = this.collectWorldInfoOverrides(target, staged);
         const initialOutput = isMainOutputMode
@@ -1578,6 +1707,12 @@ export class AgentRunner {
                                 vars: resumeVars,
                                 injectionSession: input.injectionSession,
                                 ejsSession: resumeEjsSession,
+                                transformSessionId: runId,
+                                transformAgentId: effectiveAgent.id,
+                                transformPhase: input.phase,
+                                transformTarget: target,
+                                transformSessionBag,
+                                transformLayer: 'layer0_prefix',
                                 onVariablesMutated: (updates) => {
                                     Object.assign(resumeVars, updates);
                                 },
@@ -1602,6 +1737,12 @@ export class AgentRunner {
                             vars: resumeVars,
                             injectionSession: input.injectionSession,
                             ejsSession: resumeEjsSession,
+                            transformSessionId: runId,
+                            transformAgentId: effectiveAgent.id,
+                            transformPhase: input.phase,
+                            transformTarget: target,
+                            transformSessionBag,
+                            transformLayer: 'layer2_floating',
                             onVariablesMutated: (updates) => {
                                 Object.assign(resumeVars, updates);
                             },
@@ -1716,10 +1857,15 @@ export class AgentRunner {
                     ...(input.injectionSession ? { injectionSession: input.injectionSession } : {}),
                     ...(workspaceNotices.noticeXml ? { workspaceNotice: workspaceNotices.noticeXml } : {}),
                     ...(isMainTurnRoot ? { vfs: this.vfs } : {}),
+                    transformSessionId: runId,
+                    transformPhase: input.phase,
+                    transformSessionBag,
+                    canEditPath,
+                    canWritePath,
                 });
 
             if (currentAssembled.preRenderedBlocks) {
-                baseAssembleInput.preRenderedBlocks = currentAssembled.preRenderedBlocks;
+                baseAssembleInput.preRenderedBlocks = new Map(currentAssembled.preRenderedBlocks);
             }
             if (currentAssembled.preRenderedSystemRules !== undefined) {
                 baseAssembleInput.preRenderedSystemRules = currentAssembled.preRenderedSystemRules;
@@ -1727,6 +1873,12 @@ export class AgentRunner {
             if (currentAssembled.effectiveMacroOverrides) {
                 baseAssembleInput.macroOverrides = currentAssembled.effectiveMacroOverrides;
             }
+            if (currentAssembled.transformedRecentChatMessages) {
+                activeRecentChatMessages = [...currentAssembled.transformedRecentChatMessages];
+            }
+            const nonCacheableFloatingBlockIds = new Set(
+                currentAssembled.nonCacheableFloatingBlockIds ?? [],
+            );
 
             const consumedSideBriefPaths =
                 input.resumeMessages === undefined && isMainTurnRoot
@@ -1748,6 +1900,61 @@ export class AgentRunner {
                     recentChatMessages: activeRecentChatMessages,
                     inFlightMessages: turnMessages,
                 });
+
+            const refreshFloatingAndReassembleInFlight = async () => {
+                if (nonCacheableFloatingBlockIds.size > 0) {
+                    const floatTailBlocks = shouldFloatTailPromptBlocks(promptTriggerContext);
+                    const blocksToRefresh = (effectiveAgent.promptBlocks ?? []).filter(
+                        (b) =>
+                            b.enabled
+                            && nonCacheableFloatingBlockIds.has(b.id)
+                            && (b.placement === 'floating_tail'
+                                || (floatTailBlocks && b.placement === 'tail'))
+                            && b.content.trim().length > 0
+                            && matchesPromptTriggers(b.triggers, promptTriggerContext),
+                    );
+                    if (blocksToRefresh.length > 0) {
+                        const rawMetaVars = this.bridge.getMetadata()?.variables;
+                        const roundVars: Record<string, unknown> = {
+                            ...(rawMetaVars && typeof rawMetaVars === 'object' && !Array.isArray(rawMetaVars)
+                                ? (rawMetaVars as Record<string, unknown>)
+                                : {}),
+                            ...workingVars,
+                        };
+                        const roundMacroOverrides = buildLayer2MacroOverrides(
+                            roundVars,
+                            baseAssembleInput.macroOverrides,
+                        );
+                        const refreshed = await prerenderPromptBlocks(blocksToRefresh, {
+                            hostBridge: this.bridge,
+                            macroOverrides: roundMacroOverrides,
+                            vars: roundVars,
+                            injectionSession: input.injectionSession,
+                            transformSessionId: runId,
+                            transformAgentId: effectiveAgent.id,
+                            transformPhase: input.phase,
+                            transformTarget: target,
+                            transformSessionBag,
+                            transformLayer: 'layer2_floating',
+                            signal,
+                        });
+                        const nextPreRendered = new Map(baseAssembleInput.preRenderedBlocks ?? []);
+                        const blockById = new Map(blocksToRefresh.map((b) => [b.id, b]));
+                        for (const [blockId, msgs] of refreshed.entries()) {
+                            nextPreRendered.set(
+                                blockId,
+                                input.injectionSession
+                                    ? applyOutletsToCanonicalMessages(msgs, input.injectionSession, {
+                                        dropEmptyTextMessages: blockById.get(blockId)?.role !== 'custom',
+                                    })
+                                    : msgs,
+                            );
+                        }
+                        baseAssembleInput.preRenderedBlocks = nextPreRendered;
+                    }
+                }
+                return reassembleInFlight();
+            };
 
             const compactHistoryDeterministic = async (params: {
                 high: number;
@@ -1895,6 +2102,10 @@ export class AgentRunner {
             let toolRoundsExecuted = 0;
             let emptyOutputRetried = false;
             let overflowRecoveryAttempted = false;
+            let outputFixAttempts = 0;
+            const maxOutputFixAttempts = DEFAULT_MAX_OUTPUT_FIX_ATTEMPTS;
+            const outputSessionBag: Record<string, unknown> = {};
+            const outputSessionId = runId;
 
             // Per-turn strict tool loop state (causally bound to this target & AbortSignal)
             const readSignatureCounts = new Map<string, number>();
@@ -2098,6 +2309,33 @@ export class AgentRunner {
 
                 const roundToolChoice = await computeRoundToolChoice();
                 let roundRetriesUsed = 0;
+
+                interface OutputMutationDirective {
+                    toolCallId: string;
+                    operation: OutputProcessOperation;
+                    result: OutputProcessResult;
+                    fixCounted: boolean;
+                }
+                let pendingMutationDirectives = new Map<string, OutputMutationDirective>();
+                let pendingTurnFinishOutcome: {
+                    operation: 'finish_turn' | 'plain_finish';
+                    result: OutputProcessResult;
+                } | undefined;
+
+                const peekPrefillPrefix = (): string => {
+                    const trailingTurnMsg = turnMessages[turnMessages.length - 1];
+                    if (isPrefillAssistantMessage(trailingTurnMsg)) {
+                        return extractMessageText(trailingTurnMsg.content);
+                    }
+                    const lastFloatingMsg =
+                        currentAssembled.floatingTailMessages[
+                            currentAssembled.floatingTailMessages.length - 1
+                        ];
+                    if (isPrefillAssistantMessage(lastFloatingMsg)) {
+                        return extractMessageText(lastFloatingMsg.content);
+                    }
+                    return '';
+                };
                 let nonStrictRefusalRetried = false;
                 let turnOutput: Awaited<ReturnType<AgentRunner['invokeLLM']>>;
 
@@ -2229,6 +2467,201 @@ export class AgentRunner {
                                             retryable: true,
                                         },
                                     );
+                                }
+                            }
+                        }
+
+                        pendingMutationDirectives = new Map();
+                        pendingTurnFinishOutcome = undefined;
+
+                        if (this.bridge.processOutputText && !isLengthFinishReason(turnOutput.finishReason)) {
+                            const prefillPrefix = peekPrefillPrefix();
+                            const hasPrefill = prefillPrefix.length > 0;
+                            const buildBaseMeta = (
+                                stage: 'output_mutation' | 'turn_finish',
+                                operation: OutputProcessOperation,
+                            ) => ({
+                                runner: 'agent' as const,
+                                stage,
+                                operation,
+                                finishMode: strictToolLoop
+                                    ? ('strict_tool' as const)
+                                    : ('plain_text' as const),
+                                sessionId: outputSessionId,
+                                round: roundsCompleted + 1,
+                                retryAttempt: roundRetriesUsed,
+                                maxRetries: maxRoundRetries,
+                                fixAttempt: outputFixAttempts,
+                                maxFixAttempts: maxOutputFixAttempts,
+                                target: { ...target },
+                                messageId: target.messageId,
+                                swipeId: target.swipeId,
+                                agentId: agent.id,
+                                agentName: agent.name,
+                                ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                                stream: Boolean(llmRequest.stream),
+                                hasPrefill,
+                                sessionBag: outputSessionBag,
+                            });
+
+                            if (turnOutput.toolCalls.length === 0) {
+                                const currentOut = isMainOutputMode
+                                    ? await readCurrentOutputSafe()
+                                    : '';
+                                const shouldValidatePlain = !isMainOutputMode
+                                    || currentOut.trim().length > 0;
+                                if (shouldValidatePlain) {
+                                    const candidateText = isMainOutputMode
+                                        ? currentOut
+                                        : `${prefillPrefix}${turnOutput.content ?? ''}`;
+                                    const res = await runOutputProcess(this.bridge, {
+                                        text: candidateText,
+                                        meta: {
+                                            ...buildBaseMeta('turn_finish', 'plain_finish'),
+                                            ...(isMainOutputMode
+                                                ? { filePath: OUTPUT_FILE_PATH }
+                                                : {}),
+                                        },
+                                    });
+                                    if (
+                                        res.action === 'retry'
+                                        && !isMainOutputMode
+                                        && roundRetriesUsed < maxRoundRetries
+                                    ) {
+                                        throw new LLMTransportError(
+                                            res.retryReason
+                                                ?? 'Output validation requested retry.',
+                                            {
+                                                code: ROUND_RETRY_ERROR_CODES.OUTPUT_VALIDATION_RETRY,
+                                                retryable: true,
+                                            },
+                                        );
+                                    }
+                                    pendingTurnFinishOutcome = {
+                                        operation: 'plain_finish',
+                                        result: res,
+                                    };
+                                }
+                            } else if (
+                                strictToolLoop
+                                && finishTurnSpec
+                                && turnOutput.toolCalls.every(
+                                    (tc) => tc.name === FINISH_TURN_TOOL_NAME,
+                                )
+                            ) {
+                                const primaryFinish = turnOutput.toolCalls[0];
+                                const parsedFinish = parseFinishTurnArgs(
+                                    primaryFinish.arguments,
+                                    finishTurnSpec.definition.parameters,
+                                );
+                                if (parsedFinish.ok) {
+                                    let ready = false;
+                                    let candidateText = '';
+                                    if (finishTurnMode === 'main_output') {
+                                        const currentOut = await readCurrentOutputSafe();
+                                        if (currentOut.trim().length > 0) {
+                                            ready = true;
+                                            candidateText = currentOut;
+                                        }
+                                    } else if (finishTurnMode === 'side_effect') {
+                                        if (hasWriteToolExecuted || toolRoundsExecuted > 0) {
+                                            ready = true;
+                                            candidateText =
+                                                typeof parsedFinish.data.status === 'string'
+                                                && parsedFinish.data.status.trim().length > 0
+                                                    ? parsedFinish.data.status.trim()
+                                                    : String(parsedFinish.data.step_brief ?? '').trim();
+                                        }
+                                    } else {
+                                        ready = true;
+                                        candidateText = String(parsedFinish.data.response ?? '');
+                                    }
+
+                                    if (ready) {
+                                        const res = await runOutputProcess(this.bridge, {
+                                            text: candidateText,
+                                            meta: {
+                                                ...buildBaseMeta('turn_finish', 'finish_turn'),
+                                                toolCallId: primaryFinish.id,
+                                                toolName: primaryFinish.name,
+                                                ...(isMainOutputMode
+                                                    ? { filePath: OUTPUT_FILE_PATH }
+                                                    : {}),
+                                            },
+                                        });
+                                        if (
+                                            res.action === 'retry'
+                                            && !isMainOutputMode
+                                            && roundRetriesUsed < maxRoundRetries
+                                        ) {
+                                            throw new LLMTransportError(
+                                                res.retryReason
+                                                    ?? 'Output validation requested retry.',
+                                                {
+                                                    code: ROUND_RETRY_ERROR_CODES.OUTPUT_VALIDATION_RETRY,
+                                                    retryable: true,
+                                                },
+                                            );
+                                        }
+                                        pendingTurnFinishOutcome = {
+                                            operation: 'finish_turn',
+                                            result: res,
+                                        };
+                                    }
+                                }
+                            } else if (!hasToolRoundLimit || toolRoundsExecuted < maxToolRounds) {
+                                let simulatedOutput = await readCurrentOutputSafe();
+                                for (const tc of turnOutput.toolCalls) {
+                                    const parsedArgs = parseArgsForLog(tc.arguments);
+                                    if (!isOutputMutationToolCall(tc.name, parsedArgs)) {
+                                        continue;
+                                    }
+                                    const sim = simulateOutputMutationCandidate(
+                                        tc.name,
+                                        parsedArgs,
+                                        simulatedOutput,
+                                    );
+                                    if (!sim) {
+                                        continue;
+                                    }
+                                    const res = await runOutputProcess(this.bridge, {
+                                        text: sim.candidateText,
+                                        meta: {
+                                            ...buildBaseMeta('output_mutation', sim.operation),
+                                            filePath: OUTPUT_FILE_PATH,
+                                            toolCallId: tc.id,
+                                            toolName: tc.name,
+                                            previousText: simulatedOutput,
+                                        },
+                                    });
+                                    if (
+                                        res.action === 'retry'
+                                        && roundRetriesUsed < maxRoundRetries
+                                    ) {
+                                        throw new LLMTransportError(
+                                            res.retryReason
+                                                ?? 'Output mutation validation requested retry.',
+                                            {
+                                                code: ROUND_RETRY_ERROR_CODES.OUTPUT_VALIDATION_RETRY,
+                                                retryable: true,
+                                            },
+                                        );
+                                    }
+                                    pendingMutationDirectives.set(tc.id, {
+                                        toolCallId: tc.id,
+                                        operation: sim.operation,
+                                        result: res,
+                                        fixCounted: false,
+                                    });
+                                    const willRejectWrite =
+                                        res.action === 'fix'
+                                        && res.rejectWrite
+                                        && outputFixAttempts < maxOutputFixAttempts;
+                                    if (!willRejectWrite) {
+                                        simulatedOutput = res.changed
+                                            ? res.text
+                                            : sim.candidateText;
+                                    }
                                 }
                             }
                         }
@@ -2391,6 +2824,7 @@ export class AgentRunner {
 
                 if (turnOutput.toolCalls.length === 0) {
                     let finalContent = turnOutput.content;
+                    let persistedContent = turnOutput.content;
                     if (isMainOutputMode) {
                         const currentOutput = await readCurrentOutputSafe();
 
@@ -2419,7 +2853,7 @@ export class AgentRunner {
                                     canonicalClone(systemCheckMsg),
                                 );
 
-                                currentAssembled = reassembleInFlight();
+                                currentAssembled = await refreshFloatingAndReassembleInFlight();
                                 continue;
                             }
 
@@ -2432,12 +2866,70 @@ export class AgentRunner {
                         finalContent = currentOutput;
                     }
 
+                    if (pendingTurnFinishOutcome) {
+                        const finishOutcome = pendingTurnFinishOutcome;
+                        const wantsFix =
+                            finishOutcome.result.action === 'fix'
+                            || (isMainOutputMode && finishOutcome.result.action === 'retry');
+                        if (
+                            wantsFix
+                            && outputFixAttempts < maxOutputFixAttempts
+                            && (!hasToolRoundLimit || toolRoundsExecuted < maxToolRounds)
+                        ) {
+                            outputFixAttempts += 1;
+                            toolRoundsExecuted += 1;
+                            const feedbackMsg = formatOutputFixFeedback(
+                                finishOutcome.result.fixMessage
+                                    ?? finishOutcome.result.retryReason
+                                    ?? 'Output validation requested a revision.',
+                                {
+                                    stage: 'turn_finish',
+                                    operation: 'plain_finish',
+                                    requestedBy: finishOutcome.result.requestedBy,
+                                },
+                            );
+                            const rejectedAssistantMsg: CanonicalMessage = {
+                                role: 'assistant',
+                                content: turnOutput.content ?? '',
+                                ...(turnOutput.reasoningContent
+                                    ? { reasoningContent: turnOutput.reasoningContent }
+                                    : {}),
+                            };
+                            const feedbackUserMsg: CanonicalMessage = {
+                                role: 'user',
+                                content: feedbackMsg,
+                            };
+                            turnMessages.push(rejectedAssistantMsg, feedbackUserMsg);
+                            completedTurnMessages.push(
+                                canonicalClone(rejectedAssistantMsg),
+                                canonicalClone(feedbackUserMsg),
+                            );
+                            currentAssembled = await refreshFloatingAndReassembleInFlight();
+                            continue;
+                        }
+                        if (finishOutcome.result.changed) {
+                            finalContent = finishOutcome.result.text;
+                            if (isMainOutputMode) {
+                                await this.vfs.writeFile(OUTPUT_FILE_PATH, finishOutcome.result.text, {
+                                    target,
+                                    staged,
+                                    source: 'agentic_output_process',
+                                });
+                                extractor?.markToolExecuted(finishOutcome.result.text);
+                            } else {
+                                persistedContent = finishOutcome.result.text;
+                            }
+                        }
+                    }
+
                     return await finalizeSuccessfulTurn({
                         finalContent,
-                        persistedAssistantContent: turnOutput.content,
+                        persistedAssistantContent: persistedContent,
                         reasoningContent: turnOutput.reasoningContent,
                     });
                 }
+
+                let turnFinishFixFeedback: string | undefined;
 
                 // Strict tool loop: check pure `finish_turn` completion BEFORE `maxToolRounds` guardrail.
                 if (
@@ -2452,39 +2944,117 @@ export class AgentRunner {
                     );
 
                     if (parsedFinish.ok) {
+                        const finishOutcome = pendingTurnFinishOutcome;
+                        const wantsFinishFix =
+                            finishOutcome
+                            && (finishOutcome.result.action === 'fix'
+                                || (isMainOutputMode && finishOutcome.result.action === 'retry'))
+                            && outputFixAttempts < maxOutputFixAttempts
+                            && (!hasToolRoundLimit || toolRoundsExecuted < maxToolRounds);
+
                         if (finishTurnMode === 'main_output') {
                             const currentOutput = await readCurrentOutputSafe();
                             if (currentOutput.trim().length > 0) {
-                                const stepBrief = String(parsedFinish.data.step_brief ?? '').trim();
-                                return await finalizeSuccessfulTurn({
-                                    finalContent: currentOutput,
-                                    persistedAssistantContent:
-                                        turnOutput.content.trim() || stepBrief,
-                                    reasoningContent: turnOutput.reasoningContent,
-                                });
+                                if (wantsFinishFix) {
+                                    outputFixAttempts += 1;
+                                    shrinkToWriteAndFinish = false;
+                                    consecutiveDuplicateReadOnlyRounds = 0;
+                                    turnFinishFixFeedback = formatOutputFixFeedback(
+                                        finishOutcome.result.fixMessage
+                                            ?? finishOutcome.result.retryReason
+                                            ?? 'Output validation requested a revision.',
+                                        {
+                                            stage: 'turn_finish',
+                                            operation: 'finish_turn',
+                                            requestedBy: finishOutcome.result.requestedBy,
+                                        },
+                                    );
+                                } else {
+                                    let resolvedFinalContent = currentOutput;
+                                    if (finishOutcome?.result.changed) {
+                                        resolvedFinalContent = finishOutcome.result.text;
+                                        await this.vfs.writeFile(
+                                            OUTPUT_FILE_PATH,
+                                            resolvedFinalContent,
+                                            {
+                                                target,
+                                                staged,
+                                                source: 'agentic_output_process',
+                                            },
+                                        );
+                                        extractor?.markToolExecuted(resolvedFinalContent);
+                                    }
+                                    const stepBrief = String(
+                                        parsedFinish.data.step_brief ?? '',
+                                    ).trim();
+                                    return await finalizeSuccessfulTurn({
+                                        finalContent: resolvedFinalContent,
+                                        persistedAssistantContent:
+                                            turnOutput.content.trim() || stepBrief,
+                                        reasoningContent: turnOutput.reasoningContent,
+                                    });
+                                }
                             }
                             // Fall through below to reject empty `/output.md` `finish_turn` and continue loop.
                         } else if (finishTurnMode === 'side_effect') {
                             if (hasWriteToolExecuted || toolRoundsExecuted > 0) {
-                                const statusText =
-                                    typeof parsedFinish.data.status === 'string'
-                                    && parsedFinish.data.status.trim().length > 0
-                                        ? parsedFinish.data.status.trim()
-                                        : String(parsedFinish.data.step_brief ?? '').trim();
-                                return await finalizeSuccessfulTurn({
-                                    finalContent: statusText,
-                                    persistedAssistantContent: statusText,
-                                    reasoningContent: turnOutput.reasoningContent,
-                                });
+                                if (wantsFinishFix) {
+                                    outputFixAttempts += 1;
+                                    shrinkToWriteAndFinish = false;
+                                    consecutiveDuplicateReadOnlyRounds = 0;
+                                    turnFinishFixFeedback = formatOutputFixFeedback(
+                                        finishOutcome.result.fixMessage
+                                            ?? finishOutcome.result.retryReason
+                                            ?? 'Output validation requested a revision.',
+                                        {
+                                            stage: 'turn_finish',
+                                            operation: 'finish_turn',
+                                            requestedBy: finishOutcome.result.requestedBy,
+                                        },
+                                    );
+                                } else {
+                                    const rawStatusText =
+                                        typeof parsedFinish.data.status === 'string'
+                                        && parsedFinish.data.status.trim().length > 0
+                                            ? parsedFinish.data.status.trim()
+                                            : String(parsedFinish.data.step_brief ?? '').trim();
+                                    const statusText = finishOutcome?.result.changed
+                                        ? finishOutcome.result.text
+                                        : rawStatusText;
+                                    return await finalizeSuccessfulTurn({
+                                        finalContent: statusText,
+                                        persistedAssistantContent: statusText,
+                                        reasoningContent: turnOutput.reasoningContent,
+                                    });
+                                }
                             }
                             // Fall through below to reject premature round-1 side-effect `finish_turn`.
                         } else {
-                            const responseText = String(parsedFinish.data.response ?? '');
-                            return await finalizeSuccessfulTurn({
-                                finalContent: responseText,
-                                persistedAssistantContent: responseText,
-                                reasoningContent: turnOutput.reasoningContent,
-                            });
+                            if (wantsFinishFix) {
+                                outputFixAttempts += 1;
+                                shrinkToWriteAndFinish = false;
+                                consecutiveDuplicateReadOnlyRounds = 0;
+                                turnFinishFixFeedback = formatOutputFixFeedback(
+                                    finishOutcome.result.fixMessage
+                                        ?? finishOutcome.result.retryReason
+                                        ?? 'Output validation requested a revision.',
+                                    {
+                                        stage: 'turn_finish',
+                                        operation: 'finish_turn',
+                                        requestedBy: finishOutcome.result.requestedBy,
+                                    },
+                                );
+                            } else {
+                                const rawResponseText = String(parsedFinish.data.response ?? '');
+                                const responseText = finishOutcome?.result.changed
+                                    ? finishOutcome.result.text
+                                    : rawResponseText;
+                                return await finalizeSuccessfulTurn({
+                                    finalContent: responseText,
+                                    persistedAssistantContent: responseText,
+                                    reasoningContent: turnOutput.reasoningContent,
+                                });
+                            }
                         }
                     }
                 }
@@ -2584,6 +3154,17 @@ export class AgentRunner {
                                         scopeId: `${agent.id}:${target.messageId}#${target.swipeId}`,
                                     },
                                 );
+                            } else if (turnFinishFixFeedback) {
+                                execResult = {
+                                    ok: false,
+                                    toolName: toolCall.name,
+                                    output: JSON.stringify({
+                                        ok: false,
+                                        error: turnFinishFixFeedback,
+                                    }),
+                                    error: turnFinishFixFeedback,
+                                    durationMs: Math.max(0, Date.now() - stepStartedAt),
+                                };
                             } else if (finishTurnMode === 'main_output') {
                                 execResult = {
                                     ok: false,
@@ -2623,16 +3204,96 @@ export class AgentRunner {
                         }
                     } else {
                         roundNonFinishCount += 1;
-                        execResult = await registry.executeToolCall(
-                            toolCall.name,
-                            toolCall.arguments,
-                            toolCtx,
-                            {
-                                toolCallId: toolCall.id,
-                                spillStore: registry.getSpillStore() ?? this.spillStore,
-                                scopeId: `${agent.id}:${target.messageId}#${target.swipeId}`,
-                            },
+                        const mutationDirective = pendingMutationDirectives.get(toolCall.id);
+                        const shouldRejectWrite = Boolean(
+                            mutationDirective
+                            && mutationDirective.result.action === 'fix'
+                            && mutationDirective.result.rejectWrite
+                            && outputFixAttempts < maxOutputFixAttempts,
                         );
+                        if (shouldRejectWrite && mutationDirective) {
+                            outputFixAttempts += 1;
+                            mutationDirective.fixCounted = true;
+                            const rejectMsg = formatOutputFixFeedback(
+                                mutationDirective.result.fixMessage
+                                    ?? 'Output validation rejected this write.',
+                                {
+                                    stage: 'output_mutation',
+                                    operation: mutationDirective.operation,
+                                    rejectWrite: true,
+                                    requestedBy: mutationDirective.result.requestedBy,
+                                },
+                            );
+                            execResult = {
+                                ok: false,
+                                toolName: toolCall.name,
+                                output: JSON.stringify({
+                                    ok: false,
+                                    rejected: true,
+                                    path: OUTPUT_FILE_PATH,
+                                    error: rejectMsg,
+                                }),
+                                error: rejectMsg,
+                                durationMs: Math.max(0, Date.now() - stepStartedAt),
+                            };
+                        } else {
+                            execResult = await registry.executeToolCall(
+                                toolCall.name,
+                                toolCall.arguments,
+                                toolCtx,
+                                {
+                                    toolCallId: toolCall.id,
+                                    spillStore: registry.getSpillStore() ?? this.spillStore,
+                                    scopeId: `${agent.id}:${target.messageId}#${target.swipeId}`,
+                                },
+                            );
+                        }
+
+                        if (execResult.ok && mutationDirective) {
+                            if (mutationDirective.result.changed) {
+                                await this.vfs.writeFile(
+                                    OUTPUT_FILE_PATH,
+                                    mutationDirective.result.text,
+                                    {
+                                        target,
+                                        staged,
+                                        source: 'agentic_output_process',
+                                    },
+                                );
+                                if (
+                                    mutationDirective.operation === 'append_reply_view'
+                                    || mutationDirective.operation === 'replace_reply_view'
+                                ) {
+                                    await this.bridge.refreshMessageView({ ...target });
+                                }
+                            }
+                            if (
+                                mutationDirective.result.action === 'fix'
+                                && !mutationDirective.result.rejectWrite
+                                && !mutationDirective.fixCounted
+                                && outputFixAttempts < maxOutputFixAttempts
+                            ) {
+                                outputFixAttempts += 1;
+                                mutationDirective.fixCounted = true;
+                                const softFixMsg = formatOutputFixFeedback(
+                                    mutationDirective.result.fixMessage
+                                        ?? 'Output validation requested a revision.',
+                                    {
+                                        stage: 'output_mutation',
+                                        operation: mutationDirective.operation,
+                                        rejectWrite: false,
+                                        requestedBy: mutationDirective.result.requestedBy,
+                                    },
+                                );
+                                execResult = {
+                                    ...execResult,
+                                    output: attachValidationWarningToToolOutput(
+                                        execResult.output,
+                                        softFixMsg,
+                                    ),
+                                };
+                            }
+                        }
 
                         if (
                             extractor
@@ -2741,7 +3402,7 @@ export class AgentRunner {
                 finishExtractor?.resetRound();
 
                 // Re-assemble with frozen Layer 0 + frozen Layer 1 + appended inFlightMessages.
-                currentAssembled = reassembleInFlight();
+                currentAssembled = await refreshFloatingAndReassembleInFlight();
             }
         } catch (error) {
             if (error instanceof MaxToolRoundsError || error instanceof TurnInterruptedError) {

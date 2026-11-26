@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { ToolEditOperation, ToolExecutionContext } from '@/core/bridge';
 import { isSpillPath } from '@/core/context';
 import type { VfsEntryStat, VfsSearchHit } from '@/core/types';
-import { hashText, normalizeVfsPath } from '@/core/utils';
+import { hashText, isPathAllowed, normalizeVfsPath } from '@/core/utils';
 import {
     AGENT_WORKSPACE_MAX_FILES,
     AGENT_WORKSPACE_MAX_FILE_BYTES,
@@ -647,7 +647,31 @@ export function createFsTools(): ToolDefinition[] {
                     return formatted.text;
                 }
 
-                const rawContent = await ctx.fs.read(normalizedPath);
+                const canWriteFn = (ctx.fs as { canWrite?: (path: string) => boolean }).canWrite;
+                const pathWriteAllowed = typeof canWriteFn === 'function'
+                    ? canWriteFn.call(ctx.fs, normalizedPath)
+                    : isPathAllowed(ctx.permissions.write, normalizedPath);
+                let mountWritable = true;
+                const statFn = getStatFn(ctx.fs);
+                if (statFn) {
+                    try {
+                        const st = await statFn(normalizedPath);
+                        if (st && st.writable === false) {
+                            mountWritable = false;
+                        }
+                    } catch {
+                        // Let ctx.fs.read report ENOENT / EACCES cleanly.
+                    }
+                }
+                const writable = Boolean(pathWriteAllowed && mountWritable);
+                const editable = Boolean(writable && (ctx.canEditFiles ?? true));
+
+                const rawContent = await ctx.fs.read(normalizedPath, {
+                    editable,
+                    writable,
+                    ...(ctx.agentId ? { transformAgentId: ctx.agentId } : {}),
+                    ...(ctx.phase ? { transformPhase: ctx.phase } : {}),
+                });
                 const formatted = formatFileReadResult({
                     path: normalizedPath,
                     rawContent,

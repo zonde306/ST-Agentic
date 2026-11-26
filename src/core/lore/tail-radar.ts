@@ -60,6 +60,14 @@ export interface RadarScanInput {
     defaultCaseSensitive?: boolean;
     /** Default whole-word matching when `entry.matchWholeWords` is null/undefined (default `false`). */
     defaultMatchWholeWords?: boolean;
+    /** Whether the reading agent can edit the scanned path (`editable` metadata). */
+    canEditPath?: (path: string) => boolean;
+    /** Whether the reading agent can write the scanned path (`writable` metadata). */
+    canWritePath?: (path: string) => boolean;
+    sessionId?: string;
+    agentId?: string;
+    phase?: string;
+    sessionBag?: Record<string, unknown>;
 }
 
 export interface SideClueRadarScanInput {
@@ -407,7 +415,17 @@ export class TailRadar {
                 continue;
             }
 
-            const evaluated = await this.evaluator.evaluate(classified, evaluateOpts);
+            const evaluated = await this.evaluator.evaluate(classified, {
+                ...evaluateOpts,
+                dryRun: true,
+                source: 'lore_radar',
+                editable: scanOptions.canEditPath?.(classified.vfsPath) ?? false,
+                writable: scanOptions.canWritePath?.(classified.vfsPath) ?? false,
+                ...(scanOptions.sessionId !== undefined ? { sessionId: scanOptions.sessionId } : {}),
+                ...(scanOptions.agentId !== undefined ? { agentId: scanOptions.agentId } : {}),
+                ...(scanOptions.phase !== undefined ? { phase: scanOptions.phase } : {}),
+                ...(scanOptions.sessionBag !== undefined ? { sessionBag: scanOptions.sessionBag } : {}),
+            });
             if (evaluated.conditionSkipped) {
                 continue;
             }

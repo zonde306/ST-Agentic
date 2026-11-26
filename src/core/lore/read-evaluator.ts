@@ -1,4 +1,4 @@
-import type { HostBridge, PromptInjectionSession } from '@/core/bridge';
+import { type HostBridge, type PromptInjectionSession, runPromptTransform } from '@/core/bridge';
 import type {
     ClassifiedLoreEntry,
     LoreReadContext,
@@ -14,8 +14,6 @@ import {
     extractIfConditions,
     hasPrivateDecorator,
 } from './decorators';
-
-const EJS_DETECT_PATTERN = /<%[\s\S]*?%>/;
 
 export type LoreOverrideSource = ReadonlyMap<string, string> | Record<string, string>;
 
@@ -51,6 +49,14 @@ export interface LoreEvaluateOptions {
     injectionSession?: PromptInjectionSession;
     applyLoreReadRegex?: LoreReadRegexCallback;
     onEjsError?: 'fallback' | 'throw';
+    editable?: boolean;
+    writable?: boolean;
+    dryRun?: boolean;
+    source?: 'vfs_read' | 'lore_radar' | 'lore_outlet';
+    sessionId?: string;
+    agentId?: string;
+    phase?: string;
+    sessionBag?: Record<string, unknown>;
 }
 
 export interface LoreReadResult {
@@ -64,6 +70,8 @@ export interface LoreReadResult {
     ejsEvaluated: boolean;
     conditionSkipped?: boolean;
     ejsError?: string;
+    cacheable?: boolean;
+    transformChanged?: boolean;
 }
 
 function isClassifiedEntry(
@@ -175,6 +183,7 @@ export class LoreReadEvaluator {
         return this.runPipeline({
             world: rawEntry.world,
             uid: rawEntry.uid,
+            comment: rawEntry.comment ?? '',
             path: vfsPath,
             initialText,
             decorators,
@@ -196,6 +205,7 @@ export class LoreReadEvaluator {
         return this.runPipeline({
             world: context.world,
             uid: context.uid,
+            comment: context.comment ?? '',
             path: context.path,
             initialText,
             decorators: parsedRaw.decorators,
@@ -203,6 +213,13 @@ export class LoreReadEvaluator {
             callOptions: {
                 ...callOptions,
                 target: context.target,
+                ...(context.editable !== undefined ? { editable: context.editable } : {}),
+                ...(context.writable !== undefined ? { writable: context.writable } : {}),
+                ...(context.dryRun !== undefined ? { dryRun: context.dryRun } : {}),
+                ...(context.sessionId !== undefined ? { sessionId: context.sessionId } : {}),
+                ...(context.agentId !== undefined ? { agentId: context.agentId } : {}),
+                ...(context.phase !== undefined ? { phase: context.phase } : {}),
+                ...(context.sessionBag !== undefined ? { sessionBag: context.sessionBag } : {}),
             },
         });
     }
@@ -260,13 +277,14 @@ export class LoreReadEvaluator {
     private async runPipeline(params: {
         world: string;
         uid: number;
+        comment: string;
         path: string;
         initialText: string;
         decorators: readonly ParsedDecorator[];
         overridden: boolean;
         callOptions?: LoreEvaluateOptions;
     }): Promise<LoreReadResult> {
-        const { world, uid, path, initialText, decorators, overridden, callOptions } = params;
+        const { world, uid, comment, path, initialText, decorators, overridden, callOptions } = params;
 
         const metadataVars = extractMetadataVariables(this.hostBridge.getMetadata());
         const effectiveVars: Record<string, unknown> = {
@@ -316,27 +334,61 @@ export class LoreReadEvaluator {
 
         let ejsEvaluated = false;
         let ejsError: string | undefined;
+        let cacheable = true;
+        let transformChanged = false;
 
-        if (this.hostBridge.evaluateOptionalEjs && EJS_DETECT_PATTERN.test(workingText)) {
+        if (this.hostBridge.transformPromptText || this.hostBridge.evaluateOptionalEjs) {
             const errorPolicy = callOptions?.onEjsError ?? this.options.onEjsError ?? 'fallback';
             const isPrivate = hasPrivateDecorator(decorators);
-            try {
-                workingText = await this.hostBridge.evaluateOptionalEjs(
-                    workingText,
-                    effectiveVars,
-                    {
-                        ...(callOptions?.injectionSession
-                            ? { injectionSession: callOptions.injectionSession }
-                            : {}),
-                        ...(isPrivate ? { isPrivate: true } : {}),
+            const source = callOptions?.source ?? (callOptions?.dryRun ? 'lore_radar' : 'vfs_read');
+            const effectiveTarget =
+                callOptions?.target
+                ?? (() => {
+                    const chatList = this.hostBridge.getChat();
+                    if (chatList.length === 0) {
+                        return undefined;
+                    }
+                    const lastIdx = chatList.length - 1;
+                    return {
+                        messageId: lastIdx,
+                        swipeId: chatList[lastIdx]?.swipeId ?? 0,
+                    };
+                })();
+            const result = await runPromptTransform(this.hostBridge, {
+                text: workingText,
+                source,
+                layer: 'tool_read',
+                dryRun: Boolean(callOptions?.dryRun),
+                meta: {
+                    sessionId: callOptions?.sessionId ?? source,
+                    ...(callOptions?.agentId ? { agentId: callOptions.agentId } : {}),
+                    ...(callOptions?.phase ? { phase: callOptions.phase } : {}),
+                    ...(effectiveTarget ? { target: effectiveTarget } : {}),
+                    path,
+                    mount: 'lorebooks',
+                    editable: Boolean(callOptions?.editable),
+                    writable: Boolean(callOptions?.writable),
+                    lore: {
+                        world,
+                        uid,
+                        comment,
+                        overridden,
                     },
-                );
-                ejsEvaluated = true;
-            } catch (error) {
-                if (errorPolicy === 'throw') {
-                    throw error;
-                }
-                ejsError = error instanceof Error ? error.message : String(error);
+                    vars: effectiveVars,
+                    ...(isPrivate ? { isPrivate: true } : {}),
+                    ...(callOptions?.injectionSession
+                        ? { injectionSession: callOptions.injectionSession }
+                        : {}),
+                },
+                ...(callOptions?.sessionBag ? { sessionBag: callOptions.sessionBag } : {}),
+                onError: errorPolicy,
+            });
+            workingText = result.text;
+            ejsEvaluated = result.handledSyntaxes.has('ejs');
+            cacheable = result.cacheable;
+            transformChanged = result.changed;
+            if (result.errors.length > 0) {
+                ejsError = result.errors[0].error.message;
             }
         }
 
@@ -356,6 +408,8 @@ export class LoreReadEvaluator {
             charCount: workingText.length,
             overridden,
             ejsEvaluated,
+            cacheable,
+            transformChanged,
             ...(ejsError !== undefined ? { ejsError } : {}),
         };
     }

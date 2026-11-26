@@ -57,9 +57,17 @@ export interface LoreReadContext {
     world: string;
     uid: number;
     path: string;
+    comment?: string;
     target?: MessageTarget;
     rawContent: string;
     overriddenContent?: string;
+    editable?: boolean;
+    writable?: boolean;
+    dryRun?: boolean;
+    sessionId?: string;
+    agentId?: string;
+    phase?: string;
+    sessionBag?: Record<string, unknown>;
 }
 
 export type LoreReadHook = (context: LoreReadContext) => Promise<string> | string;

@@ -5,13 +5,14 @@ import {
     type SubAgentDescriptor,
     TurnInterruptedError,
 } from '@/core/agents';
-import type {
-    HostBridge,
-    LLMTransport,
-    PromptInjectionSession,
-    SerializedPromptInjected,
-    ToolExecutionContext,
-    ToolSideGenApi,
+import {
+    type HostBridge,
+    type LLMTransport,
+    type PromptInjectionSession,
+    type SerializedPromptInjected,
+    type ToolExecutionContext,
+    type ToolSideGenApi,
+    runPromptTransform,
 } from '@/core/bridge';
 import {
     createDefaultMainAgent,
@@ -1862,7 +1863,7 @@ export class PipelineOrchestrator {
 
         const hasEjsTemplates = unit.triggers.some((r) => r.instructionTemplate.includes('<%'));
         let baseVars: Record<string, unknown> | undefined;
-        if (hasEjsTemplates && this.bridge.evaluateOptionalEjs) {
+        if (this.bridge.transformPromptText || (hasEjsTemplates && this.bridge.evaluateOptionalEjs)) {
             baseVars = await this.vfs
                 .readVariables({ target: ctx.target, staged: ctx.staged ?? true })
                 .catch(() => ({}));
@@ -1877,21 +1878,27 @@ export class PipelineOrchestrator {
                 triggerTargetPath: rule.targetPath ?? '',
             };
             let text = this.bridge.substituteMacros(rule.instructionTemplate, ruleOverrides);
-            if (baseVars && this.bridge.evaluateOptionalEjs && text.includes('<%')) {
+            if (this.bridge.transformPromptText || (baseVars && this.bridge.evaluateOptionalEjs && text.includes('<%'))) {
                 const ejsVars: Record<string, unknown> = {
-                    ...baseVars,
+                    ...(baseVars ?? {}),
                     ...ruleOverrides,
                     target: ctx.target,
                 };
-                try {
-                    text = await this.bridge.evaluateOptionalEjs(
-                        text,
-                        ejsVars,
-                        ctx.injectionSession ? { injectionSession: ctx.injectionSession } : undefined,
-                    );
-                } catch {
-                    // Keep macro-substituted fallback text on EJS runtime error
-                }
+                const res = await runPromptTransform(this.bridge, {
+                    text,
+                    source: 'trigger_prompt',
+                    layer: 'trigger',
+                    meta: {
+                        sessionId: `trigger_${unit.unitId}`,
+                        phase: unit.phase,
+                        target: ctx.target,
+                        isChatMessage: false,
+                        vars: ejsVars,
+                        ...(ctx.injectionSession ? { injectionSession: ctx.injectionSession } : {}),
+                    },
+                    onError: 'fallback',
+                });
+                text = res.text;
             }
             return text.trim();
         };

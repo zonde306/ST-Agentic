@@ -67,7 +67,19 @@ export interface ToolSpillStoreApi {
 }
 
 export interface ToolFsApi {
-    read(path: string, opts?: { startLine?: number; endLine?: number }): Promise<string>;
+    read(
+        path: string,
+        opts?: {
+            startLine?: number;
+            endLine?: number;
+            editable?: boolean;
+            writable?: boolean;
+            transformSessionId?: string;
+            transformAgentId?: string;
+            transformPhase?: string;
+            transformSessionBag?: Record<string, unknown>;
+        },
+    ): Promise<string>;
     write(path: string, content: string): Promise<void>;
     append?(path: string, content: string): Promise<void>;
     edit(
@@ -126,6 +138,9 @@ export interface ToolExecutionContext {
     readonly target: MessageTarget;
     signal: AbortSignal;
     permissions: ScopedPermissions;
+    readonly canEditFiles?: boolean;
+    readonly agentId?: string;
+    readonly phase?: string;
     readSet?: Map<string, string>;
     spillStore?: ToolSpillStoreApi;
 }

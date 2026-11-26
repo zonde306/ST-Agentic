@@ -5,7 +5,7 @@ import {
     UndoStore,
     createChatMetadataUndoAdapter,
 } from '@/core/assistant';
-import type { ToolSideGenApi } from '@/core/bridge';
+import { PROMPT_TRANSFORM_EVENTS, type ToolSideGenApi } from '@/core/bridge';
 import {
     buildPresetFromPromptsImport,
     createDefaultSettings,
@@ -107,6 +107,7 @@ import {
     createHostPromptInjectionSession,
     evaluateOptionalEjs,
     getEjsTemplateFeatures,
+    registerBuiltinEjsPromptTransformHook,
 } from '@/host/ejs-adapter';
 import {
     embedFilesToCard,
@@ -1994,6 +1995,19 @@ jQuery(async () => {
                 ),
         });
 
+        registerBuiltinEjsPromptTransformHook({
+            eventSource: eventSource as unknown as Parameters<
+                typeof registerBuiltinEjsPromptTransformHook
+            >[0]['eventSource'],
+            getExtraHelpers: () =>
+                createEjsVfsHelpers(
+                    () => runtimeRefs.vfs,
+                    () => runtimeRefs.store,
+                    () => resolveValidTarget(runtimeRefs.appStore?.getSnapshot().activeTarget),
+                ),
+            onCompatWarning: reportCompatWarning,
+        });
+
         const initial = loadOrMigrateSettings();
         let currentSettings = initial.settings;
 
@@ -2835,6 +2849,7 @@ jQuery(async () => {
 
         const publicApi: AgenticPublicApi = {
             version: AGENTIC_VERSION,
+            events: PROMPT_TRANSFORM_EVENTS,
             getSettings: () => canonicalClone(currentSettings),
             openConsole: (tab, deepLink) => {
                 appStore?.openConsole(tab, deepLink);

@@ -53,7 +53,7 @@ export interface VfsTargetOptions {
 
 export type VfsTemplateEvaluator = (
     text: string,
-    opts?: VfsTargetOptions,
+    opts?: VfsReadOptions & { path?: string; mount?: string },
 ) => Promise<string>;
 
 export interface VfsReadOptions extends VfsTargetOptions {
@@ -64,6 +64,12 @@ export interface VfsReadOptions extends VfsTargetOptions {
      * optional EJS (`<% ... %>`) evaluation (and bypass `LoreReadHook` on `/lorebooks/*`).
      */
     raw?: boolean;
+    editable?: boolean;
+    writable?: boolean;
+    transformSessionId?: string;
+    transformAgentId?: string;
+    transformPhase?: string;
+    transformSessionBag?: Record<string, unknown>;
 }
 
 export interface VfsWriteOptions extends VfsTargetOptions {

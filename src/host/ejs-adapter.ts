@@ -1,4 +1,10 @@
-import type { EjsEvaluateOptions, EjsFeaturesSnapshot } from '@/core/bridge';
+import {
+    type EjsEvaluateOptions,
+    type EjsFeaturesSnapshot,
+    PROMPT_TRANSFORM_EVENTS,
+    type PromptTransformListener,
+    createEjsPromptTransformListener,
+} from '@/core/bridge';
 import {
     LocalPromptInjectionSession,
     type PromptInjectionSession,
@@ -297,4 +303,58 @@ export async function evaluateOptionalEjs(
         return '';
     }
     return typeof evaluated === 'string' ? evaluated : String(evaluated);
+}
+
+export interface PromptTransformEventSourceLike {
+    makeLast(event: string, listener: PromptTransformListener): void;
+    removeListener(event: string, listener: PromptTransformListener): void;
+}
+
+export interface RegisterBuiltinEjsPromptTransformOptions {
+    eventSource: PromptTransformEventSourceLike;
+    getExtraHelpers?: () => Record<string, unknown> | undefined;
+    onCompatWarning?: (code: string, message: string) => void;
+    includeUserInput?: boolean;
+}
+
+/**
+ * Mount the built-in optional EJS evaluator onto SillyTavern's `eventSource` using `makeLast`
+ * so external extensions registered via `on(...)` run first and may claim `'ejs'` in
+ * `payload.handledSyntaxes` to supersede built-in evaluation.
+ */
+export function registerBuiltinEjsPromptTransformHook(
+    options: RegisterBuiltinEjsPromptTransformOptions,
+): () => void {
+    const baseListener = createEjsPromptTransformListener(
+        async (text, vars, evalOpts) => {
+            if (!isEjsTemplateAvailable()) {
+                return text;
+            }
+            return await evaluateOptionalEjs(
+                text,
+                vars,
+                options.getExtraHelpers?.(),
+                {
+                    ...evalOpts,
+                    onCompatWarning: options.onCompatWarning,
+                },
+            );
+        },
+        {
+            includeUserInput: options.includeUserInput,
+            extId: 'builtin-ejs',
+        },
+    );
+
+    const listener: PromptTransformListener = async (payload) => {
+        if (!isEjsTemplateAvailable()) {
+            return;
+        }
+        await baseListener(payload);
+    };
+
+    options.eventSource.makeLast(PROMPT_TRANSFORM_EVENTS.TRANSFORM, listener);
+    return () => {
+        options.eventSource.removeListener(PROMPT_TRANSFORM_EVENTS.TRANSFORM, listener);
+    };
 }

@@ -106,6 +106,7 @@ deleteVariable('a.b', option)
 
 ### 常驻全局/角色脚本（非楼层内嵌 UI）
 - 如果需要监听全局事件、做后台 HUD 或跨楼层脚本库，使用 `tavern_helper_scripts_read` / `tavern_helper_scripts_upsert`（`full + stAdmin` 模式），改完后可调用 `st_sync_runtime` 立即同步到运行中的 `TavernHelper`。
+- 若要在 `JS-Slash-Runner` 脚本中监听 ST-Agentic 的提示词变换或输出校验事件（`agentic_prompt_transform`、`agentic_output_process`），请先阅读 **`/docs/event-hooks.md`**。
 
 ---
 

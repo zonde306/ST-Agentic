@@ -1,5 +1,5 @@
 import MiniSearch from 'minisearch';
-import type { HostBridge, ToolEditResult } from '@/core/bridge';
+import { type HostBridge, type ToolEditResult, runPromptTransform } from '@/core/bridge';
 import type { DocsRegistry } from '@/core/docs';
 import { ChatDataStore } from '@/core/store';
 import type {
@@ -283,7 +283,7 @@ function buildSnippet(content: string, matchedTerms: string[], rawQuery: string 
     return `${start > 0 ? '...' : ''}${slice}${end < content.length ? '...' : ''}`;
 }
 
-const EJS_DETECT_PATTERN = /<%[\s\S]*?%>/;
+const MAX_VFS_READ_TRANSFORM_CACHE = 256;
 
 function stringifyMacroVar(value: unknown): string {
     if (value === undefined || value === null) {
@@ -335,6 +335,7 @@ export class VirtualFileSystem {
 
     private readonly defaultTarget?: MessageTarget;
     private readonly defaultStaged?: boolean;
+    private readonly readTransformCache = new Map<string, string>();
 
     constructor(options: VirtualFileSystemOptions) {
         this.bridge = options.bridge;
@@ -488,7 +489,11 @@ export class VirtualFileSystem {
         if (!merged.raw && this.shouldEvaluatePlainMount(routed.mount)) {
             const { startLine, endLine, ...fullReadOpts } = merged;
             const rawContent = await routed.mount.readFile(routed.relPath, fullReadOpts);
-            const evaluated = await this.evaluateTemplateText(rawContent, fullReadOpts);
+            const evaluated = await this.evaluateTemplateText(rawContent, {
+                ...fullReadOpts,
+                path: routed.normalizedPath,
+                mount: routed.mount.mountName,
+            });
             return sliceLines(evaluated, startLine, endLine);
         }
         return await routed.mount.readFile(routed.relPath, merged);
@@ -867,9 +872,13 @@ export class VirtualFileSystem {
 
     private async evaluateTemplateText(
         rawText: string,
-        opts?: VfsTargetOptions,
+        opts?: VfsReadOptions & { path?: string; mount?: string },
     ): Promise<string> {
-        if (!rawText || (!rawText.includes('{{') && !rawText.includes('<%'))) {
+        const hasTransformHook = Boolean(this.bridge.transformPromptText || this.bridge.evaluateOptionalEjs);
+        if (!rawText) {
+            return rawText;
+        }
+        if (!rawText.includes('{{') && !rawText.includes('<%') && !this.bridge.transformPromptText) {
             return rawText;
         }
 
@@ -900,22 +909,75 @@ export class VirtualFileSystem {
             macroOverrides[`var:${k}`] = stringifyMacroVar(v);
         }
 
-        let workingText = rawText.includes('{{')
+        const workingText = rawText.includes('{{')
             ? this.bridge.substituteMacros(
                 rawText,
                 Object.keys(macroOverrides).length > 0 ? macroOverrides : undefined,
             )
             : rawText;
 
-        if (this.bridge.evaluateOptionalEjs && EJS_DETECT_PATTERN.test(workingText)) {
-            try {
-                workingText = await this.bridge.evaluateOptionalEjs(workingText, effectiveVars);
-            } catch {
-                // Keep macro-substituted fallback text when optional EJS throws.
-            }
+        if (!hasTransformHook) {
+            return workingText;
         }
 
-        return workingText;
+        const editable = Boolean(opts?.editable);
+        const writable = Boolean(opts?.writable);
+        const path = opts?.path ?? '';
+        const mount = opts?.mount ?? '';
+        const effectiveTarget: MessageTarget | undefined =
+            opts?.target
+            ?? this.defaultTarget
+            ?? (() => {
+                const chatList = this.bridge.getChat();
+                if (chatList.length === 0) {
+                    return undefined;
+                }
+                const lastIdx = chatList.length - 1;
+                return {
+                    messageId: lastIdx,
+                    swipeId: chatList[lastIdx]?.swipeId ?? 0,
+                };
+            })();
+        const targetKey = effectiveTarget
+            ? `${effectiveTarget.messageId}:${effectiveTarget.swipeId}`
+            : '';
+        const cacheKey = `${path}\x00${mount}\x00${targetKey}\x00${editable ? '1' : '0'}\x00${writable ? '1' : '0'}\x00${workingText}`;
+        const cached = this.readTransformCache.get(cacheKey);
+        if (cached !== undefined) {
+            return cached;
+        }
+
+        const result = await runPromptTransform(this.bridge, {
+            text: workingText,
+            source: 'vfs_read',
+            layer: 'tool_read',
+            dryRun: false,
+            meta: {
+                sessionId: opts?.transformSessionId ?? 'vfs_read',
+                ...(opts?.transformAgentId ? { agentId: opts.transformAgentId } : {}),
+                ...(opts?.transformPhase ? { phase: opts.transformPhase } : {}),
+                ...(effectiveTarget ? { target: effectiveTarget } : {}),
+                ...(path ? { path } : {}),
+                ...(mount ? { mount } : {}),
+                editable,
+                writable,
+                vars: effectiveVars,
+            },
+            ...(opts?.transformSessionBag ? { sessionBag: opts.transformSessionBag } : {}),
+            onError: 'fallback',
+        });
+
+        if (result.cacheable && Object.keys(result.cacheKeys).length === 0) {
+            if (this.readTransformCache.size >= MAX_VFS_READ_TRANSFORM_CACHE) {
+                const oldestKey = this.readTransformCache.keys().next().value;
+                if (oldestKey !== undefined) {
+                    this.readTransformCache.delete(oldestKey);
+                }
+            }
+            this.readTransformCache.set(cacheKey, result.text);
+        }
+
+        return result.text;
     }
 
     private mergeReadOpts<T extends VfsTargetOptions>(opts?: T): T {

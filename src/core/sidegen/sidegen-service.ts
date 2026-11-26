@@ -4,8 +4,14 @@ import type {
     LLMRequest,
     LLMToolChoice,
     LLMTransport,
+    OutputProcessResult,
     ToolSideCluesApi,
     ToolSideGenApi,
+} from '@/core/bridge';
+import {
+    DEFAULT_MAX_OUTPUT_FIX_ATTEMPTS,
+    formatOutputFixFeedback,
+    runOutputProcess,
 } from '@/core/bridge';
 import {
     DEFAULT_CONNECTION_ID,
@@ -239,6 +245,32 @@ function consumeTrailingPrefill(
             const popped = baseMessages.pop()!;
             return contentToText(popped.content);
         }
+    }
+    return '';
+}
+
+function peekTrailingPrefill(
+    activeTailMessages: readonly CanonicalMessage[],
+    inFlightMessages: readonly CanonicalMessage[],
+    baseMessages: readonly CanonicalMessage[],
+): string {
+    if (activeTailMessages.length > 0) {
+        const lastTail = activeTailMessages[activeTailMessages.length - 1];
+        return isTrailingPrefillAssistantMessage(lastTail)
+            ? contentToText(lastTail.content)
+            : '';
+    }
+    if (inFlightMessages.length > 0) {
+        const lastInFlight = inFlightMessages[inFlightMessages.length - 1];
+        return isTrailingPrefillAssistantMessage(lastInFlight)
+            ? contentToText(lastInFlight.content)
+            : '';
+    }
+    if (baseMessages.length > 0) {
+        const lastBase = baseMessages[baseMessages.length - 1];
+        return isTrailingPrefillAssistantMessage(lastBase)
+            ? contentToText(lastBase.content)
+            : '';
     }
     return '';
 }
@@ -612,6 +644,7 @@ export class SideGenService implements ToolSideGenApi {
                 connection,
                 baseMessages,
                 tailMessages: presetPrompts.tailMessages,
+                anchor: startAnchor,
                 signal,
             });
 
@@ -807,6 +840,8 @@ export class SideGenService implements ToolSideGenApi {
                 baseMessages,
                 tailMessages: presetPrompts.tailMessages,
                 cacheBreakpoints: cacheBreakpoints.length > 0 ? cacheBreakpoints : undefined,
+                sessionId,
+                anchor: startAnchor,
                 signal,
             });
 
@@ -1156,6 +1191,8 @@ export class SideGenService implements ToolSideGenApi {
         baseMessages: CanonicalMessage[];
         tailMessages: readonly CanonicalMessage[];
         cacheBreakpoints?: number[];
+        sessionId?: string;
+        anchor?: MessageTarget;
         signal: AbortSignal;
     }): Promise<{
         text: string;
@@ -1183,8 +1220,15 @@ export class SideGenService implements ToolSideGenApi {
         const activeTailMessages: CanonicalMessage[] = canonicalClone([...params.tailMessages]);
         let cumulativeUsage = normalizeUsage();
         let lastRequest!: LLMRequest;
+        let nonFixRounds = 0;
+        let roundIndex = 0;
+        let outputFixAttempts = 0;
+        const maxOutputFixAttempts = DEFAULT_MAX_OUTPUT_FIX_ATTEMPTS;
+        const outputSessionBag: Record<string, unknown> = {};
+        const outputSessionId = params.sessionId ?? 'sidegen_once';
 
-        for (let round = 0; round < maxRounds; round += 1) {
+        while (nonFixRounds < maxRounds) {
+            roundIndex += 1;
             throwIfAborted(params.signal, 'SideGen turn aborted before LLM call');
 
             const messages: CanonicalMessage[] = [
@@ -1209,6 +1253,10 @@ export class SideGenService implements ToolSideGenApi {
 
             let roundOutput!: SideGenRoundOutput;
             let roundRetriesUsed = 0;
+            let sideTurnOutputOutcome: {
+                operation: 'finish_turn' | 'plain_finish';
+                result: OutputProcessResult;
+            } | undefined;
             let streamedFinishResponse = '';
             let streamedFinishStepBrief = '';
             const finishTurnExtractor = strictToolLoop
@@ -1231,6 +1279,7 @@ export class SideGenService implements ToolSideGenApi {
                 throwIfAborted(params.signal, 'SideGen round aborted');
                 streamedFinishResponse = '';
                 streamedFinishStepBrief = '';
+                sideTurnOutputOutcome = undefined;
                 finishTurnExtractor?.resetRound();
 
                 try {
@@ -1305,6 +1354,87 @@ export class SideGenService implements ToolSideGenApi {
                         }
                     }
 
+                    if (
+                        this.bridge.processOutputText
+                        && !isLengthFinishReason(roundOutput.finishReason)
+                    ) {
+                        const isSoloFinish =
+                            strictToolLoop
+                            && roundOutput.toolCalls.length === 1
+                            && roundOutput.toolCalls[0].name === FINISH_TURN_TOOL_NAME;
+                        const isPlainFinish = !strictToolLoop && roundOutput.toolCalls.length === 0;
+                        if (isSoloFinish || isPlainFinish) {
+                            const prefillPrefix = peekTrailingPrefill(
+                                activeTailMessages,
+                                inFlightMessages,
+                                baseMessages,
+                            );
+                            let candidateText: string;
+                            if (isSoloFinish) {
+                                const parsedArgs = safeParseJsonObject(
+                                    roundOutput.toolCalls[0].arguments,
+                                );
+                                const parsedResponse =
+                                    typeof parsedArgs.response === 'string'
+                                        ? parsedArgs.response
+                                        : '';
+                                const extractedResponse =
+                                    finishTurnExtractor && !finishTurnExtractor.isSuppressed()
+                                        ? finishTurnExtractor.getDecodedResponse()
+                                            || streamedFinishResponse
+                                        : '';
+                                candidateText = parsedResponse || extractedResponse;
+                            } else {
+                                candidateText = `${prefillPrefix}${roundOutput.content ?? ''}`;
+                            }
+                            const resolvedAnchor = params.anchor ?? this.resolveCurrentAnchor();
+                            const res = await runOutputProcess(this.bridge, {
+                                text: candidateText,
+                                meta: {
+                                    runner: 'sidegen',
+                                    stage: 'turn_finish',
+                                    operation: isSoloFinish ? 'finish_turn' : 'plain_finish',
+                                    finishMode: strictToolLoop ? 'strict_tool' : 'plain_text',
+                                    sessionId: outputSessionId,
+                                    round: roundIndex,
+                                    retryAttempt: roundRetriesUsed,
+                                    maxRetries: maxRoundRetries,
+                                    fixAttempt: outputFixAttempts,
+                                    maxFixAttempts: maxOutputFixAttempts,
+                                    target: { ...resolvedAnchor },
+                                    messageId: resolvedAnchor.messageId,
+                                    swipeId: resolvedAnchor.swipeId,
+                                    ...(isSoloFinish
+                                        ? {
+                                              toolCallId: roundOutput.toolCalls[0].id,
+                                              toolName: FINISH_TURN_TOOL_NAME,
+                                          }
+                                        : {}),
+                                    surface: 'sidegen',
+                                    stream: useStream,
+                                    hasPrefill: prefillPrefix.length > 0,
+                                    sessionBag: outputSessionBag,
+                                },
+                            });
+                            if (
+                                res.action === 'retry'
+                                && roundRetriesUsed < maxRoundRetries
+                            ) {
+                                throw new LLMTransportError(
+                                    res.retryReason ?? 'Output validation requested retry.',
+                                    {
+                                        retryable: true,
+                                        code: ROUND_RETRY_ERROR_CODES.OUTPUT_VALIDATION_RETRY,
+                                    },
+                                );
+                            }
+                            sideTurnOutputOutcome = {
+                                operation: isSoloFinish ? 'finish_turn' : 'plain_finish',
+                                result: res,
+                            };
+                        }
+                    }
+
                     break;
                 } catch (llmError) {
                     if (isAbortError(llmError) || params.signal.aborted) {
@@ -1350,8 +1480,40 @@ export class SideGenService implements ToolSideGenApi {
             }
 
             if (!strictToolLoop) {
+                if (
+                    sideTurnOutputOutcome?.result.action === 'fix'
+                    && outputFixAttempts < maxOutputFixAttempts
+                ) {
+                    outputFixAttempts += 1;
+                    const feedback = formatOutputFixFeedback(
+                        sideTurnOutputOutcome.result.fixMessage
+                            ?? 'Output validation requested a revision.',
+                        {
+                            stage: 'turn_finish',
+                            operation: 'plain_finish',
+                            requestedBy: sideTurnOutputOutcome.result.requestedBy,
+                        },
+                    );
+                    inFlightMessages.push(
+                        {
+                            role: 'assistant',
+                            content: roundOutput.content ?? '',
+                            ...(roundOutput.reasoningContent
+                                ? { reasoningContent: roundOutput.reasoningContent }
+                                : {}),
+                        },
+                        {
+                            role: 'user',
+                            content: feedback,
+                        },
+                    );
+                    continue;
+                }
+                const resolvedPlainText = sideTurnOutputOutcome?.result.changed
+                    ? sideTurnOutputOutcome.result.text
+                    : roundOutput.content;
                 return {
-                    text: roundOutput.content,
+                    text: resolvedPlainText,
                     ...(roundOutput.reasoningContent
                         ? { reasoningContent: roundOutput.reasoningContent }
                         : {}),
@@ -1365,6 +1527,41 @@ export class SideGenService implements ToolSideGenApi {
                 && roundOutput.toolCalls[0].name === FINISH_TURN_TOOL_NAME;
 
             if (isSoloFinishTurn) {
+                if (
+                    sideTurnOutputOutcome?.result.action === 'fix'
+                    && outputFixAttempts < maxOutputFixAttempts
+                ) {
+                    outputFixAttempts += 1;
+                    const feedback = formatOutputFixFeedback(
+                        sideTurnOutputOutcome.result.fixMessage
+                            ?? 'Output validation requested a revision.',
+                        {
+                            stage: 'turn_finish',
+                            operation: 'finish_turn',
+                            requestedBy: sideTurnOutputOutcome.result.requestedBy,
+                        },
+                    );
+                    inFlightMessages.push(
+                        {
+                            role: 'assistant',
+                            content: roundOutput.content,
+                            ...(roundOutput.reasoningContent
+                                ? { reasoningContent: roundOutput.reasoningContent }
+                                : {}),
+                            toolCalls: canonicalClone(roundOutput.toolCalls),
+                        },
+                        {
+                            role: 'tool',
+                            toolCallId: roundOutput.toolCalls[0].id,
+                            toolName: FINISH_TURN_TOOL_NAME,
+                            content: JSON.stringify({
+                                ok: false,
+                                error: feedback,
+                            }),
+                        },
+                    );
+                    continue;
+                }
                 const parsedArgs = safeParseJsonObject(roundOutput.toolCalls[0].arguments);
                 const parsedResponse =
                     typeof parsedArgs.response === 'string' ? parsedArgs.response : '';
@@ -1372,7 +1569,10 @@ export class SideGenService implements ToolSideGenApi {
                     finishTurnExtractor && !finishTurnExtractor.isSuppressed()
                         ? finishTurnExtractor.getDecodedResponse() || streamedFinishResponse
                         : '';
-                const finalResponse = parsedResponse || extractedResponse;
+                const rawFinalResponse = parsedResponse || extractedResponse;
+                const finalResponse = sideTurnOutputOutcome?.result.changed
+                    ? sideTurnOutputOutcome.result.text
+                    : rawFinalResponse;
                 const parsedStepBrief =
                     typeof parsedArgs.step_brief === 'string'
                         ? parsedArgs.step_brief
@@ -1401,6 +1601,7 @@ export class SideGenService implements ToolSideGenApi {
                 };
             }
 
+            nonFixRounds += 1;
             // Mixed-call / unexpected tool deferral: push assistantToolMessage (no prefill flags)
             // + deferred/error tool responses and ask the model to call solo finish_turn next round.
             const assistantToolMessage: CanonicalMessage = {
@@ -1569,6 +1770,10 @@ export class SideGenService implements ToolSideGenApi {
                   hostBridge: this.bridge,
                   macroOverrides,
                   vars,
+                  transformSessionId: `sidegen_${mode}`,
+                  transformPhase: 'sidegen',
+                  transformTarget: anchor,
+                  transformLayer: 'layer0_prefix',
               })
             : [];
         const tailMessages = needTail
@@ -1576,6 +1781,10 @@ export class SideGenService implements ToolSideGenApi {
                   hostBridge: this.bridge,
                   macroOverrides,
                   vars,
+                  transformSessionId: `sidegen_${mode}`,
+                  transformPhase: 'sidegen',
+                  transformTarget: anchor,
+                  transformLayer: 'layer2_tail',
               })
             : [];
 

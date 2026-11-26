@@ -5,6 +5,12 @@ import type {
     LLMRequest,
     LLMToolChoice,
     LLMTransport,
+    OutputProcessResult,
+} from '@/core/bridge';
+import {
+    DEFAULT_MAX_OUTPUT_FIX_ATTEMPTS,
+    formatOutputFixFeedback,
+    runOutputProcess,
 } from '@/core/bridge';
 import {
     createDefaultSettings,
@@ -285,6 +291,25 @@ function consumeTrailingPrefill(
             const popped = inFlightMessages.pop()!;
             return canonicalContentToPlainText(popped.content);
         }
+    }
+    return '';
+}
+
+function peekTrailingPrefill(
+    activeTailMessages: readonly CanonicalMessage[],
+    inFlightMessages: readonly CanonicalMessage[],
+): string {
+    if (activeTailMessages.length > 0) {
+        const lastTail = activeTailMessages[activeTailMessages.length - 1];
+        return isTrailingPrefillAssistantMessage(lastTail)
+            ? canonicalContentToPlainText(lastTail.content)
+            : '';
+    }
+    if (inFlightMessages.length > 0) {
+        const lastInFlight = inFlightMessages[inFlightMessages.length - 1];
+        return isTrailingPrefillAssistantMessage(lastInFlight)
+            ? canonicalContentToPlainText(lastInFlight.content)
+            : '';
     }
     return '';
 }
@@ -636,6 +661,7 @@ function buildAssistantSystemPrompt(
         );
     }
     lines.push(
+        `- /docs/event-hooks.md — agentic_prompt_transform & agentic_output_process eventSource hooks (${hasThScripts ? 'JS-Slash-Runner & ' : ''}extensions), cache control, messageId/swipeId/target, retry & requestFix`,
         '- /docs/agentic-config.md — agentic_config_read / agentic_settings_patch / agentic_preset_component_* / agentic_connection_upsert',
     );
     if (externalDocs.length > 0) {
@@ -2292,6 +2318,9 @@ export class AssistantRunner {
             };
 
             let overflowRecoveryAttempted = false;
+            let outputFixAttempts = 0;
+            const maxOutputFixAttempts = DEFAULT_MAX_OUTPUT_FIX_ATTEMPTS;
+            const outputSessionBag: Record<string, unknown> = {};
 
             while (rounds < this.maxToolRounds) {
                 throwIfAssistantAborted(controller.signal);
@@ -2372,6 +2401,10 @@ export class AssistantRunner {
                 let turnOutput!: TurnLLMOutput;
                 let transientRetriesUsed = 0;
                 let hasNativeReasoning = false;
+                let assistantTurnOutputOutcome: {
+                    operation: 'finish_turn' | 'plain_finish';
+                    result: OutputProcessResult;
+                } | undefined;
                 let roundStepBriefThinkBuffer = '';
                 let finishTurnStreamedAnyResponse = false;
                 let finishTurnStreamedAnyStepBrief = false;
@@ -2434,6 +2467,7 @@ export class AssistantRunner {
                     finishTurnStreamedAnyResponse = false;
                     finishTurnStreamedAnyStepBrief = false;
                     finishTurnExtractor?.resetRound();
+                    assistantTurnOutputOutcome = undefined;
 
                     try {
                         turnOutput = await this.invokeLLM(request, useStream, {
@@ -2520,6 +2554,87 @@ export class AssistantRunner {
                                         },
                                     );
                                 }
+                            }
+                        }
+
+                        if (
+                            this.bridge.processOutputText
+                            && !isLengthFinishReason(turnOutput.finishReason)
+                        ) {
+                            const isSoloFinish =
+                                strictToolLoop
+                                && turnOutput.toolCalls.length === 1
+                                && turnOutput.toolCalls[0].name === FINISH_TURN_TOOL_NAME;
+                            const isPlainFinish = turnOutput.toolCalls.length === 0;
+                            if (isSoloFinish || isPlainFinish) {
+                                const prefillPrefix = peekTrailingPrefill(
+                                    activeTailMessages,
+                                    inFlightMessages,
+                                );
+                                let candidateText: string;
+                                if (isSoloFinish) {
+                                    const finishArgs = safeParseJsonObject(
+                                        turnOutput.toolCalls[0].arguments,
+                                    );
+                                    const parsedResponse =
+                                        typeof finishArgs.response === 'string'
+                                            ? finishArgs.response
+                                            : '';
+                                    const streamedResponse =
+                                        finishTurnExtractor && !finishTurnExtractor.isSuppressed()
+                                            ? finishTurnExtractor.getDecodedResponse()
+                                            : '';
+                                    candidateText = parsedResponse || streamedResponse;
+                                } else {
+                                    candidateText = `${prefillPrefix}${turnOutput.content ?? ''}`;
+                                }
+                                const maxRetriesAllowed =
+                                    this.autoRetryConfig === false ? 0 : effectiveMaxRoundRetries;
+                                const res = await runOutputProcess(this.bridge, {
+                                    text: candidateText,
+                                    meta: {
+                                        runner: 'assistant',
+                                        stage: 'turn_finish',
+                                        operation: isSoloFinish ? 'finish_turn' : 'plain_finish',
+                                        finishMode: strictToolLoop ? 'strict_tool' : 'plain_text',
+                                        sessionId,
+                                        round: rounds,
+                                        retryAttempt: transientRetriesUsed,
+                                        maxRetries: maxRetriesAllowed,
+                                        fixAttempt: outputFixAttempts,
+                                        maxFixAttempts: maxOutputFixAttempts,
+                                        target: { ...target },
+                                        messageId: target.messageId,
+                                        swipeId: target.swipeId,
+                                        ...(isSoloFinish
+                                            ? {
+                                                  toolCallId: turnOutput.toolCalls[0].id,
+                                                  toolName: FINISH_TURN_TOOL_NAME,
+                                              }
+                                            : {}),
+                                        surface: currentSession.mode,
+                                        stream: useStream,
+                                        hasPrefill: prefillPrefix.length > 0,
+                                        sessionBag: outputSessionBag,
+                                    },
+                                });
+                                if (
+                                    res.action === 'retry'
+                                    && this.autoRetryConfig !== false
+                                    && transientRetriesUsed < effectiveMaxRoundRetries
+                                ) {
+                                    throw new LLMTransportError(
+                                        res.retryReason ?? 'Output validation requested retry.',
+                                        {
+                                            retryable: true,
+                                            code: ROUND_RETRY_ERROR_CODES.OUTPUT_VALIDATION_RETRY,
+                                        },
+                                    );
+                                }
+                                assistantTurnOutputOutcome = {
+                                    operation: isSoloFinish ? 'finish_turn' : 'plain_finish',
+                                    result: res,
+                                };
                             }
                         }
 
@@ -2754,6 +2869,49 @@ export class AssistantRunner {
                     && turnOutput.toolCalls[0].name === FINISH_TURN_TOOL_NAME;
 
                 if (isSoloFinishTurn) {
+                    if (
+                        assistantTurnOutputOutcome?.result.action === 'fix'
+                        && outputFixAttempts < maxOutputFixAttempts
+                        && rounds < this.maxToolRounds
+                    ) {
+                        outputFixAttempts += 1;
+                        finishTurnExtractor?.resetRound();
+                        contentBuffer = roundStartContentBuffer;
+                        thinkBuffer = roundStartThinkBuffer;
+                        currentRoundThinkBuffer = '';
+                        syncAssistantBubble();
+
+                        const feedback = formatOutputFixFeedback(
+                            assistantTurnOutputOutcome.result.fixMessage
+                                ?? 'Output validation requested a revision.',
+                            {
+                                stage: 'turn_finish',
+                                operation: 'finish_turn',
+                                requestedBy: assistantTurnOutputOutcome.result.requestedBy,
+                            },
+                        );
+                        inFlightMessages.push(
+                            {
+                                role: 'assistant',
+                                content: turnOutput.content ?? '',
+                                ...(turnOutput.reasoningContent
+                                    ? { reasoningContent: turnOutput.reasoningContent }
+                                    : {}),
+                                toolCalls: canonicalClone(turnOutput.toolCalls),
+                            },
+                            {
+                                role: 'tool',
+                                toolCallId: turnOutput.toolCalls[0].id,
+                                toolName: FINISH_TURN_TOOL_NAME,
+                                content: JSON.stringify({
+                                    ok: false,
+                                    error: feedback,
+                                }),
+                            },
+                        );
+                        continue;
+                    }
+
                     const finishArgs = safeParseJsonObject(turnOutput.toolCalls[0].arguments);
                     const parsedResponse =
                         typeof finishArgs.response === 'string' ? finishArgs.response : '';
@@ -2761,7 +2919,10 @@ export class AssistantRunner {
                         finishTurnExtractor && !finishTurnExtractor.isSuppressed()
                             ? finishTurnExtractor.getDecodedResponse()
                             : '';
-                    const finalResponse = parsedResponse || streamedResponse;
+                    const rawFinalResponse = parsedResponse || streamedResponse;
+                    const finalResponse = assistantTurnOutputOutcome?.result.changed
+                        ? assistantTurnOutputOutcome.result.text
+                        : rawFinalResponse;
 
                     if (useStream) {
                         if (!finishTurnStreamedAnyResponse) {
@@ -2780,6 +2941,9 @@ export class AssistantRunner {
                             } else {
                                 contentBuffer = `${roundStartContentBuffer}${finalResponse}`;
                             }
+                        }
+                        if (assistantTurnOutputOutcome?.result.changed) {
+                            syncAssistantBubble();
                         }
                     } else {
                         contentBuffer = `${roundStartContentBuffer}${finalResponse}`;
@@ -2821,8 +2985,51 @@ export class AssistantRunner {
 
                 // Final text-only turn: commit to TrajectoryStore & run adaptive watermark check.
                 if (turnOutput.toolCalls.length === 0) {
+                    if (
+                        assistantTurnOutputOutcome?.result.action === 'fix'
+                        && outputFixAttempts < maxOutputFixAttempts
+                        && rounds < this.maxToolRounds
+                    ) {
+                        outputFixAttempts += 1;
+                        finishTurnExtractor?.resetRound();
+                        contentBuffer = roundStartContentBuffer;
+                        thinkBuffer = roundStartThinkBuffer;
+                        currentRoundThinkBuffer = '';
+                        syncAssistantBubble();
+
+                        const feedback = formatOutputFixFeedback(
+                            assistantTurnOutputOutcome.result.fixMessage
+                                ?? 'Output validation requested a revision.',
+                            {
+                                stage: 'turn_finish',
+                                operation: 'plain_finish',
+                                requestedBy: assistantTurnOutputOutcome.result.requestedBy,
+                            },
+                        );
+                        inFlightMessages.push(
+                            {
+                                role: 'assistant',
+                                content: turnOutput.content ?? '',
+                                ...(turnOutput.reasoningContent
+                                    ? { reasoningContent: turnOutput.reasoningContent }
+                                    : {}),
+                            },
+                            {
+                                role: 'user',
+                                content: feedback,
+                            },
+                        );
+                        continue;
+                    }
+
+                    let finalPlainContent = turnOutput.content;
+                    if (assistantTurnOutputOutcome?.result.changed) {
+                        finalPlainContent = assistantTurnOutputOutcome.result.text;
+                        contentBuffer = `${roundStartContentBuffer}${finalPlainContent}`;
+                        syncAssistantBubble();
+                    }
                     const finalContentForTrajectory =
-                        committedContentPrefixLen === 0 ? contentBuffer : turnOutput.content;
+                        committedContentPrefixLen === 0 ? contentBuffer : finalPlainContent;
                     return await commitFinalAssistantTurn(
                         finalContentForTrajectory,
                         turnOutput.reasoningContent,
@@ -3840,6 +4047,10 @@ export class AssistantRunner {
                   hostBridge: this.bridge,
                   macroOverrides,
                   vars,
+                  transformSessionId: session.id,
+                  transformPhase: 'assistant',
+                  transformTarget: target,
+                  transformLayer: 'layer0_prefix',
               })
             : [];
         const tailMessages = needTail
@@ -3847,6 +4058,10 @@ export class AssistantRunner {
                   hostBridge: this.bridge,
                   macroOverrides,
                   vars,
+                  transformSessionId: session.id,
+                  transformPhase: 'assistant',
+                  transformTarget: target,
+                  transformLayer: 'layer2_tail',
               })
             : [];
 

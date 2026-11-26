@@ -1,6 +1,7 @@
 import agenticConfigDoc from './articles/agentic-config.md';
 import ejsMacrosDoc from './articles/ejs-macros.md';
 import ejsReferenceDoc from './articles/ejs-reference.md';
+import eventHooksDoc from './articles/event-hooks.md';
 import jsToolsDoc from './articles/js-tools.md';
 import scriptsDoc from './articles/scripts.md';
 import stNativeDoc from './articles/st-native.md';
@@ -76,6 +77,14 @@ export const BUILTIN_DOCS: readonly BuiltinDocEntry[] = [
         title: '状态栏与自定义 UI 渲染指南',
         summary: '基于正则 + JS-Slash-Runner 或 @@render_after 的状态栏架构、iframe 变量与事件 API',
         content: statusUiDoc,
+        source: 'builtin',
+    },
+    {
+        fileName: 'event-hooks.md',
+        path: '/docs/event-hooks.md',
+        title: '提示词变换与输出校验事件钩子指南（JS-Slash-Runner & 扩展）',
+        summary: 'agentic_prompt_transform / agentic_output_process 事件、缓存控制、楼层元数据、重试与修正及 JS-Slash-Runner 监听模板',
+        content: eventHooksDoc,
         source: 'builtin',
     },
     {
