@@ -5456,7 +5456,7 @@ textarea:focus-visible {
     line-height: 1.35;
 }
 
-/* Generation Logs — Collapsible Tool Steps & Focused Step Card */
+/* Generation Logs — Accordion Tool Steps & Focused Step Card */
 .ag-log-run-group {
     display: flex;
     flex-direction: column;
@@ -5464,53 +5464,11 @@ textarea:focus-visible {
     min-width: 0;
 }
 
-.ag-log-step-branch {
-    display: flex;
-    flex-direction: column;
+.ag-log-run-steps-hint {
+    display: inline-flex;
+    align-items: center;
     gap: 4px;
-    margin-left: 10px;
-    padding-left: 10px;
-    border-left: 2px solid var(--border);
     min-width: 0;
-}
-
-.ag-log-steps-toggle {
-    width: 100%;
-    min-width: 40px;
-    min-height: 40px;
-    max-width: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 6px;
-    padding: 6px 10px;
-    border: none;
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--muted-foreground);
-    font-size: 12px;
-    font-weight: 500;
-    text-align: left;
-    cursor: pointer;
-    overflow: hidden;
-    transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
-}
-
-.ag-log-steps-toggle:hover {
-    background: var(--hover);
-    color: var(--foreground);
-}
-
-.ag-log-steps-toggle[aria-expanded="true"] {
-    color: var(--foreground);
-}
-
-.ag-log-steps-toggle-main {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-    flex: 1 1 auto;
 }
 
 .ag-log-steps-chevron {
@@ -5527,25 +5485,13 @@ textarea:focus-visible {
     color: var(--foreground);
 }
 
-.ag-log-steps-toggle-label {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-variant-numeric: tabular-nums;
-}
-
-.ag-log-steps-toggle-meta {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-}
-
-.ag-log-steps-list {
+.ag-log-step-branch {
     display: flex;
     flex-direction: column;
     gap: 4px;
+    margin-left: 10px;
+    padding-left: 10px;
+    border-left: 2px solid var(--border);
     min-width: 0;
 }
 

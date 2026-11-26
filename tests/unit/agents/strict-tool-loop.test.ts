@@ -17,6 +17,7 @@ import type {
     AgentProfile,
     GenerationEventPayload,
     PromptBlock,
+    RoundRetryLog,
     StrictToolLoopOverride,
 } from '@/core/types';
 import { canonicalClone, canonicalStringify } from '@/core/utils';
@@ -1165,5 +1166,364 @@ describe('AgentRunner strictToolLoop, Prefill folding & round auto-retry', () =>
 
         expect(res.content).toBe('无限轮次严格闭环测试正文。');
         expect(transport.requests).toHaveLength(3);
+    });
+
+    it('applies ingest regex once to /output.md write_file arguments in TrajectoryStore without mutating raw /output.md or breaking KV cache', async () => {
+        const { bridge, transport, settings, runner } = makeStrictSetup({
+            stream: false,
+        });
+        const preset = settings.presets[settings.currentPresetId];
+        preset.regexRules = [
+            {
+                id: 'ingest_strip_trace',
+                name: 'Strip assistant inline trace',
+                pattern: '/<!--\\s*trace:[^>]*-->/g',
+                replace: '',
+                stage: 'ingest',
+                applyToUser: false,
+                applyToAssistant: true,
+                enabled: true,
+            },
+            {
+                id: 'display_fold_think',
+                name: 'Fold think for DOM only',
+                pattern: '/<think>([\\s\\S]*?)<\\/think>/g',
+                replace: '[折叠:$1]',
+                stage: 'display',
+                applyToUser: false,
+                applyToAssistant: true,
+                enabled: true,
+            },
+        ];
+
+        transport.enqueue(
+            // Turn 1 Round 1: write_file('/output.md', ...)
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'r1_write',
+                        name: 'write_file',
+                        arguments: JSON.stringify({
+                            path: '/output.md',
+                            content: '<think>内心</think>码头灯影摇曳。<!-- trace: round1 -->',
+                        }),
+                    },
+                ],
+            },
+            // Turn 1 Round 2: finish_turn
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'r1_finish',
+                        name: FINISH_TURN_TOOL_NAME,
+                        arguments: JSON.stringify({
+                            step_brief: '完成首轮<!-- trace: brief1 -->',
+                        }),
+                    },
+                ],
+            },
+            // Turn 2 Round 1: verify frozen Layer 1 prefix, then write Turn 2 output
+            (req) => {
+                const frozenWriteMsg = req.messages.find(
+                    (m) => m.role === 'assistant' && m.toolCalls?.some((tc) => tc.id === 'r1_write'),
+                );
+                expect(frozenWriteMsg).toBeDefined();
+                const frozenWriteArgs = JSON.parse(frozenWriteMsg!.toolCalls![0].arguments) as {
+                    path: string;
+                    content: string;
+                };
+                expect(frozenWriteArgs.content).toBe('<think>内心</think>码头灯影摇曳。');
+                expect(frozenWriteArgs.content).not.toContain('[折叠:');
+                expect(req.messages.some((m) => m.role === 'assistant' && m.content === '完成首轮')).toBe(
+                    true,
+                );
+
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'r2_write',
+                            name: 'write_file',
+                            arguments: JSON.stringify({
+                                path: '/output.md',
+                                content: '第二轮正文<!-- trace: round2 -->',
+                            }),
+                        },
+                    ],
+                };
+            },
+            // Turn 2 Round 2: finish_turn
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'r2_finish',
+                        name: FINISH_TURN_TOOL_NAME,
+                        arguments: JSON.stringify({ step_brief: '第二轮结束' }),
+                    },
+                ],
+            },
+        );
+
+        const res1 = await runner.run({
+            agent: 'main',
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'main_turn',
+            userInput: '第一轮行动',
+        });
+
+        // Raw /output.md and host chat message MUST retain original text (ingest only cleans TrajectoryStore)
+        expect(res1.content).toBe('<think>内心</think>码头灯影摇曳。<!-- trace: round1 -->');
+        expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe(
+            '<think>内心</think>码头灯影摇曳。<!-- trace: round1 -->',
+        );
+
+        // Add another ingest rule before Turn 2: Turn 1's frozen Layer 1 prefix MUST stay byte-for-byte invariant
+        preset.regexRules.push({
+            id: 'ingest_late_mask',
+            name: 'Late mask',
+            pattern: '码头',
+            replace: 'MASKED',
+            stage: 'ingest',
+            applyToUser: false,
+            applyToAssistant: true,
+            enabled: true,
+        });
+
+        bridge.pushMessage({ id: 2, name: '沈默', isUser: true, mes: '第二轮行动' });
+        bridge.pushMessage({ id: 3, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+
+        const res2 = await runner.run({
+            agent: 'main',
+            target: { messageId: 3, swipeId: 0 },
+            phase: 'main_turn',
+            userInput: '第二轮行动',
+        });
+
+        expect(res2.content).toBe('第二轮正文<!-- trace: round2 -->');
+        assertAppendOnlyPrefix(transport.requests[0], transport.requests[2]);
+        const layer1After = runner.trajectoryStore.getMessages('main');
+        const t1WriteFrozen = layer1After.find(
+            (m) => m.role === 'assistant' && m.toolCalls?.some((tc) => tc.id === 'r1_write'),
+        );
+        expect(JSON.parse(t1WriteFrozen!.toolCalls![0].arguments).content).toBe(
+            '<think>内心</think>码头灯影摇曳。',
+        );
+    });
+
+    it('persists retryCount and retryEvents onto AgentRunTrace and differentiates write vs read-only empty completion in after_turn', async () => {
+        // 1. Recovery & exhaustion telemetry on AgentRunTrace + onRetrying callback
+        const setupTelemetry = makeStrictSetup({
+            connectionStrict: false,
+            roundMaxRetries: 2,
+            sessionMode: 'ephemeral',
+            enabledTools: ['read_variables', 'patch_variables'],
+            roundRetryInitialDelayMs: 0,
+            roundRetryMaxDelayMs: 0,
+        });
+
+        const retryingLogs: RoundRetryLog[] = [];
+        setupTelemetry.transport.enqueue(
+            // Round 1: read_variables
+            {
+                content: '',
+                toolCalls: [
+                    { id: 'c_rv', name: 'read_variables', arguments: '{"scope":"message"}' },
+                ],
+            },
+            // Round 2 attempt 1: thinking-only empty response -> EMPTY_RESPONSE retry #1
+            {
+                content: '',
+                reasoningContent: 'internal thoughts only',
+                usage: { inputTokens: 200, cachedTokens: 0, outputTokens: 150 },
+                finishReason: 'STOP',
+            },
+            // Round 2 attempt 2: second empty -> EMPTY_RESPONSE retry #2
+            {
+                content: '  ',
+                usage: { inputTokens: 200, cachedTokens: 0, outputTokens: 12 },
+                finishReason: 'STOP',
+            },
+            // Round 2 attempt 3 (exhausts 2 retries): still empty -> fails
+            {
+                content: '',
+                reasoningContent: 'final thought preview',
+                usage: { inputTokens: 200, cachedTokens: 0, outputTokens: 80 },
+                finishReason: 'STOP',
+            },
+        );
+
+        let caughtErr: unknown;
+        try {
+            await setupTelemetry.runner.run({
+                agent: 'main',
+                target: { messageId: 1, swipeId: 0 },
+                phase: 'after_turn',
+                userInput: '读取变量并分析。',
+                onRetrying: (info) => retryingLogs.push(info),
+            });
+        } catch (err) {
+            caughtErr = err;
+        }
+
+        expect(caughtErr).toBeInstanceOf(AgentExecutionError);
+        const failTrace = (caughtErr as AgentExecutionError).trace;
+        expect(failTrace.status).toBe('error');
+        expect(failTrace.retryCount).toBe(2);
+        expect(failTrace.roundMaxRetries).toBe(2);
+        expect(failTrace.retryEvents).toHaveLength(2);
+        expect(failTrace.retryEvents?.[0]).toMatchObject({
+            round: 2,
+            attempt: 1,
+            maxAttempts: 2,
+            reason: 'EMPTY_RESPONSE',
+            finishReason: 'STOP',
+            outputTokens: 150,
+            hasReasoning: true,
+        });
+        expect(failTrace.retryEvents?.[1]).toMatchObject({
+            round: 2,
+            attempt: 2,
+            maxAttempts: 2,
+            reason: 'EMPTY_RESPONSE',
+            finishReason: 'STOP',
+            outputTokens: 12,
+        });
+        expect(failTrace.outputPreview).toContain('final thought preview');
+        expect(retryingLogs).toEqual(failTrace.retryEvents);
+
+        // 2. Non-strict after_turn trigger that already succeeded a write tool completes silently
+        const setupSilentWrite = makeStrictSetup({
+            connectionStrict: false,
+            roundMaxRetries: 2,
+            sessionMode: 'ephemeral',
+            enabledTools: ['read_variables', 'patch_variables'],
+            roundRetryInitialDelayMs: 0,
+            roundRetryMaxDelayMs: 0,
+        });
+        setupSilentWrite.transport.enqueue(
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'c_pv',
+                        name: 'patch_variables',
+                        arguments: JSON.stringify({ scope: 'message', json_merge: { synced: true } }),
+                    },
+                ],
+            },
+            // Round 2: empty text with 0 tool calls after successful patch_variables -> succeeds immediately
+            { content: '' },
+        );
+
+        const silentRes = await setupSilentWrite.runner.run({
+            agent: 'main',
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'after_turn',
+            userInput: '写入变量即可。',
+        });
+        expect(silentRes.trace.status).toBe('completed');
+        expect(silentRes.trace.retryCount).toBe(0);
+        expect(setupSilentWrite.transport.requests).toHaveLength(2);
+    });
+
+    it('ignores after_turn turn_retrying events on main capsule while preserving main retrying state across syncFromStore', () => {
+        const listeners = new Set<(event: GenerationEventPayload) => void>();
+        const services = {
+            ...createMockUIServices(),
+            subscribeEvents: (listener: (event: GenerationEventPayload) => void) => {
+                listeners.add(listener);
+                return () => listeners.delete(listener);
+            },
+        };
+        const store = new AppStore({
+            services,
+            initialTraces: [],
+            initialBackgroundTasks: [],
+        });
+
+        const capsule = new AgenticCapsuleElement();
+        const disconnect = capsule.connectStore(store, { messageId: 4, swipeId: 3 });
+
+        const emit = (event: GenerationEventPayload) => {
+            for (const listener of listeners) {
+                listener(event);
+            }
+        };
+
+        // Main turn enters running -> retrying
+        store.upsertTrace({
+            runId: 'run_main_4_3',
+            target: { messageId: 4, swipeId: 3 },
+            phase: 'main_turn',
+            agentProfileId: 'main',
+            agentName: 'Main',
+            connectionId: 'conn_1',
+            model: 'm',
+            status: 'running',
+            startedAt: Date.now(),
+            durationMs: 0,
+            usage: { inputTokens: 0, cachedTokens: 0, outputTokens: 0 },
+            toolSteps: [],
+        });
+
+        emit({
+            kind: 'turn_retrying',
+            phase: 'main_turn',
+            target: { messageId: 4, swipeId: 3 },
+            timestamp: Date.now(),
+            retryAttempt: 1,
+            retryMaxAttempts: 2,
+            retryDelayMs: 1000,
+            retryReason: 'EMPTY_RESPONSE',
+        });
+        expect(capsule.getState().status).toBe('retrying');
+
+        // Background task store update while main_turn is still running must NOT clobber main retrying state
+        store.upsertBackgroundTask({
+            taskId: 'bg_1',
+            target: { messageId: 4, swipeId: 3 },
+            phase: 'after_turn',
+            barrier: 'none',
+            agentProfileId: 'ag_phys',
+            label: '🍌生理更新',
+            state: 'running',
+            startedAt: Date.now(),
+        });
+        expect(capsule.getState().status).toBe('retrying');
+
+        // Main turn finishes -> done; subsequent after_turn turn_retrying must NOT regress capsule to retrying
+        store.upsertTrace({
+            runId: 'run_main_4_3',
+            target: { messageId: 4, swipeId: 3 },
+            phase: 'main_turn',
+            agentProfileId: 'main',
+            agentName: 'Main',
+            connectionId: 'conn_1',
+            model: 'm',
+            status: 'completed',
+            startedAt: Date.now() - 500,
+            endedAt: Date.now(),
+            durationMs: 500,
+            usage: { inputTokens: 10, cachedTokens: 0, outputTokens: 20 },
+            toolSteps: [],
+        });
+        expect(capsule.getState().status).toBe('background-running');
+
+        emit({
+            kind: 'turn_retrying',
+            phase: 'after_turn',
+            target: { messageId: 4, swipeId: 3 },
+            timestamp: Date.now(),
+            retryAttempt: 1,
+            retryMaxAttempts: 2,
+            retryDelayMs: 1200,
+            retryReason: 'EMPTY_RESPONSE',
+        });
+        expect(capsule.getState().status).toBe('background-running');
+
+        disconnect();
     });
 });

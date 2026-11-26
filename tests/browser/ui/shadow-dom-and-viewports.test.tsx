@@ -1306,39 +1306,65 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
 
         const { dialog, shadowRoot } = getShellElements();
 
-        const manyToggle = shadowRoot.querySelector(
-            '[data-log-steps-toggle="run_many"]',
+        // No secondary toggle button should exist; both runs start collapsed
+        expect(shadowRoot.querySelector('[data-log-steps-toggle]')).toBeNull();
+        const manyRunBtn = shadowRoot.querySelector(
+            '[data-log-run-item="run_many"]',
         ) as HTMLButtonElement | null;
-        const prevToggle = shadowRoot.querySelector(
-            '[data-log-steps-toggle="run_prev"]',
+        const prevRunBtn = shadowRoot.querySelector(
+            '[data-log-run-item="run_prev"]',
         ) as HTMLButtonElement | null;
-        expect(manyToggle).toBeTruthy();
-        expect(prevToggle).toBeTruthy();
-        expect(manyToggle!.getAttribute('aria-expanded')).toBe('false');
-        expect(prevToggle!.getAttribute('aria-expanded')).toBe('false');
-        expect(manyToggle!.textContent).toContain('展开 12 个工具调用');
-        expect(manyToggle!.textContent).toContain('1 失败');
-        expect(prevToggle!.textContent).toContain('展开 2 个工具调用');
+        expect(manyRunBtn).toBeTruthy();
+        expect(prevRunBtn).toBeTruthy();
+        expect(manyRunBtn!.getAttribute('aria-expanded')).toBe('false');
+        expect(prevRunBtn!.getAttribute('aria-expanded')).toBe('false');
         expect(shadowRoot.querySelector('[data-log-steps-list="run_many"]')).toBeNull();
         expect(shadowRoot.querySelector('[data-log-steps-list="run_prev"]')).toBeNull();
 
         assertNoHorizontalOverflow(dialog, shadowRoot, 'desktop:logs:collapsed');
         assertInteractiveTargetsAndTypography(shadowRoot, 'desktop:logs:collapsed');
 
-        // Expand run_many tool steps
-        manyToggle!.click();
+        // Click the initially selected run card (run_many) -> expands run_many, keeps run_prev collapsed
+        manyRunBtn!.click();
         await settleLayout(4);
 
-        expect(manyToggle!.getAttribute('aria-expanded')).toBe('true');
-        expect(manyToggle!.textContent).toContain('收起工具调用 (12)');
+        expect(manyRunBtn!.getAttribute('aria-expanded')).toBe('true');
+        expect(prevRunBtn!.getAttribute('aria-expanded')).toBe('false');
+        const manyStepsListAfterFirstClick = shadowRoot.querySelector(
+            '[data-log-steps-list="run_many"]',
+        ) as HTMLDivElement | null;
+        expect(manyStepsListAfterFirstClick).toBeTruthy();
+        expect(manyStepsListAfterFirstClick!.querySelectorAll('.ag-log-step-item')).toHaveLength(12);
+        expect(shadowRoot.querySelector('[data-log-steps-list="run_prev"]')).toBeNull();
+
+        assertNoHorizontalOverflow(dialog, shadowRoot, 'desktop:logs:expanded');
+        assertInteractiveTargetsAndTypography(shadowRoot, 'desktop:logs:expanded');
+
+        // Click run_prev -> expands run_prev and automatically collapses run_many
+        prevRunBtn!.click();
+        await settleLayout(4);
+
+        expect(prevRunBtn!.getAttribute('aria-expanded')).toBe('true');
+        expect(manyRunBtn!.getAttribute('aria-expanded')).toBe('false');
+        expect(shadowRoot.querySelector('[data-log-steps-list="run_many"]')).toBeNull();
+        const prevStepsList = shadowRoot.querySelector(
+            '[data-log-steps-list="run_prev"]',
+        ) as HTMLDivElement | null;
+        expect(prevStepsList).toBeTruthy();
+        expect(prevStepsList!.querySelectorAll('.ag-log-step-item')).toHaveLength(2);
+
+        // Click run_many again -> expands run_many and automatically collapses run_prev
+        manyRunBtn!.click();
+        await settleLayout(4);
+
+        expect(manyRunBtn!.getAttribute('aria-expanded')).toBe('true');
+        expect(prevRunBtn!.getAttribute('aria-expanded')).toBe('false');
+        expect(shadowRoot.querySelector('[data-log-steps-list="run_prev"]')).toBeNull();
         const manyStepsList = shadowRoot.querySelector(
             '[data-log-steps-list="run_many"]',
         ) as HTMLDivElement | null;
         expect(manyStepsList).toBeTruthy();
         expect(manyStepsList!.querySelectorAll('.ag-log-step-item')).toHaveLength(12);
-
-        assertNoHorizontalOverflow(dialog, shadowRoot, 'desktop:logs:expanded');
-        assertInteractiveTargetsAndTypography(shadowRoot, 'desktop:logs:expanded');
 
         // Click step #10 -> scrolls .ag-split-detail to step #10 card with focused highlight
         const detailEl = shadowRoot.querySelector('.ag-split-detail') as HTMLDivElement;
@@ -1423,12 +1449,8 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
             { timeout: 2500 },
         );
 
-        // Click run header item -> scrolls detail pane back to top
-        const manyRunBtn = shadowRoot.querySelector(
-            '[data-log-run-item="run_many"]',
-        ) as HTMLButtonElement;
-        expect(manyRunBtn).toBeTruthy();
-        manyRunBtn.click();
+        // Click already-selected & expanded run_many -> collapses run_many AND scrolls detail pane back to top
+        manyRunBtn!.click();
 
         await vi.waitFor(
             () => {
@@ -1436,11 +1458,7 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
             },
             { timeout: 2500 },
         );
-
-        // Collapse run_many again
-        manyToggle!.click();
-        await settleLayout(3);
-        expect(manyToggle!.getAttribute('aria-expanded')).toBe('false');
+        expect(manyRunBtn!.getAttribute('aria-expanded')).toBe('false');
         expect(shadowRoot.querySelector('[data-log-steps-list="run_many"]')).toBeNull();
 
         activeHarness.cleanup();
@@ -1453,22 +1471,38 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
         await settleLayout(5);
 
         const { dialog: mobileDialog, shadowRoot: mobileShadow } = getShellElements();
-        const mobileToggle = mobileShadow.querySelector(
-            '[data-log-steps-toggle="run_many"]',
+        expect(mobileShadow.querySelector('[data-log-steps-toggle]')).toBeNull();
+        const mobileManyRunBtn = mobileShadow.querySelector(
+            '[data-log-run-item="run_many"]',
         ) as HTMLButtonElement | null;
-        expect(mobileToggle).toBeTruthy();
-        expect(mobileToggle!.getAttribute('aria-expanded')).toBe('false');
+        expect(mobileManyRunBtn).toBeTruthy();
+        expect(mobileManyRunBtn!.getAttribute('aria-expanded')).toBe('false');
         expect(mobileShadow.querySelector('[data-log-steps-list="run_many"]')).toBeNull();
 
-        // Tap toggle expands in-place without pushing detail view
-        mobileToggle!.click();
+        // Tap run_many -> expands run_many and pushes into detail view
+        mobileManyRunBtn!.click();
         await settleLayout(4);
-        expect(mobileToggle!.getAttribute('aria-expanded')).toBe('true');
+
+        const backBtnToMaster = mobileShadow.querySelector('.ag-stack-back-btn') as HTMLButtonElement | null;
+        expect(backBtnToMaster).toBeTruthy();
+        expect(isElementVisible(backBtnToMaster!)).toBe(true);
+
+        // Return to master list -> run_many is expanded with 12 step buttons
+        backBtnToMaster!.click();
+        await settleLayout(4);
         expect(mobileShadow.querySelector('.ag-stack-back-btn')).toBeNull();
+
+        const mobileRunBtnAfterBack = mobileShadow.querySelector(
+            '[data-log-run-item="run_many"]',
+        ) as HTMLButtonElement | null;
+        expect(mobileRunBtnAfterBack).toBeTruthy();
+        expect(mobileRunBtnAfterBack!.getAttribute('aria-expanded')).toBe('true');
+
         const mobileStepsList = mobileShadow.querySelector(
             '[data-log-steps-list="run_many"]',
         ) as HTMLDivElement | null;
         expect(mobileStepsList).toBeTruthy();
+        expect(mobileStepsList!.querySelectorAll('.ag-log-step-item')).toHaveLength(12);
 
         assertNoHorizontalOverflow(mobileDialog, mobileShadow, 'mobile:logs:expanded');
         assertInteractiveTargetsAndTypography(mobileShadow, 'mobile:logs:expanded');
@@ -1610,6 +1644,135 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
             const taskGroup = capShadow.querySelector('.cap-task-group') as HTMLElement | null;
             expect(taskGroup).toBeTruthy();
             expect(taskGroup!.getBoundingClientRect().right).toBeLessThanOrEqual(shellRect.right + 1);
+        }
+    });
+
+    it('renders retry telemetry, retry history, and targeted rerun button in LogsView across desktop and mobile viewports', async () => {
+        for (const vp of [
+            { label: 'desktop', width: 1280, height: 800, isMobile: false },
+            { label: 'mobile', width: 390, height: 844, isMobile: true },
+        ]) {
+            activeHarness?.cleanup();
+            activeHarness = null;
+            await page.viewport(vp.width, vp.height);
+
+            const rerunCalls: Array<{
+                target?: { messageId: number; swipeId: number };
+                options?: { triggerIds?: string[] };
+            }> = [];
+            const baseServices = createMockUIServices();
+            const failedAfterTurnTrace = {
+                runId: 'run_4_3_phys_retry',
+                target: { messageId: 4, swipeId: 3 },
+                phase: 'after_turn' as const,
+                agentProfileId: 'ag_phys',
+                agentName: '🍌生理更新',
+                triggerId: 'tr_phys_1',
+                triggerLabel: '🍌生理更新',
+                triggerSource: 'worldinfo' as const,
+                lorebookNames: ['生理系统'],
+                connectionId: 'conn_gemini',
+                model: 'gemini-4-hydrogen',
+                status: 'error' as const,
+                startedAt: Date.now() - 108_000,
+                endedAt: Date.now() - 100,
+                durationMs: 107_950,
+                usage: {
+                    inputTokens: 9641,
+                    cachedTokens: 0,
+                    outputTokens: 223,
+                    totalTokens: 9864,
+                    cacheHitRate: 0,
+                },
+                toolSteps: [
+                    {
+                        stepIndex: 0,
+                        toolCallId: 'call_read_vars_1',
+                        toolName: 'read_variables',
+                        args: { scope: 'message' },
+                        result: '{"ok":true}',
+                        ok: true,
+                        durationMs: 1,
+                        startedAt: Date.now() - 107_000,
+                    },
+                ],
+                retryCount: 2,
+                roundMaxRetries: 2,
+                retryEvents: [
+                    {
+                        round: 2,
+                        attempt: 1,
+                        maxAttempts: 2,
+                        reason: 'EMPTY_RESPONSE',
+                        delayMs: 1200,
+                        timestamp: Date.now() - 50_000,
+                        finishReason: 'STOP',
+                        outputTokens: 223,
+                        hasReasoning: true,
+                    },
+                    {
+                        round: 2,
+                        attempt: 2,
+                        maxAttempts: 2,
+                        reason: 'EMPTY_RESPONSE',
+                        delayMs: 2400,
+                        timestamp: Date.now() - 20_000,
+                        finishReason: 'STOP',
+                    },
+                ],
+                error: 'Model returned an empty response with no tool calls.',
+            };
+
+            const traces = [failedAfterTurnTrace, ...createMockTraces()];
+            activeHarness = createHarness({
+                initialTab: 'logs',
+                initialOpen: true,
+                services: {
+                    ...baseServices,
+                    listTraces: async () => traces,
+                    rerunAfterTurn: async (target, options) => {
+                        rerunCalls.push({ target, options });
+                    },
+                },
+            });
+            activeHarness.store.setTraces(traces);
+            await settleLayout(5);
+
+            const { dialog, shadowRoot } = getShellElements();
+            const failedItem = shadowRoot.querySelector(
+                '[data-log-run-item="run_4_3_phys_retry"]',
+            ) as HTMLButtonElement | null;
+            expect(failedItem, `${vp.label}: expected failed run item`).toBeTruthy();
+            expect(failedItem!.textContent).toContain('重试 2 次');
+
+            failedItem!.click();
+            await settleLayout(5);
+
+            const retryHistoryCard = shadowRoot.querySelector(
+                '[data-log-retry-history="run_4_3_phys_retry"]',
+            ) as HTMLElement | null;
+            expect(retryHistoryCard, `${vp.label}: expected retry history card`).toBeTruthy();
+            expect(retryHistoryCard!.textContent).toContain('自动重试记录 (2)');
+            expect(retryHistoryCard!.textContent).toContain('EMPTY_RESPONSE');
+            expect(retryHistoryCard!.textContent).toContain('含思考内容');
+
+            const rerunBtn = shadowRoot.querySelector(
+                'button.ag-log-rerun-btn',
+            ) as HTMLButtonElement | null;
+            expect(rerunBtn, `${vp.label}: expected manual rerun button`).toBeTruthy();
+            expect(rerunBtn!.textContent).toContain('重试此触发器');
+
+            assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:logs:retry_detail`);
+            assertInteractiveTargetsAndTypography(shadowRoot, `${vp.label}:logs:retry_detail`);
+
+            rerunBtn!.click();
+            await vi.waitFor(() => {
+                expect(rerunCalls).toHaveLength(1);
+            });
+            expect(rerunCalls[0]).toEqual({
+                target: { messageId: 4, swipeId: 3 },
+                options: { triggerIds: ['tr_phys_1'] },
+            });
         }
     });
 });

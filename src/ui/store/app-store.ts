@@ -329,7 +329,7 @@ export interface AgenticUIServices {
     // Traces & Execution Actions (View 2 & Capsule / Magic Menu)
     listTraces(filter?: { messageId?: number; swipeId?: number }): Promise<AgentRunTrace[]>;
     clearTraces?(): Promise<void>;
-    rerunAfterTurn(target?: MessageTarget): Promise<void>;
+    rerunAfterTurn(target?: MessageTarget, options?: { triggerIds?: string[] }): Promise<void>;
     resumeTurn?(target: MessageTarget): Promise<void>;
     cancelBackgroundTask(taskId: string): Promise<void>;
 
@@ -1133,11 +1133,19 @@ export class AppStore {
         this.pushToast('已发送中断信号，仅取消该后台任务', 'warning');
     }
 
-    async rerunAfterTurn(target?: MessageTarget): Promise<void> {
+    async rerunAfterTurn(
+        target?: MessageTarget,
+        options?: { triggerIds?: string[]; label?: string },
+    ): Promise<void> {
         const resolved = target ?? this.state.activeTarget;
-        await this.services.rerunAfterTurn(resolved);
+        const serviceOpts = options?.triggerIds?.length
+            ? { triggerIds: options.triggerIds }
+            : undefined;
+        await this.services.rerunAfterTurn(resolved, serviceOpts);
         this.pushToast(
-            `已重新派发楼层 #${resolved.messageId}#${resolved.swipeId} 的后置触发任务`,
+            options?.label
+                ? `已重新派发 #${resolved.messageId}#${resolved.swipeId} 的后置触发：${options.label}`
+                : `已重新派发楼层 #${resolved.messageId}#${resolved.swipeId} 的后置触发任务`,
             'primary',
         );
     }

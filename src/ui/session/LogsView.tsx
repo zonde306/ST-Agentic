@@ -182,6 +182,7 @@ function matchesSearch(trace: AgentRunTrace, query: string): boolean {
         || (trace.lorebookNames?.some((name) => name.toLowerCase().includes(q)) ?? false)
         || (trace.outputPreview?.toLowerCase().includes(q) ?? false)
         || (trace.error?.toLowerCase().includes(q) ?? false)
+        || (trace.retryEvents?.some((ev) => ev.reason.toLowerCase().includes(q)) ?? false)
         || `#${trace.target.messageId}`.includes(q)
     ) {
         return true;
@@ -202,7 +203,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
         () => deepLink.logId ?? traces[0]?.runId ?? null,
     );
     const [highlightedStepKey, setHighlightedStepKey] = useState<string | null>(null);
-    const [expandedRunIds, setExpandedRunIds] = useState<ReadonlySet<string>>(() => new Set());
+    const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
     const [scrollRequest, setScrollRequest] = useState<{
         runId: string;
         stepKey: string | null;
@@ -211,6 +212,8 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
     const [detailOpen, setDetailOpen] = useState(false);
     const [detailTab, setDetailTab] = useState<DetailViewTab>('steps');
     const [refreshing, setRefreshing] = useState(false);
+    const [rerunningRunId, setRerunningRunId] = useState<string | null>(null);
+    const [resumingRunId, setResumingRunId] = useState<string | null>(null);
 
     const lastDeepLinkSigRef = useRef<string>('');
     const didAutoLoadRef = useRef(false);
@@ -259,6 +262,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
         if (deepLink.logId) {
             setSelectedRunId(deepLink.logId);
             setHighlightedStepKey(null);
+            setExpandedRunId(null);
             setDetailOpen(true);
             setScrollRequest((prev) => ({
                 runId: deepLink.logId!,
@@ -274,6 +278,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             if (matched) {
                 setSelectedRunId(matched.runId);
                 setHighlightedStepKey(null);
+                setExpandedRunId(null);
                 setDetailOpen(true);
                 setScrollRequest((prev) => ({
                     runId: matched.runId,
@@ -318,24 +323,33 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
         [filteredTraces, selectedRunId],
     );
 
-    const handleToggleRunSteps = useCallback((runId: string) => {
-        setExpandedRunIds((prev) => {
-            const next = new Set(prev);
-            if (next.has(runId)) {
-                next.delete(runId);
-            } else {
-                next.add(runId);
+    const handleClickRunItem = (trace: AgentRunTrace) => {
+        const wasSelected = selectedTrace?.runId === trace.runId;
+        const hasSteps = trace.toolSteps.length > 0;
+        setSelectedRunId(trace.runId);
+        setHighlightedStepKey(null);
+        setExpandedRunId((prev) => {
+            if (!hasSteps) {
+                return null;
             }
-            return next;
+            if (wasSelected && prev === trace.runId) {
+                return null;
+            }
+            return trace.runId;
         });
-    }, []);
+        setDetailOpen(true);
+        setScrollRequest((prev) => ({
+            runId: trace.runId,
+            stepKey: null,
+            nonce: (prev?.nonce ?? 0) + 1,
+        }));
+    };
 
-    const handleSelectRun = (runId: string, stepKey: string | null = null) => {
+    const handleSelectStep = (runId: string, stepKey: string) => {
         setSelectedRunId(runId);
+        setExpandedRunId(runId);
         setHighlightedStepKey(stepKey);
-        if (stepKey !== null) {
-            setDetailTab('steps');
-        }
+        setDetailTab('steps');
         setDetailOpen(true);
         setScrollRequest((prev) => ({
             runId,
@@ -407,7 +421,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             store.setTraces([]);
             setSelectedRunId(null);
             setHighlightedStepKey(null);
-            setExpandedRunIds(new Set());
+            setExpandedRunId(null);
             store.pushToast('已清空内存运行日志', 'warning');
         } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
@@ -422,6 +436,64 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             ok ? `已复制 ${label} 到剪贴板` : '剪贴板不可用，复制失败',
             ok ? 'success' : 'warning',
         );
+    };
+
+    const handleRerunTrace = async (trace: AgentRunTrace) => {
+        if (rerunningRunId) {
+            return;
+        }
+        const prevRunIds = new Set(store.getSnapshot().traces.map((t) => t.runId));
+        const triggerIds = trace.triggerId
+            ?.split(',')
+            .map((id) => id.trim())
+            .filter(Boolean);
+        setRerunningRunId(trace.runId);
+        try {
+            await store.rerunAfterTurn(
+                trace.target,
+                triggerIds && triggerIds.length > 0
+                    ? {
+                          triggerIds,
+                          label: trace.triggerLabel ?? trace.agentName,
+                      }
+                    : undefined,
+            );
+            await store.refreshTraces().catch(() => {});
+            const newestTrace = store
+                .getSnapshot()
+                .traces.find(
+                    (t) =>
+                        !prevRunIds.has(t.runId)
+                        && t.target.messageId === trace.target.messageId
+                        && t.target.swipeId === trace.target.swipeId
+                        && t.phase === 'after_turn',
+                );
+            if (newestTrace) {
+                setSelectedRunId(newestTrace.runId);
+                setHighlightedStepKey(null);
+            }
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            store.pushToast(`重新运行触发器失败：${msg}`, 'error');
+        } finally {
+            setRerunningRunId((prev) => (prev === trace.runId ? null : prev));
+        }
+    };
+
+    const handleResumeTrace = async (trace: AgentRunTrace) => {
+        if (resumingRunId || !store.services.resumeTurn) {
+            return;
+        }
+        setResumingRunId(trace.runId);
+        try {
+            await store.resumeTurn(trace.target);
+            await store.refreshTraces().catch(() => {});
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            store.pushToast(`继续生成失败：${msg}`, 'error');
+        } finally {
+            setResumingRunId((prev) => (prev === trace.runId ? null : prev));
+        }
     };
 
     const masterPane = (
@@ -505,210 +577,171 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                     title="暂无匹配的生成或工具日志"
                     description="请尝试切换楼层/阶段筛选，或在聊天中触发一次生成。"
                 />
-            ) : (() => {
-                const trimmedLowerQuery = searchQuery.trim().toLowerCase();
-                return (
-                    <div class="ag-list" style={{ padding: 0, gap: '8px' }}>
-                        {filteredTraces.map((trace) => {
-                            const isSelected = selectedTrace?.runId === trace.runId;
-                            const isScriptTrace = trace.model === '0-token-script';
-                            const lorebookLabel = formatTraceLorebooks(trace);
-                            const hitRate = computeCacheHitPercent(trace.usage);
-                            const statusMeta = getRunStatusMeta(trace.status);
-                            const isStepsExpanded = expandedRunIds.has(trace.runId);
-                            const failedStepsCount = trace.toolSteps.reduce(
-                                (count, step) => count + (step.ok ? 0 : 1),
-                                0,
-                            );
-                            const matchedStepsCount = trimmedLowerQuery
-                                ? trace.toolSteps.reduce(
-                                    (count, step) =>
-                                        count + (stepMatchesSearch(step, trimmedLowerQuery) ? 1 : 0),
-                                    0,
-                                )
-                                : 0;
-                            return (
-                                <div
-                                    key={trace.runId}
-                                    class="ag-log-run-group"
-                                    data-log-run-id={trace.runId}
+            ) : (
+                <div class="ag-list" style={{ padding: 0, gap: '8px' }}>
+                    {filteredTraces.map((trace) => {
+                        const isSelected = selectedTrace?.runId === trace.runId;
+                        const isScriptTrace = trace.model === '0-token-script';
+                        const lorebookLabel = formatTraceLorebooks(trace);
+                        const hitRate = computeCacheHitPercent(trace.usage);
+                        const statusMeta = getRunStatusMeta(trace.status);
+                        const hasSteps = trace.toolSteps.length > 0;
+                        const isStepsExpanded = hasSteps && expandedRunId === trace.runId;
+                        return (
+                            <div
+                                key={trace.runId}
+                                class="ag-log-run-group"
+                                data-log-run-id={trace.runId}
+                            >
+                                <button
+                                    type="button"
+                                    class={
+                                        isSelected && !isMobile
+                                            ? 'ag-list-item ag-list-item-active'
+                                            : 'ag-list-item'
+                                    }
+                                    aria-expanded={hasSteps ? isStepsExpanded : undefined}
+                                    data-log-run-item={trace.runId}
+                                    onClick={() => handleClickRunItem(trace)}
                                 >
-                                    <button
-                                        type="button"
-                                        class={
-                                            isSelected && !isMobile
-                                                ? 'ag-list-item ag-list-item-active'
-                                                : 'ag-list-item'
-                                        }
-                                        data-log-run-item={trace.runId}
-                                        onClick={() => handleSelectRun(trace.runId, null)}
+                                    <div
+                                        class="ag-row"
+                                        style={{ justifyContent: 'space-between', gap: '6px' }}
                                     >
-                                        <div
-                                            class="ag-row"
-                                            style={{ justifyContent: 'space-between', gap: '6px' }}
+                                        <span
+                                            class="ag-list-item-title"
+                                            style={{
+                                                minWidth: 0,
+                                                overflow: 'hidden',
+                                                textOverflow: 'ellipsis',
+                                                whiteSpace: 'nowrap',
+                                            }}
                                         >
-                                            <span
-                                                class="ag-list-item-title"
-                                                style={{
-                                                    minWidth: 0,
-                                                    overflow: 'hidden',
-                                                    textOverflow: 'ellipsis',
-                                                    whiteSpace: 'nowrap',
-                                                }}
-                                            >
-                                                #{trace.target.messageId}#{trace.target.swipeId} ·{' '}
-                                                {trace.agentName}
-                                            </span>
-                                            <span style={{ flexShrink: 0 }}>
-                                                {isScriptTrace ? (
-                                                    <Badge tone="neutral">脚本</Badge>
-                                                ) : (
-                                                    <Badge tone={hitRate >= 70 ? 'success' : 'neutral'}>
-                                                        {hitRate.toFixed(1)}% 命中
-                                                    </Badge>
-                                                )}
-                                            </span>
-                                        </div>
-                                        <div class="ag-list-item-meta">
-                                            <span class="ag-row" style={{ gap: '4px' }}>
-                                                <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
+                                            #{trace.target.messageId}#{trace.target.swipeId} ·{' '}
+                                            {trace.agentName}
+                                        </span>
+                                        <span style={{ flexShrink: 0 }}>
+                                            {isScriptTrace ? (
+                                                <Badge tone="neutral">脚本</Badge>
+                                            ) : (
+                                                <Badge tone={hitRate >= 70 ? 'success' : 'neutral'}>
+                                                    {hitRate.toFixed(1)}% 命中
+                                                </Badge>
+                                            )}
+                                        </span>
+                                    </div>
+                                    <div class="ag-list-item-meta">
+                                        <span class="ag-row" style={{ gap: '4px', flexWrap: 'wrap' }}>
+                                            <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
+                                            {(trace.retryCount ?? 0) > 0 ? (
+                                                <Badge tone="warning">重试 {trace.retryCount} 次</Badge>
+                                            ) : null}
+                                            <span class="ag-log-run-steps-hint">
                                                 <span>
                                                     {isScriptTrace
                                                         ? trace.phase
                                                         : `${trace.phase} · ${trace.toolSteps.length} 步`}
                                                 </span>
-                                            </span>
-                                            <span class="ag-mono">
-                                                {formatDurationMs(trace.durationMs)}
-                                            </span>
-                                        </div>
-                                        {lorebookLabel ? (
-                                            <div
-                                                class="ag-row"
-                                                title={`世界书：${lorebookLabel}`}
-                                                style={{
-                                                    gap: '4px',
-                                                    fontSize: '11px',
-                                                    color: 'var(--muted-foreground)',
-                                                    minWidth: 0,
-                                                    marginTop: '2px',
-                                                }}
-                                            >
-                                                <span style={{ display: 'inline-flex', flexShrink: 0 }}>
-                                                    <IconBookOpen size={12} />
-                                                </span>
-                                                <span
-                                                    style={{
-                                                        overflow: 'hidden',
-                                                        textOverflow: 'ellipsis',
-                                                        whiteSpace: 'nowrap',
-                                                        minWidth: 0,
-                                                    }}
-                                                >
-                                                    {lorebookLabel}
-                                                </span>
-                                            </div>
-                                        ) : trace.triggerSource === 'preset' ? (
-                                            <div
-                                                style={{
-                                                    fontSize: '11px',
-                                                    color: 'var(--muted-foreground)',
-                                                    marginTop: '2px',
-                                                }}
-                                            >
-                                                来源：预设触发器
-                                            </div>
-                                        ) : null}
-                                    </button>
-
-                                    {trace.toolSteps.length > 0 ? (
-                                        <div class="ag-log-step-branch">
-                                            <button
-                                                type="button"
-                                                class="ag-log-steps-toggle"
-                                                aria-expanded={isStepsExpanded}
-                                                data-log-steps-toggle={trace.runId}
-                                                onClick={() => handleToggleRunSteps(trace.runId)}
-                                            >
-                                                <span class="ag-log-steps-toggle-main">
+                                                {hasSteps ? (
                                                     <span
                                                         class="ag-log-steps-chevron"
                                                         data-open={isStepsExpanded ? 'true' : 'false'}
                                                         aria-hidden="true"
                                                     >
-                                                        <IconChevronRight size={14} />
-                                                    </span>
-                                                    <span class="ag-log-steps-toggle-label">
-                                                        {isStepsExpanded
-                                                            ? `收起工具调用 (${trace.toolSteps.length})`
-                                                            : `展开 ${trace.toolSteps.length} 个工具调用`}
-                                                    </span>
-                                                </span>
-                                                {(matchedStepsCount > 0 || failedStepsCount > 0) ? (
-                                                    <span class="ag-log-steps-toggle-meta">
-                                                        {matchedStepsCount > 0 ? (
-                                                            <Badge tone="primary">
-                                                                命中 {matchedStepsCount}
-                                                            </Badge>
-                                                        ) : null}
-                                                        {failedStepsCount > 0 ? (
-                                                            <Badge tone="error">
-                                                                {failedStepsCount} 失败
-                                                            </Badge>
-                                                        ) : null}
+                                                        <IconChevronRight size={12} />
                                                     </span>
                                                 ) : null}
-                                            </button>
-
-                                            {isStepsExpanded ? (
-                                                <div
-                                                    class="ag-log-steps-list"
-                                                    data-log-steps-list={trace.runId}
-                                                >
-                                                    {trace.toolSteps.map((step, arrayIndex) => {
-                                                        const stepKey = getStepDomKey(step, arrayIndex);
-                                                        const stepSelected =
-                                                            isSelected && highlightedStepKey === stepKey;
-                                                        return (
-                                                            <button
-                                                                key={`${trace.runId}_${stepKey}`}
-                                                                type="button"
-                                                                class={
-                                                                    stepSelected && !isMobile
-                                                                        ? 'ag-log-step-item ag-log-step-item-active'
-                                                                        : 'ag-log-step-item'
-                                                                }
-                                                                data-log-step-btn={stepKey}
-                                                                data-log-step-index={step.stepIndex}
-                                                                title={buildStepTooltip(step)}
-                                                                onClick={() =>
-                                                                    handleSelectRun(trace.runId, stepKey)
-                                                                }
-                                                            >
-                                                                <span class="ag-mono ag-log-step-name">
-                                                                    #{step.stepIndex + 1} {step.toolName}
-                                                                </span>
-                                                                <span class="ag-log-step-meta">
-                                                                    <Badge tone={step.ok ? 'success' : 'error'}>
-                                                                        {step.ok ? 'OK' : 'ERR'}
-                                                                    </Badge>
-                                                                    <span class="ag-log-step-duration">
-                                                                        {formatDurationMs(step.durationMs)}
-                                                                    </span>
-                                                                </span>
-                                                            </button>
-                                                        );
-                                                    })}
-                                                </div>
-                                            ) : null}
+                                            </span>
+                                        </span>
+                                        <span class="ag-mono">
+                                            {formatDurationMs(trace.durationMs)}
+                                        </span>
+                                    </div>
+                                    {lorebookLabel ? (
+                                        <div
+                                            class="ag-row"
+                                            title={`世界书：${lorebookLabel}`}
+                                            style={{
+                                                gap: '4px',
+                                                fontSize: '11px',
+                                                color: 'var(--muted-foreground)',
+                                                minWidth: 0,
+                                                marginTop: '2px',
+                                            }}
+                                        >
+                                            <span style={{ display: 'inline-flex', flexShrink: 0 }}>
+                                                <IconBookOpen size={12} />
+                                            </span>
+                                            <span
+                                                style={{
+                                                    overflow: 'hidden',
+                                                    textOverflow: 'ellipsis',
+                                                    whiteSpace: 'nowrap',
+                                                    minWidth: 0,
+                                                }}
+                                            >
+                                                {lorebookLabel}
+                                            </span>
+                                        </div>
+                                    ) : trace.triggerSource === 'preset' ? (
+                                        <div
+                                            style={{
+                                                fontSize: '11px',
+                                                color: 'var(--muted-foreground)',
+                                                marginTop: '2px',
+                                            }}
+                                        >
+                                            来源：预设触发器
                                         </div>
                                     ) : null}
-                                </div>
-                            );
-                        })}
-                    </div>
-                );
-            })()}
+                                </button>
+
+                                {isStepsExpanded ? (
+                                    <div
+                                        class="ag-log-step-branch"
+                                        data-log-steps-list={trace.runId}
+                                    >
+                                        {trace.toolSteps.map((step, arrayIndex) => {
+                                            const stepKey = getStepDomKey(step, arrayIndex);
+                                            const stepSelected =
+                                                isSelected && highlightedStepKey === stepKey;
+                                            return (
+                                                <button
+                                                    key={`${trace.runId}_${stepKey}`}
+                                                    type="button"
+                                                    class={
+                                                        stepSelected && !isMobile
+                                                            ? 'ag-log-step-item ag-log-step-item-active'
+                                                            : 'ag-log-step-item'
+                                                    }
+                                                    data-log-step-btn={stepKey}
+                                                    data-log-step-index={step.stepIndex}
+                                                    title={buildStepTooltip(step)}
+                                                    onClick={() =>
+                                                        handleSelectStep(trace.runId, stepKey)
+                                                    }
+                                                >
+                                                    <span class="ag-mono ag-log-step-name">
+                                                        #{step.stepIndex + 1} {step.toolName}
+                                                    </span>
+                                                    <span class="ag-log-step-meta">
+                                                        <Badge tone={step.ok ? 'success' : 'error'}>
+                                                            {step.ok ? 'OK' : 'ERR'}
+                                                        </Badge>
+                                                        <span class="ag-log-step-duration">
+                                                            {formatDurationMs(step.durationMs)}
+                                                        </span>
+                                                    </span>
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                ) : null}
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
         </div>
     );
 
@@ -735,10 +768,28 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             durationMs: selectedTrace.durationMs,
             usage: selectedTrace.usage,
             toolSteps: selectedTrace.toolSteps,
+            ...(selectedTrace.retryCount !== undefined
+                ? { retryCount: selectedTrace.retryCount }
+                : {}),
+            ...(selectedTrace.roundMaxRetries !== undefined
+                ? { roundMaxRetries: selectedTrace.roundMaxRetries }
+                : {}),
+            ...(selectedTrace.retryEvents?.length
+                ? { retryEvents: selectedTrace.retryEvents }
+                : {}),
             outputPreview: selectedTrace.outputPreview,
             error: selectedTrace.error,
             requestSnapshot: selectedTrace.requestSnapshot,
         };
+
+        const isAfterTurnRerunnable = selectedTrace.phase === 'after_turn';
+        const isMainTurnResumable =
+            selectedTrace.phase === 'main_turn'
+            && selectedTrace.status === 'interrupted'
+            && Boolean(store.services.resumeTurn);
+        const isRerunningThis = rerunningRunId === selectedTrace.runId;
+        const isResumingThis = resumingRunId === selectedTrace.runId;
+        const rerunLabel = selectedTrace.triggerId ? '重试此触发器' : '重跑后置触发';
 
         return (
             <div
@@ -757,6 +808,11 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                 </div>
                                 <div class="ag-card-subtitle ag-row-wrap" style={{ marginTop: '4px' }}>
                                     <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
+                                    {(selectedTrace.retryCount ?? 0) > 0 ? (
+                                        <Badge tone="warning">
+                                            自动重试 {selectedTrace.retryCount} 次
+                                        </Badge>
+                                    ) : null}
                                     <Badge tone="primary">
                                         {selectedTrace.phase} ({getPhaseLabel(selectedTrace.phase)})
                                     </Badge>
@@ -786,6 +842,39 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                             </div>
 
                             <div class="ag-card-actions">
+                                {isAfterTurnRerunnable ? (
+                                    <Button
+                                        size="sm"
+                                        variant={
+                                            selectedTrace.status === 'error'
+                                            || selectedTrace.status === 'aborted'
+                                                ? 'primary'
+                                                : 'secondary'
+                                        }
+                                        icon={<IconRefresh size={14} />}
+                                        loading={isRerunningThis}
+                                        disabled={isRerunningThis}
+                                        ariaLabel={rerunLabel}
+                                        className="ag-log-rerun-btn"
+                                        onClick={() => void handleRerunTrace(selectedTrace)}
+                                    >
+                                        {isRerunningThis ? '重跑中...' : rerunLabel}
+                                    </Button>
+                                ) : null}
+                                {isMainTurnResumable ? (
+                                    <Button
+                                        size="sm"
+                                        variant="primary"
+                                        icon={<IconRefresh size={14} />}
+                                        loading={isResumingThis}
+                                        disabled={isResumingThis}
+                                        ariaLabel="继续生成"
+                                        className="ag-log-resume-btn"
+                                        onClick={() => void handleResumeTrace(selectedTrace)}
+                                    >
+                                        {isResumingThis ? '恢复中...' : '继续生成'}
+                                    </Button>
+                                ) : null}
                                 <SegmentedControl<DetailViewTab>
                                     ariaLabel="日志详情视图"
                                     value={detailTab}
@@ -889,14 +978,90 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                     {selectedTrace.error ? (
                         <div class="ag-banner ag-banner-error ag-row" style={{ alignItems: 'flex-start' }}>
                             <IconAlertTriangle size={16} />
-                            <div class="ag-mono" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                                {selectedTrace.error}
+                            <div class="ag-stack-v" style={{ gap: '4px', minWidth: 0 }}>
+                                <div class="ag-mono" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                                    {selectedTrace.error}
+                                </div>
+                                {!isScriptTrace && (selectedTrace.retryCount ?? 0) > 0 ? (
+                                    <div style={{ fontSize: '12px', opacity: 0.9 }}>
+                                        已自动重试 {selectedTrace.retryCount}
+                                        {selectedTrace.roundMaxRetries !== undefined
+                                            ? `/${selectedTrace.roundMaxRetries}`
+                                            : ''}
+                                        {' '}次后仍失败（可在「API 连接」中调整单拍自动重试次数
+                                        {isAfterTurnRerunnable
+                                            ? `，或点击上方「${rerunLabel}」手动重试`
+                                            : ''}
+                                        ）。
+                                    </div>
+                                ) : !isScriptTrace && selectedTrace.roundMaxRetries === 0 ? (
+                                    <div style={{ fontSize: '12px', opacity: 0.9 }}>
+                                        当前连接的单拍自动重试次数为 0，未执行自动重试。
+                                    </div>
+                                ) : null}
                             </div>
                         </div>
                     ) : null}
 
                     {detailTab === 'steps' ? (
                         <div class="ag-stack-v">
+                            {selectedTrace.retryEvents && selectedTrace.retryEvents.length > 0 ? (
+                                <div class="ag-card" data-log-retry-history={selectedTrace.runId}>
+                                    <div class="ag-card-header">
+                                        <span class="ag-card-title">
+                                            自动重试记录 ({selectedTrace.retryEvents.length})
+                                        </span>
+                                    </div>
+                                    <div class="ag-card-body ag-stack-v" style={{ gap: '8px' }}>
+                                        {selectedTrace.retryEvents.map((ev, idx) => (
+                                            <div
+                                                key={`${selectedTrace.runId}_retry_${ev.round}_${ev.attempt}_${idx}`}
+                                                class="ag-banner ag-banner-warning ag-stack-v"
+                                                style={{ gap: '4px' }}
+                                            >
+                                                <div
+                                                    class="ag-row-wrap"
+                                                    style={{ justifyContent: 'space-between', gap: '6px' }}
+                                                >
+                                                    <div class="ag-row-wrap" style={{ gap: '6px' }}>
+                                                        <Badge tone="neutral">Round #{ev.round}</Badge>
+                                                        <Badge tone="warning">
+                                                            第 {ev.attempt}/{ev.maxAttempts} 次
+                                                        </Badge>
+                                                        <span class="ag-mono" style={{ fontWeight: 600 }}>
+                                                            {ev.reason}
+                                                        </span>
+                                                        {ev.finishReason ? (
+                                                            <Badge tone="neutral">
+                                                                finish: {ev.finishReason}
+                                                            </Badge>
+                                                        ) : null}
+                                                        {ev.outputTokens !== undefined ? (
+                                                            <Badge tone="neutral">
+                                                                out: {formatTokenCount(ev.outputTokens)} tok
+                                                            </Badge>
+                                                        ) : null}
+                                                        {ev.hasReasoning ? (
+                                                            <Badge tone="primary">含思考内容</Badge>
+                                                        ) : null}
+                                                    </div>
+                                                    <span
+                                                        class="ag-mono"
+                                                        style={{
+                                                            fontSize: '11px',
+                                                            color: 'var(--muted-foreground)',
+                                                        }}
+                                                    >
+                                                        等待 {formatDurationMs(ev.delayMs)} ·{' '}
+                                                        {formatTimestamp(ev.timestamp)}
+                                                    </span>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            ) : null}
+
                             {selectedTrace.toolSteps.length === 0 ? (
                                 <div class="ag-banner ag-banner-neutral">
                                     {isScriptTrace

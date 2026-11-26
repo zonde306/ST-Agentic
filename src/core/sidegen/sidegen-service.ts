@@ -13,13 +13,20 @@ import {
     selectPresetBlocksForContext,
 } from '@/core/config';
 import {
-    buildSideGenMacroOverrides,
+    type RegexSource,
     type Layer1TurnGroup,
     TrajectoryStore,
+    applyIngestRegexText,
+    buildSideGenMacroOverrides,
     estimateRequestTokens,
     groupLayer1Turns,
     renderPromptBlocks,
 } from '@/core/context';
+import {
+    RegexPipeline,
+    applyRegexRulesWithReport,
+    type RegexSender,
+} from '@/core/regex';
 import {
     LLMTransportError,
     ROUND_RETRY_ERROR_CODES,
@@ -95,6 +102,7 @@ export interface SideGenServiceOptions {
     getDefaultConnectionId?: () => string;
     getSettings?: () => Settings | undefined;
     resolveConnection?: (connectionId: string) => ApiConnection | undefined;
+    regexPipeline?: RegexPipeline | (() => RegexSource | undefined);
     defaultDelivery?: SideClueDelivery;
     defaultWatermark?: { high: number; low: number };
     summarizeCompaction?: SideCompactionSummarizer;
@@ -453,6 +461,7 @@ export class SideGenService implements ToolSideGenApi {
     private readonly getDefaultConnectionIdFn?: () => string;
     private readonly getSettingsFn?: () => Settings | undefined;
     private readonly resolveConnectionFn?: (connectionId: string) => ApiConnection | undefined;
+    private readonly regexProvider?: RegexPipeline | (() => RegexSource | undefined);
     private readonly defaultWatermark: { high: number; low: number };
     private readonly summarizeCompactionFn?: SideCompactionSummarizer;
     private readonly roundRetryOptions?: SideGenRoundRetryOptions;
@@ -493,6 +502,7 @@ export class SideGenService implements ToolSideGenApi {
         this.getDefaultConnectionIdFn = options.getDefaultConnectionId;
         this.getSettingsFn = options.getSettings;
         this.resolveConnectionFn = options.resolveConnection;
+        this.regexProvider = options.regexPipeline;
         this.defaultWatermark = normalizeWatermark(
             options.defaultWatermark,
             { ...DEFAULT_SIDE_SESSION_WATERMARK },
@@ -568,9 +578,10 @@ export class SideGenService implements ToolSideGenApi {
             throwIfAborted(signal, 'SideGen runOnce aborted before request');
 
             const { connectionId, connection } = this.resolveRequestConnection(opts.connectionId);
+            const ingestedPrompt = this.applyIngestRegex(opts.prompt, 'user');
             const presetPrompts = await this.resolvePresetPromptMessages('once', startAnchor, {
                 historyMessages: [],
-                currentPrompt: opts.prompt,
+                currentPrompt: ingestedPrompt,
                 generationType: 'quiet',
                 connection,
             });
@@ -586,7 +597,7 @@ export class SideGenService implements ToolSideGenApi {
             }
 
             const userContent = this.composeUserContent(
-                opts.prompt,
+                ingestedPrompt,
                 opts.mainChatDepth,
                 opts.includeVars,
                 startAnchor,
@@ -610,16 +621,19 @@ export class SideGenService implements ToolSideGenApi {
                 throw createAbortError('SideGen runOnce aborted: active chat changed');
             }
 
+            const ingestedText = this.applyIngestRegex(turnResult.text, 'assistant');
+            const displayText = this.applyDisplayRegex(turnResult.text, 'assistant');
+
             let bridgedPath: string | undefined;
             if (opts.bridge) {
                 this.assertAnchorUnchanged(startAnchor, 'runOnce bridge commit');
                 const written = await this.clues.write({
                     path: opts.bridge.path,
-                    body: turnResult.text,
+                    body: ingestedText,
                     delivery: opts.bridge.delivery,
                     title: opts.bridge.title,
                     keywords: opts.bridge.keywords,
-                    summary: opts.bridge.summary ?? deriveCompactSummary(turnResult.text),
+                    summary: opts.bridge.summary ?? deriveCompactSummary(ingestedText),
                     anchor: toBranchKey(startAnchor),
                     target: startAnchor,
                 });
@@ -635,12 +649,12 @@ export class SideGenService implements ToolSideGenApi {
                 startedAt,
                 durationMs,
                 usage: turnResult.usage,
-                outputPreview: turnResult.text.slice(0, 200),
+                outputPreview: displayText.slice(0, 200),
                 request: turnResult.request,
             });
 
             return {
-                text: turnResult.text,
+                text: displayText,
                 ...(bridgedPath ? { bridgedPath } : {}),
                 usage: {
                     inputTokens: turnResult.usage.inputTokens,
@@ -743,6 +757,7 @@ export class SideGenService implements ToolSideGenApi {
             const { connectionId, connection } = this.resolveRequestConnection(
                 opts.connectionId ?? session.connectionId,
             );
+            const ingestedPrompt = this.applyIngestRegex(prompt, 'user');
             const hasFrozenPrefix = Boolean(this.trajectoryStore.getFrozenPrefix(threadId));
             const layer1Messages = this.trajectoryStore
                 .getMessages(threadId)
@@ -750,7 +765,7 @@ export class SideGenService implements ToolSideGenApi {
             const presetPrompts = await this.resolvePresetPromptMessages('session', startAnchor, {
                 skipPrefix: hasFrozenPrefix,
                 historyMessages: layer1Messages,
-                currentPrompt: prompt,
+                currentPrompt: ingestedPrompt,
                 generationType: 'normal',
                 connection,
             });
@@ -763,7 +778,7 @@ export class SideGenService implements ToolSideGenApi {
             );
 
             const userContent = this.composeUserContent(
-                prompt,
+                ingestedPrompt,
                 opts.mainChatDepth,
                 opts.includeVars,
                 startAnchor,
@@ -807,10 +822,13 @@ export class SideGenService implements ToolSideGenApi {
                 throw createAbortError(`SideGen send(${sessionId}) aborted: session was deleted`);
             }
 
+            const ingestedText = this.applyIngestRegex(turnResult.text, 'assistant');
+            const displayText = this.applyDisplayRegex(turnResult.text, 'assistant');
+
             // Persist clean unwrapped assistant message (zero `finish_turn` pseudo tool-calls/results).
             const assistantMessage: CanonicalMessage = {
                 role: 'assistant',
-                content: turnResult.text,
+                content: ingestedText,
                 ...(turnResult.reasoningContent
                     ? { reasoningContent: turnResult.reasoningContent }
                     : {}),
@@ -864,8 +882,8 @@ export class SideGenService implements ToolSideGenApi {
             if (updatedConfig.autoBridge) {
                 bridgedPath = await this.applyAutoBridge(
                     updatedConfig,
-                    prompt,
-                    turnResult.text,
+                    ingestedPrompt,
+                    ingestedText,
                     startAnchor,
                 );
             }
@@ -880,12 +898,12 @@ export class SideGenService implements ToolSideGenApi {
                 startedAt,
                 durationMs,
                 usage: turnResult.usage,
-                outputPreview: turnResult.text.slice(0, 200),
+                outputPreview: displayText.slice(0, 200),
                 request: turnResult.request,
             });
 
             return {
-                text: turnResult.text,
+                text: displayText,
                 sessionId: updatedConfig.id,
                 ...(bridgedPath ? { bridgedPath } : {}),
                 usage: {
@@ -1673,11 +1691,53 @@ export class SideGenService implements ToolSideGenApi {
         }
 
         const lines = tail.map((msg) => {
+            const sender: Extract<RegexSender, 'user' | 'assistant'> = msg.isUser
+                ? 'user'
+                : 'assistant';
             const roleLabel = msg.isUser ? 'User' : 'Assistant';
             const speaker = msg.name?.trim() ? `${roleLabel} (${msg.name.trim()})` : roleLabel;
-            return `[#${msg.id} ${speaker}]: ${msg.mes}`;
+            const cleanedMes = this.applyIngestRegex(msg.mes ?? '', sender);
+            return `[#${msg.id} ${speaker}]: ${cleanedMes}`;
         });
         return `<main-chat-context>\n${lines.join('\n')}\n</main-chat-context>`;
+    }
+
+    private resolveRegexSource(): RegexSource | undefined {
+        if (typeof this.regexProvider === 'function') {
+            return this.regexProvider();
+        }
+        if (this.regexProvider !== undefined) {
+            return this.regexProvider;
+        }
+        const settings = this.getSettingsFn?.();
+        return settings ? resolveActivePreset(settings).regexRules : undefined;
+    }
+
+    private applyIngestRegex(
+        text: string,
+        sender: Extract<RegexSender, 'user' | 'assistant'>,
+    ): string {
+        return applyIngestRegexText(text, sender, this.resolveRegexSource());
+    }
+
+    private applyDisplayRegex(
+        text: string,
+        sender: Extract<RegexSender, 'user' | 'assistant'>,
+    ): string {
+        if (!text) {
+            return text;
+        }
+        const regex = this.resolveRegexSource();
+        if (!regex) {
+            return text;
+        }
+        const report = regex instanceof RegexPipeline
+            ? regex.runWithReport(text, { stage: 'display', sender })
+            : applyRegexRulesWithReport(text, regex, { stage: 'display', sender });
+        if (report.appliedRuleIds.length === 0) {
+            return text;
+        }
+        return this.bridge.substituteMacros(report.output);
     }
 
     private readVarsObject(anchor: MessageTarget): Record<string, unknown> {

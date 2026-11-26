@@ -588,4 +588,155 @@ describe('ContextAssembler', () => {
         );
         expect(turn2.layer2Messages[0].content).toContain('DYN=VISIBLE');
     });
+
+    it('applies ingest regex once to /output.md and reply view tool-call payloads in finalizeTurn without touching non-output paths or mutating frozen history', () => {
+        const store = new TrajectoryStore();
+        const assembler = new ContextAssembler();
+        const rules: RegexRule[] = [
+            {
+                id: 'strip_status_ingest',
+                name: 'Strip assistant status comments',
+                pattern: '/<!--\\s*status:[\\s\\S]*?-->/g',
+                replace: '',
+                stage: 'ingest',
+                applyToUser: false,
+                applyToAssistant: true,
+                enabled: true,
+            },
+            {
+                id: 'display_only_rule',
+                name: 'Display rule must not run on Layer 1',
+                pattern: '/<think>([\\s\\S]*?)<\\/think>/g',
+                replace: '[collapsed:$1]',
+                stage: 'display',
+                applyToUser: true,
+                applyToAssistant: true,
+                enabled: true,
+            },
+            {
+                id: 'lore_only_rule',
+                name: 'Lore rule must not run on Layer 1',
+                pattern: '码头',
+                replace: 'LORE_MASKED',
+                stage: 'lore_read',
+                applyToUser: true,
+                applyToAssistant: true,
+                enabled: true,
+            },
+        ];
+        const regex = new RegexPipeline(rules);
+
+        const turnMessages = [
+            { role: 'user' as const, content: '继续观察码头。' },
+            {
+                role: 'assistant' as const,
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'tc_write_output',
+                        name: 'write_file',
+                        arguments: JSON.stringify({
+                            path: '/output.md',
+                            content: '<think>推理</think>码头夜色渐深。<!-- status: hp=90 -->',
+                        }),
+                    },
+                    {
+                        id: 'tc_append_output',
+                        name: 'append_file',
+                        arguments: JSON.stringify({
+                            path: 'output.md',
+                            content: '追加正文<!-- status: phase=2 -->',
+                        }),
+                    },
+                    {
+                        id: 'tc_edit_output',
+                        name: 'edit_file',
+                        arguments: JSON.stringify({
+                            path: '/output.md',
+                            search: '码头夜色渐深。<!-- status: hp=90 -->',
+                            replace: '码头雾气弥漫。<!-- status: hp=85 -->',
+                            edits: [
+                                {
+                                    search: '旧句<!-- status: old -->',
+                                    replace: '新句<!-- status: new -->',
+                                },
+                            ],
+                        }),
+                    },
+                    {
+                        id: 'tc_write_notes',
+                        name: 'write_file',
+                        arguments: JSON.stringify({
+                            path: '/memory/notes.md',
+                            content: '笔记保留<!-- status: keep -->',
+                        }),
+                    },
+                    {
+                        id: 'tc_append_view',
+                        name: 'append_reply_view',
+                        arguments: JSON.stringify({
+                            text: '卡片正文<!-- status: card -->',
+                        }),
+                    },
+                ],
+            },
+        ];
+
+        assembler.finalizeTurn({
+            trajectoryStore: store,
+            agentId: 'main',
+            target: { messageId: 1, swipeId: 0 },
+            turnMessages,
+            finalAssistantMessage: {
+                role: 'assistant',
+                content: '已完成写作。<!-- status: done -->',
+            },
+            regex,
+        });
+
+        const frozen = store.getMessages('main');
+        expect(frozen).toHaveLength(3);
+        const toolCalls = frozen[1].toolCalls!;
+        expect(JSON.parse(toolCalls[0].arguments)).toEqual({
+            path: '/output.md',
+            content: '<think>推理</think>码头夜色渐深。',
+        });
+        expect(JSON.parse(toolCalls[1].arguments)).toEqual({
+            path: 'output.md',
+            content: '追加正文',
+        });
+        expect(JSON.parse(toolCalls[2].arguments)).toEqual({
+            path: '/output.md',
+            search: '码头夜色渐深。',
+            replace: '码头雾气弥漫。',
+            edits: [{ search: '旧句', replace: '新句' }],
+        });
+        // Non-/output.md path stays untouched
+        expect(JSON.parse(toolCalls[3].arguments)).toEqual({
+            path: '/memory/notes.md',
+            content: '笔记保留<!-- status: keep -->',
+        });
+        expect(JSON.parse(toolCalls[4].arguments)).toEqual({
+            text: '卡片正文',
+        });
+        expect(frozen[2].content).toBe('已完成写作。');
+
+        // Late ingest rules MUST NOT retroactively mutate already-frozen Layer 1 tool arguments
+        regex.setRules([
+            ...rules,
+            {
+                id: 'late_strip',
+                name: 'Late mask',
+                pattern: '码头',
+                replace: 'REDACTED',
+                stage: 'ingest',
+                applyToUser: true,
+                applyToAssistant: true,
+                enabled: true,
+            },
+        ]);
+        expect(JSON.parse(store.getMessages('main')[1].toolCalls![0].arguments).content).toBe(
+            '<think>推理</think>码头夜色渐深。',
+        );
+    });
 });

@@ -29,6 +29,20 @@ export type AgentRunStatus = 'running' | 'completed' | 'interrupted' | 'aborted'
 
 export type OffMainlineRunKind = 'assistant' | 'sidegen_once' | 'sidegen_session';
 
+export interface RoundRetryLog {
+    /** 1-based LLM round index within the run (`roundsCompleted + 1`). */
+    round: number;
+    /** 1-based retry attempt within that round (`1..maxAttempts`). */
+    attempt: number;
+    maxAttempts: number;
+    reason: string;
+    delayMs: number;
+    timestamp: number;
+    finishReason?: string;
+    outputTokens?: number;
+    hasReasoning?: boolean;
+}
+
 export interface AgentRunTrace {
     runId: string;
     target: MessageTarget;
@@ -47,6 +61,9 @@ export interface AgentRunTrace {
     durationMs: number;
     usage: TokenUsage;
     toolSteps: ToolStepLog[];
+    retryCount?: number;
+    roundMaxRetries?: number;
+    retryEvents?: RoundRetryLog[];
     outputPreview?: string;
     interruptedReason?: InterruptedReason;
     error?: string;

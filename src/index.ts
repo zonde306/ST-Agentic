@@ -1375,9 +1375,15 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             getAppStore()?.setTraces([]);
         },
 
-        async rerunAfterTurn(targetInput?: MessageTarget): Promise<void> {
+        async rerunAfterTurn(
+            targetInput?: MessageTarget,
+            options?: { triggerIds?: string[] },
+        ): Promise<void> {
             const target = resolveTarget(targetInput);
-            const handles = await orchestrator.rerunAfterTurn(target);
+            const handles = await orchestrator.rerunAfterTurn(
+                target,
+                options?.triggerIds?.length ? { triggerIds: options.triggerIds } : {},
+            );
             const storeUi = getAppStore();
             storeUi?.setBackgroundTasks(barrierCoordinator.listTasks());
             await Promise.allSettled(handles.map((handle) => handle.promise));
@@ -2060,6 +2066,7 @@ jQuery(async () => {
             trajectoryStore,
             dataStore: store,
             vfs,
+            regexPipeline,
             getDefaultConnectionId: () => currentSettings.currentConnectionId,
             getSettings: () => currentSettings,
             resolveConnection: resolveConnectionById,
@@ -2774,8 +2781,8 @@ jQuery(async () => {
                 appStore?.closeConsole();
             },
             runTurn: (input) => orchestrator.runTurn(input),
-            rerunAfterTurn: async (target) => {
-                await uiServices.rerunAfterTurn(target);
+            rerunAfterTurn: async (target, options) => {
+                await uiServices.rerunAfterTurn(target, options);
             },
             sideGen: sideGenApi,
             assistant: publicAssistantApi,

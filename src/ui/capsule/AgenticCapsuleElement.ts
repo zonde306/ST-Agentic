@@ -1141,6 +1141,9 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
             }
 
             if (event.kind === 'turn_retrying') {
+                if (event.phase === 'after_turn' || event.phase === 'maintenance') {
+                    return;
+                }
                 this.setState({
                     status: 'retrying',
                     retryAttempt: event.retryAttempt ?? 1,
@@ -1202,7 +1205,10 @@ export class AgenticCapsuleElement extends BaseHTMLElement {
                 } else if (mainTrace.status === 'interrupted') {
                     derivedStatus = 'interrupted';
                 } else if (hasActiveTasks) {
-                    derivedStatus = 'background-running';
+                    derivedStatus =
+                        this._state.status === 'retrying' && mainTrace.status === 'running'
+                            ? 'retrying'
+                            : 'background-running';
                 } else if (mainTrace.status === 'completed') {
                     derivedStatus = 'done';
                 } else if (

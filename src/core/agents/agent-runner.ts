@@ -86,6 +86,7 @@ import type {
     RadarScanResult,
     RawLoreEntry,
     RegexRule,
+    RoundRetryLog,
     ScopedPermissions,
     Settings,
     TokenUsage,
@@ -295,6 +296,7 @@ export interface AgentRunInput {
     onReasoningDelta?: (delta: string) => void;
     onToolStart?: (step: ToolStepLog) => void;
     onToolComplete?: (step: ToolStepLog) => void;
+    onRetrying?: (info: RoundRetryLog) => void;
 }
 
 export interface AgentRunResult {
@@ -1181,7 +1183,14 @@ export class AgentRunner {
                 ? this.snapshotRecentChat(target, input.phase, agent.ephemeralWindowSize)
                 : undefined);
 
+        const maxRoundRetries = Math.max(0, Math.floor(connection.roundMaxRetries ?? 2));
         const toolSteps: ToolStepLog[] = [];
+        const retryEvents: RoundRetryLog[] = [];
+        const buildTraceRetryFields = () => ({
+            retryCount: retryEvents.length,
+            roundMaxRetries: maxRoundRetries,
+            ...(retryEvents.length > 0 ? { retryEvents: canonicalClone(retryEvents) } : {}),
+        });
         let cumulativeUsage: TokenUsage = {
             inputTokens: 0,
             cachedTokens: 0,
@@ -1228,6 +1237,7 @@ export class AgentRunner {
                 durationMs: 0,
                 usage: { ...cumulativeUsage },
                 toolSteps: [],
+                ...buildTraceRetryFields(),
             },
             false,
         );
@@ -1308,6 +1318,7 @@ export class AgentRunner {
                     durationMs: Math.max(0, endedAt - startedAt),
                     usage: cumulativeUsage,
                     toolSteps: canonicalClone(toolSteps),
+                    ...buildTraceRetryFields(),
                     ...(lastContent ? { outputPreview: lastContent.slice(0, 240) } : {}),
                     ...(lastReasoning && !lastContent
                         ? { outputPreview: lastReasoning.slice(0, 240) }
@@ -1405,6 +1416,7 @@ export class AgentRunner {
                     durationMs: Math.max(0, endedAt - startedAt),
                     usage: cumulativeUsage,
                     toolSteps: canonicalClone(toolSteps),
+                    ...buildTraceRetryFields(),
                     ...(currentOutput
                         ? { outputPreview: currentOutput.slice(0, 240) }
                         : lastContent
@@ -1838,7 +1850,6 @@ export class AgentRunner {
             const maxToolRounds = hasToolRoundLimit
                 ? Math.floor(agent.maxToolRounds)
                 : Number.POSITIVE_INFINITY;
-            const maxRoundRetries = Math.max(0, Math.floor(connection.roundMaxRetries ?? 2));
             let toolRoundsExecuted = 0;
             let emptyOutputRetried = false;
             let overflowRecoveryAttempted = false;
@@ -1972,6 +1983,7 @@ export class AgentRunner {
                         durationMs: Math.max(0, endedAt - startedAt),
                         usage: cumulativeUsage,
                         toolSteps: canonicalClone(toolSteps),
+                        ...buildTraceRetryFields(),
                         outputPreview: params.finalContent.slice(0, 240),
                         requestSnapshot: lastRequestSnapshot,
                     },
@@ -2023,7 +2035,11 @@ export class AgentRunner {
                         durationMs: Math.max(0, endedAt - startedAt),
                         usage: cumulativeUsage,
                         toolSteps: canonicalClone(toolSteps),
+                        ...buildTraceRetryFields(),
                         ...(lastContent ? { outputPreview: lastContent.slice(0, 240) } : {}),
+                        ...(lastReasoning && !lastContent
+                            ? { outputPreview: lastReasoning.slice(0, 240) }
+                            : {}),
                         error: errorMessage,
                         requestSnapshot: lastRequestSnapshot,
                     },
@@ -2072,6 +2088,14 @@ export class AgentRunner {
                             }
                             : undefined;
 
+                    let lastAttemptDiag:
+                        | {
+                              finishReason?: string;
+                              outputTokens?: number;
+                              hasReasoning?: boolean;
+                          }
+                        | undefined;
+
                     try {
                         turnOutput = await this.invokeLLM({
                             request: llmRequest,
@@ -2087,15 +2111,37 @@ export class AgentRunner {
                             onToolCallDelta,
                         });
 
+                        lastAttemptDiag = {
+                            ...(turnOutput.finishReason
+                                ? { finishReason: turnOutput.finishReason }
+                                : {}),
+                            ...(turnOutput.usage.outputTokens > 0
+                                ? { outputTokens: turnOutput.usage.outputTokens }
+                                : {}),
+                            ...(turnOutput.reasoningContent?.trim()
+                                ? { hasReasoning: true }
+                                : {}),
+                        };
+
                         if (!isLengthFinishReason(turnOutput.finishReason)) {
                             if (turnOutput.toolCalls.length === 0 && !turnOutput.content.trim()) {
-                                throw new LLMTransportError(
-                                    'Model returned an empty response with no tool calls.',
-                                    {
-                                        code: ROUND_RETRY_ERROR_CODES.EMPTY_RESPONSE,
-                                        retryable: true,
-                                    },
-                                );
+                                const allowSilentSideEffectFinish =
+                                    !strictToolLoop
+                                    && !isMainOutputMode
+                                    && input.phase !== 'main_turn'
+                                    && hasWriteToolExecuted;
+                                if (!allowSilentSideEffectFinish) {
+                                    if (turnOutput.reasoningContent?.trim()) {
+                                        lastReasoning = turnOutput.reasoningContent;
+                                    }
+                                    throw new LLMTransportError(
+                                        'Model returned an empty response with no tool calls.',
+                                        {
+                                            code: ROUND_RETRY_ERROR_CODES.EMPTY_RESPONSE,
+                                            retryable: true,
+                                        },
+                                    );
+                                }
                             }
                             if (
                                 llmRequest.toolChoice?.mode === 'required'
@@ -2177,6 +2223,45 @@ export class AgentRunner {
                                 jitterRatio: 0.25,
                             });
                             const retryReason = formatRoundRetryReason(error);
+                            const retryTimestamp = Date.now();
+                            const retryEntry: RoundRetryLog = {
+                                round: roundsCompleted + 1,
+                                attempt: roundRetriesUsed,
+                                maxAttempts: maxRoundRetries,
+                                reason: retryReason,
+                                delayMs: retryDelayMs,
+                                timestamp: retryTimestamp,
+                                ...(lastAttemptDiag?.finishReason
+                                    ? { finishReason: lastAttemptDiag.finishReason }
+                                    : {}),
+                                ...(lastAttemptDiag?.outputTokens !== undefined
+                                    ? { outputTokens: lastAttemptDiag.outputTokens }
+                                    : {}),
+                                ...(lastAttemptDiag?.hasReasoning
+                                    ? { hasReasoning: true }
+                                    : {}),
+                            };
+                            retryEvents.push(retryEntry);
+
+                            this.traceLogger.recordTrace(
+                                {
+                                    runId,
+                                    target: { ...target },
+                                    phase: input.phase,
+                                    agentProfileId: agent.id,
+                                    agentName: agent.name,
+                                    ...traceTriggerMeta,
+                                    connectionId: connection.id,
+                                    model: connection.model,
+                                    status: 'running',
+                                    startedAt,
+                                    durationMs: Math.max(0, retryTimestamp - startedAt),
+                                    usage: cumulativeUsage,
+                                    toolSteps: canonicalClone(toolSteps),
+                                    ...buildTraceRetryFields(),
+                                },
+                                false,
+                            );
 
                             if (extractor) {
                                 const committedOutput = await readCurrentOutputSafe();
@@ -2197,7 +2282,7 @@ export class AgentRunner {
                             this.traceLogger.emit({
                                 kind: 'turn_retrying',
                                 target: { ...target },
-                                timestamp: Date.now(),
+                                timestamp: retryTimestamp,
                                 phase: input.phase,
                                 runId,
                                 agentProfileId: agent.id,
@@ -2206,6 +2291,7 @@ export class AgentRunner {
                                 retryDelayMs,
                                 retryReason,
                             });
+                            input.onRetrying?.(canonicalClone(retryEntry));
 
                             await delayWithAbort(retryDelayMs, signal);
                             continue;
@@ -2515,6 +2601,11 @@ export class AgentRunner {
                             extractor.markToolExecuted(currentOut);
                         }
 
+                        if (!READ_ONLY_TOOL_NAMES.has(toolCall.name) && execResult.ok) {
+                            hasWriteToolExecuted = true;
+                            roundHadSuccessfulWrite = true;
+                        }
+
                         if (strictToolLoop) {
                             if (READ_ONLY_TOOL_NAMES.has(toolCall.name)) {
                                 const signature = buildToolCallSignature(
@@ -2532,10 +2623,6 @@ export class AgentRunner {
                                 }
                             } else {
                                 roundAllDuplicateReadOnly = false;
-                                if (execResult.ok) {
-                                    hasWriteToolExecuted = true;
-                                    roundHadSuccessfulWrite = true;
-                                }
                             }
                         }
                     }

@@ -65,6 +65,7 @@ import type {
     Preset,
     RawLoreEntry,
     RegexRule,
+    RoundRetryLog,
     ScopedPermissions,
     Settings,
     ToolStepLog,
@@ -890,19 +891,31 @@ export class PipelineOrchestrator {
 
     /**
      * Manually re-run `after_turn` triggers for a specific `(messageId, swipeId)` target.
+     * When `options.triggerIds` is provided, only those trigger rule IDs are re-dispatched
+     * without aborting unrelated sibling tasks on the same floor.
      */
     async rerunAfterTurn(
         targetInput: MessageTarget,
-        options: { turnNumber?: number; signal?: AbortSignal } = {},
+        options: { turnNumber?: number; triggerIds?: readonly string[]; signal?: AbortSignal } = {},
     ): Promise<DispatchedTaskHandle<TriggerExecutionResult>[]> {
         const target = freezeTarget(targetInput);
         if (options.signal) {
             throwIfAborted(options.signal);
         }
 
-        // Abort any stuck after_turn tasks for this exact target and clear pending staging.
-        this.barrierCoordinator.abortTarget(target, 'Manual rerun of after_turn');
-        this.store.rollbackStagedData(target);
+        const requestedTriggerIds = (options.triggerIds ?? [])
+            .map((id) => id.trim())
+            .filter(Boolean);
+        const onlyTriggerIds =
+            requestedTriggerIds.length > 0 ? new Set(requestedTriggerIds) : undefined;
+
+        if (!onlyTriggerIds) {
+            // Full floor rerun aborts any stuck after_turn tasks for this exact target and clears pending staging.
+            this.barrierCoordinator.abortTarget(target, 'Manual rerun of after_turn');
+            this.store.rollbackStagedData(target);
+        } else if (!this.barrierCoordinator.hasActiveTasksForTarget(target)) {
+            this.store.rollbackStagedData(target);
+        }
 
         const settings = this.settingsProvider();
         const preset = resolveActivePreset(settings);
@@ -930,6 +943,7 @@ export class PipelineOrchestrator {
             loreEntries,
             subAgents: compiled.subAgents,
             globalVarSchema,
+            ...(onlyTriggerIds ? { onlyTriggerIds } : {}),
             signal: options.signal,
         });
     }
@@ -1142,6 +1156,42 @@ export class PipelineOrchestrator {
         }
     }
 
+    private async matchAfterTurnBatch(
+        ruleBatch: readonly TriggerRule[],
+        context: {
+            target: MessageTarget;
+            turnNumber: number;
+            scanText: string;
+            signal: AbortSignal;
+            staged: boolean;
+            injectionSession?: PromptInjectionSession;
+            onlyTriggerIds?: ReadonlySet<string>;
+        },
+    ): Promise<{
+        matchedRules: TriggerRule[];
+        matchOverridesByRuleId: Map<string, Record<string, string>>;
+    }> {
+        const matchedRules: TriggerRule[] = [];
+        const matchOverridesByRuleId = new Map<string, Record<string, string>>();
+        for (const rule of ruleBatch) {
+            const evaluated = await this.evaluateCondition(rule, {
+                target: context.target,
+                turnNumber: context.turnNumber,
+                scanText: context.scanText,
+                signal: context.signal,
+                staged: context.staged,
+                injectionSession: context.injectionSession,
+            });
+            if (evaluated.matched || context.onlyTriggerIds?.has(rule.id)) {
+                matchedRules.push(rule);
+                if (evaluated.matchOverrides) {
+                    matchOverridesByRuleId.set(rule.id, evaluated.matchOverrides);
+                }
+            }
+        }
+        return { matchedRules, matchOverridesByRuleId };
+    }
+
     private async dispatchAfterTurnUnits(params: {
         target: MessageTarget;
         turnNumber: number;
@@ -1155,9 +1205,15 @@ export class PipelineOrchestrator {
         subAgents: readonly SubAgentDescriptor[];
         globalVarSchema?: z.ZodTypeAny;
         injectionSession?: PromptInjectionSession;
+        onlyTriggerIds?: ReadonlySet<string>;
         signal?: AbortSignal;
     }): Promise<DispatchedTaskHandle<TriggerExecutionResult>[]> {
-        const afterRules = params.allTriggers.filter((t) => t.phase === 'after_turn' && t.enabled);
+        const afterRules = params.allTriggers.filter(
+            (t) =>
+                t.phase === 'after_turn'
+                && t.enabled
+                && (!params.onlyTriggerIds || params.onlyTriggerIds.has(t.id)),
+        );
         if (afterRules.length === 0) {
             return [];
         }
@@ -1174,24 +1230,18 @@ export class PipelineOrchestrator {
             const waitBeforeBatch = prevTurnOrderPromise ?? (batchHasIf ? prevAnyOrderPromise : undefined);
 
             if (batchIdx === 0 || !waitBeforeBatch) {
-                const matchedRules: TriggerRule[] = [];
-                const matchOverridesByRuleId = new Map<string, Record<string, string>>();
-                for (const rule of ruleBatch) {
-                    const evaluated = await this.evaluateCondition(rule, {
+                const { matchedRules, matchOverridesByRuleId } = await this.matchAfterTurnBatch(
+                    ruleBatch,
+                    {
                         target: params.target,
                         turnNumber: params.turnNumber,
                         scanText,
                         signal: params.signal ?? new AbortController().signal,
                         staged: false,
                         injectionSession: params.injectionSession,
-                    });
-                    if (evaluated.matched) {
-                        matchedRules.push(rule);
-                        if (evaluated.matchOverrides) {
-                            matchOverridesByRuleId.set(rule.id, evaluated.matchOverrides);
-                        }
-                    }
-                }
+                        onlyTriggerIds: params.onlyTriggerIds,
+                    },
+                );
                 if (matchedRules.length === 0) {
                     continue;
                 }
@@ -1234,6 +1284,14 @@ export class PipelineOrchestrator {
                                 staged: true,
                                 injectionSession: params.injectionSession,
                                 matchOverrides: unitOverrides,
+                                onToolStart: (step) => {
+                                    taskCtx.setCurrentStep(`${unit.label} · ${step.toolName}`);
+                                },
+                                onRetrying: (info) => {
+                                    taskCtx.setCurrentStep(
+                                        `${unit.label} · 自动重试 (${info.attempt}/${info.maxAttempts}): ${info.reason}`,
+                                    );
+                                },
                                 signal: taskCtx.signal,
                             });
 
@@ -1274,24 +1332,16 @@ export class PipelineOrchestrator {
                     await waitBeforeBatch;
                     throwIfAborted(taskCtx.signal);
 
-                    const matchedRules: TriggerRule[] = [];
-                    const matchOverridesByRuleId = new Map<string, Record<string, string>>();
-                    for (const rule of ruleBatch) {
-                        const evaluated = await this.evaluateCondition(rule, {
+                    const { matchedRules, matchOverridesByRuleId } =
+                        await this.matchAfterTurnBatch(ruleBatch, {
                             target: taskCtx.target,
                             turnNumber: params.turnNumber,
                             scanText,
                             signal: taskCtx.signal,
                             staged: false,
                             injectionSession: params.injectionSession,
+                            onlyTriggerIds: params.onlyTriggerIds,
                         });
-                        if (evaluated.matched) {
-                            matchedRules.push(rule);
-                            if (evaluated.matchOverrides) {
-                                matchOverridesByRuleId.set(rule.id, evaluated.matchOverrides);
-                            }
-                        }
-                    }
 
                     if (matchedRules.length === 0) {
                         return {
@@ -1331,6 +1381,14 @@ export class PipelineOrchestrator {
                                     unit.triggers,
                                     matchOverridesByRuleId,
                                 ),
+                                onToolStart: (step) => {
+                                    taskCtx.setCurrentStep(`${unit.label} · ${step.toolName}`);
+                                },
+                                onRetrying: (info) => {
+                                    taskCtx.setCurrentStep(
+                                        `${unit.label} · 自动重试 (${info.attempt}/${info.maxAttempts}): ${info.reason}`,
+                                    );
+                                },
                                 signal: taskCtx.signal,
                             }),
                         ),
@@ -1443,6 +1501,8 @@ export class PipelineOrchestrator {
             staged: boolean;
             injectionSession?: PromptInjectionSession;
             matchOverrides?: Record<string, string>;
+            onToolStart?: (step: ToolStepLog) => void;
+            onRetrying?: (info: RoundRetryLog) => void;
             signal: AbortSignal;
         },
     ): Promise<TriggerExecutionResult> {
@@ -1511,7 +1571,8 @@ export class PipelineOrchestrator {
             ...(lorebookNames.length > 0 ? { lorebookNames } : {}),
             staged: ctx.staged,
             ...(ctx.injectionSession ? { injectionSession: ctx.injectionSession } : {}),
-            stream: false,
+            ...(ctx.onToolStart ? { onToolStart: ctx.onToolStart } : {}),
+            ...(ctx.onRetrying ? { onRetrying: ctx.onRetrying } : {}),
             signal: ctx.signal,
             macroOverrides: triggerMacroOverrides,
         });
@@ -1539,6 +1600,8 @@ export class PipelineOrchestrator {
             staged: boolean;
             injectionSession?: PromptInjectionSession;
             matchOverrides?: Record<string, string>;
+            onToolStart?: (step: ToolStepLog) => void;
+            onRetrying?: (info: RoundRetryLog) => void;
             signal: AbortSignal;
         },
     ): Promise<TriggerExecutionResult> {

@@ -8,7 +8,14 @@ import type {
 } from '../bridge';
 import type { ApiConnection } from '../types';
 import { ConcurrencyLimiter } from './concurrency-limiter';
-import { createAbortError, isAbortError, isRetryableStatus, LLMTransportError, throwIfAborted } from './errors';
+import {
+    createAbortError,
+    isAbortError,
+    isRetryableStatus,
+    LLMTransportError,
+    ROUND_RETRY_ERROR_CODES,
+    throwIfAborted,
+} from './errors';
 import { type CompiledModelsRequest, type CompiledPayload, PayloadCompiler } from './payload-compiler';
 import { type RetryOptions, defaultShouldRetry, delayWithAbort, withRetry } from './retry';
 import { assembleStreamChunks, parseCompletionResponse, parseSSEStream } from './sse-parser';
@@ -479,7 +486,7 @@ export class FetchLLMTransport implements LLMTransport {
                         && !contentType.includes('text/event-stream')
                     ) {
                         const text = await readTextWithAbort(response, request.signal);
-                        const parsedJson = this.parseJsonOrThrow(text);
+                        const parsedJson = this.parseJsonOrThrow(text, { retryableOnTransientBody: true });
                         const result = parseCompletionResponse(parsedJson, compiled.providerFormat, {
                             parseThinkTags: this.parseThinkTags,
                         });
@@ -751,13 +758,32 @@ export class FetchLLMTransport implements LLMTransport {
         }
 
         const rawText = await readTextWithAbort(response, signal);
-        const parsedJson = this.parseJsonOrThrow(rawText);
+        const parsedJson = this.parseJsonOrThrow(rawText, { retryableOnTransientBody: true });
         return parseCompletionResponse(parsedJson, compiled.providerFormat, {
             parseThinkTags: this.parseThinkTags,
         });
     }
 
-    private parseJsonOrThrow(rawText: string): unknown {
+    private parseJsonOrThrow(
+        rawText: string,
+        options?: { retryableOnTransientBody?: boolean },
+    ): unknown {
+        const trimmed = rawText.trim();
+        if (options?.retryableOnTransientBody) {
+            if (trimmed.length === 0) {
+                throw new LLMTransportError('LLM returned an empty HTTP 200 response body', {
+                    code: ROUND_RETRY_ERROR_CODES.EMPTY_RESPONSE,
+                    retryable: true,
+                    responseBody: rawText,
+                });
+            }
+            if (trimmed.startsWith('<')) {
+                throw new LLMTransportError('LLM returned an unexpected HTML response body', {
+                    retryable: true,
+                    responseBody: rawText.slice(0, 500),
+                });
+            }
+        }
         try {
             return JSON.parse(rawText);
         } catch (err) {

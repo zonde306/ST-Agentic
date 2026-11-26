@@ -4,7 +4,7 @@ import { createDefaultConnection, createDefaultSettings } from '@/core/config';
 import { TrajectoryStore } from '@/core/context';
 import { LLMTransportError } from '@/core/llm';
 import { SideGenService, toSideThreadId } from '@/core/sidegen';
-import type { ApiConnection, PromptBlock } from '@/core/types';
+import type { ApiConnection, PromptBlock, RegexRule } from '@/core/types';
 import { canonicalClone } from '@/core/utils';
 import { createOffMainlineTestBridge } from '../../fixtures/off-mainline-fixtures';
 import { ScriptedLLMTransport, type ScriptedTurnInput } from '../../mocks/scripted-llm';
@@ -48,6 +48,7 @@ function createSideGenHarness(
     opts?: {
         connection?: Partial<ApiConnection>;
         extraPromptBlocks?: PromptBlock[];
+        regexRules?: RegexRule[];
         ejsEvaluator?: (text: string, vars: Record<string, unknown>) => Promise<string>;
     },
 ) {
@@ -69,10 +70,13 @@ function createSideGenHarness(
     });
     settings.connections['side-strict'] = conn;
 
+    const preset = settings.presets[settings.currentPresetId];
     if (opts?.extraPromptBlocks?.length) {
-        const preset = settings.presets[settings.currentPresetId];
         const mainAgent = preset.agents[preset.mainAgentId];
         mainAgent.promptBlocks = [...mainAgent.promptBlocks, ...opts.extraPromptBlocks];
+    }
+    if (opts?.regexRules?.length) {
+        preset.regexRules = [...opts.regexRules];
     }
 
     const service = new SideGenService({
@@ -526,5 +530,213 @@ describe('SideGenService — A1.3 Async Custom/EJS Prompts, Transparent finish_t
         );
         expect(foldedAssistant?.content).toBe('前置：准备核查');
         expect(foldedAssistant?.extraFields).toBeUndefined();
+    });
+
+    it('applies user/assistant ingest and display regex across finish_turn.response, plain text, mainChatDepth, and /side/* bridges', async () => {
+        const regexRules: RegexRule[] = [
+            {
+                id: 'rx_user_ooc',
+                name: 'Strip user OOC',
+                pattern: '/\\s*\\[OOC:[^\\]]*\\]/g',
+                replace: '',
+                stage: 'ingest',
+                applyToUser: true,
+                applyToAssistant: false,
+                enabled: true,
+            },
+            {
+                id: 'rx_asst_status',
+                name: 'Strip assistant status',
+                pattern: '/<!--\\s*status:[\\s\\S]*?-->/g',
+                replace: '',
+                stage: 'ingest',
+                applyToUser: false,
+                applyToAssistant: true,
+                enabled: true,
+            },
+            {
+                id: 'rx_asst_think_ingest',
+                name: 'Strip think from history',
+                pattern: '/<think>[\\s\\S]*?<\\/think>/g',
+                replace: '',
+                stage: 'ingest',
+                applyToUser: false,
+                applyToAssistant: true,
+                enabled: true,
+            },
+            {
+                id: 'rx_asst_think_display',
+                name: 'Format think for display',
+                pattern: '/<think>([\\s\\S]*?)<\\/think>/g',
+                replace: '[思考($1) · {{user}}]',
+                stage: 'display',
+                applyToUser: false,
+                applyToAssistant: true,
+                enabled: true,
+            },
+            {
+                id: 'rx_asst_status_display',
+                name: 'Format status for display',
+                pattern: '/<!--\\s*status:([\\s\\S]*?)\\s*-->/g',
+                replace: '[状态:$1]',
+                stage: 'display',
+                applyToUser: false,
+                applyToAssistant: true,
+                enabled: true,
+            },
+        ];
+
+        // 1. Strict finish_turn.response path (runOnce + persistent send + autoBridge)
+        const { bridge, transport, trajectoryStore, settings, service } = createSideGenHarness(
+            [
+                // runOnce
+                {
+                    toolCalls: [
+                        {
+                            id: 'ft_rx_once',
+                            name: 'finish_turn',
+                            arguments: JSON.stringify({
+                                step_brief: '一次线外回复',
+                                response: '<think>暗哨</think>码头安全。<!-- status:ok -->',
+                            }),
+                        },
+                    ],
+                },
+                // session turn 1
+                {
+                    toolCalls: [
+                        {
+                            id: 'ft_rx_s1',
+                            name: 'finish_turn',
+                            arguments: JSON.stringify({
+                                step_brief: '首轮',
+                                response: '<think>盘算</think>收到暗号。<!-- status:ready -->',
+                            }),
+                        },
+                    ],
+                },
+                // session turn 2
+                {
+                    toolCalls: [
+                        {
+                            id: 'ft_rx_s2',
+                            name: 'finish_turn',
+                            arguments: JSON.stringify({
+                                step_brief: '次轮',
+                                response: '马上撤离。<!-- status:done -->',
+                            }),
+                        },
+                    ],
+                },
+            ],
+            {
+                connection: { strictToolLoop: true, stream: false },
+                regexRules,
+            },
+        );
+
+        // Push a main-chat turn with OOC & status comment so mainChatDepth=2 also gets ingest-cleaned
+        bridge.pushMessage({
+            id: 2,
+            name: 'User',
+            isUser: true,
+            mes: '检查码头[OOC: 测试]',
+        });
+        bridge.pushMessage({
+            id: 3,
+            name: 'Char',
+            isUser: false,
+            mes: '码头警戒中<!-- status:raw -->',
+        });
+
+        const onceRes = await service.runOnce({
+            prompt: '确认东门[OOC: 忽略我]',
+            mainChatDepth: 2,
+            bridge: {
+                path: '/side/notes/rx-once.md',
+                delivery: 'radar_hint',
+                keywords: ['东门'],
+            },
+        });
+
+        // Returned result.text gets display regex (even tags stripped by ingest) + macro expansion
+        expect(onceRes.text).toBe('[思考(暗哨) · 调查员]码头安全。[状态:ok]');
+        const onceUserMsg = String(
+            transport.requests[0].messages[transport.requests[0].messages.length - 1].content,
+        );
+        expect(onceUserMsg).toContain('确认东门');
+        expect(onceUserMsg).not.toContain('[OOC:');
+        expect(onceUserMsg).toContain('检查码头');
+        expect(onceUserMsg).toContain('码头警戒中');
+        expect(onceUserMsg).not.toContain('<!-- status:raw');
+
+        // Bridged /side/* clue receives ingest-cleaned text (no display formatting, no raw status/think)
+        const onceAnchor = { messageId: 3, swipeId: 0 };
+        const bridgedOnce = await service.clues.read('/side/notes/rx-once.md', onceAnchor);
+        expect(bridgedOnce?.body).toBe('码头安全。');
+
+        await service.createSession({
+            id: 'side:rx',
+            title: '正则支线',
+            systemPrompt: '线外规则',
+            autoBridge: {
+                path: '/side/comms/rx-session.md',
+                delivery: 'next_turn_brief',
+                keywords: ['暗号'],
+                title: '正则对话记录',
+                mode: 'append',
+            },
+        });
+
+        const s1 = await service.send('side:rx', '暗号确认[OOC: 附注]');
+        expect(s1.text).toBe('[思考(盘算) · 调查员]收到暗号。[状态:ready]');
+
+        const threadId = toSideThreadId('side:rx');
+        const layer1AfterT1 = trajectoryStore.getMessages(threadId);
+        expect(layer1AfterT1).toHaveLength(2);
+        expect(layer1AfterT1[0].content).toBe('暗号确认');
+        expect(layer1AfterT1[1].content).toBe('收到暗号。');
+
+        const bridgedSession = await service.clues.read('/side/comms/rx-session.md', onceAnchor);
+        expect(bridgedSession?.body).toContain('- [调查员]: 暗号确认');
+        expect(bridgedSession?.body).toContain('- [正则支线]: 收到暗号。');
+        expect(bridgedSession?.body).not.toContain('[思考(');
+
+        // Adding a late ingest rule MUST NOT mutate already-frozen Turn 1 messages in TrajectoryStore
+        settings.presets[settings.currentPresetId].regexRules.push({
+            id: 'rx_late_mask',
+            name: 'Late mask',
+            pattern: '暗号',
+            replace: 'MASKED',
+            stage: 'ingest',
+            applyToUser: true,
+            applyToAssistant: true,
+            enabled: true,
+        });
+
+        const s2 = await service.send('side:rx', '新指令');
+        expect(s2.text).toBe('马上撤离。[状态:done]');
+        const turn2ReqMsgs = transport.requests[2].messages;
+        expect(turn2ReqMsgs.some((m) => m.role === 'user' && m.content === '暗号确认')).toBe(true);
+        expect(turn2ReqMsgs.some((m) => m.role === 'assistant' && m.content === '收到暗号。')).toBe(true);
+
+        // 2. Non-strict plain-text mode also applies ingest + display regex
+        const { trajectoryStore: plainTrajectory, service: plainService } = createSideGenHarness(
+            [{ content: '<think>纯文本</think>完毕<!-- status:plain -->' }],
+            {
+                connection: { strictToolLoop: false, stream: false },
+                regexRules,
+            },
+        );
+        await plainService.createSession({
+            id: 'side:rx-plain',
+            title: '纯文本正则',
+            systemPrompt: '系统',
+        });
+        const plainRes = await plainService.send('side:rx-plain', '你好[OOC: test]');
+        expect(plainRes.text).toBe('[思考(纯文本) · 调查员]完毕[状态:plain]');
+        const plainLayer1 = plainTrajectory.getMessages(toSideThreadId('side:rx-plain'));
+        expect(plainLayer1[0].content).toBe('你好');
+        expect(plainLayer1[1].content).toBe('完毕');
     });
 });

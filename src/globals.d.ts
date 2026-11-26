@@ -70,7 +70,7 @@ export interface AgenticPublicApi {
     openConsole(tab?: ConsoleTabId, deepLink?: DeepLinkState): void;
     closeConsole(): void;
     runTurn(input: RunTurnInput): Promise<RunTurnResult>;
-    rerunAfterTurn(target?: MessageTarget): Promise<void>;
+    rerunAfterTurn(target?: MessageTarget, options?: { triggerIds?: string[] }): Promise<void>;
     readonly sideGen: ToolSideGenApi;
     readonly assistant: AgenticAssistantPublicApi;
     readonly docs: AgenticDocsPublicApi;

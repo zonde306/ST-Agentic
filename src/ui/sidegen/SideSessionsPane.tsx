@@ -1,4 +1,6 @@
 import { useMemo, useState } from 'preact/hooks';
+import { resolveActivePreset } from '@/core/config';
+import { applyRegexRules } from '@/core/regex';
 import type {
     SideClueDelivery,
     SideSessionInfo,
@@ -75,6 +77,17 @@ export function SideSessionsPane({ store }: SideSessionsPaneProps) {
     const settings = useSideGenStoreSlice(store, (s) => s.settings);
     const activeTarget = useSideGenStoreSlice(store, (s) => s.activeTarget);
     const defaultDelivery = settings.offMainline?.defaultDelivery ?? 'radar_hint';
+    const regexRules = useMemo(
+        () => resolveActivePreset(settings).regexRules,
+        [settings],
+    );
+    const formatTranscriptContent = (entry: SideSessionTranscriptEntry): string =>
+        entry.role === 'user' || entry.role === 'assistant'
+            ? applyRegexRules(entry.content, regexRules, {
+                  stage: 'display',
+                  sender: entry.role,
+              })
+            : entry.content;
 
     const [scopeFilter, setScopeFilter] = useState<ScopeFilter>('all');
     const [compactingId, setCompactingId] = useState<string | null>(null);
@@ -151,7 +164,7 @@ export function SideSessionsPane({ store }: SideSessionsPaneProps) {
             return;
         }
         const text = transcriptEntries
-            .map((entry) => `[${entry.role}]\n${entry.content}`)
+            .map((entry) => `[${entry.role}]\n${formatTranscriptContent(entry)}`)
             .join('\n\n---\n\n');
         const ok = await copyTextSafe(text);
         store.pushToast(
@@ -642,7 +655,9 @@ export function SideSessionsPane({ store }: SideSessionsPaneProps) {
                                                 </span>
                                             ) : null}
                                         </div>
-                                        <div style={{ whiteSpace: 'pre-wrap' }}>{entry.content}</div>
+                                        <div style={{ whiteSpace: 'pre-wrap' }}>
+                                            {formatTranscriptContent(entry)}
+                                        </div>
                                     </div>
                                 ))}
                             </div>

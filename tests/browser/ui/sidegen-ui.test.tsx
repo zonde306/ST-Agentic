@@ -823,4 +823,55 @@ describe('SideGen Console Dual-Viewport UI Contract (TS4.2)', () => {
         assertNoHorizontalOverflow(dialog, shadowRoot, 'mobile:sidegen:sdk');
         assertTouchTargetsAndTypography(shadowRoot, 'mobile:sidegen:sdk');
     });
+
+    it('applies active preset display regex rules to assistant transcript entries in SideSessionsPane without altering system entries', async () => {
+        await page.viewport(1280, 800);
+        const runtime = createMockSideGenRuntime();
+        runtime.transcripts['phone:linwan'] = [
+            {
+                role: 'system',
+                content: '<think>系统规则保持原文</think>',
+                timestamp: 1732320000000,
+            },
+            {
+                role: 'user',
+                content: '东区现在什么情况？',
+                timestamp: 1732326500000,
+            },
+            {
+                role: 'assistant',
+                content: '<think>先确认巡逻时间</think>东区暗哨已经撤离。',
+                timestamp: 1732326600000,
+            },
+        ];
+
+        activeHarness = mountSideGenHarness({ runtime });
+        await settleLayout(5);
+
+        const { shadowRoot } = getShellElements();
+        const sessionsTab = shadowRoot.querySelector(
+            'button[data-sidegen-subtab="sessions"]',
+        ) as HTMLButtonElement;
+        expect(sessionsTab).toBeTruthy();
+        sessionsTab.click();
+        await settleLayout(4);
+
+        const branchCard = shadowRoot.querySelector(
+            'article[data-side-session-id="phone:linwan"]',
+        ) as HTMLElement;
+        expect(branchCard).toBeTruthy();
+
+        const viewTranscriptBtn = findButtonByText(branchCard, '查看记录');
+        expect(viewTranscriptBtn).toBeTruthy();
+        viewTranscriptBtn!.click();
+        await settleLayout(5);
+
+        const transcriptModal = shadowRoot.querySelector('.ag-modal-backdrop') as HTMLDivElement;
+        expect(transcriptModal).toBeTruthy();
+        const items = transcriptModal.querySelectorAll('.ag-side-transcript-item');
+        expect(items.length).toBe(3);
+        expect(items[0].textContent).toContain('<think>系统规则保持原文</think>');
+        expect(items[2].textContent).toContain('[思考已折叠: 先确认巡逻时间]东区暗哨已经撤离。');
+        expect(items[2].textContent).not.toContain('<think>先确认巡逻时间</think>');
+    });
 });

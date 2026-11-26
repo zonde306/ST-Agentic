@@ -30,6 +30,7 @@ import type {
     AgentProfile,
     CanonicalContentPart,
     CanonicalMessage,
+    CanonicalToolCall,
     CanonicalToolSchema,
     ChatMessageSnapshot,
     ClassifiedLoreEntry,
@@ -253,6 +254,122 @@ export function ingestCanonicalMessage(
         }
         return part;
     });
+    return cloned;
+}
+
+const OUTPUT_FILE_CONTENT_TOOLS = new Set(['write_file', 'append_file']);
+const OUTPUT_VIEW_TEXT_TOOLS = new Set(['append_reply_view', 'replace_reply_view']);
+
+function normalizeSimplePath(rawPath: string): string {
+    const parts = rawPath.trim().replace(/\\/g, '/').split('/');
+    const stack: string[] = [];
+    for (const part of parts) {
+        if (!part || part === '.') {
+            continue;
+        }
+        if (part === '..') {
+            stack.pop();
+        } else {
+            stack.push(part);
+        }
+    }
+    return `/${stack.join('/')}`;
+}
+
+function isOutputMarkdownPath(rawPath: unknown): boolean {
+    return typeof rawPath === 'string' && normalizeSimplePath(rawPath) === '/output.md';
+}
+
+function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
+    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Apply `ingest`-stage regex rules once to `/output.md` (and reply view) tool-call
+ * payloads before freezing `turnMessages` into Layer 1. Returns `tc` untouched if
+ * nothing changed so argument JSON is never re-serialized unnecessarily.
+ */
+function ingestOutputToolCall(
+    tc: CanonicalToolCall,
+    regex: RegexSource,
+): CanonicalToolCall {
+    const isFileContentTool = OUTPUT_FILE_CONTENT_TOOLS.has(tc.name);
+    const isEditTool = tc.name === 'edit_file';
+    const isViewTool = OUTPUT_VIEW_TEXT_TOOLS.has(tc.name);
+
+    if (!isFileContentTool && !isEditTool && !isViewTool) {
+        return tc;
+    }
+
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(tc.arguments);
+    } catch {
+        return tc;
+    }
+    if (!isPlainJsonObject(parsed)) {
+        return tc;
+    }
+
+    let changed = false;
+    const cleanStringField = (obj: Record<string, unknown>, key: string): void => {
+        const prev = obj[key];
+        if (typeof prev !== 'string' || prev.length === 0) {
+            return;
+        }
+        const cleaned = applyIngestRegexText(prev, 'assistant', regex);
+        if (cleaned !== prev) {
+            obj[key] = cleaned;
+            changed = true;
+        }
+    };
+
+    if (isFileContentTool) {
+        if (!isOutputMarkdownPath(parsed.path)) {
+            return tc;
+        }
+        cleanStringField(parsed, 'content');
+    } else if (isEditTool) {
+        if (!isOutputMarkdownPath(parsed.path)) {
+            return tc;
+        }
+        cleanStringField(parsed, 'search');
+        cleanStringField(parsed, 'replace');
+        if (Array.isArray(parsed.edits)) {
+            for (const op of parsed.edits) {
+                if (isPlainJsonObject(op)) {
+                    cleanStringField(op, 'search');
+                    cleanStringField(op, 'replace');
+                }
+            }
+        }
+    } else if (isViewTool) {
+        cleanStringField(parsed, 'text');
+    }
+
+    if (!changed) {
+        return tc;
+    }
+
+    return {
+        ...tc,
+        arguments: JSON.stringify(parsed),
+    };
+}
+
+/**
+ * Clone a `turnMessages` entry and apply `ingest` regex once to `/output.md` tool calls
+ * on assistant tool-call messages (leaving user messages and tool results untouched).
+ */
+export function ingestTurnOutputMessage(
+    message: CanonicalMessage,
+    regex?: RegexSource,
+): CanonicalMessage {
+    const cloned = canonicalClone(message);
+    if (!regex || cloned.role !== 'assistant' || !cloned.toolCalls?.length) {
+        return cloned;
+    }
+    cloned.toolCalls = cloned.toolCalls.map((tc) => ingestOutputToolCall(tc, regex));
     return cloned;
 }
 
@@ -1438,11 +1555,14 @@ export class ContextAssembler {
 
     /**
      * Append a completed turn into `TrajectoryStore` (applying `ingest` regex ONCE to
-     * `finalAssistantMessage` before freezing) and record the `(messageId, swipeId)` checkpoint.
+     * `/output.md` tool-call payloads in `turnMessages` and `finalAssistantMessage`
+     * before freezing) and record the `(messageId, swipeId)` checkpoint.
      */
     finalizeTurn(input: FinalizeTurnInput): void {
         const agentId = input.agentId ?? DEFAULT_MAIN_AGENT_ID;
-        const messagesToAppend: CanonicalMessage[] = input.turnMessages.map((m) => canonicalClone(m));
+        const messagesToAppend: CanonicalMessage[] = input.turnMessages.map((m) =>
+            ingestTurnOutputMessage(m, input.regex),
+        );
 
         if (input.finalAssistantMessage) {
             messagesToAppend.push(

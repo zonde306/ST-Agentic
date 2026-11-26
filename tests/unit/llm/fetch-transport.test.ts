@@ -840,4 +840,67 @@ describe('FetchLLMTransport', () => {
             message: 'Invalid field in generationConfig',
         });
     });
+
+    it('retries empty HTTP 200 and HTML gateway HTTP 200 responses in complete() while keeping malformed JSON non-retryable', async () => {
+        const conn = makeConnection({ id: 'conn-retry-body', stream: false });
+
+        let transientAttempts = 0;
+        const transientTransport = new FetchLLMTransport({
+            fetchImpl: async () => {
+                transientAttempts += 1;
+                if (transientAttempts === 1) {
+                    return new Response('', { status: 200, headers: { 'Content-Type': 'application/json' } });
+                }
+                if (transientAttempts === 2) {
+                    return new Response('<html><body>502 Bad Gateway</body></html>', {
+                        status: 200,
+                        headers: { 'Content-Type': 'text/html' },
+                    });
+                }
+                return new Response(
+                    JSON.stringify({
+                        choices: [{ message: { content: 'Recovered after transient body' }, finish_reason: 'stop' }],
+                        usage: { prompt_tokens: 10, completion_tokens: 5 },
+                    }),
+                    { status: 200, headers: { 'Content-Type': 'application/json' } },
+                );
+            },
+            connections: { [conn.id]: conn },
+            retry: { maxAttempts: 3, initialDelayMs: 0, maxDelayMs: 0, backoffFactor: 1, jitterRatio: 0 },
+        });
+
+        const okResp = await transientTransport.complete({
+            connectionId: conn.id,
+            messages: [{ role: 'user', content: 'ping' }],
+            tools: [],
+        });
+        expect(okResp.content).toBe('Recovered after transient body');
+        expect(transientAttempts).toBe(3);
+
+        let malformedAttempts = 0;
+        const malformedTransport = new FetchLLMTransport({
+            fetchImpl: async () => {
+                malformedAttempts += 1;
+                return new Response('{"truncated": ', {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            },
+            connections: { [conn.id]: conn },
+            retry: { maxAttempts: 3, initialDelayMs: 0, maxDelayMs: 0, backoffFactor: 1, jitterRatio: 0 },
+        });
+
+        await expect(
+            malformedTransport.complete({
+                connectionId: conn.id,
+                messages: [{ role: 'user', content: 'ping' }],
+                tools: [],
+            }),
+        ).rejects.toMatchObject({
+            name: 'LLMTransportError',
+            retryable: false,
+            message: 'Failed to parse LLM JSON response',
+        });
+        expect(malformedAttempts).toBe(1);
+    });
 });

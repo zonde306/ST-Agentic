@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { LLMRequest } from '@/core/bridge';
 import {
     createDefaultConnection,
     createDefaultMainAgent,
@@ -2262,4 +2263,231 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
             lorebookNames: ['GroupBookA', 'GroupBookB'],
         });
     });
+
+    it('records after_turn retry progress in BarrierCoordinator/AgentRunTrace and selectively reruns a single triggerId without aborting siblings', async () => {
+        const physAgent = createDefaultMainAgent({
+            id: 'ag_phys',
+            connectionId: 'conn_main',
+            sessionMode: 'ephemeral',
+            enabledTools: ['read_variables', 'patch_variables'],
+            permissions: { read: ['/state/variables.json'], write: ['/state/variables.json'] },
+        });
+        const imgAgent = createDefaultMainAgent({
+            id: 'ag_img',
+            connectionId: 'conn_main',
+            sessionMode: 'ephemeral',
+            enabledTools: ['read_variables'],
+            permissions: { read: ['/state/variables.json'], write: [] },
+        });
+
+        const siblingGate = new DeferredGate<void>();
+        const triggers: TriggerRule[] = [
+            {
+                id: 'tr_img',
+                label: '🍌生图调用',
+                source: 'preset',
+                phase: 'after_turn',
+                order: 1,
+                barrier: 'none',
+                agentProfileId: 'ag_img',
+                kind: 'agent',
+                condition: { type: 'always' },
+                instructionTemplate: 'Generate image prompt.',
+                enabled: true,
+            },
+            {
+                id: 'tr_phys',
+                label: '🍌生理更新',
+                source: 'preset',
+                phase: 'after_turn',
+                order: 1,
+                barrier: 'self',
+                agentProfileId: 'ag_phys',
+                kind: 'agent',
+                targetPath: '/state/variables.json',
+                condition: { type: 'always' },
+                instructionTemplate: 'Update physiology variables.',
+                enabled: true,
+            },
+        ];
+
+        const bridge = new MemoryHostBridge({
+            identity: { userName: '沈默', charName: '林晚' },
+            characterFields: { description: '灰港调查员。' },
+        });
+        const conn = createDefaultConnection({
+            id: 'conn_main',
+            model: 'gemini-test',
+            stream: true,
+            roundMaxRetries: 2,
+        });
+        const mainAgent = createDefaultMainAgent({
+            id: 'main',
+            connectionId: 'conn_main',
+            sessionMode: 'persistent',
+            enabledTools: ['read_file', 'write_file', 'read_variables', 'patch_variables'],
+            permissions: { read: ['/**'], write: ['/memory/**', '/state/variables.json'] },
+        });
+        const preset = createDefaultPreset({
+            id: 'preset_retry_trigger',
+            mainAgentId: 'main',
+            agents: { main: mainAgent, ag_phys: physAgent, ag_img: imgAgent },
+            triggers,
+        });
+        const settings = createDefaultSettings({
+            runMode: 'takeover',
+            connections: { [conn.id]: conn },
+            currentConnectionId: conn.id,
+            presets: { [preset.id]: preset },
+            currentPresetId: preset.id,
+        });
+
+        const transport = new ScriptedLLMTransport();
+        const traceLogger = new TraceLogger();
+        const taskSteps: string[] = [];
+        traceLogger.subscribe((ev) => {
+            if (ev.kind === 'background_task_updated' && ev.task?.currentStep) {
+                taskSteps.push(ev.task.currentStep);
+            }
+        });
+
+        const orchestrator = new PipelineOrchestrator({
+            bridge,
+            transport,
+            settings: () => settings,
+            traceLogger,
+            sandbox: new IframeJsSandbox(),
+        });
+
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '开始场景' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+
+        // Track invocations by agent prompt/template
+        let imgRunCount = 0;
+        let physAttempts = 0;
+        // Deterministic router handles any parallel ordering between tr_img and tr_phys rounds
+        const routeAfterTurnCall = (req: LLMRequest) => {
+            const text = JSON.stringify(req.messages);
+            if (text.includes('Generate image prompt')) {
+                imgRunCount += 1;
+                return { content: 'img ok' };
+            }
+            physAttempts += 1;
+            if (!text.includes('phys_read_1')) {
+                return {
+                    content: '',
+                    toolCalls: [
+                        { id: 'phys_read_1', name: 'read_variables', arguments: '{"scope":"message"}' },
+                    ],
+                };
+            }
+            return {
+                content: '',
+                reasoningContent: 'thinking only',
+                usage: { inputTokens: 100, cachedTokens: 0, outputTokens: 223 },
+                finishReason: 'STOP',
+            };
+        };
+
+        transport.enqueue(
+            // 1. main_turn
+            writeOutputTurn('主线正文完成。', 'w_main_selective'),
+            { content: 'main ok' },
+            // 2. after_turn parallel units (tr_img + tr_phys Round 1 + tr_phys Round 2 initial & 2 retries)
+            routeAfterTurnCall,
+            routeAfterTurnCall,
+            routeAfterTurnCall,
+            routeAfterTurnCall,
+            routeAfterTurnCall,
+        );
+
+        const turnRes = await orchestrator.runTurn({
+            action: 'normal',
+            target: { messageId: 1, swipeId: 0 },
+            userInput: '开始场景',
+            turnNumber: 1,
+        });
+        bridge.chat[1].mes = turnRes.content;
+        bridge.chat[1].swipes = [turnRes.content];
+
+        await orchestrator.barrierCoordinator.awaitAllSettled();
+
+        expect(imgRunCount).toBe(1);
+        expect(physAttempts).toBe(4); // 1 (read_variables round) + 3 (round 2 initial + 2 retries)
+        expect(taskSteps.some((s) => s.includes('自动重试 (1/2)'))).toBe(true);
+        expect(taskSteps.some((s) => s.includes('自动重试 (2/2)'))).toBe(true);
+
+        const failedPhysTrace = traceLogger
+            .listTraces({ phase: 'after_turn', agentProfileId: 'ag_phys' })
+            .find((t) => t.triggerId === 'tr_phys');
+        expect(failedPhysTrace).toBeDefined();
+        expect(failedPhysTrace?.status).toBe('error');
+        expect(failedPhysTrace?.retryCount).toBe(2);
+        expect(failedPhysTrace?.roundMaxRetries).toBe(2);
+        expect(failedPhysTrace?.retryEvents).toHaveLength(2);
+        expect(failedPhysTrace?.retryEvents?.[0]).toMatchObject({
+            round: 2,
+            attempt: 1,
+            maxAttempts: 2,
+            reason: 'EMPTY_RESPONSE',
+            finishReason: 'STOP',
+            outputTokens: 223,
+            hasReasoning: true,
+        });
+
+        // Now dispatch a long-running unrelated background task on floor (1, 0) for tr_img,
+        // and verify targeted rerunAfterTurn({ messageId: 1, swipeId: 0 }, { triggerIds: ['tr_phys'] })
+        // does NOT abort the unrelated sibling task and re-runs ONLY tr_phys!
+        const unrelatedHandle = orchestrator.barrierCoordinator.dispatch(
+            {
+                target: { messageId: 1, swipeId: 0 },
+                phase: 'after_turn',
+                barrier: 'none',
+                agentProfileId: 'ag_img',
+                label: 'Unrelated Running Sibling',
+            },
+            async (ctx) => {
+                await siblingGate.promise;
+                return ctx.taskId;
+            },
+        );
+
+        transport.enqueue(
+            (req) => {
+                expect(req.stream).toBe(true);
+                return {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'phys_patch_ok',
+                            name: 'patch_variables',
+                            arguments: JSON.stringify({ scope: 'message', json_merge: { fatigue: 42 } }),
+                        },
+                    ],
+                };
+            },
+            // Round 2 silent completion after successful write tool!
+            { content: '' },
+        );
+
+        const rerunHandles = await orchestrator.rerunAfterTurn(
+            { messageId: 1, swipeId: 0 },
+            { triggerIds: ['tr_phys'], turnNumber: 1 },
+        );
+        expect(rerunHandles).toHaveLength(1);
+        await Promise.allSettled(rerunHandles.map((h) => h.promise));
+
+        // Unrelated sibling task remained active and was NOT aborted
+        expect(unrelatedHandle.getStatus().state).toBe('running');
+        siblingGate.resolve();
+        await unrelatedHandle.promise;
+
+        // tr_img trigger itself was NOT re-run
+        expect(imgRunCount).toBe(1);
+
+        const varsAfterRerun = await orchestrator.vfs.readVariables({
+            target: { messageId: 1, swipeId: 0 },
+        });
+        expect(varsAfterRerun.fatigue).toBe(42);
+    }, 15_000);
 });
