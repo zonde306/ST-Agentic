@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
 import { resolveActivePreset } from '@/core/config';
-import { buildWorldInfoTriggerRuleId } from '@/core/triggers';
+import { buildWorldInfoTriggerRuleId, DecoratorCompiler } from '@/core/triggers';
 import type {
     BarrierPolicy,
     ClassifiedLoreEntry,
     PipelinePhase,
+    Preset,
     TriggerCondition,
     TriggerRule,
 } from '@/core/types';
@@ -63,63 +64,42 @@ const TRIGGER_DECORATOR_PREFIXES = [
     '@@evaluate_ejs',
 ];
 
+const WI_RULE_COMPILER = new DecoratorCompiler();
+
 function isPipelineLoreEntry(item: ClassifiedLoreEntry): boolean {
     return item.decorators.some((d) =>
         TRIGGER_DECORATOR_PREFIXES.some((prefix) => d.name.startsWith(prefix)),
     );
 }
 
-function inferRuleFromLoreEntry(
+/**
+ * Compile a scanned World Info entry into an editable `TriggerRule` preview/import model
+ * using `DecoratorCompiler` so `targetPath`, multiline fenced schemas, `condition`,
+ * `ifConditions`, and `@@*_ejs*` scripts match runtime compilation.
+ */
+export function inferRuleFromLoreEntry(
     item: ClassifiedLoreEntry,
-    defaultAgentId: string,
+    preset: Preset,
 ): TriggerRule {
+    const compiled = WI_RULE_COMPILER.compileEntry(item.entry, { preset });
+    if (compiled?.trigger) {
+        const rule = compiled.trigger;
+        const validAgentProfileId =
+            rule.kind === 'script' || Object.hasOwn(preset.agents, rule.agentProfileId)
+                ? rule.agentProfileId
+                : preset.mainAgentId;
+        return {
+            ...rule,
+            agentProfileId: validAgentProfileId,
+            enabled: !item.entry.disable,
+        };
+    }
+
     const primary =
         item.decorators.find((d) =>
             TRIGGER_DECORATOR_PREFIXES.some((prefix) => d.name.startsWith(prefix)),
         ) ?? item.decorators[0];
-    const batchOrderDec = item.decorators.find((d) => d.name === '@@batch_order');
-    const groupDec = item.decorators.find((d) => d.name === '@@group');
-
     const decName = primary?.name ?? '@@trigger';
-    const params = primary?.params ?? {};
-    const phaseRaw = (params.phase ?? '').toLowerCase();
-
-    let phase: PipelinePhase = decName.endsWith('_before') ? 'before_turn' : 'after_turn';
-    if (phaseRaw === 'before' || phaseRaw === 'before_turn') {
-        phase = 'before_turn';
-    } else if (phaseRaw === 'main' || phaseRaw === 'main_turn') {
-        phase = 'main_turn';
-    } else if (phaseRaw === 'maintenance') {
-        phase = 'maintenance';
-    } else if (phaseRaw === 'after' || phaseRaw === 'after_turn') {
-        phase = 'after_turn';
-    }
-
-    let barrier: BarrierPolicy = phase === 'before_turn' ? 'turn' : 'self';
-    if (decName.startsWith('@@variables')) {
-        barrier = 'turn';
-    }
-    if (params.barrier === 'turn' || params.barrier === 'self' || params.barrier === 'none') {
-        barrier = params.barrier;
-    }
-
-    const orderNum = Number(params.order ?? batchOrderDec?.args[0] ?? 1);
-    const order = Number.isFinite(orderNum) ? Math.trunc(orderNum) : 1;
-
-    const rawGroup = (params.group ?? groupDec?.args[0] ?? groupDec?.rawArgs ?? '').trim();
-    const forceIsolate = ['none', 'isolate', 'off', 'false'].includes(rawGroup.toLowerCase());
-    const tag = primary?.args[0]?.trim() ?? '';
-    const inferredGroupName = forceIsolate
-        ? undefined
-        : rawGroup
-            ? rawGroup
-            : decName.startsWith('@@variables')
-                ? (tag ? `variables:${tag}` : 'variables')
-                : undefined;
-
-    const jsonSchemaDec = item.decorators.find((d) => d.name === '@@json_schema');
-    const zodSchemaDec = item.decorators.find((d) => d.name === '@@zod_schema');
-
     const sourceWorld = item.entry.world?.trim() || undefined;
     return {
         id: buildWorldInfoTriggerRuleId(item.entry.world, item.entry.uid),
@@ -129,23 +109,14 @@ function inferRuleFromLoreEntry(
         ...(typeof item.entry.uid === 'number' && Number.isFinite(item.entry.uid)
             ? { sourceEntryUid: item.entry.uid }
             : {}),
-        phase,
-        order,
-        barrier,
-        agentProfileId: params.profile?.trim() || defaultAgentId,
-        kind: decName === '@@script' || decName.startsWith('@@evaluate_ejs') ? 'script' : 'agent',
-        tag,
-        ...(inferredGroupName ? { groupName: inferredGroupName } : {}),
+        phase: decName.endsWith('_before') ? 'before_turn' : 'after_turn',
+        order: 1,
+        barrier: decName.endsWith('_before') ? 'turn' : 'self',
+        agentProfileId: preset.mainAgentId,
+        kind: decName === '@@script' || decName.includes('_ejs') ? 'script' : 'agent',
         condition: { type: 'always' },
         instructionTemplate: item.cleanContent,
         decorator: decName,
-        targetPath: decName.startsWith('@@variables') ? '/state/variables.json' : item.vfsPath,
-        ...(jsonSchemaDec
-            ? { schemaSource: { kind: 'json', raw: jsonSchemaDec.rawArgs } }
-            : zodSchemaDec
-                ? { schemaSource: { kind: 'zod', raw: zodSchemaDec.rawArgs } }
-                : {}),
-        ...(decName === '@@script' ? { scriptCode: item.cleanContent } : {}),
         enabled: !item.entry.disable,
     };
 }
@@ -238,7 +209,7 @@ export function PipelineView(props: Partial<ConsoleViewProps> = {}) {
         return loreEntries
             .map((entry) => ({
                 lore: entry,
-                inferred: inferRuleFromLoreEntry(entry, activePreset.mainAgentId),
+                inferred: inferRuleFromLoreEntry(entry, activePreset),
             }))
             .filter(({ lore, inferred }) => {
                 if (existingIds.has(inferred.id)) {
@@ -252,7 +223,7 @@ export function PipelineView(props: Partial<ConsoleViewProps> = {}) {
                 }
                 return true;
             });
-    }, [activePreset.mainAgentId, activePreset.triggers, loreEntries]);
+    }, [activePreset, loreEntries]);
 
     useEffect(() => {
         if (!selection) {
@@ -1109,6 +1080,16 @@ export function PipelineView(props: Partial<ConsoleViewProps> = {}) {
                             <Badge tone="neutral">
                                 order: {activeScannedItem.inferred.order}
                             </Badge>
+                            {activeScannedItem.inferred.targetPath ? (
+                                <Badge tone="neutral" className="ag-mono">
+                                    target: {activeScannedItem.inferred.targetPath}
+                                </Badge>
+                            ) : null}
+                            {activeScannedItem.inferred.schemaSource ? (
+                                <Badge tone="neutral" className="ag-mono">
+                                    schema: {activeScannedItem.inferred.schemaSource.kind}
+                                </Badge>
+                            ) : null}
                             {activeScannedItem.lore.decorators.map((dec, idx) => (
                                 <Badge key={`${dec.name}_${idx}`} tone="warning" className="ag-mono">
                                     {dec.name}

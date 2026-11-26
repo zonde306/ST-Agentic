@@ -1561,21 +1561,65 @@ export class PipelineOrchestrator {
             return await this.executeScriptUnit(unit, ctx);
         }
 
+        const startedAt = Date.now();
         const profile = resolveEffectiveUnitAgentProfile(
             unit,
             ctx.preset,
             ctx.derivedAgentsByRuleId,
             ctx.effectiveAgents,
         );
-
-        const unitSchema = await this.compileUnitVariableSchema(unit, ctx.globalVarSchema);
-        const { promptInput, triggerPrompt } = await this.buildTriggerAgentPrompt(unit, ctx);
-        const permissions = mergeUnitPermissions(profile.permissions, unit.triggers);
-        const triggerTools = resolveUnitTools(profile.enabledTools, unit.triggers);
-
         const triggerIds = unit.triggers.map((t) => t.id);
         const lorebookNames = collectUnitLorebookNames(unit.triggers);
         const triggerSource = resolveUnitTriggerSource(unit.triggers, lorebookNames);
+
+        let unitSchema: z.ZodTypeAny | undefined;
+        let promptInput: string;
+        let triggerPrompt: string;
+        try {
+            unitSchema = await this.compileUnitVariableSchema(unit, ctx.globalVarSchema);
+            const built = await this.buildTriggerAgentPrompt(unit, ctx);
+            promptInput = built.promptInput;
+            triggerPrompt = built.triggerPrompt;
+        } catch (error) {
+            if (!isAbortError(error) && !ctx.signal.aborted) {
+                const endedAt = Date.now();
+                const conn = resolveConnection(this.settingsProvider(), profile.connectionId);
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                this.traceLogger.recordTrace(
+                    {
+                        runId: `trigger_prep_${triggerIds.join('_') || unit.unitId}_${ctx.target.messageId}_${ctx.target.swipeId}_${startedAt}`,
+                        target: { ...ctx.target },
+                        phase: unit.phase,
+                        agentProfileId: profile.id,
+                        agentName: profile.name || unit.label,
+                        triggerId: triggerIds.join(','),
+                        triggerLabel: unit.label,
+                        ...(triggerSource ? { triggerSource } : {}),
+                        ...(lorebookNames.length > 0 ? { lorebookNames } : {}),
+                        connectionId: conn.id,
+                        model: conn.model || 'trigger-prep',
+                        status: 'error',
+                        startedAt,
+                        endedAt,
+                        durationMs: Math.max(0, endedAt - startedAt),
+                        usage: {
+                            inputTokens: 0,
+                            cachedTokens: 0,
+                            outputTokens: 0,
+                            totalTokens: 0,
+                            cacheHitRate: 0,
+                        },
+                        toolSteps: [],
+                        error: errorMessage,
+                    },
+                    true,
+                );
+            }
+            throw error;
+        }
+
+        const permissions = mergeUnitPermissions(profile.permissions, unit.triggers);
+        const triggerTools = resolveUnitTools(profile.enabledTools, unit.triggers);
         const decorators = unit.triggers
             .map((t) => t.decorator)
             .filter((d): d is string => Boolean(d));
@@ -1917,9 +1961,17 @@ export class PipelineOrchestrator {
             if (!rule.schemaSource) {
                 continue;
             }
-            const compiled = await normalizeTriggerSchema(rule.schemaSource, this.sandbox);
-            if (compiled) {
-                merged = merged ? deepMergeZod(merged, compiled) : compiled;
+            try {
+                const compiled = await normalizeTriggerSchema(rule.schemaSource, this.sandbox);
+                if (compiled) {
+                    merged = merged ? deepMergeZod(merged, compiled) : compiled;
+                }
+            } catch (error) {
+                if (isAbortError(error)) {
+                    throw error;
+                }
+                const msg = error instanceof Error ? error.message : String(error);
+                throw new Error(`[@@${rule.schemaSource.kind}_schema (${rule.label})] ${msg}`);
             }
         }
         return merged;

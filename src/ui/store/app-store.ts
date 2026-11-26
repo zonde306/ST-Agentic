@@ -1149,6 +1149,7 @@ export class AppStore {
         },
     ): Promise<void> {
         const resolved = target ?? this.state.activeTarget;
+        const prevRunIds = new Set(this.state.traces.map((t) => t.runId));
         const serviceOpts: { triggerIds?: string[]; force?: boolean } = {};
         if (options?.triggerIds?.length) {
             serviceOpts.triggerIds = options.triggerIds;
@@ -1161,12 +1162,29 @@ export class AppStore {
             Object.keys(serviceOpts).length > 0 ? serviceOpts : undefined,
         );
         if (!options?.silentToast) {
-            this.pushToast(
-                options?.label
-                    ? `已重新派发 #${resolved.messageId}#${resolved.swipeId} 的后置触发：${options.label}`
-                    : `已重新派发楼层 #${resolved.messageId}#${resolved.swipeId} 的后置触发任务`,
-                'primary',
+            const newestErrorTrace = this.state.traces.find(
+                (t) =>
+                    !prevRunIds.has(t.runId)
+                    && t.target.messageId === resolved.messageId
+                    && t.target.swipeId === resolved.swipeId
+                    && t.phase === 'after_turn'
+                    && t.status === 'error',
             );
+            if (newestErrorTrace) {
+                const labelPrefix = options?.label ? `「${options.label}」` : '';
+                this.pushToast(
+                    `触发器${labelPrefix}在 #${resolved.messageId}#${resolved.swipeId} 执行失败：${newestErrorTrace.error || '请查看日志'}`,
+                    'error',
+                    5000,
+                );
+            } else {
+                this.pushToast(
+                    options?.label
+                        ? `已重新派发 #${resolved.messageId}#${resolved.swipeId} 的后置触发：${options.label}`
+                        : `已重新派发楼层 #${resolved.messageId}#${resolved.swipeId} 的后置触发任务`,
+                    'primary',
+                );
+            }
         }
     }
 

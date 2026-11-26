@@ -2706,4 +2706,65 @@ describe('PipelineOrchestrator & 3-Tier BarrierCoordinator', () => {
         expect(vars.presetForced).toBe(1);
         expect(vars.wiForced).toBe(2);
     }, 15_000);
+
+    it('records an error trace with schema context when @@zod_schema compilation fails before LLM generation', async () => {
+        const brokenRuleId = buildWorldInfoTriggerRuleId('状态栏世界书', 91);
+        const { bridge, transport, traceLogger, orchestrator } = createPipelineFixture({
+            lorebooks: {
+                状态栏世界书: [
+                    {
+                        world: '状态栏世界书',
+                        uid: 91,
+                        comment: '坏掉的 Zod Schema 触发器',
+                        content: [
+                            '@@trigger status_data_update phase=after order=3 barrier=turn target=/state/variables.json',
+                            '@@zod_schema',
+                            '```js',
+                            'const S = z.object({ name: z.string().optional().max(10) });',
+                            'return z.looseObject({ statusData: S });',
+                            '```',
+                            '更新 statusData。',
+                        ].join('\n'),
+                        keys: [],
+                        keysecondary: [],
+                        constant: true,
+                        selective: false,
+                        disable: false,
+                        position: 0,
+                        depth: 0,
+                        order: 3,
+                        role: 0,
+                    },
+                ],
+            },
+        });
+
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '第一轮' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: 'AI回复', swipeId: 0 });
+
+        const handles = await orchestrator.rerunAfterTurn(
+            { messageId: 1, swipeId: 0 },
+            { triggerIds: [brokenRuleId], force: true, turnNumber: 1 },
+        );
+        expect(handles).toHaveLength(1);
+
+        await expect(handles[0].promise).rejects.toThrow(/@@zod_schema/);
+        expect(transport.requests).toHaveLength(0);
+
+        const traces = traceLogger.listTraces({
+            messageId: 1,
+            swipeId: 0,
+            phase: 'after_turn',
+        });
+        expect(traces).toHaveLength(1);
+        expect(traces[0]).toMatchObject({
+            status: 'error',
+            phase: 'after_turn',
+            triggerId: brokenRuleId,
+            triggerLabel: '坏掉的 Zod Schema 触发器',
+            target: { messageId: 1, swipeId: 0 },
+        });
+        expect(traces[0].error).toContain('@@zod_schema');
+        expect(traces[0].error).toContain('坏掉的 Zod Schema 触发器');
+    }, 15_000);
 });

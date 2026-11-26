@@ -65,6 +65,7 @@ import {
     compileSlashBridgeTool,
     createBuiltinToolRegistry,
     createToolExecutionContext,
+    isAbortError,
     registerCustomTools,
     type ToolRegistry,
 } from '@/core/tools';
@@ -1380,6 +1381,11 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             options?: { triggerIds?: string[]; force?: boolean },
         ): Promise<void> {
             const target = resolveTarget(targetInput);
+            const prevRunIds = new Set(
+                traceLogger
+                    .listTraces({ messageId: target.messageId, swipeId: target.swipeId })
+                    .map((t) => t.runId),
+            );
             const handles = await orchestrator.rerunAfterTurn(target, {
                 ...(options?.triggerIds?.length ? { triggerIds: options.triggerIds } : {}),
                 ...(options?.force ? { force: true } : {}),
@@ -1391,11 +1397,30 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             }
             const storeUi = getAppStore();
             storeUi?.setBackgroundTasks(barrierCoordinator.listTasks());
-            await Promise.allSettled(handles.map((handle) => handle.promise));
+            const settled = await Promise.allSettled(handles.map((handle) => handle.promise));
             trajectoryStore.saveToHost(bridge);
             storeUi?.setBackgroundTasks(barrierCoordinator.listTasks());
             if (storeUi) {
                 await storeUi.refreshTraces();
+            }
+            const firstNonAbortRejection = settled.find(
+                (res): res is PromiseRejectedResult =>
+                    res.status === 'rejected' && !isAbortError(res.reason),
+            );
+            if (firstNonAbortRejection) {
+                const hasNewErrorTrace = traceLogger
+                    .listTraces({
+                        messageId: target.messageId,
+                        swipeId: target.swipeId,
+                        phase: 'after_turn',
+                        status: 'error',
+                    })
+                    .some((t) => !prevRunIds.has(t.runId));
+                if (!hasNewErrorTrace) {
+                    throw firstNonAbortRejection.reason instanceof Error
+                        ? firstNonAbortRejection.reason
+                        : new Error(String(firstNonAbortRejection.reason));
+                }
             }
         },
 

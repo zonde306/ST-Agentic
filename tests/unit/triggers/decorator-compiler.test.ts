@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { createDefaultMainAgent, createDefaultPreset } from '@/core/config';
+import { WIClassifier } from '@/core/lore';
 import { DecoratorCompiler, groupTriggersForExecution } from '@/core/triggers';
 import type { RawLoreEntry, TriggerRule } from '@/core/types';
 import { VirtualFileSystem } from '@/core/vfs';
+import { inferRuleFromLoreEntry } from '@/ui/studio/PipelineView';
 import { MemoryHostBridge } from '../../mocks';
 
 function makeEntry(partial: Partial<RawLoreEntry> & { uid: number; content: string }): RawLoreEntry {
@@ -573,5 +575,55 @@ describe('DecoratorCompiler & Trigger Grouping', () => {
         const isolatedLoreAgent = compiled.derivedAgentsByRuleId[loreRule.id];
         expect(isolatedVarsAgent.permissions.write).toEqual(['/state/variables.json']);
         expect(isolatedLoreAgent.permissions.write).toEqual(['/lorebooks/霜烬纪元/Group-Lore-302.md']);
+    });
+
+    it('compiles @@trigger with target=/state/variables.json and multiline fenced @@zod_schema and preserves metadata in inferRuleFromLoreEntry', () => {
+        const entry = makeEntry({
+            uid: 303,
+            comment: '通用状态栏结算',
+            constant: false,
+            keys: ['状态', '结算'],
+            content: [
+                '@@trigger status_data_update phase=after order=3 barrier=turn target=/state/variables.json',
+                '@@zod_schema',
+                '```js',
+                'const StatusDataSchema = z.object({ 地点: z.string().optional() });',
+                'return z.looseObject({ statusData: StatusDataSchema });',
+                '```',
+                '请读取并更新 statusData。',
+            ].join('\n'),
+        });
+
+        const preset = createDefaultPreset({
+            mainAgentId: 'main',
+            agents: { main: createDefaultMainAgent() },
+        });
+        const compiler = new DecoratorCompiler();
+        const compiled = compiler.compile([entry], { preset });
+        expect(compiled.triggers).toHaveLength(1);
+
+        const rule = compiled.triggers[0];
+        expect(rule.targetPath).toBe('/state/variables.json');
+        expect(rule.barrier).toBe('turn');
+        expect(rule.order).toBe(3);
+        expect(rule.tag).toBe('status_data_update');
+        expect(rule.condition).toEqual({ type: 'keyword', keys: ['状态', '结算'] });
+        expect(rule.schemaSource).toEqual({
+            kind: 'zod',
+            raw: [
+                'const StatusDataSchema = z.object({ 地点: z.string().optional() });',
+                'return z.looseObject({ statusData: StatusDataSchema });',
+            ].join('\n'),
+        });
+        expect(rule.instructionTemplate).toBe('请读取并更新 statusData。');
+
+        const classified = new WIClassifier().classifyEntry(entry);
+        const inferred = inferRuleFromLoreEntry(classified, preset);
+        expect(inferred.targetPath).toBe('/state/variables.json');
+        expect(inferred.schemaSource).toEqual(rule.schemaSource);
+        expect(inferred.instructionTemplate).toBe('请读取并更新 statusData。');
+        expect(inferred.condition).toEqual({ type: 'keyword', keys: ['状态', '结算'] });
+        expect(inferred.agentProfileId).toBe('main');
+        expect(inferred.enabled).toBe(true);
     });
 });
