@@ -834,6 +834,44 @@ describe('STAuthorBridge', () => {
         );
     });
 
+    it('expands auto-prompt macros via single-pass post-substitution without leaking into dynamicMacros or re-evaluating inner tokens', () => {
+        const bridge = new STHostBridge({
+            resolveFileMacroSync: (filePath) => `[FILE:${filePath}]`,
+        });
+        let capturedOptions: unknown;
+
+        stMocks.fns.substituteParams.mockImplementationOnce((...args: unknown[]) => {
+            capturedOptions = args[1];
+            return String(args[0] ?? '');
+        });
+
+        const manifestPayload =
+            '<core-manifest>\n- {{user}} literal\n- {{file::/secret.md}}\n</core-manifest>';
+
+        const output = bridge.substituteMacros(
+            'slot={{coreManifest}}|alias={{core-manifest}}|user={{lastUserMessage}}',
+            {
+                coreManifest: manifestPayload,
+                'core-manifest': manifestPayload,
+                lastUserMessage: 'User wrote {{coreManifest}} and {{loreHint}}',
+                loreHint: '<lore-hint>ignored</lore-hint>',
+            },
+        );
+
+        // Auto-prompt aliases must NOT be passed into dynamicMacros
+        expect(capturedOptions).toEqual({
+            dynamicMacros: {
+                lastUserMessage: 'User wrote {{coreManifest}} and {{loreHint}}',
+            },
+        });
+        // Single-pass post-substitution:
+        // - {{coreManifest}} and {{core-manifest}} expand to manifestPayload verbatim (without expanding {{user}} or {{file::/secret.md}} inside it)
+        // - {{loreHint}} was not referenced in the template, so literal {{loreHint}} inside lastUserMessage stays intact
+        expect(output).toBe(
+            `slot=${manifestPayload}|alias=${manifestPayload}|user=User wrote {{coreManifest}} and {{loreHint}}`,
+        );
+    });
+
     it('lists and saves scoped regex via SCRIPT_TYPES.SCOPED and embeds agentic payload', async () => {
         const settings = createDefaultSettings();
         const bridge = new STHostBridge({ getSettings: () => settings });

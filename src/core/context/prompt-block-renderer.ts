@@ -7,6 +7,7 @@ import type {
     PromptBlock,
 } from '@/core/types';
 import { canonicalClone, canonicalStringify } from '@/core/utils';
+import { substituteAutoPromptMacrosFallback } from './auto-prompt-macros';
 
 export interface PromptBlockRenderSyncOptions {
     hostBridge?: Pick<HostBridge, 'substituteMacros'>;
@@ -153,8 +154,11 @@ function applyMacros(
     hostBridge?: Pick<HostBridge, 'substituteMacros'>,
     macroOverrides?: Record<string, string>,
 ): string {
-    if (!text || !hostBridge) {
+    if (!text) {
         return text;
+    }
+    if (!hostBridge) {
+        return substituteAutoPromptMacrosFallback(text, macroOverrides);
     }
     return hostBridge.substituteMacros(text, macroOverrides);
 }

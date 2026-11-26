@@ -45,6 +45,18 @@ import type {
     WICategory,
 } from '@/core/types';
 import { canonicalClone, canonicalStringify, stripJsonSchemaMeta } from '@/core/utils';
+import {
+    LAYER0_AUTO_PROMPT_KEYS,
+    LAYER2_AUTO_PROMPT_KEYS,
+    type AutoPromptMacroKey,
+    type ClaimedAutoPromptMacros,
+    type Layer2AutoPromptMacroKey,
+    buildAutoPromptMacroOverrides,
+    detectClaimedAutoPromptMacros,
+    extractAutoPromptMacroKeys,
+    hasAutoPromptMacroOverride,
+    substituteAutoPromptMacrosFallback,
+} from './auto-prompt-macros';
 import { prerenderPromptBlocks, renderPromptBlockSync } from './prompt-block-renderer';
 import {
     LocalPromptInjectionSession,
@@ -62,6 +74,8 @@ export interface StaticPrefixResult {
     layer0EndIndex: number;
     coreManifest: CoreManifestResult;
     systemRuleCount: number;
+    manifestText: string;
+    systemRulesXml: string;
 }
 
 export interface ContextLayerStats {
@@ -461,10 +475,153 @@ function substituteText(
     hostBridge?: HostBridge,
     overrides?: Record<string, string>,
 ): string {
-    if (!text || !hostBridge) {
+    if (!text) {
         return text;
     }
+    if (!hostBridge) {
+        return substituteAutoPromptMacrosFallback(text, overrides);
+    }
     return hostBridge.substituteMacros(text, overrides);
+}
+
+/**
+ * Build `<core-manifest>` XML text (including hollow-card notice, `/character/*`,
+ * `/persona/description.md`, Category ② lore, and sorted `/preset/*` reference files).
+ */
+export function buildFormattedCoreManifest(params: {
+    characterFields?: Record<string, string>;
+    classifiedLore?: readonly ClassifiedLoreEntry[];
+    personaDescription?: string;
+    hollowThreshold?: number;
+    presetFiles?: Record<string, string>;
+}): { coreManifest: CoreManifestResult; manifestText: string } {
+    const coreEntries = (params.classifiedLore ?? []).filter(
+        (item) => item.category === 'core_manifest' && !item.entry.disable,
+    );
+    const coreManifest = buildCoreManifest({
+        characterFields: params.characterFields ?? {},
+        coreEntries,
+        personaDescription: params.personaDescription,
+        hollowThreshold: params.hollowThreshold,
+    });
+
+    let manifestText = coreManifest.text;
+    const presetFileNames = Object.keys(params.presetFiles ?? {})
+        .map((name) => name.replace(/^\/+/, ''))
+        .filter(Boolean)
+        .sort(compareCodeUnits);
+    if (presetFileNames.length > 0) {
+        const presetLines = presetFileNames.map((name) => `- /preset/${name}`);
+        manifestText = manifestText.replace(
+            /<\/core-manifest>$/,
+            `预设参考文档（/preset/*，按需调用 read_file 阅读）：\n${presetLines.join('\n')}\n</core-manifest>`,
+        );
+    }
+
+    return { coreManifest, manifestText };
+}
+
+export function formatSystemRulesXml(renderedRules: readonly string[]): string {
+    return renderedRules.length > 0
+        ? `<system-rules>\n${renderedRules.join('\n\n')}\n</system-rules>`
+        : '';
+}
+
+export function formatDynamicRemindersXml(reminderLines: readonly string[]): string {
+    return reminderLines.length > 0
+        ? `<dynamic-reminders>\n${reminderLines.join('\n')}\n</dynamic-reminders>`
+        : '';
+}
+
+function renderSystemRulesSync(params: {
+    classifiedLore?: readonly ClassifiedLoreEntry[];
+    hostBridge?: HostBridge;
+    macroOverrides?: Record<string, string>;
+    preRenderedSystemRules?: readonly string[];
+}): string[] {
+    const renderedRules: string[] = [];
+    if (params.preRenderedSystemRules !== undefined) {
+        for (const ruleText of params.preRenderedSystemRules) {
+            const trimmed = ruleText.trim();
+            if (trimmed) {
+                renderedRules.push(trimmed);
+            }
+        }
+        return renderedRules;
+    }
+
+    const systemRules = (params.classifiedLore ?? [])
+        .filter((item) => item.category === 'system_rule' && !item.entry.disable)
+        .sort(
+            (a, b) =>
+                b.entry.order - a.entry.order
+                || a.entry.depth - b.entry.depth
+                || compareCodeUnits(a.entry.world, b.entry.world)
+                || a.entry.uid - b.entry.uid,
+        );
+
+    for (const item of systemRules) {
+        const text = substituteText(
+            item.cleanContent,
+            params.hostBridge,
+            params.macroOverrides,
+        ).trim();
+        if (!text) {
+            continue;
+        }
+        const title = item.entry.comment?.trim();
+        renderedRules.push(title ? `### ${title}\n${text}` : text);
+    }
+    return renderedRules;
+}
+
+function fillMissingLayer2AutoOverrides(
+    existingOverrides?: Record<string, string>,
+): Record<string, string> {
+    const missing: Partial<Record<Layer2AutoPromptMacroKey, string>> = {};
+    for (const key of LAYER2_AUTO_PROMPT_KEYS) {
+        if (!hasAutoPromptMacroOverride(existingOverrides, key)) {
+            missing[key] = '';
+        }
+    }
+    return buildAutoPromptMacroOverrides(missing);
+}
+
+/**
+ * Build static Layer 0 auto-prompt macro overrides (`coreManifest`, `systemRules`) and empty
+ * fallbacks for any unset Layer 2 auto-prompt keys (used on `resumeMessages` pre-render paths).
+ */
+export function buildStaticAutoPromptMacroOverrides(params: {
+    characterFields?: Record<string, string>;
+    personaDescription?: string;
+    loreEntries?: readonly (RawLoreEntry | ClassifiedLoreEntry)[];
+    wiRouterOverrides?: Record<string, WICategory>;
+    presetFiles?: Record<string, string>;
+    hollowThreshold?: number;
+    hostBridge?: HostBridge;
+    macroOverrides?: Record<string, string>;
+}): Record<string, string> {
+    const classified = classifyAllEntries(params.loreEntries, params.wiRouterOverrides);
+    const { manifestText } = buildFormattedCoreManifest({
+        characterFields: params.characterFields,
+        classifiedLore: classified,
+        personaDescription: params.personaDescription,
+        hollowThreshold: params.hollowThreshold,
+        presetFiles: params.presetFiles,
+    });
+    const renderedRules = renderSystemRulesSync({
+        classifiedLore: classified,
+        hostBridge: params.hostBridge,
+        macroOverrides: params.macroOverrides,
+    });
+    const systemRulesXml = formatSystemRulesXml(renderedRules);
+    return {
+        ...fillMissingLayer2AutoOverrides(params.macroOverrides),
+        ...buildAutoPromptMacroOverrides({
+            coreManifest: manifestText,
+            systemRules: systemRulesXml,
+        }),
+    };
 }
 
 function wrapXmlIfNeeded(tag: string, body: string): string {
@@ -577,9 +734,12 @@ function resolvePrefixDynamicDeps(blocks: readonly PromptBlock[]): {
     injectKeys: string[];
     hasDynamicInjectKey: boolean;
     outletKeys: string[];
+    autoPromptDynamicKeys: Layer2AutoPromptMacroKey[];
 } {
     const injectKeys = new Set<string>();
     const outletKeys = new Set<string>();
+    const autoPromptDynamicSet = new Set<Layer2AutoPromptMacroKey>();
+    const layer2KeySet = new Set<AutoPromptMacroKey>(LAYER2_AUTO_PROMPT_KEYS);
     let hasDynamicInjectKey = false;
 
     for (const block of blocks) {
@@ -593,13 +753,25 @@ function resolvePrefixDynamicDeps(blocks: readonly PromptBlock[]): {
         for (const oKey of extractReferencedOutletKeys(block.content)) {
             outletKeys.add(oKey);
         }
+        for (const apKey of extractAutoPromptMacroKeys(block.content)) {
+            if (layer2KeySet.has(apKey)) {
+                autoPromptDynamicSet.add(apKey as Layer2AutoPromptMacroKey);
+            }
+        }
     }
 
+    const autoPromptDynamicKeys = Array.from(autoPromptDynamicSet).sort(compareCodeUnits);
+
     return {
-        hasAnyDynamicDeps: injectKeys.size > 0 || hasDynamicInjectKey || outletKeys.size > 0,
+        hasAnyDynamicDeps:
+            injectKeys.size > 0
+            || hasDynamicInjectKey
+            || outletKeys.size > 0
+            || autoPromptDynamicKeys.length > 0,
         injectKeys: Array.from(injectKeys).sort(compareCodeUnits),
         hasDynamicInjectKey,
         outletKeys: Array.from(outletKeys).sort(compareCodeUnits),
+        autoPromptDynamicKeys,
     };
 }
 
@@ -607,6 +779,7 @@ function computePrefixDynamicFingerprint(
     deps: ReturnType<typeof resolvePrefixDynamicDeps>,
     session: PromptInjectionSession,
     outletOverrides: Record<string, string>,
+    dynamicAutoPromptValues?: Partial<Record<Layer2AutoPromptMacroKey, string>>,
 ): string | undefined {
     if (!deps.hasAnyDynamicDeps) {
         return undefined;
@@ -616,7 +789,14 @@ function computePrefixDynamicFingerprint(
             ? computeInjectionDigest(session, deps.hasDynamicInjectKey ? 'all' : deps.injectKeys)
             : '';
     const outletParts = deps.outletKeys.map((k) => `${k}:${outletOverrides[`outlet:${k}`] ?? ''}`);
-    return `${injectDigest}|${outletParts.join('\x02')}`;
+    const base = `${injectDigest}|${outletParts.join('\x02')}`;
+    if (deps.autoPromptDynamicKeys.length === 0) {
+        return base;
+    }
+    const autoParts = deps.autoPromptDynamicKeys.map(
+        (k) => `${k}:${dynamicAutoPromptValues?.[k] ?? ''}`,
+    );
+    return `${base}|${autoParts.join('\x02')}`;
 }
 
 const PREFIX_MACRO_SIDE_EFFECT_RE =
@@ -692,12 +872,22 @@ export function computeLayer0StaticFingerprint(input: {
         .filter(Boolean)
         .sort(compareCodeUnits);
 
+    const claimedAutoPrompts = detectClaimedAutoPromptMacros({
+        promptBlocks,
+        systemBasePrompt: input.systemBasePrompt,
+        promptTriggerContext: input.promptTriggerContext,
+    });
+    const suppressedLayer0AutoPrompts = LAYER0_AUTO_PROMPT_KEYS.filter((k) =>
+        claimedAutoPrompts.all.has(k),
+    );
+
     const canonicalTools = canonicalizeTools(input.tools);
     const digestSource = canonicalStringify({
         systemBaseSpec,
         prefixBlocks,
         tools: canonicalTools,
         presetFileNames,
+        ...(suppressedLayer0AutoPrompts.length > 0 ? { suppressedLayer0AutoPrompts } : {}),
     });
     return `v2:${hashString64Hex(digestSource)}`;
 }
@@ -788,6 +978,36 @@ export class ContextAssembler {
         const canonicalTools = canonicalizeTools(input.tools);
         const promptBlocks = input.agent.promptBlocks ?? [];
         const layer0Messages: CanonicalMessage[] = [];
+        const classified = input.classifiedLore ?? [];
+
+        const claimed = detectClaimedAutoPromptMacros({
+            promptBlocks,
+            systemBasePrompt: input.systemBasePrompt,
+            promptTriggerContext: input.promptTriggerContext,
+        });
+
+        // Pre-compute Core Manifest & System Rules so prefix blocks can reference {{coreManifest}} / {{systemRules}}.
+        const { coreManifest, manifestText } = buildFormattedCoreManifest({
+            characterFields: input.characterFields,
+            classifiedLore: classified,
+            personaDescription: input.personaDescription,
+            hollowThreshold: input.hollowThreshold,
+            presetFiles: input.presetFiles,
+        });
+        const renderedRules = renderSystemRulesSync({
+            classifiedLore: classified,
+            hostBridge: input.hostBridge,
+            macroOverrides: input.macroOverrides,
+            preRenderedSystemRules: input.preRenderedSystemRules,
+        });
+        const systemRulesXml = formatSystemRulesXml(renderedRules);
+        const effectivePrefixMacroOverrides: Record<string, string> = {
+            ...(input.macroOverrides ?? {}),
+            ...buildAutoPromptMacroOverrides({
+                coreManifest: manifestText,
+                systemRules: systemRulesXml,
+            }),
+        };
 
         // 1. Decoupled System Base (multi-character / world-simulator safe)
         const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
@@ -795,7 +1015,7 @@ export class ContextAssembler {
             const resolvedBase = substituteText(
                 input.systemBasePrompt,
                 input.hostBridge,
-                input.macroOverrides,
+                effectivePrefixMacroOverrides,
             ).trim();
             if (resolvedBase) {
                 const baseRole =
@@ -819,7 +1039,7 @@ export class ContextAssembler {
                 } else {
                     const rendered = renderPromptBlockSync(systemBaseBlock, {
                         hostBridge: input.hostBridge,
-                        macroOverrides: input.macroOverrides,
+                        macroOverrides: effectivePrefixMacroOverrides,
                         precedingMessages: layer0Messages,
                     });
                     layer0Messages.push(...rendered);
@@ -829,7 +1049,7 @@ export class ContextAssembler {
             const resolvedBase = substituteText(
                 this.defaultSystemBase,
                 input.hostBridge,
-                input.macroOverrides,
+                effectivePrefixMacroOverrides,
             ).trim();
             if (resolvedBase) {
                 layer0Messages.push({
@@ -839,76 +1059,21 @@ export class ContextAssembler {
             }
         }
 
-        // 2. Category ① `system_rule` compiled block
-        const classified = input.classifiedLore ?? [];
-        const renderedRules: string[] = [];
-        if (input.preRenderedSystemRules !== undefined) {
-            for (const ruleText of input.preRenderedSystemRules) {
-                const trimmed = ruleText.trim();
-                if (trimmed) {
-                    renderedRules.push(trimmed);
-                }
-            }
-        } else {
-            const systemRules = classified
-                .filter((item) => item.category === 'system_rule' && !item.entry.disable)
-                .sort(
-                    (a, b) =>
-                        b.entry.order - a.entry.order
-                        || a.entry.depth - b.entry.depth
-                        || compareCodeUnits(a.entry.world, b.entry.world)
-                        || a.entry.uid - b.entry.uid,
-                );
-
-            for (const item of systemRules) {
-                const text = substituteText(
-                    item.cleanContent,
-                    input.hostBridge,
-                    input.macroOverrides,
-                ).trim();
-                if (!text) {
-                    continue;
-                }
-                const title = item.entry.comment?.trim();
-                renderedRules.push(title ? `### ${title}\n${text}` : text);
-            }
-        }
-
-        if (renderedRules.length > 0) {
+        // 2. Category ① `system_rule` compiled block (suppressed when claimed by {{systemRules}})
+        if (!claimed.all.has('systemRules') && systemRulesXml) {
             layer0Messages.push({
                 role: 'system',
-                content: `<system-rules>\n${renderedRules.join('\n\n')}\n</system-rules>`,
+                content: systemRulesXml,
             });
         }
 
-        // 3. Core Manifest (/character/* + Category ② core_manifest + hollow-card notice)
-        const coreEntries = classified.filter(
-            (item) => item.category === 'core_manifest' && !item.entry.disable,
-        );
-        const coreManifest = buildCoreManifest({
-            characterFields: input.characterFields ?? {},
-            coreEntries,
-            personaDescription: input.personaDescription,
-            hollowThreshold: input.hollowThreshold,
-        });
-
-        let manifestText = coreManifest.text;
-        const presetFileNames = Object.keys(input.presetFiles ?? {})
-            .map((name) => name.replace(/^\/+/, ''))
-            .filter(Boolean)
-            .sort(compareCodeUnits);
-        if (presetFileNames.length > 0) {
-            const presetLines = presetFileNames.map((name) => `- /preset/${name}`);
-            manifestText = manifestText.replace(
-                /<\/core-manifest>$/,
-                `预设参考文档（/preset/*，按需调用 read_file 阅读）：\n${presetLines.join('\n')}\n</core-manifest>`,
-            );
+        // 3. Core Manifest (/character/* + Category ② core_manifest + hollow-card notice; suppressed when claimed by {{coreManifest}})
+        if (!claimed.all.has('coreManifest')) {
+            layer0Messages.push({
+                role: 'system',
+                content: manifestText,
+            });
         }
-
-        layer0Messages.push({
-            role: 'system',
-            content: manifestText,
-        });
 
         // 4. Additional `prefix` PromptBlocks (preserving explicit order, role, and multi-message custom blocks)
         const prefixBlocks = promptBlocks.filter(
@@ -927,7 +1092,7 @@ export class ContextAssembler {
             } else {
                 const rendered = renderPromptBlockSync(block, {
                     hostBridge: input.hostBridge,
-                    macroOverrides: input.macroOverrides,
+                    macroOverrides: effectivePrefixMacroOverrides,
                     precedingMessages: layer0Messages,
                 });
                 layer0Messages.push(...rendered);
@@ -940,6 +1105,8 @@ export class ContextAssembler {
             layer0EndIndex: layer0Messages.length - 1,
             coreManifest,
             systemRuleCount: renderedRules.length,
+            manifestText,
+            systemRulesXml,
         };
     }
 
@@ -951,92 +1118,13 @@ export class ContextAssembler {
         const characterFields = input.characterFields ?? hostBridge?.getCharacterFields() ?? {};
         const personaDescription = input.personaDescription ?? hostBridge?.getPersonaDescription() ?? '';
         const classified = classifyAllEntries(input.loreEntries, input.wiRouterOverrides);
-
-        let layer0Messages: CanonicalMessage[];
-        let tools: CanonicalToolSchema[];
-        let layer0EndIndex: number;
-        let coreManifest: CoreManifestResult;
-        let systemRuleCount: number;
-
-        const isPersistent = input.agent.sessionMode === 'persistent';
-        const hasTriggerScopedBlocks = (input.agent.promptBlocks ?? []).some(
-            (b) => b.triggers && b.triggers.length > 0,
-        );
-        const isNonMainTriggerRun =
-            isPersistent
-            && input.promptTriggerContext !== undefined
-            && input.promptTriggerContext.kind !== 'main'
-            && hasTriggerScopedBlocks;
-        const staticFingerprint = computeLayer0StaticFingerprint({
-            agent: input.agent,
-            tools: input.tools,
-            presetFiles: input.presetFiles,
+        const claimed = detectClaimedAutoPromptMacros({
+            promptBlocks: input.agent.promptBlocks,
             systemBasePrompt: input.systemBasePrompt,
             promptTriggerContext: input.promptTriggerContext,
         });
-        const expectedFingerprint = input.prefixFingerprint ?? staticFingerprint;
-        const rawFrozen =
-            isPersistent && !input.forceRecompilePrefix && !isNonMainTriggerRun
-                ? input.trajectoryStore?.getFrozenPrefix(input.agent.id) ?? null
-                : null;
-        const existingFrozen =
-            rawFrozen
-            && (input.prefixFingerprint !== undefined
-                ? rawFrozen.prefixFingerprint === input.prefixFingerprint
-                : doesFrozenPrefixMatch(rawFrozen, staticFingerprint))
-                ? rawFrozen
-                : null;
 
-        if (existingFrozen) {
-            tools = canonicalClone(existingFrozen.tools) as CanonicalToolSchema[];
-            layer0Messages = canonicalClone(existingFrozen.messages) as CanonicalMessage[];
-            layer0EndIndex = existingFrozen.layer0EndIndex;
-            const coreEntries = classified.filter(
-                (item) => item.category === 'core_manifest' && !item.entry.disable,
-            );
-            coreManifest = buildCoreManifest({
-                characterFields,
-                coreEntries,
-                personaDescription,
-                hollowThreshold: input.hollowThreshold,
-            });
-            systemRuleCount = classified.filter(
-                (item) => item.category === 'system_rule' && !item.entry.disable,
-            ).length;
-        } else {
-            const prefix = this.compileStaticPrefix({
-                agent: input.agent,
-                tools: input.tools,
-                characterFields,
-                personaDescription,
-                classifiedLore: classified,
-                presetFiles: input.presetFiles,
-                hollowThreshold: input.hollowThreshold,
-                systemBasePrompt: input.systemBasePrompt,
-                promptTriggerContext: input.promptTriggerContext,
-                preRenderedBlocks: input.preRenderedBlocks,
-                preRenderedSystemRules: input.preRenderedSystemRules,
-                macroOverrides: input.macroOverrides,
-                hostBridge,
-            });
-            tools = prefix.tools;
-            layer0Messages = prefix.messages;
-            layer0EndIndex = prefix.layer0EndIndex;
-            coreManifest = prefix.coreManifest;
-            systemRuleCount = prefix.systemRuleCount;
-
-            if (isPersistent && !isNonMainTriggerRun && input.trajectoryStore) {
-                input.trajectoryStore.setFrozenPrefix(
-                    {
-                        tools,
-                        messages: layer0Messages,
-                        layer0EndIndex,
-                        prefixFingerprint: expectedFingerprint,
-                    },
-                    input.agent.id,
-                );
-            }
-        }
+        const isPersistent = input.agent.sessionMode === 'persistent';
 
         // Layer 1: Frozen trajectory (persistent) or sliding recent turns (ephemeral)
         let layer1Messages: CanonicalMessage[];
@@ -1056,13 +1144,28 @@ export class ContextAssembler {
             }
         }
 
-        // Layer 2: Tail-Only Dynamic Zone (or frozen in-flight messages during tool loop)
-        let layer2Messages: CanonicalMessage[];
+        // Pre-compute Layer 2 dynamic auto-prompt XML values so both prefix & tail blocks can expand them.
         let consumedSideBriefPaths: string[] = [];
         let sideHintResult: SideClueRadarScanResult | undefined;
+        let layer2AutoParts: {
+            turnBriefXml: string;
+            sideBriefXml: string;
+            workspaceNoticeXml: string;
+            remindersXml: string;
+            loreHintXml: string;
+            sideHintXml: string;
+        } = {
+            turnBriefXml: '',
+            sideBriefXml: '',
+            workspaceNoticeXml: '',
+            remindersXml: '',
+            loreHintXml: '',
+            sideHintXml: '',
+        };
+        let layer2AutoOverrides: Record<string, string>;
 
         if (input.inFlightMessages !== undefined) {
-            layer2Messages = input.inFlightMessages.map((m) => canonicalClone(m));
+            layer2AutoOverrides = fillMissingLayer2AutoOverrides(input.macroOverrides);
         } else {
             const briefClues = input.sideBrief === undefined && input.sideClues?.length
                 ? selectUnconsumedSideBriefClues(input.sideClues)
@@ -1098,17 +1201,211 @@ export class ContextAssembler {
                 }
             }
 
-            layer2Messages = this.buildLayer2Messages(input, classified, {
+            const baseLayer2MacroOverrides = buildLayer2MacroOverrides(input.vars, input.macroOverrides);
+            const reminderLines: string[] = [];
+            if (input.includeCategory4DynamicEntries !== false) {
+                if (input.preRenderedDynamicReminders !== undefined) {
+                    for (const line of input.preRenderedDynamicReminders) {
+                        const trimmed = line.trim();
+                        if (trimmed) {
+                            reminderLines.push(trimmed);
+                        }
+                    }
+                } else {
+                    const dynamicEntries = classified
+                        .filter(
+                            (item) =>
+                                item.category === 'dynamic_or_trigger'
+                                && !item.entry.disable
+                                && (item.reason === 'dynamic_at_depth' || item.reason === 'conditional_dynamic'),
+                        )
+                        .sort(
+                            (a, b) =>
+                                b.entry.order - a.entry.order
+                                || a.entry.depth - b.entry.depth
+                                || compareCodeUnits(a.entry.world, b.entry.world)
+                                || a.entry.uid - b.entry.uid,
+                        );
+                    for (const item of dynamicEntries) {
+                        const rendered = substituteText(
+                            item.cleanContent,
+                            input.hostBridge,
+                            baseLayer2MacroOverrides,
+                        ).trim();
+                        if (rendered) {
+                            reminderLines.push(rendered);
+                        }
+                    }
+                }
+            }
+            if (input.dynamicReminders) {
+                for (const line of input.dynamicReminders) {
+                    const trimmed = line.trim();
+                    if (trimmed) {
+                        reminderLines.push(trimmed);
+                    }
+                }
+            }
+
+            const turnBriefXml = input.turnBrief ? wrapXmlIfNeeded('turn-brief', input.turnBrief) : '';
+            const workspaceNoticeXml = input.workspaceNotice?.trim() ?? '';
+            const remindersXml = formatDynamicRemindersXml(reminderLines);
+            const loreHintXml = typeof input.loreHint === 'string'
+                ? input.loreHint.trim()
+                : (input.loreHint?.hintXml?.trim() ?? '');
+
+            layer2AutoParts = {
+                turnBriefXml,
                 sideBriefXml,
+                workspaceNoticeXml,
+                remindersXml,
+                loreHintXml,
                 sideHintXml,
+            };
+            layer2AutoOverrides = buildAutoPromptMacroOverrides({
+                turnBrief: turnBriefXml,
+                sideBrief: sideBriefXml,
+                workspaceNotice: workspaceNoticeXml,
+                dynamicReminders: remindersXml,
+                loreHint: loreHintXml,
+                sideHint: sideHintXml,
             });
         }
 
-        const floatingTailMessages = this.buildFloatingTailMessages(input, [
-            ...layer0Messages,
-            ...layer1Messages,
-            ...layer2Messages,
-        ]);
+        const prefixInputMacroOverrides: Record<string, string> = {
+            ...(input.macroOverrides ?? {}),
+            ...layer2AutoOverrides,
+        };
+
+        let layer0Messages: CanonicalMessage[];
+        let tools: CanonicalToolSchema[];
+        let layer0EndIndex: number;
+        let coreManifest: CoreManifestResult;
+        let systemRuleCount: number;
+        let manifestText: string;
+        let systemRulesXml: string;
+
+        const hasTriggerScopedBlocks = (input.agent.promptBlocks ?? []).some(
+            (b) => b.triggers && b.triggers.length > 0,
+        );
+        const isNonMainTriggerRun =
+            isPersistent
+            && input.promptTriggerContext !== undefined
+            && input.promptTriggerContext.kind !== 'main'
+            && hasTriggerScopedBlocks;
+        const staticFingerprint = computeLayer0StaticFingerprint({
+            agent: input.agent,
+            tools: input.tools,
+            presetFiles: input.presetFiles,
+            systemBasePrompt: input.systemBasePrompt,
+            promptTriggerContext: input.promptTriggerContext,
+        });
+        const expectedFingerprint = input.prefixFingerprint ?? staticFingerprint;
+        const rawFrozen =
+            isPersistent && !input.forceRecompilePrefix && !isNonMainTriggerRun
+                ? input.trajectoryStore?.getFrozenPrefix(input.agent.id) ?? null
+                : null;
+        const existingFrozen =
+            rawFrozen
+            && (input.prefixFingerprint !== undefined
+                ? rawFrozen.prefixFingerprint === input.prefixFingerprint
+                : doesFrozenPrefixMatch(rawFrozen, staticFingerprint))
+                ? rawFrozen
+                : null;
+
+        if (existingFrozen) {
+            tools = canonicalClone(existingFrozen.tools) as CanonicalToolSchema[];
+            layer0Messages = canonicalClone(existingFrozen.messages) as CanonicalMessage[];
+            layer0EndIndex = existingFrozen.layer0EndIndex;
+            const formatted = buildFormattedCoreManifest({
+                characterFields,
+                classifiedLore: classified,
+                personaDescription,
+                hollowThreshold: input.hollowThreshold,
+                presetFiles: input.presetFiles,
+            });
+            coreManifest = formatted.coreManifest;
+            manifestText = formatted.manifestText;
+            systemRuleCount = classified.filter(
+                (item) => item.category === 'system_rule' && !item.entry.disable,
+            ).length;
+            systemRulesXml = claimed.tail.has('systemRules')
+                ? formatSystemRulesXml(
+                      renderSystemRulesSync({
+                          classifiedLore: classified,
+                          hostBridge,
+                          macroOverrides: prefixInputMacroOverrides,
+                          preRenderedSystemRules: input.preRenderedSystemRules,
+                      }),
+                  )
+                : '';
+        } else {
+            const prefix = this.compileStaticPrefix({
+                agent: input.agent,
+                tools: input.tools,
+                characterFields,
+                personaDescription,
+                classifiedLore: classified,
+                presetFiles: input.presetFiles,
+                hollowThreshold: input.hollowThreshold,
+                systemBasePrompt: input.systemBasePrompt,
+                promptTriggerContext: input.promptTriggerContext,
+                preRenderedBlocks: input.preRenderedBlocks,
+                preRenderedSystemRules: input.preRenderedSystemRules,
+                macroOverrides: prefixInputMacroOverrides,
+                hostBridge,
+            });
+            tools = prefix.tools;
+            layer0Messages = prefix.messages;
+            layer0EndIndex = prefix.layer0EndIndex;
+            coreManifest = prefix.coreManifest;
+            systemRuleCount = prefix.systemRuleCount;
+            manifestText = prefix.manifestText;
+            systemRulesXml = prefix.systemRulesXml;
+
+            if (isPersistent && !isNonMainTriggerRun && input.trajectoryStore) {
+                input.trajectoryStore.setFrozenPrefix(
+                    {
+                        tools,
+                        messages: layer0Messages,
+                        layer0EndIndex,
+                        prefixFingerprint: expectedFingerprint,
+                    },
+                    input.agent.id,
+                );
+            }
+        }
+
+        const effectiveMacroOverrides: Record<string, string> = {
+            ...prefixInputMacroOverrides,
+            ...buildAutoPromptMacroOverrides({
+                coreManifest: manifestText,
+                systemRules: systemRulesXml,
+            }),
+        };
+
+        // Layer 2: Tail-Only Dynamic Zone (or frozen in-flight messages during tool loop)
+        let layer2Messages: CanonicalMessage[];
+        if (input.inFlightMessages !== undefined) {
+            layer2Messages = input.inFlightMessages.map((m) => canonicalClone(m));
+        } else {
+            layer2Messages = this.buildLayer2Messages(
+                input,
+                layer2AutoParts,
+                claimed,
+                effectiveMacroOverrides,
+            );
+        }
+
+        const floatingTailMessages = this.buildFloatingTailMessages(
+            input,
+            [
+                ...layer0Messages,
+                ...layer1Messages,
+                ...layer2Messages,
+            ],
+            effectiveMacroOverrides,
+        );
 
         const allMessages = [
             ...layer0Messages,
@@ -1153,7 +1450,7 @@ export class ContextAssembler {
             ...(input.preRenderedSystemRules !== undefined
                 ? { preRenderedSystemRules: input.preRenderedSystemRules }
                 : {}),
-            ...(input.macroOverrides ? { effectiveMacroOverrides: input.macroOverrides } : {}),
+            ...(Object.keys(effectiveMacroOverrides).length > 0 ? { effectiveMacroOverrides } : {}),
             stats: {
                 layer0MessageCount: layer0Messages.length,
                 layer1MessageCount: layer1Messages.length,
@@ -1508,6 +1805,48 @@ export class ContextAssembler {
         };
 
         // Determine matching prefix blocks and check Layer 0 dynamic dirty fingerprint
+        const characterFields = rest.characterFields ?? hostBridge.getCharacterFields() ?? {};
+        const personaDescription = rest.personaDescription ?? hostBridge.getPersonaDescription() ?? '';
+        const claimed = detectClaimedAutoPromptMacros({
+            promptBlocks,
+            systemBasePrompt: rest.systemBasePrompt,
+            promptTriggerContext: rest.promptTriggerContext,
+        });
+        const { manifestText } = buildFormattedCoreManifest({
+            characterFields,
+            classifiedLore: classified,
+            personaDescription,
+            hollowThreshold: rest.hollowThreshold,
+            presetFiles: rest.presetFiles,
+        });
+
+        const turnBriefXml =
+            rest.inFlightMessages === undefined && rest.turnBrief
+                ? wrapXmlIfNeeded('turn-brief', rest.turnBrief)
+                : '';
+        const sideBriefXml =
+            rest.inFlightMessages === undefined
+                ? (rest.sideBrief !== undefined
+                      ? wrapXmlIfNeeded('side-brief', rest.sideBrief)
+                      : formatSideBriefXml(
+                            sideClues?.length ? selectUnconsumedSideBriefClues(sideClues) : [],
+                        ))
+                : '';
+        const workspaceNoticeXml =
+            rest.inFlightMessages === undefined ? (rest.workspaceNotice?.trim() ?? '') : '';
+        const loreHintXml =
+            rest.inFlightMessages === undefined
+                ? (typeof loreHint === 'string'
+                      ? loreHint.trim()
+                      : (loreHint?.hintXml?.trim() ?? ''))
+                : '';
+        const sideHintXml =
+            rest.inFlightMessages === undefined
+                ? (typeof sideHint === 'string'
+                      ? sideHint.trim()
+                      : (sideHint?.hintXml?.trim() ?? ''))
+                : '';
+
         const matchingPrefixBlocks: PromptBlock[] = [];
         const systemBaseBlock = promptBlocks.find((b) => b.id === 'system_base');
         if (
@@ -1539,10 +1878,163 @@ export class ContextAssembler {
             promptTriggerContext: rest.promptTriggerContext,
         });
         const prefixDeps = resolvePrefixDynamicDeps(matchingPrefixBlocks);
+
+        let preRenderedSystemRules: string[] | undefined = rest.preRenderedSystemRules
+            ? [...rest.preRenderedSystemRules]
+            : undefined;
+        let preRenderedDynamicReminders: string[] | undefined = rest.preRenderedDynamicReminders
+            ? [...rest.preRenderedDynamicReminders]
+            : undefined;
+
+        const renderSystemRulesAsync = async (): Promise<string[]> => {
+            const systemRuleEntries = classified
+                .filter((item) => item.category === 'system_rule' && !item.entry.disable)
+                .sort(
+                    (a, b) =>
+                        b.entry.order - a.entry.order
+                        || a.entry.depth - b.entry.depth
+                        || compareCodeUnits(a.entry.world, b.entry.world)
+                        || a.entry.uid - b.entry.uid,
+                );
+            const renderedRulesList: string[] = [];
+            for (const item of systemRuleEntries) {
+                const ifConds = extractIfConditions(item.decorators);
+                const passed = await evaluateIfConditions(ifConds, hostBridge, liveVars, {
+                    injectionSession: session,
+                });
+                if (!passed) {
+                    continue;
+                }
+                const preMacroVars = extractMetadataVarsFallback(hostBridge);
+                let text = substituteText(item.cleanContent, hostBridge, combinedMacroOverrides);
+                syncMetadataVarDiff(preMacroVars);
+                if (hostBridge.evaluateOptionalEjs && text.includes('<%')) {
+                    try {
+                        text = await evalEjsWithTurnSync(text, liveVars, {
+                            ...(hasPrivateDecorator(item.decorators) ? { isPrivate: true } : {}),
+                        });
+                    } catch {
+                        // Keep macro-substituted fallback text
+                    }
+                }
+                const trimmed = text.trim();
+                if (!trimmed) {
+                    continue;
+                }
+                const title = item.entry.comment?.trim();
+                renderedRulesList.push(title ? `### ${title}\n${trimmed}` : trimmed);
+            }
+            return renderedRulesList;
+        };
+
+        const renderDynamicRemindersAsync = async (
+            varsSnapshot: Record<string, unknown>,
+            overridesSnapshot: Record<string, string> | undefined,
+        ): Promise<string[]> => {
+            const dynamicEntries = classified
+                .filter(
+                    (item) =>
+                        item.category === 'dynamic_or_trigger'
+                        && !item.entry.disable
+                        && (item.reason === 'dynamic_at_depth' || item.reason === 'conditional_dynamic'),
+                )
+                .sort(
+                    (a, b) =>
+                        b.entry.order - a.entry.order
+                        || a.entry.depth - b.entry.depth
+                        || compareCodeUnits(a.entry.world, b.entry.world)
+                        || a.entry.uid - b.entry.uid,
+                );
+            const renderedReminders: string[] = [];
+            for (const item of dynamicEntries) {
+                const ifConds = extractIfConditions(item.decorators);
+                const passed = await evaluateIfConditions(ifConds, hostBridge, varsSnapshot, {
+                    injectionSession: session,
+                });
+                if (!passed) {
+                    continue;
+                }
+                const preMacroVars = extractMetadataVarsFallback(hostBridge);
+                let text = substituteText(item.cleanContent, hostBridge, overridesSnapshot);
+                syncMetadataVarDiff(preMacroVars);
+                if (hostBridge.evaluateOptionalEjs && text.includes('<%')) {
+                    try {
+                        text = await evalEjsWithTurnSync(text, varsSnapshot, {
+                            ...(hasPrivateDecorator(item.decorators) ? { isPrivate: true } : {}),
+                        });
+                    } catch {
+                        // Keep macro-substituted fallback text
+                    }
+                }
+                const trimmed = text.trim();
+                if (trimmed) {
+                    renderedReminders.push(trimmed);
+                }
+            }
+            return renderedReminders;
+        };
+
+        if (
+            rest.inFlightMessages === undefined
+            && prefixDeps.autoPromptDynamicKeys.includes('dynamicReminders')
+            && rest.includeCategory4DynamicEntries !== false
+            && preRenderedDynamicReminders === undefined
+        ) {
+            session.setForceOutlet(true);
+            try {
+                const preDynamicOverrides = buildLayer2MacroOverrides(liveVars, {
+                    ...combinedMacroOverrides,
+                    ...buildAutoPromptMacroOverrides({
+                        coreManifest: manifestText,
+                        turnBrief: turnBriefXml,
+                        sideBrief: sideBriefXml,
+                        workspaceNotice: workspaceNoticeXml,
+                        loreHint: loreHintXml,
+                        sideHint: sideHintXml,
+                    }),
+                });
+                preRenderedDynamicReminders = await renderDynamicRemindersAsync(
+                    liveVars,
+                    preDynamicOverrides,
+                );
+            } finally {
+                session.setForceOutlet(false);
+            }
+        }
+
+        const buildDynamicAutoPromptFingerprintValues = (): Partial<
+            Record<Layer2AutoPromptMacroKey, string>
+        > => {
+            if (rest.inFlightMessages !== undefined) {
+                return {
+                    turnBrief: rest.macroOverrides?.turnBrief ?? '',
+                    sideBrief: rest.macroOverrides?.sideBrief ?? '',
+                    workspaceNotice: rest.macroOverrides?.workspaceNotice ?? '',
+                    dynamicReminders: rest.macroOverrides?.dynamicReminders ?? '',
+                    loreHint: rest.macroOverrides?.loreHint ?? '',
+                    sideHint: rest.macroOverrides?.sideHint ?? '',
+                };
+            }
+            return {
+                turnBrief: turnBriefXml,
+                sideBrief: sideBriefXml,
+                workspaceNotice: workspaceNoticeXml,
+                dynamicReminders: formatDynamicRemindersXml([
+                    ...(preRenderedDynamicReminders ?? []),
+                    ...(rest.dynamicReminders ?? []),
+                ]),
+                loreHint: loreHintXml,
+                sideHint: sideHintXml,
+            };
+        };
+
         const initialDynamicFingerprint = computePrefixDynamicFingerprint(
             prefixDeps,
             session,
             outletMacroOverrides,
+            prefixDeps.autoPromptDynamicKeys.length > 0
+                ? buildDynamicAutoPromptFingerprintValues()
+                : undefined,
         );
         const frozenMatches = doesFrozenPrefixMatch(
             existingFrozen,
@@ -1559,23 +2051,54 @@ export class ContextAssembler {
         const newlyRenderedPrefixIds: string[] = [];
         const newlyRenderedTailIds: string[] = [];
         const newlyRenderedFloatingIds: string[] = [];
-        let preRenderedSystemRules: string[] | undefined = rest.preRenderedSystemRules
-            ? [...rest.preRenderedSystemRules]
-            : undefined;
-        let preRenderedDynamicReminders: string[] | undefined = rest.preRenderedDynamicReminders
-            ? [...rest.preRenderedDynamicReminders]
-            : undefined;
+
+        let fullCombinedMacroOverrides: Record<string, string> = { ...combinedMacroOverrides };
 
         session.setForceOutlet(true);
         try {
             if (!willUseFrozenPrefix) {
+                if (claimed.prefix.has('systemRules') && preRenderedSystemRules === undefined) {
+                    preRenderedSystemRules = await renderSystemRulesAsync();
+                }
+
+                const prefixAutoOverrides = buildAutoPromptMacroOverrides({
+                    coreManifest: manifestText,
+                    ...(preRenderedSystemRules !== undefined
+                        ? { systemRules: formatSystemRulesXml(preRenderedSystemRules) }
+                        : {}),
+                    ...(rest.inFlightMessages === undefined
+                        ? {
+                              turnBrief: turnBriefXml,
+                              sideBrief: sideBriefXml,
+                              workspaceNotice: workspaceNoticeXml,
+                              loreHint: loreHintXml,
+                              sideHint: sideHintXml,
+                              ...(preRenderedDynamicReminders !== undefined || rest.dynamicReminders
+                                  ? {
+                                        dynamicReminders: formatDynamicRemindersXml([
+                                            ...(preRenderedDynamicReminders ?? []),
+                                            ...(rest.dynamicReminders ?? []),
+                                        ]),
+                                    }
+                                  : {}),
+                          }
+                        : {}),
+                });
+                const prefixMacroOverrides: Record<string, string> = {
+                    ...combinedMacroOverrides,
+                    ...(rest.inFlightMessages !== undefined
+                        ? fillMissingLayer2AutoOverrides(rest.macroOverrides)
+                        : {}),
+                    ...prefixAutoOverrides,
+                };
+
                 const prefixBlocksToRender = matchingPrefixBlocks.filter(
                     (block) => !preRenderedBlocks.has(block.id),
                 );
                 if (prefixBlocksToRender.length > 0) {
                     const renderedPrefix = await prerenderPromptBlocks(prefixBlocksToRender, {
                         hostBridge,
-                        macroOverrides: combinedMacroOverrides,
+                        macroOverrides: prefixMacroOverrides,
                         vars: liveVars,
                         injectionSession: session,
                         ejsSession,
@@ -1588,111 +2111,108 @@ export class ContextAssembler {
                 }
 
                 if (preRenderedSystemRules === undefined) {
-                    const systemRuleEntries = classified
-                        .filter((item) => item.category === 'system_rule' && !item.entry.disable)
-                        .sort(
-                            (a, b) =>
-                                b.entry.order - a.entry.order
-                                || a.entry.depth - b.entry.depth
-                                || compareCodeUnits(a.entry.world, b.entry.world)
-                                || a.entry.uid - b.entry.uid,
-                        );
-                    const renderedRulesList: string[] = [];
-                    for (const item of systemRuleEntries) {
-                        const ifConds = extractIfConditions(item.decorators);
-                        const passed = await evaluateIfConditions(ifConds, hostBridge, liveVars, {
-                            injectionSession: session,
-                        });
-                        if (!passed) {
-                            continue;
-                        }
-                        const preMacroVars = extractMetadataVarsFallback(hostBridge);
-                        let text = substituteText(item.cleanContent, hostBridge, combinedMacroOverrides);
-                        syncMetadataVarDiff(preMacroVars);
-                        if (hostBridge.evaluateOptionalEjs && text.includes('<%')) {
-                            try {
-                                text = await evalEjsWithTurnSync(text, liveVars, {
-                                    ...(hasPrivateDecorator(item.decorators) ? { isPrivate: true } : {}),
-                                });
-                            } catch {
-                                // Keep macro-substituted fallback text
-                            }
-                        }
-                        const trimmed = text.trim();
-                        if (!trimmed) {
-                            continue;
-                        }
-                        const title = item.entry.comment?.trim();
-                        renderedRulesList.push(title ? `### ${title}\n${trimmed}` : trimmed);
-                    }
-                    preRenderedSystemRules = renderedRulesList;
+                    preRenderedSystemRules = await renderSystemRulesAsync();
                 }
-            } else if (rest.inFlightMessages === undefined) {
-                const sideEffectPrefixBlocks = matchingPrefixBlocks.filter((block) =>
-                    hasPrefixSideEffect(block.content),
-                );
-                if (sideEffectPrefixBlocks.length > 0) {
-                    await prerenderPromptBlocks(sideEffectPrefixBlocks, {
-                        hostBridge,
-                        macroOverrides: combinedMacroOverrides,
-                        vars: liveVars,
-                        injectionSession: session,
-                        ejsSession,
-                        onVariablesMutated: applyTurnVarUpdates,
-                    });
+            } else {
+                if (rest.inFlightMessages === undefined) {
+                    const sideEffectPrefixBlocks = matchingPrefixBlocks.filter((block) =>
+                        hasPrefixSideEffect(block.content),
+                    );
+                    if (sideEffectPrefixBlocks.length > 0) {
+                        const sideEffectMacroOverrides: Record<string, string> = {
+                            ...combinedMacroOverrides,
+                            ...buildAutoPromptMacroOverrides({
+                                coreManifest: manifestText,
+                            }),
+                        };
+                        await prerenderPromptBlocks(sideEffectPrefixBlocks, {
+                            hostBridge,
+                            macroOverrides: sideEffectMacroOverrides,
+                            vars: liveVars,
+                            injectionSession: session,
+                            ejsSession,
+                            onVariablesMutated: applyTurnVarUpdates,
+                        });
+                    }
+                }
+                if (claimed.tail.has('systemRules') && preRenderedSystemRules === undefined) {
+                    preRenderedSystemRules = await renderSystemRulesAsync();
                 }
             }
 
+            const systemRulesXml = formatSystemRulesXml(preRenderedSystemRules ?? []);
             const floatTailBlocks = shouldFloatTailPromptBlocks(rest.promptTriggerContext);
             const layer2Vars =
                 Object.keys(mutatedTurnVars).length > 0
                     ? { ...(rest.vars ?? {}), ...mutatedTurnVars }
                     : rest.vars;
-            const layer2MacroOverrides = buildLayer2MacroOverrides(layer2Vars, combinedMacroOverrides);
+            const preReminderMacroOverrides: Record<string, string> = {
+                ...combinedMacroOverrides,
+                ...(rest.inFlightMessages === undefined
+                    ? buildAutoPromptMacroOverrides({
+                          coreManifest: manifestText,
+                          systemRules: systemRulesXml,
+                          turnBrief: turnBriefXml,
+                          sideBrief: sideBriefXml,
+                          workspaceNotice: workspaceNoticeXml,
+                          loreHint: loreHintXml,
+                          sideHint: sideHintXml,
+                      })
+                    : {
+                          ...fillMissingLayer2AutoOverrides(rest.macroOverrides),
+                          ...buildAutoPromptMacroOverrides({
+                              coreManifest: manifestText,
+                              systemRules: systemRulesXml,
+                          }),
+                      }),
+            };
+            const layer2MacroOverrides = buildLayer2MacroOverrides(
+                layer2Vars,
+                preReminderMacroOverrides,
+            );
 
-            if (rest.inFlightMessages === undefined && rest.includeCategory4DynamicEntries !== false && preRenderedDynamicReminders === undefined) {
-                const dynamicEntries = classified
-                    .filter(
-                        (item) =>
-                            item.category === 'dynamic_or_trigger'
-                            && !item.entry.disable
-                            && (item.reason === 'dynamic_at_depth' || item.reason === 'conditional_dynamic'),
-                    )
-                    .sort(
-                        (a, b) =>
-                            b.entry.order - a.entry.order
-                            || a.entry.depth - b.entry.depth
-                            || compareCodeUnits(a.entry.world, b.entry.world)
-                            || a.entry.uid - b.entry.uid,
-                    );
-                const renderedReminders: string[] = [];
-                for (const item of dynamicEntries) {
-                    const ifConds = extractIfConditions(item.decorators);
-                    const passed = await evaluateIfConditions(ifConds, hostBridge, liveVars, {
-                        injectionSession: session,
-                    });
-                    if (!passed) {
-                        continue;
-                    }
-                    const preMacroVars = extractMetadataVarsFallback(hostBridge);
-                    let text = substituteText(item.cleanContent, hostBridge, layer2MacroOverrides);
-                    syncMetadataVarDiff(preMacroVars);
-                    if (hostBridge.evaluateOptionalEjs && text.includes('<%')) {
-                        try {
-                            text = await evalEjsWithTurnSync(text, liveVars, {
-                                ...(hasPrivateDecorator(item.decorators) ? { isPrivate: true } : {}),
-                            });
-                        } catch {
-                            // Keep macro-substituted fallback text
-                        }
-                    }
-                    const trimmed = text.trim();
-                    if (trimmed) {
-                        renderedReminders.push(trimmed);
-                    }
-                }
-                preRenderedDynamicReminders = renderedReminders;
+            if (
+                rest.inFlightMessages === undefined
+                && rest.includeCategory4DynamicEntries !== false
+                && preRenderedDynamicReminders === undefined
+            ) {
+                preRenderedDynamicReminders = await renderDynamicRemindersAsync(
+                    liveVars,
+                    layer2MacroOverrides,
+                );
             }
+
+            const remindersXml = formatDynamicRemindersXml([
+                ...(preRenderedDynamicReminders ?? []),
+                ...(rest.dynamicReminders ?? []),
+            ]);
+            const fullAutoOverrides =
+                rest.inFlightMessages === undefined
+                    ? buildAutoPromptMacroOverrides({
+                          coreManifest: manifestText,
+                          systemRules: systemRulesXml,
+                          turnBrief: turnBriefXml,
+                          sideBrief: sideBriefXml,
+                          workspaceNotice: workspaceNoticeXml,
+                          dynamicReminders: remindersXml,
+                          loreHint: loreHintXml,
+                          sideHint: sideHintXml,
+                      })
+                    : {
+                          ...fillMissingLayer2AutoOverrides(rest.macroOverrides),
+                          ...buildAutoPromptMacroOverrides({
+                              coreManifest: manifestText,
+                              systemRules: systemRulesXml,
+                          }),
+                      };
+            fullCombinedMacroOverrides = {
+                ...combinedMacroOverrides,
+                ...fullAutoOverrides,
+            };
+            const tailRenderMacroOverrides = buildLayer2MacroOverrides(
+                layer2Vars,
+                fullCombinedMacroOverrides,
+            );
 
             if (!floatTailBlocks && rest.inFlightMessages === undefined) {
                 const tailBlocksToRender = promptBlocks.filter(
@@ -1706,7 +2226,7 @@ export class ContextAssembler {
                 if (tailBlocksToRender.length > 0) {
                     const renderedTail = await prerenderPromptBlocks(tailBlocksToRender, {
                         hostBridge,
-                        macroOverrides: layer2MacroOverrides,
+                        macroOverrides: tailRenderMacroOverrides,
                         vars: liveVars,
                         injectionSession: session,
                         ejsSession,
@@ -1734,7 +2254,7 @@ export class ContextAssembler {
                         : rest.vars;
                 const latestLayer2MacroOverrides = buildLayer2MacroOverrides(
                     latestLayer2Vars,
-                    combinedMacroOverrides,
+                    fullCombinedMacroOverrides,
                 );
                 const renderedFloating = await prerenderPromptBlocks(floatingBlocksToRender, {
                     hostBridge,
@@ -1770,17 +2290,37 @@ export class ContextAssembler {
             preRenderedSystemRules = preRenderedSystemRules
                 .map((rule) => session.applyOutlets(rule).trim())
                 .filter(Boolean);
+            fullCombinedMacroOverrides = {
+                ...fullCombinedMacroOverrides,
+                ...buildAutoPromptMacroOverrides({
+                    systemRules: formatSystemRulesXml(preRenderedSystemRules),
+                }),
+            };
         }
         if (preRenderedDynamicReminders) {
             preRenderedDynamicReminders = preRenderedDynamicReminders
                 .map((line) => session.applyOutlets(line).trim())
                 .filter(Boolean);
+            if (rest.inFlightMessages === undefined) {
+                fullCombinedMacroOverrides = {
+                    ...fullCombinedMacroOverrides,
+                    ...buildAutoPromptMacroOverrides({
+                        dynamicReminders: formatDynamicRemindersXml([
+                            ...preRenderedDynamicReminders,
+                            ...(rest.dynamicReminders ?? []),
+                        ]),
+                    }),
+                };
+            }
         }
 
         const finalDynamicFingerprint = computePrefixDynamicFingerprint(
             prefixDeps,
             session,
             outletMacroOverrides,
+            prefixDeps.autoPromptDynamicKeys.length > 0
+                ? buildDynamicAutoPromptFingerprintValues()
+                : undefined,
         );
         const finalPrefixFingerprint =
             finalDynamicFingerprint !== undefined
@@ -1800,7 +2340,7 @@ export class ContextAssembler {
             ...(preRenderedSystemRules !== undefined ? { preRenderedSystemRules } : {}),
             ...(preRenderedDynamicReminders !== undefined ? { preRenderedDynamicReminders } : {}),
             prefixFingerprint: finalPrefixFingerprint,
-            macroOverrides: combinedMacroOverrides,
+            macroOverrides: fullCombinedMacroOverrides,
             hostBridge,
         });
     }
@@ -1828,72 +2368,27 @@ export class ContextAssembler {
 
     private buildLayer2Messages(
         input: ContextAssembleInput,
-        classified: readonly ClassifiedLoreEntry[],
-        sideBlocks: { sideBriefXml?: string; sideHintXml?: string } = {},
+        autoParts: {
+            turnBriefXml: string;
+            sideBriefXml: string;
+            workspaceNoticeXml: string;
+            remindersXml: string;
+            loreHintXml: string;
+            sideHintXml: string;
+        },
+        claimed: ClaimedAutoPromptMacros,
+        effectiveMacroOverrides: Record<string, string>,
     ): CanonicalMessage[] {
         const layer2Messages: CanonicalMessage[] = [];
-        const macroOverrides = buildLayer2MacroOverrides(input.vars, input.macroOverrides);
-
-        // 1. Dynamic reminders: Category ④ `dynamic_at_depth` + `conditional_dynamic` + explicit `dynamicReminders`
-        const reminderLines: string[] = [];
-        if (input.includeCategory4DynamicEntries !== false) {
-            if (input.preRenderedDynamicReminders !== undefined) {
-                for (const line of input.preRenderedDynamicReminders) {
-                    const trimmed = line.trim();
-                    if (trimmed) {
-                        reminderLines.push(trimmed);
-                    }
-                }
-            } else {
-                const dynamicEntries = classified
-                    .filter(
-                        (item) =>
-                            item.category === 'dynamic_or_trigger'
-                            && !item.entry.disable
-                            && (item.reason === 'dynamic_at_depth' || item.reason === 'conditional_dynamic'),
-                    )
-                    .sort(
-                        (a, b) =>
-                            b.entry.order - a.entry.order
-                            || a.entry.depth - b.entry.depth
-                            || compareCodeUnits(a.entry.world, b.entry.world)
-                            || a.entry.uid - b.entry.uid,
-                    );
-                for (const item of dynamicEntries) {
-                    const rendered = substituteText(item.cleanContent, input.hostBridge, macroOverrides).trim();
-                    if (rendered) {
-                        reminderLines.push(rendered);
-                    }
-                }
-            }
-        }
-        if (input.dynamicReminders) {
-            for (const line of input.dynamicReminders) {
-                const trimmed = line.trim();
-                if (trimmed) {
-                    reminderLines.push(trimmed);
-                }
-            }
-        }
-
-        const turnBriefXml = input.turnBrief ? wrapXmlIfNeeded('turn-brief', input.turnBrief) : '';
-        const sideBriefXml = sideBlocks.sideBriefXml?.trim() ?? '';
-        const workspaceNoticeXml = input.workspaceNotice?.trim() ?? '';
-        const remindersXml = reminderLines.length > 0
-            ? `<dynamic-reminders>\n${reminderLines.join('\n')}\n</dynamic-reminders>`
-            : '';
-        const loreHintXml = typeof input.loreHint === 'string'
-            ? input.loreHint.trim()
-            : (input.loreHint?.hintXml?.trim() ?? '');
-        const sideHintXml = sideBlocks.sideHintXml?.trim() ?? '';
+        const macroOverrides = buildLayer2MacroOverrides(input.vars, effectiveMacroOverrides);
 
         const tailBlocks = [
-            turnBriefXml,
-            sideBriefXml,
-            workspaceNoticeXml,
-            remindersXml,
-            loreHintXml,
-            sideHintXml,
+            claimed.all.has('turnBrief') ? '' : autoParts.turnBriefXml,
+            claimed.all.has('sideBrief') ? '' : autoParts.sideBriefXml,
+            claimed.all.has('workspaceNotice') ? '' : autoParts.workspaceNoticeXml,
+            claimed.all.has('dynamicReminders') ? '' : autoParts.remindersXml,
+            claimed.all.has('loreHint') ? '' : autoParts.loreHintXml,
+            claimed.all.has('sideHint') ? '' : autoParts.sideHintXml,
         ].filter((s) => s.length > 0);
         const tailSuffix = tailBlocks.join('\n\n');
 
@@ -1981,8 +2476,12 @@ export class ContextAssembler {
     private buildFloatingTailMessages(
         input: ContextAssembleInput,
         precedingMessages: readonly CanonicalMessage[],
+        effectiveMacroOverrides?: Record<string, string>,
     ): CanonicalMessage[] {
-        const macroOverrides = buildLayer2MacroOverrides(input.vars, input.macroOverrides);
+        const macroOverrides = buildLayer2MacroOverrides(
+            input.vars,
+            effectiveMacroOverrides ?? input.macroOverrides,
+        );
         const placements: ReadonlyArray<'tail' | 'floating_tail'> = shouldFloatTailPromptBlocks(
             input.promptTriggerContext,
         )

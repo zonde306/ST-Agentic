@@ -21,6 +21,7 @@ import {
     applyOutletsToCanonicalMessages,
     buildLayer2MacroOverrides,
     buildMainSurfaceMacroOverrides,
+    buildStaticAutoPromptMacroOverrides,
     buildWorkspaceNotices,
     computeLayer0StaticFingerprint,
     ContextAssembler,
@@ -1490,10 +1491,6 @@ export class AgentRunner {
                           }
                         : undefined,
             });
-            const preRenderMacroOverrides = buildLayer2MacroOverrides(
-                workingVars,
-                effectiveMacroOverrides,
-            );
 
             // Pre-render matching Layer 0 `prefix` blocks (EJS + Track A/B custom JSON) once per run
             // whenever Layer 0 will not reuse a frozen prefix, so Round 2+ synchronous `reassembleInFlight()`
@@ -1526,6 +1523,19 @@ export class AgentRunner {
 
             let preRenderedBlocks: Map<string, CanonicalMessage[]> | undefined;
             if (input.resumeMessages !== undefined) {
+                const resumeAutoMacroOverrides = buildStaticAutoPromptMacroOverrides({
+                    characterFields,
+                    personaDescription,
+                    loreEntries,
+                    wiRouterOverrides: preset.wiRouterOverrides,
+                    presetFiles: preset.files,
+                    hostBridge: this.bridge,
+                    macroOverrides: effectiveMacroOverrides,
+                });
+                const resumePreRenderMacroOverrides = buildLayer2MacroOverrides(workingVars, {
+                    ...effectiveMacroOverrides,
+                    ...resumeAutoMacroOverrides,
+                });
                 const resumeEjsSession: EjsRenderSession = {};
                 const rawMetaVars = this.bridge.getMetadata()?.variables;
                 const resumeVars: Record<string, unknown> = {
@@ -1564,7 +1574,7 @@ export class AgentRunner {
                         if (prefixBlocksToRender.length > 0) {
                             preRenderedBlocks = await prerenderPromptBlocks(prefixBlocksToRender, {
                                 hostBridge: this.bridge,
-                                macroOverrides: preRenderMacroOverrides,
+                                macroOverrides: resumePreRenderMacroOverrides,
                                 vars: resumeVars,
                                 injectionSession: input.injectionSession,
                                 ejsSession: resumeEjsSession,
@@ -1588,7 +1598,7 @@ export class AgentRunner {
                     if (floatingTailBlocksToRender.length > 0) {
                         const renderedFloating = await prerenderPromptBlocks(floatingTailBlocksToRender, {
                             hostBridge: this.bridge,
-                            macroOverrides: preRenderMacroOverrides,
+                            macroOverrides: resumePreRenderMacroOverrides,
                             vars: resumeVars,
                             injectionSession: input.injectionSession,
                             ejsSession: resumeEjsSession,

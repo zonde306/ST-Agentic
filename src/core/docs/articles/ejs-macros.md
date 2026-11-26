@@ -62,6 +62,23 @@ ST-Agentic 通过 `evaluateOptionalEjs()` 集成可选插件 **`ST-Prompt-Templa
 | `{{triggerPrompt}}` | 当前触发器 / `@@agent` 子智能体对应的世界书条目指令正文（已渲染宏与 EJS，不含 `Target VFS Path` / `Latest User Input` 等外围包装；非触发场景为空字符串） | 触发器 / `@@agent` 子智能体 |
 | `{{triggerLabel}}` / `{{triggerId}}` / `{{triggerPhase}}` / `{{triggerTargetPath}}` | 当前触发器标题、规则 ID、阶段（`before_turn`/`after_turn`/`maintenance`）与目标 VFS 路径 | 触发器 / `@@agent` 子智能体 |
 
+### 自动注入提示词宏（精准控制预设位置与角色）
+
+当任一**已启用且匹配当前触发条件**的 `PromptBlock` 引用了下方任意宏（同时支持 `camelCase`、`snake_case` 与 `kebab-case` 别名，如 `{{coreManifest}}` / `{{core_manifest}}` / `{{core-manifest}}`）时，ST-Agentic 会自动**取消该块原有的默认位置自动注入**（不再作为独立的 Layer 0 `system` 消息 / Gemini `systemInstruction` 或 Layer 2 默认 user 尾部拼接），改为在预设指定的积木位置与角色原样展开；若当前没有任何生效积木引用该宏，则保持原有的自动注入行为。
+
+| 宏（及别名） | 对应自动注入内容 | 推荐 `placement`（KV 缓存建议） |
+| :--- | :--- | :--- |
+| `{{coreManifest}}` / `{{core_manifest}}` / `{{core-manifest}}` | `<core-manifest>`（空壳卡提示、`/character/*`、`/persona/description.md`、Category ② 常驻世界书与 `/preset/*` 索引） | `prefix`（静态前缀） |
+| `{{systemRules}}` / `{{system_rules}}` / `{{system-rules}}` | `<system-rules>`（Category ① `@@system` 系统规则汇总；无规则时展开为空） | `prefix`（静态前缀） |
+| `{{turnBrief}}` / `{{turn_brief}}` / `{{turn-brief}}` | `<turn-brief>`（`before_turn` 触发器回合简报） | `tail` |
+| `{{sideBrief}}` / `{{side_brief}}` / `{{side-brief}}` | `<side-brief>`（未消费的 `next_turn_brief` `/side/*` 线索简报） | `tail` |
+| `{{workspaceNotice}}` / `{{workspace_notice}}` / `{{workspace-notice}}` | `<workspace-instructions-notice>` / `<workspace-doc-updates>` / `<workspace-shared-updates>` | `tail` |
+| `{{dynamicReminders}}` / `{{dynamic_reminders}}` / `{{dynamic-reminders}}` | `<dynamic-reminders>`（Category ④ `dynamic_at_depth` / `conditional_dynamic` 动态提醒） | `tail` |
+| `{{loreHint}}` / `{{lore_hint}}` / `{{lore-hint}}` | `<lore-hint>`（TailRadar 世界书关键词雷达提示） | `tail` |
+| `{{sideHint}}` / `{{side_hint}}` / `{{side-hint}}` | `<side-hint>`（TailRadar `/side/*` 线索雷达提示） | `tail` |
+
+> 提示：请勿将 `{{loreHint}}`、`{{turnBrief}}`、`{{dynamicReminders}}` 等 Layer 2 动态宏放入 `prefix` 积木中，否则每回合都会导致 Layer 0 前缀缓存失效。
+
 ---
 
 ## 4. VFS 全量挂载点速查

@@ -49,6 +49,7 @@ import type {
     WriteChatMessageOptions,
 } from '@/core/bridge';
 import { resolveActivePreset } from '@/core/config';
+import { AUTO_PROMPT_MACRO_ALIAS_LOWER_SET } from '@/core/context';
 import { applyRegexRules } from '@/core/regex';
 import type { ChatDataStore } from '@/core/store';
 import type {
@@ -1070,6 +1071,12 @@ export class STHostBridge implements HostBridge {
                     continue;
                 }
                 const lowerKey = key.toLowerCase();
+                if (AUTO_PROMPT_MACRO_ALIAS_LOWER_SET.has(lowerKey)) {
+                    if (presentTemplateMacros.has(lowerKey)) {
+                        fallbackMap.set(lowerKey, value);
+                    }
+                    continue;
+                }
                 if (PRE_SUBSTITUTE_OVERRIDE_KEYS.has(lowerKey)) {
                     preSubstituteMap.set(lowerKey, value);
                     continue;
