@@ -1,7 +1,14 @@
 import { type ComponentChildren, Fragment, type TargetedMouseEvent } from 'preact';
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { ToastItem, ToastTone } from '../store/app-store';
-import { IconAlertTriangle, IconCheck, IconClose, IconInfo, IconMore } from './Icons';
+import {
+    IconAlertTriangle,
+    IconCheck,
+    IconChevronDown,
+    IconClose,
+    IconInfo,
+    IconMore,
+} from './Icons';
 
 export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
 export type ButtonSize = 'sm' | 'md';
@@ -593,6 +600,396 @@ export function DropdownMenu({
                             </button>
                         </Fragment>
                     ))}
+                </div>
+            ) : null}
+        </div>
+    );
+}
+
+export interface SplitActionMenuItem {
+    id: string;
+    label: string;
+    description?: string;
+    icon?: ComponentChildren;
+    tone?: 'default' | 'danger';
+    disabled?: boolean;
+    title?: string;
+    onClick: () => void;
+}
+
+export interface SplitActionButtonProps {
+    label: string;
+    icon?: ComponentChildren;
+    variant?: ButtonVariant;
+    size?: ButtonSize;
+    disabled?: boolean;
+    loading?: boolean;
+    title?: string;
+    onClick: () => void;
+    menuItems: ReadonlyArray<SplitActionMenuItem>;
+    menuAlign?: 'left' | 'right';
+    ariaLabel?: string;
+    menuAriaLabel?: string;
+    className?: string;
+}
+
+/**
+ * Unified split action button: primary action button seamlessly joined with a
+ * `▾` dropdown trigger and Shadow-DOM-safe popover menu.
+ */
+export function SplitActionButton({
+    label,
+    icon,
+    variant = 'secondary',
+    size = 'md',
+    disabled = false,
+    loading = false,
+    title,
+    onClick,
+    menuItems,
+    menuAlign = 'right',
+    ariaLabel,
+    menuAriaLabel,
+    className,
+}: SplitActionButtonProps) {
+    const [open, setOpen] = useState(false);
+    const [floatingPos, setFloatingPos] = useState<{ top: number; left: number } | null>(null);
+    const wrapRef = useRef<HTMLDivElement | null>(null);
+    const caretRef = useRef<HTMLButtonElement | null>(null);
+    const menuRef = useRef<HTMLDivElement | null>(null);
+
+    const isDisabled = disabled || loading;
+    const hasMenu = menuItems.length > 0;
+    const resolvedMenuLabel = menuAriaLabel ?? `${label}更多操作`;
+
+    useEffect(() => {
+        if ((isDisabled || !hasMenu) && open) {
+            setOpen(false);
+        }
+    }, [isDisabled, hasMenu, open]);
+
+    const updateMenuPosition = useCallback(() => {
+        if (typeof window === 'undefined') {
+            return;
+        }
+        const wrap = wrapRef.current;
+        const menu = menuRef.current;
+        if (!wrap || !menu) {
+            return;
+        }
+
+        const wrapRect = wrap.getBoundingClientRect();
+        if (wrapRect.width === 0 && wrapRect.height === 0) {
+            setFloatingPos(null);
+            return;
+        }
+
+        // Probe the containing block origin for `position: fixed` so clamping works
+        // identically inside regular viewports, Shadow Roots, and filtered modals.
+        const prevPosition = menu.style.position;
+        const prevTop = menu.style.top;
+        const prevLeft = menu.style.left;
+        const prevRight = menu.style.right;
+        menu.style.position = 'fixed';
+        menu.style.top = '0px';
+        menu.style.left = '0px';
+        menu.style.right = 'auto';
+
+        const probeRect = menu.getBoundingClientRect();
+        const cbLeft = probeRect.left;
+        const cbTop = probeRect.top;
+        const menuWidth = probeRect.width;
+        const menuHeight = probeRect.height;
+
+        const viewportWidth = Math.min(
+            window.innerWidth,
+            window.visualViewport?.width ?? window.innerWidth,
+        );
+        const viewportHeight = Math.min(
+            window.innerHeight,
+            window.visualViewport?.height ?? window.innerHeight,
+        );
+        const margin = 8;
+        const gap = 6;
+
+        const effectiveWidth = Math.min(menuWidth, Math.max(0, viewportWidth - margin * 2));
+        const preferredX =
+            menuAlign === 'left' ? wrapRect.left : wrapRect.right - effectiveWidth;
+        const maxX = Math.max(margin, viewportWidth - effectiveWidth - margin);
+        const clampedX = Math.min(Math.max(preferredX, margin), maxX);
+
+        const belowY = wrapRect.bottom + gap;
+        const aboveY = wrapRect.top - gap - menuHeight;
+        const preferredY =
+            belowY + menuHeight <= viewportHeight - margin || aboveY < margin
+                ? belowY
+                : aboveY;
+        const maxY = Math.max(margin, viewportHeight - menuHeight - margin);
+        const clampedY = Math.min(Math.max(preferredY, margin), maxY);
+
+        const nextTop = Math.round(clampedY - cbTop);
+        const nextLeft = Math.round(clampedX - cbLeft);
+
+        menu.style.position = prevPosition;
+        menu.style.top = prevTop;
+        menu.style.left = prevLeft;
+        menu.style.right = prevRight;
+
+        setFloatingPos((prev) =>
+            prev && prev.top === nextTop && prev.left === nextLeft
+                ? prev
+                : { top: nextTop, left: nextLeft },
+        );
+    }, [menuAlign]);
+
+    useLayoutEffect(() => {
+        if (!open) {
+            setFloatingPos(null);
+            return;
+        }
+        updateMenuPosition();
+
+        const rootNode = wrapRef.current?.getRootNode?.();
+        const shadowRoot =
+            typeof ShadowRoot !== 'undefined' && rootNode instanceof ShadowRoot
+                ? rootNode
+                : null;
+        const onRelayout = () => {
+            updateMenuPosition();
+        };
+
+        window.addEventListener('resize', onRelayout);
+        window.addEventListener('scroll', onRelayout, true);
+        window.visualViewport?.addEventListener('resize', onRelayout);
+        if (shadowRoot) {
+            shadowRoot.addEventListener('scroll', onRelayout, true);
+        }
+
+        return () => {
+            window.removeEventListener('resize', onRelayout);
+            window.removeEventListener('scroll', onRelayout, true);
+            window.visualViewport?.removeEventListener('resize', onRelayout);
+            if (shadowRoot) {
+                shadowRoot.removeEventListener('scroll', onRelayout, true);
+            }
+        };
+    }, [open, menuItems.length, updateMenuPosition]);
+
+    useEffect(() => {
+        if (!open) {
+            return;
+        }
+        const rootNode = wrapRef.current?.getRootNode?.();
+        const shadowRoot =
+            typeof ShadowRoot !== 'undefined' && rootNode instanceof ShadowRoot
+                ? rootNode
+                : null;
+
+        const isInsideSplitButton = (event: Event): boolean => {
+            const currentWrap = wrapRef.current;
+            if (!currentWrap) {
+                return false;
+            }
+            if (typeof event.composedPath === 'function') {
+                const path = event.composedPath();
+                if (path.length > 0) {
+                    if (path.includes(currentWrap)) {
+                        return true;
+                    }
+                    if (
+                        shadowRoot
+                        && shadowRoot.mode === 'closed'
+                        && event.currentTarget !== shadowRoot
+                        && path.includes(shadowRoot.host)
+                    ) {
+                        return true;
+                    }
+                    return false;
+                }
+            }
+            const target = event.target;
+            return target instanceof Node ? currentWrap.contains(target) : false;
+        };
+
+        const onOutsideInteract = (event: Event) => {
+            if (!isInsideSplitButton(event)) {
+                setOpen(false);
+            }
+        };
+
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                event.stopPropagation();
+                setOpen(false);
+                const currentWrap = wrapRef.current;
+                const activeEl = shadowRoot?.activeElement ?? document.activeElement;
+                if (currentWrap && activeEl instanceof Node && currentWrap.contains(activeEl)) {
+                    caretRef.current?.focus();
+                }
+            }
+        };
+
+        window.addEventListener('pointerdown', onOutsideInteract, true);
+        window.addEventListener('mousedown', onOutsideInteract, true);
+        window.addEventListener('click', onOutsideInteract, true);
+        window.addEventListener('keydown', onKeyDown, true);
+
+        if (shadowRoot) {
+            shadowRoot.addEventListener('pointerdown', onOutsideInteract, true);
+            shadowRoot.addEventListener('mousedown', onOutsideInteract, true);
+            shadowRoot.addEventListener('click', onOutsideInteract, true);
+            shadowRoot.addEventListener('keydown', onKeyDown as EventListener, true);
+        }
+
+        return () => {
+            window.removeEventListener('pointerdown', onOutsideInteract, true);
+            window.removeEventListener('mousedown', onOutsideInteract, true);
+            window.removeEventListener('click', onOutsideInteract, true);
+            window.removeEventListener('keydown', onKeyDown, true);
+            if (shadowRoot) {
+                shadowRoot.removeEventListener('pointerdown', onOutsideInteract, true);
+                shadowRoot.removeEventListener('mousedown', onOutsideInteract, true);
+                shadowRoot.removeEventListener('click', onOutsideInteract, true);
+                shadowRoot.removeEventListener('keydown', onKeyDown as EventListener, true);
+            }
+        };
+    }, [open]);
+
+    const wrapClasses = [
+        'ag-split-btn',
+        `ag-split-btn-${variant}`,
+        size === 'sm' ? 'ag-split-btn-sm' : 'ag-split-btn-md',
+        className ?? '',
+    ]
+        .filter(Boolean)
+        .join(' ');
+
+    const sharedBtnClasses = [
+        'ag-btn',
+        `ag-btn-${variant}`,
+        size === 'sm' ? 'ag-btn-sm' : 'ag-btn-md',
+    ].join(' ');
+
+    const handleMainClick = () => {
+        if (isDisabled) {
+            return;
+        }
+        if (open) {
+            setOpen(false);
+        }
+        onClick();
+    };
+
+    const handleCaretClick = () => {
+        if (isDisabled || !hasMenu) {
+            return;
+        }
+        setOpen((prev) => !prev);
+    };
+
+    const handleItemClick = (item: SplitActionMenuItem) => {
+        if (item.disabled) {
+            return;
+        }
+        setOpen(false);
+        item.onClick();
+    };
+
+    return (
+        <div
+            ref={wrapRef}
+            class={wrapClasses}
+            role="group"
+            aria-label={ariaLabel ?? label}
+            data-variant={variant}
+            data-size={size}
+            data-open={open ? 'true' : 'false'}
+        >
+            <button
+                type="button"
+                class={`${sharedBtnClasses} ag-split-btn-main`}
+                disabled={isDisabled}
+                title={title}
+                aria-label={ariaLabel}
+                aria-busy={loading || undefined}
+                onClick={handleMainClick}
+            >
+                {icon ? <span class="ag-btn-icon">{icon}</span> : null}
+                <span class="ag-btn-label">{label}</span>
+            </button>
+            {hasMenu ? (
+                <button
+                    ref={caretRef}
+                    type="button"
+                    class={`${sharedBtnClasses} ag-split-btn-caret`}
+                    disabled={isDisabled}
+                    title={resolvedMenuLabel}
+                    aria-label={resolvedMenuLabel}
+                    aria-haspopup="menu"
+                    aria-expanded={open}
+                    onClick={handleCaretClick}
+                >
+                    <span class="ag-split-btn-caret-icon" aria-hidden="true">
+                        <IconChevronDown size={14} />
+                    </span>
+                </button>
+            ) : null}
+            {open && hasMenu ? (
+                <div
+                    ref={menuRef}
+                    class="ag-split-menu"
+                    role="menu"
+                    aria-label={resolvedMenuLabel}
+                    data-align={menuAlign}
+                    data-floating={floatingPos ? 'fixed' : 'absolute'}
+                    style={
+                        floatingPos
+                            ? {
+                                  top: `${floatingPos.top}px`,
+                                  left: `${floatingPos.left}px`,
+                              }
+                            : undefined
+                    }
+                >
+                    {menuItems.map((item) => {
+                        const isDanger = item.tone === 'danger';
+                        const hasDesc = Boolean(item.description);
+                        const itemClasses = [
+                            'ag-split-menu-item',
+                            isDanger ? 'ag-split-menu-item-danger' : '',
+                            hasDesc ? 'ag-split-menu-item-with-desc' : '',
+                        ]
+                            .filter(Boolean)
+                            .join(' ');
+                        return (
+                            <button
+                                key={item.id}
+                                type="button"
+                                role="menuitem"
+                                class={itemClasses}
+                                data-menu-item-id={item.id}
+                                data-tone={item.tone ?? 'default'}
+                                disabled={item.disabled}
+                                title={item.title}
+                                onClick={() => handleItemClick(item)}
+                            >
+                                {item.icon ? (
+                                    <span class="ag-split-menu-item-icon" aria-hidden="true">
+                                        {item.icon}
+                                    </span>
+                                ) : null}
+                                <span class="ag-split-menu-item-text">
+                                    <span class="ag-split-menu-item-label">{item.label}</span>
+                                    {item.description ? (
+                                        <span class="ag-split-menu-item-desc">
+                                            {item.description}
+                                        </span>
+                                    ) : null}
+                                </span>
+                            </button>
+                        );
+                    })}
                 </div>
             ) : null}
         </div>
