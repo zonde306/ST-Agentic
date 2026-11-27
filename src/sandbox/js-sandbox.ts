@@ -1038,7 +1038,7 @@ function createSandboxMessagesProxy(
                 typeof replacer === 'function'
                     ? (content: string, msg: CanonicalMessage, idx: number) => {
                         const out = replacer(content, cloneExecutionBoundaryValue(msg, method), idx);
-                        return typeof out === 'string' ? out : String(out ?? '');
+                        return typeof out === 'string' ? out : (undefined as unknown as string);
                     }
                     : replacer;
             return hostMessages.replaceContent(wrappedSelector, wrappedReplacer);
@@ -1221,6 +1221,7 @@ function createSandboxBodyBridge(hostBody: Record<string, unknown>): {
     return {
         workingBody,
         syncBack: () => {
+            const stagedEntries: Array<[string, unknown]> = [];
             const nextKeys = new Set<string>();
             for (const key of Object.keys(workingBody)) {
                 if (FORBIDDEN_BOUNDARY_KEYS.has(key)) {
@@ -1230,8 +1231,12 @@ function createSandboxBodyBridge(hostBody: Record<string, unknown>): {
                 if (val === undefined) {
                     continue;
                 }
+                const cloned = cloneExecutionBoundaryValue(val, 'body');
                 nextKeys.add(key);
-                hostBody[key] = cloneExecutionBoundaryValue(val, 'body');
+                stagedEntries.push([key, cloned]);
+            }
+            for (const [key, cloned] of stagedEntries) {
+                hostBody[key] = cloned;
             }
             for (const existingKey of Object.keys(hostBody)) {
                 if (!FORBIDDEN_BOUNDARY_KEYS.has(existingKey) && !nextKeys.has(existingKey)) {
@@ -1433,52 +1438,52 @@ export class IframeJsSandbox implements ScriptSandbox {
                     const prevSignal = activeSignal;
                     activeSignal = combined.signal;
 
-                    const isDisposed = () => realm.handle.isDisposed();
-                    const scopedSideGen = createSandboxSideGenProxy(
-                        ctx.sideGen,
-                        combined.signal,
-                        isDisposed,
-                    );
-                    const scopedAgent = createSandboxAgentProxy(
-                        ctx.agent,
-                        combined.signal,
-                        isDisposed,
-                    );
-                    const scopedMessages = ctx.messages
-                        ? createSandboxMessagesProxy(ctx.messages, combined.signal, isDisposed)
-                        : undefined;
-                    const scopedEvent = ctx.event
-                        ? createSandboxEventSnapshot(ctx.event)
-                        : undefined;
-                    const scopedControl = ctx.control
-                        ? createSandboxControlProxy(ctx.control, combined.signal, isDisposed)
-                        : undefined;
-                    const bodyBridge = ctx.body
-                        ? createSandboxBodyBridge(ctx.body)
-                        : undefined;
-                    const outputBridge = ctx.output
-                        ? createSandboxOutputBridge(ctx.output)
-                        : undefined;
-
-                    const scopedCtx: ToolExecutionContext = {
-                        fs: ctx.fs,
-                        vars: ctx.vars,
-                        message: ctx.message,
-                        st: ctx.st,
-                        sideGen: scopedSideGen,
-                        agent: scopedAgent,
-                        ...(scopedMessages ? { messages: scopedMessages } : {}),
-                        ...(scopedEvent ? { event: scopedEvent } : {}),
-                        ...(scopedControl ? { control: scopedControl } : {}),
-                        ...(bodyBridge ? { body: bodyBridge.workingBody } : {}),
-                        ...(outputBridge ? { output: outputBridge.workingOutput } : {}),
-                        target: Object.freeze({ ...ctx.target }),
-                        signal: combined.signal,
-                        permissions: ctx.permissions,
-                        ...(ctx.readSet ? { readSet: ctx.readSet } : {}),
-                    };
-
                     try {
+                        const isDisposed = () => realm.handle.isDisposed();
+                        const scopedSideGen = createSandboxSideGenProxy(
+                            ctx.sideGen,
+                            combined.signal,
+                            isDisposed,
+                        );
+                        const scopedAgent = createSandboxAgentProxy(
+                            ctx.agent,
+                            combined.signal,
+                            isDisposed,
+                        );
+                        const scopedMessages = ctx.messages
+                            ? createSandboxMessagesProxy(ctx.messages, combined.signal, isDisposed)
+                            : undefined;
+                        const scopedEvent = ctx.event
+                            ? createSandboxEventSnapshot(ctx.event)
+                            : undefined;
+                        const scopedControl = ctx.control
+                            ? createSandboxControlProxy(ctx.control, combined.signal, isDisposed)
+                            : undefined;
+                        const bodyBridge = ctx.body
+                            ? createSandboxBodyBridge(ctx.body)
+                            : undefined;
+                        const outputBridge = ctx.output
+                            ? createSandboxOutputBridge(ctx.output)
+                            : undefined;
+
+                        const scopedCtx: ToolExecutionContext = {
+                            fs: ctx.fs,
+                            vars: ctx.vars,
+                            message: ctx.message,
+                            st: ctx.st,
+                            sideGen: scopedSideGen,
+                            agent: scopedAgent,
+                            ...(scopedMessages ? { messages: scopedMessages } : {}),
+                            ...(scopedEvent ? { event: scopedEvent } : {}),
+                            ...(scopedControl ? { control: scopedControl } : {}),
+                            ...(bodyBridge ? { body: bodyBridge.workingBody } : {}),
+                            ...(outputBridge ? { output: outputBridge.workingOutput } : {}),
+                            target: Object.freeze({ ...ctx.target }),
+                            signal: combined.signal,
+                            permissions: ctx.permissions,
+                            ...(ctx.readSet ? { readSet: ctx.readSet } : {}),
+                        };
+
                         const executionTimeoutMs = resolveToolTimeoutMs(
                             def.timeoutMs ?? options.timeoutMs,
                             this.defaultTimeoutMs,
@@ -1527,78 +1532,80 @@ export class IframeJsSandbox implements ScriptSandbox {
 
         const handleBox: { current?: ManagedSandboxHandle } = {};
         const isDisposed = () => handleBox.current?.isDisposed() ?? false;
-        const scopedSideGen = createSandboxSideGenProxy(
-            ctx.sideGen,
-            combined.signal,
-            isDisposed,
-        );
-        const scopedAgent = createSandboxAgentProxy(
-            ctx.agent,
-            combined.signal,
-            isDisposed,
-        );
-        const scopedMessages = ctx.messages
-            ? createSandboxMessagesProxy(ctx.messages, combined.signal, isDisposed)
-            : undefined;
-        const scopedEvent = ctx.event
-            ? createSandboxEventSnapshot(ctx.event)
-            : undefined;
-        const scopedControl = ctx.control
-            ? createSandboxControlProxy(ctx.control, combined.signal, isDisposed)
-            : undefined;
-        const bodyBridge = ctx.body
-            ? createSandboxBodyBridge(ctx.body)
-            : undefined;
-        const outputBridge = ctx.output
-            ? createSandboxOutputBridge(ctx.output)
-            : undefined;
-
-        const scopedCtx: ToolExecutionContext = {
-            fs: ctx.fs,
-            vars: ctx.vars,
-            message: ctx.message,
-            st: ctx.st,
-            sideGen: scopedSideGen,
-            agent: scopedAgent,
-            ...(scopedMessages ? { messages: scopedMessages } : {}),
-            ...(scopedEvent ? { event: scopedEvent } : {}),
-            ...(scopedControl ? { control: scopedControl } : {}),
-            ...(bodyBridge ? { body: bodyBridge.workingBody } : {}),
-            ...(outputBridge ? { output: outputBridge.workingOutput } : {}),
-            target: Object.freeze({ ...ctx.target }),
-            signal: combined.signal,
-            permissions: ctx.permissions,
-            ...(ctx.readSet ? { readSet: ctx.readSet } : {}),
-        };
-
-        const realm = this.createRealm(id, 'script', {
-            allowNetwork,
-            schemaMode: false,
-            getActiveSignal: () => combined.signal,
-            injections: {
-                z,
-                _: createSafeLodash(),
-                defineTool,
-                ctx: scopedCtx,
-                fs: scopedCtx.fs,
-                vars: scopedCtx.vars,
-                message: scopedCtx.message,
-                st: scopedCtx.st,
-                sideGen: scopedCtx.sideGen,
-                agent: scopedCtx.agent,
-                messages: scopedCtx.messages,
-                event: scopedCtx.event,
-                control: scopedCtx.control,
-                body: scopedCtx.body,
-                output: scopedCtx.output,
-                target: scopedCtx.target,
-                signal: scopedCtx.signal,
-            },
-        });
-        handleBox.current = realm.handle;
-        realm.handle.trackAbortController(runController);
+        let realm: RealmContext | undefined;
 
         try {
+            const scopedSideGen = createSandboxSideGenProxy(
+                ctx.sideGen,
+                combined.signal,
+                isDisposed,
+            );
+            const scopedAgent = createSandboxAgentProxy(
+                ctx.agent,
+                combined.signal,
+                isDisposed,
+            );
+            const scopedMessages = ctx.messages
+                ? createSandboxMessagesProxy(ctx.messages, combined.signal, isDisposed)
+                : undefined;
+            const scopedEvent = ctx.event
+                ? createSandboxEventSnapshot(ctx.event)
+                : undefined;
+            const scopedControl = ctx.control
+                ? createSandboxControlProxy(ctx.control, combined.signal, isDisposed)
+                : undefined;
+            const bodyBridge = ctx.body
+                ? createSandboxBodyBridge(ctx.body)
+                : undefined;
+            const outputBridge = ctx.output
+                ? createSandboxOutputBridge(ctx.output)
+                : undefined;
+
+            const scopedCtx: ToolExecutionContext = {
+                fs: ctx.fs,
+                vars: ctx.vars,
+                message: ctx.message,
+                st: ctx.st,
+                sideGen: scopedSideGen,
+                agent: scopedAgent,
+                ...(scopedMessages ? { messages: scopedMessages } : {}),
+                ...(scopedEvent ? { event: scopedEvent } : {}),
+                ...(scopedControl ? { control: scopedControl } : {}),
+                ...(bodyBridge ? { body: bodyBridge.workingBody } : {}),
+                ...(outputBridge ? { output: outputBridge.workingOutput } : {}),
+                target: Object.freeze({ ...ctx.target }),
+                signal: combined.signal,
+                permissions: ctx.permissions,
+                ...(ctx.readSet ? { readSet: ctx.readSet } : {}),
+            };
+
+            realm = this.createRealm(id, 'script', {
+                allowNetwork,
+                schemaMode: false,
+                getActiveSignal: () => combined.signal,
+                injections: {
+                    z,
+                    _: createSafeLodash(),
+                    defineTool,
+                    ctx: scopedCtx,
+                    fs: scopedCtx.fs,
+                    vars: scopedCtx.vars,
+                    message: scopedCtx.message,
+                    st: scopedCtx.st,
+                    sideGen: scopedCtx.sideGen,
+                    agent: scopedCtx.agent,
+                    messages: scopedCtx.messages,
+                    event: scopedCtx.event,
+                    control: scopedCtx.control,
+                    body: scopedCtx.body,
+                    output: scopedCtx.output,
+                    target: scopedCtx.target,
+                    signal: scopedCtx.signal,
+                },
+            });
+            handleBox.current = realm.handle;
+            realm.handle.trackAbortController(runController);
+
             const result = await raceWithSignalAndTimeout(
                 realm.evaluateCode(code, 'script'),
                 combined.signal,
@@ -1613,9 +1620,11 @@ export class IframeJsSandbox implements ScriptSandbox {
         } finally {
             combined.cleanup();
             callerLinked.cleanup();
-            realm.handle.untrackAbortController(runController);
-            if (!options.keepAlive) {
-                this.lifecycle.dispose(id);
+            if (realm) {
+                realm.handle.untrackAbortController(runController);
+                if (!options.keepAlive) {
+                    this.lifecycle.dispose(id);
+                }
             }
         }
     }

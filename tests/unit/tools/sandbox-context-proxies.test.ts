@@ -15,6 +15,7 @@ import type { AgentRunTrace, AssistantRoundLog } from '@/core/types';
 import {
     IframeJsSandbox,
     SandboxAgentError,
+    SandboxExecutionError,
     SandboxLifecycleManager,
 } from '@/sandbox';
 import { MemoryHostBridge } from '../../mocks';
@@ -420,6 +421,82 @@ describe('IframeJsSandbox extended context proxies (agent, messages, event, cont
         expect(postAction).toBe('fix');
         expect(fixMessage).toBe('Check tags');
         expect(rejectWrite).toBe(true);
+    });
+
+    it('preserves skip semantics when replaceContent replacer returns undefined, keeps body syncBack atomic, and cleans abort listeners on pre-eval clone failure', async () => {
+        // 1. messages.replaceContent callback returning undefined skips modifying unmatched messages
+        const messagesCtrl = createEphemeralMessagesController([
+            { role: 'system', content: 'Keep system intact' },
+            { role: 'user', content: 'keep user intact' },
+            { role: 'user', content: 'rewrite me' },
+        ]);
+
+        const replacedCount = (await sandbox.evaluateScript(
+            `
+            return messages.replaceContent(
+                (msg) => msg.role === 'user',
+                (content) => {
+                    if (content.includes('rewrite')) {
+                        return content.toUpperCase();
+                    }
+                    return undefined;
+                },
+            );
+            `,
+            createBaseCtx({ messages: messagesCtrl }),
+            { id: 'replace_skip_undefined', allowNetwork: false },
+        )) as number;
+
+        expect(replacedCount).toBe(1);
+        expect(messagesCtrl.toMessages()).toEqual([
+            { role: 'system', content: 'Keep system intact' },
+            { role: 'user', content: 'keep user intact' },
+            { role: 'user', content: 'REWRITE ME' },
+        ]);
+
+        // 2. Atomic body syncBack: if any key fails cloning, ZERO partial mutations or deletions occur on hostBody
+        const atomicBody: Record<string, unknown> = {
+            temperature: 0.7,
+            keep_me: 'untouched',
+        };
+        await expect(
+            sandbox.evaluateScript(
+                `
+                body.temperature = 0.2;
+                delete body.keep_me;
+                body.bad = () => {};
+                `,
+                createBaseCtx({ body: atomicBody }),
+                { id: 'body_atomic_syncback', allowNetwork: false },
+            ),
+        ).rejects.toThrow(SandboxExecutionError);
+
+        expect(atomicBody).toEqual({
+            temperature: 0.7,
+            keep_me: 'untouched',
+        });
+
+        // 3. Pre-eval clone error cleans up combined/caller abort listeners cleanly
+        const ac = new AbortController();
+        const addSpy = vi.spyOn(ac.signal, 'addEventListener');
+        const removeSpy = vi.spyOn(ac.signal, 'removeEventListener');
+        const uncloneableEvent = {
+            type: 'generation_error',
+            timestamp: 1,
+            data: { fn: () => 'bad' },
+        } as unknown as ToolEventPayload;
+
+        await expect(
+            sandbox.evaluateScript(
+                `return 1;`,
+                createBaseCtx({ signal: ac.signal, event: uncloneableEvent }),
+                { id: 'preeval_cleanup_check', allowNetwork: false },
+            ),
+        ).rejects.toThrow(SandboxExecutionError);
+
+        expect(addSpy).toHaveBeenCalled();
+        expect(removeSpy).toHaveBeenCalledTimes(addSpy.mock.calls.length);
+        expect(lifecycle.getStats().activeSandboxes).toBe(0);
     });
 
     it('supports extended AgentRunTrace and AssistantRoundLog contracts cleanly', () => {
