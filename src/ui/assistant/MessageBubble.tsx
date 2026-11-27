@@ -814,8 +814,9 @@ export function MessageBubble({
                                     <IconRefresh size={13} />
                                 </span>
                                 <span>
-                                    网络波动，正在自动重试 ({message.retryStatus.attempt}/
-                                    {message.retryStatus.maxAttempts})…
+                                    {/空响应|EMPTY_RESPONSE/i.test(message.retryStatus.reason)
+                                        ? `模型返回空响应，正在自动重试 (${message.retryStatus.attempt}/${message.retryStatus.maxAttempts})…`
+                                        : `网络波动，正在自动重试 (${message.retryStatus.attempt}/${message.retryStatus.maxAttempts})…`}
                                 </span>
                             </span>
                             {message.retryStatus.reason ? (

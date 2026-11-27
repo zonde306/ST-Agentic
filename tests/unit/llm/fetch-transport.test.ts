@@ -903,4 +903,75 @@ describe('FetchLLMTransport', () => {
         });
         expect(malformedAttempts).toBe(1);
     });
+
+    it('retries stream() when HTTP 200 streaming response has null body (EMPTY_RESPONSE)', async () => {
+        const conn = makeConnection({ id: 'conn-null-stream-body', stream: true });
+        let attempts = 0;
+
+        const transport = new FetchLLMTransport({
+            fetchImpl: async () => {
+                attempts += 1;
+                if (attempts === 1) {
+                    return new Response(null, {
+                        status: 200,
+                        headers: { 'Content-Type': 'text/event-stream' },
+                    });
+                }
+                return new Response(
+                    makeSSEStream([
+                        'data: {"choices":[{"index":0,"delta":{"content":"Recovered stream"}}]}\n\n',
+                        'data: [DONE]\n\n',
+                    ]),
+                    {
+                        status: 200,
+                        headers: { 'Content-Type': 'text/event-stream' },
+                    },
+                );
+            },
+            connections: { [conn.id]: conn },
+            retry: { maxAttempts: 2, initialDelayMs: 0, maxDelayMs: 0, backoffFactor: 1, jitterRatio: 0 },
+        });
+
+        const chunks: string[] = [];
+        for await (const chunk of transport.stream({
+            connectionId: conn.id,
+            messages: [{ role: 'user', content: 'ping' }],
+            tools: [],
+        })) {
+            if (chunk.type === 'text_delta' && chunk.textDelta) {
+                chunks.push(chunk.textDelta);
+            }
+        }
+        expect(attempts).toBe(2);
+        expect(chunks.join('')).toBe('Recovered stream');
+
+        // Exhausting retries surfaces EMPTY_RESPONSE LLMTransportError with retryable: true
+        const alwaysNullTransport = new FetchLLMTransport({
+            fetchImpl: async () =>
+                new Response(null, {
+                    status: 200,
+                    headers: { 'Content-Type': 'text/event-stream' },
+                }),
+            connections: { [conn.id]: conn },
+            retry: false,
+        });
+
+        let caught: unknown;
+        try {
+            for await (const chunk of alwaysNullTransport.stream({
+                connectionId: conn.id,
+                messages: [{ role: 'user', content: 'ping' }],
+                tools: [],
+            })) {
+                void chunk;
+            }
+        } catch (err) {
+            caught = err;
+        }
+        expect(caught).toBeInstanceOf(LLMTransportError);
+        expect(caught).toMatchObject({
+            code: 'EMPTY_RESPONSE',
+            retryable: true,
+        });
+    });
 });

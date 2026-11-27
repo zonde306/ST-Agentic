@@ -2527,6 +2527,7 @@ export class AssistantRunner {
                 const finishTurnExtractor = strictToolLoop
                     ? new FinishTurnStreamExtractor({
                           onResponseDelta: (delta) => {
+                              activeRetryStatus = undefined;
                               finishTurnStreamedAnyResponse = true;
                               contentBuffer += delta;
                               options.onDelta?.(delta);
@@ -2534,6 +2535,7 @@ export class AssistantRunner {
                           },
                           onStepBriefDelta: (delta) => {
                               if (!hasNativeReasoning) {
+                                  activeRetryStatus = undefined;
                                   finishTurnStreamedAnyStepBrief = true;
                                   roundStepBriefThinkBuffer += delta;
                                   thinkBuffer += delta;
@@ -2590,11 +2592,13 @@ export class AssistantRunner {
                             onTextDelta: strictToolLoop
                                 ? undefined
                                 : (delta) => {
+                                      activeRetryStatus = undefined;
                                       contentBuffer += delta;
                                       options.onDelta?.(delta);
                                       syncAssistantBubble();
                                   },
                             onReasoningDelta: (delta) => {
+                                activeRetryStatus = undefined;
                                 if (!hasNativeReasoning && finishTurnStreamedAnyStepBrief) {
                                     thinkBuffer = roundStartThinkBuffer;
                                     roundStepBriefThinkBuffer = '';
@@ -2606,23 +2610,29 @@ export class AssistantRunner {
                                 options.onReasoningDelta?.(delta);
                                 syncAssistantBubble();
                             },
-                            onToolCallDelta: finishTurnExtractor
-                                ? (index, delta) => {
-                                      finishTurnExtractor.feedToolCallDelta(index, delta);
-                                  }
-                                : undefined,
+                            onToolCallDelta: (index, delta) => {
+                                if (activeRetryStatus) {
+                                    activeRetryStatus = undefined;
+                                    syncAssistantBubble({ retryStatus: undefined });
+                                }
+                                finishTurnExtractor?.feedToolCallDelta(index, delta);
+                            },
                         });
 
+                        if (
+                            turnOutput.toolCalls.length === 0
+                            && !turnOutput.content.trim()
+                        ) {
+                            const isLengthEmpty = isLengthFinishReason(turnOutput.finishReason);
+                            throw new LLMTransportError(
+                                isLengthEmpty
+                                    ? '模型达到长度上限但未输出任何正文或工具调用（空响应）'
+                                    : '模型返回了空响应（可能是网络波动或流式连接提前断开）',
+                                { retryable: true, code: ROUND_RETRY_ERROR_CODES.EMPTY_RESPONSE },
+                            );
+                        }
+
                         if (!isLengthFinishReason(turnOutput.finishReason)) {
-                            if (
-                                turnOutput.toolCalls.length === 0
-                                && !turnOutput.content.trim()
-                            ) {
-                                throw new LLMTransportError(
-                                    '模型返回了空响应（可能是网络波动或流式连接提前断开）',
-                                    { retryable: true, code: ROUND_RETRY_ERROR_CODES.EMPTY_RESPONSE },
-                                );
-                            }
                             if (
                                 request.toolChoice?.mode === 'required'
                                 && turnOutput.toolCalls.length === 0
@@ -2747,6 +2757,21 @@ export class AssistantRunner {
                                         },
                                     );
                                 }
+                                if (
+                                    res.action === 'accept'
+                                    && res.changed
+                                    && !res.text.trim()
+                                    && this.autoRetryConfig !== false
+                                    && transientRetriesUsed < effectiveMaxRoundRetries
+                                ) {
+                                    throw new LLMTransportError(
+                                        '输出后处理后结果为空响应',
+                                        {
+                                            retryable: true,
+                                            code: ROUND_RETRY_ERROR_CODES.EMPTY_RESPONSE,
+                                        },
+                                    );
+                                }
                                 assistantTurnOutputOutcome = {
                                     operation: isSoloFinish ? 'finish_turn' : 'plain_finish',
                                     result: res,
@@ -2814,6 +2839,7 @@ export class AssistantRunner {
                             );
 
                             // Reset partial streaming buffers from the failed overflow attempt.
+                            activeRetryStatus = undefined;
                             finishTurnExtractor?.resetRound();
                             contentBuffer = roundStartContentBuffer;
                             thinkBuffer = roundStartThinkBuffer;
@@ -2890,9 +2916,6 @@ export class AssistantRunner {
                                 await delayWithAbort(delayMs, controller.signal);
                             }
                             throwIfAssistantAborted(controller.signal);
-
-                            activeRetryStatus = undefined;
-                            syncAssistantBubble({ retryStatus: undefined });
                             continue;
                         }
 
@@ -3884,7 +3907,66 @@ export class AssistantRunner {
                 signal: controller.signal,
             };
 
-            const turnOutput = await this.invokeLLM(request, useStream, {});
+            const effectiveMaxRoundRetries = this.resolveRoundMaxRetries(connection);
+            let retryAttemptsUsed = 0;
+            let turnOutput!: TurnLLMOutput;
+
+            // eslint-disable-next-line no-constant-condition
+            while (true) {
+                throwIfAssistantAborted(controller.signal);
+                try {
+                    turnOutput = await this.invokeLLM(request, useStream, {});
+                    if (turnOutput.toolCalls.length === 0 && !turnOutput.content.trim()) {
+                        throw new LLMTransportError(
+                            '模型返回了空响应（可能是网络波动或流式连接提前断开）',
+                            { retryable: true, code: ROUND_RETRY_ERROR_CODES.EMPTY_RESPONSE },
+                        );
+                    }
+                    if (
+                        !isLengthFinishReason(turnOutput.finishReason)
+                        && strictToolLoop
+                        && turnOutput.toolCalls.some((tc) => !isValidJsonObjectString(tc.arguments))
+                    ) {
+                        throw new LLMTransportError(
+                            '模型返回了格式损坏的工具参数 JSON（MALFORMED_TOOL_CALL）',
+                            {
+                                retryable: true,
+                                code: ROUND_RETRY_ERROR_CODES.MALFORMED_TOOL_CALL,
+                            },
+                        );
+                    }
+                    break;
+                } catch (llmError) {
+                    if (
+                        isAssistantAbortError(llmError)
+                        || isAbortError(llmError)
+                        || controller.signal.aborted
+                    ) {
+                        throw llmError;
+                    }
+                    if (
+                        this.autoRetryConfig !== false
+                        && retryAttemptsUsed < effectiveMaxRoundRetries
+                        && isRetryableRoundError(llmError)
+                    ) {
+                        retryAttemptsUsed += 1;
+                        const delayMs = computeRoundRetryDelayMs({
+                            error: llmError,
+                            attempt: retryAttemptsUsed,
+                            initialDelayMs: this.autoRetryConfig.initialDelayMs,
+                            maxDelayMs: this.autoRetryConfig.maxDelayMs,
+                            backoffFactor: this.autoRetryConfig.backoffFactor,
+                            jitterRatio: 0.25,
+                        });
+                        if (delayMs > 0) {
+                            await delayWithAbort(delayMs, controller.signal);
+                        }
+                        throwIfAssistantAborted(controller.signal);
+                        continue;
+                    }
+                    throw llmError;
+                }
+            }
             if (turnOutput.usage.inputTokens > 0) {
                 this.sessionStore.recordUsageAnchor(
                     existing.sessionId,
@@ -4593,7 +4675,9 @@ export class AssistantRunner {
             return {
                 content: resp.content ?? '',
                 reasoningContent: resp.reasoningContent ?? '',
-                toolCalls: resp.toolCalls ? canonicalClone(resp.toolCalls) : [],
+                toolCalls: resp.toolCalls
+                    ? canonicalClone(resp.toolCalls).filter((tc) => tc.name.trim().length > 0)
+                    : [],
                 usage: normalizeUsage(resp.usage),
                 finishReason: resp.finishReason,
             };

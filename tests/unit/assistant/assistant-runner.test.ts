@@ -1810,4 +1810,231 @@ describe('AssistantRunner & AssistantSessionStore (TS2.1)', () => {
             'You are the ST-Agentic Off-Mainline Assistant',
         );
     });
+
+    it('auto-retries empty responses with finishReason=length/MAX_TOKENS, rolls back leaked reasoning, and classifies exhausted retries as empty_response', async () => {
+        // 1. Empty response with MAX_TOKENS / length (completely empty + reasoning-only) retries and recovers
+        const { transport, trajectoryStore, settings, runner } = createRunnerHarness(
+            [
+                // Attempt 1: MAX_TOKENS with zero text and zero toolCalls
+                {
+                    content: '',
+                    finishReason: 'MAX_TOKENS',
+                },
+                // Attempt 2: length with reasoningContent only, zero text and zero toolCalls
+                {
+                    content: '   ',
+                    reasoningContent: '泄露的残留思考片段',
+                    finishReason: 'length',
+                },
+                // Attempt 3: clean normal response
+                {
+                    content: '重试后成功生成正文。',
+                    reasoningContent: '正常思考过程',
+                    finishReason: 'stop',
+                },
+            ],
+            {
+                stream: true,
+                autoRetry: { initialDelayMs: 2, maxDelayMs: 10, backoffFactor: 2 },
+            },
+        );
+        settings.connections.default.roundMaxRetries = 2;
+
+        const session = await runner.createSession({ title: 'MAX_TOKENS 空响应重试', mode: 'chat' });
+        const retryStatuses: AssistantRetryStatus[] = [];
+        const reply = await runner.sendPrompt(session.id, '请分析现状', {
+            onRetry: (status) => retryStatuses.push(status),
+        });
+
+        expect(transport.requests).toHaveLength(3);
+        expect(retryStatuses).toHaveLength(2);
+        expect(retryStatuses[0]).toMatchObject({ attempt: 1, maxAttempts: 2 });
+        expect(retryStatuses[1]).toMatchObject({ attempt: 2, maxAttempts: 2 });
+        expect(reply.content).toBe('重试后成功生成正文。');
+        expect(reply.think).toBe('正常思考过程');
+        expect(reply.think).not.toContain('泄露的残留思考片段');
+        expect(reply.retryStatus).toBeUndefined();
+        expect(reply.interrupted).toBeUndefined();
+        expect(trajectoryStore.getMessageCount(toAssistantThreadId(session.id))).toBe(2);
+
+        // 2. Exhausted MAX_TOKENS empty responses -> errorCode: 'empty_response' & canContinue: true
+        const exhausted = createRunnerHarness(
+            [
+                { content: '', finishReason: 'MAX_TOKENS' },
+                { content: '', finishReason: 'length' },
+            ],
+            {
+                stream: false,
+                autoRetry: { maxRetries: 1, initialDelayMs: 2, maxDelayMs: 5 },
+            },
+        );
+        const sExhausted = await exhausted.runner.createSession({ title: '空响应耗尽', mode: 'chat' });
+        await expect(exhausted.runner.sendPrompt(sExhausted.id, '测试耗尽')).rejects.toThrow(/空响应/);
+        const failedSession = exhausted.runner.getSession(sExhausted.id)!;
+        const failedMsg = failedSession.messages[failedSession.messages.length - 1]!;
+        expect(failedMsg.interrupted).toBe(true);
+        expect(failedMsg.errorCode).toBe('empty_response');
+        expect(failedMsg.canContinue).toBe(true);
+    });
+
+    it('filters blank-name tool calls in non-streaming mode and triggers EMPTY_RESPONSE auto-retry', async () => {
+        const { transport, runner } = createRunnerHarness(
+            [
+                {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'call_blank_name',
+                            name: '   ',
+                            arguments: '{}',
+                        },
+                    ],
+                },
+                {
+                    content: '已过滤无效空工具名并重试成功。',
+                },
+            ],
+            {
+                stream: false,
+                autoRetry: { maxRetries: 1, initialDelayMs: 2, maxDelayMs: 5 },
+            },
+        );
+
+        const session = await runner.createSession({ title: '空工具名过滤重试', mode: 'chat' });
+        const retryStatuses: AssistantRetryStatus[] = [];
+        const reply = await runner.sendPrompt(session.id, '检查工具调用', {
+            onRetry: (status) => retryStatuses.push(status),
+        });
+
+        expect(transport.requests).toHaveLength(2);
+        expect(retryStatuses).toHaveLength(1);
+        expect(reply.content).toBe('已过滤无效空工具名并重试成功。');
+        expect(reply.toolCalls).toBeUndefined();
+    });
+
+    it('auto-retries empty responses in retryApproval() and throws when retries are exhausted', async () => {
+        // 1. retryApproval recovers after an empty response
+        const { transport, runner } = createRunnerHarness(
+            [
+                {
+                    content: '初版草案',
+                    toolCalls: [
+                        {
+                            id: 'call_wi_init',
+                            name: 'wi_upsert_primary_entry',
+                            arguments: JSON.stringify({
+                                uid: 7,
+                                comment: '规则',
+                                keys: ['规则'],
+                                content: '@@system\n初版内容',
+                            }),
+                        },
+                    ],
+                },
+                // retryApproval attempt 1: empty response -> must retry
+                { content: '' },
+                // retryApproval attempt 2: valid revised tool proposal
+                {
+                    content: '修订版草案',
+                    toolCalls: [
+                        {
+                            id: 'call_wi_revised',
+                            name: 'wi_upsert_primary_entry',
+                            arguments: JSON.stringify({
+                                uid: 7,
+                                comment: '规则',
+                                keys: ['规则'],
+                                content: '@@system\n修订后内容',
+                            }),
+                        },
+                    ],
+                },
+            ],
+            {
+                stream: false,
+                autoRetry: { maxRetries: 1, initialDelayMs: 2, maxDelayMs: 5 },
+            },
+        );
+
+        const session = await runner.createSession({
+            title: '审批重试空响应恢复',
+            mode: 'author',
+            autoApproveAuthor: false,
+        });
+        const bubble = await runner.sendPrompt(session.id, '修改世界书 #7');
+        const approvalId = bubble.approvalIds![0];
+
+        const retried = await runner.retryApproval(approvalId, '补充细节');
+        expect(transport.requests).toHaveLength(3);
+        expect(retried?.revision).toBe(2);
+        expect(retried?.rawContent).toBe('@@system\n修订后内容');
+
+        // 2. retryApproval throws when empty responses exhaust retries (must NOT silently bump revision)
+        const exhaustedHarness = createRunnerHarness(
+            [
+                {
+                    content: '初版草案',
+                    toolCalls: [
+                        {
+                            id: 'call_wi_init_2',
+                            name: 'wi_upsert_primary_entry',
+                            arguments: JSON.stringify({
+                                uid: 7,
+                                comment: '规则',
+                                keys: ['规则'],
+                                content: '@@system\n初版内容',
+                            }),
+                        },
+                    ],
+                },
+                { content: '' },
+                { content: '   ' },
+            ],
+            {
+                stream: false,
+                autoRetry: { maxRetries: 1, initialDelayMs: 2, maxDelayMs: 5 },
+            },
+        );
+
+        const s2 = await exhaustedHarness.runner.createSession({
+            title: '审批重试空响应耗尽',
+            mode: 'author',
+            autoApproveAuthor: false,
+        });
+        const b2 = await exhaustedHarness.runner.sendPrompt(s2.id, '修改世界书 #7');
+        const appr2 = b2.approvalIds![0];
+
+        await expect(exhaustedHarness.runner.retryApproval(appr2, '再试一次')).rejects.toThrow(/空响应/);
+        expect(exhaustedHarness.transport.requests).toHaveLength(3);
+        expect(exhaustedHarness.runner.getApproval(appr2)?.revision).toBe(1);
+    });
+
+    it('auto-retries when processOutputText strips the final reply down to empty', async () => {
+        const { bridge, transport, runner } = createRunnerHarness(
+            [
+                { content: '   <STRIP_ME>   ' },
+                { content: '保留下来的有效回复。' },
+            ],
+            {
+                stream: false,
+                autoRetry: { maxRetries: 1, initialDelayMs: 2, maxDelayMs: 5 },
+            },
+        );
+
+        bridge.onOutputProcess((payload) => {
+            if (payload.text.includes('<STRIP_ME>')) {
+                payload.text = '   ';
+            }
+        });
+
+        const session = await runner.createSession({ title: '后处理清空重试', mode: 'chat' });
+        const retryStatuses: AssistantRetryStatus[] = [];
+        const reply = await runner.sendPrompt(session.id, '生成回复', {
+            onRetry: (status) => retryStatuses.push(status),
+        });
+
+        expect(transport.requests).toHaveLength(2);
+        expect(retryStatuses).toHaveLength(1);
+        expect(reply.content).toBe('保留下来的有效回复。');
+    });
 });

@@ -506,7 +506,8 @@ export class FetchLLMTransport implements LLMTransport {
                     if (!response.body) {
                         throw new LLMTransportError('Streaming response body is empty', {
                             status: response.status,
-                            retryable: false,
+                            code: ROUND_RETRY_ERROR_CODES.EMPTY_RESPONSE,
+                            retryable: true,
                         });
                     }
 
