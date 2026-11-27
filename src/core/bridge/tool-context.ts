@@ -1,5 +1,6 @@
 import type {
     CanonicalMessage,
+    CanonicalToolCall,
     InterruptedReason,
     MediaAttachment,
     MessageTarget,
@@ -235,6 +236,10 @@ export interface ToolErrorRecoveryRetryOptions {
     delayMs?: number;
     rollbackToolRounds?: number;
     dropHistoryTurns?: number;
+    connectionId?: string;
+    temperature?: number;
+    maxTokens?: number;
+    mode?: 'round' | 'turn';
 }
 
 export interface ToolErrorRecoveryControl {
@@ -246,11 +251,19 @@ export interface ToolErrorRecoveryControl {
     readonly delayMs?: number;
     readonly rollbackToolRounds?: number;
     readonly dropHistoryTurns?: number;
+    readonly connectionId?: string;
+    readonly temperature?: number;
+    readonly maxTokens?: number;
+    readonly mode?: 'round' | 'turn';
+    readonly retryOptions?: ToolErrorRecoveryRetryOptions;
     readonly fallbackContent?: string;
 }
 
 export interface ToolPostprocessOutput {
     text: string;
+    content?: string;
+    reasoningContent?: string;
+    toolCalls?: CanonicalToolCall[];
     readonly originalText: string;
     readonly stage?: 'output_mutation' | 'turn_finish';
     readonly operation?: string;

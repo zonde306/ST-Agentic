@@ -4,6 +4,7 @@ import type {
     ToolAgentRunOptions,
     ToolAgentRunResult,
     ToolErrorRecoveryControl,
+    ToolErrorRecoveryRetryOptions,
     ToolEventPayload,
     ToolExecutionContext,
     ToolPostprocessControl,
@@ -539,5 +540,363 @@ describe('IframeJsSandbox extended context proxies (agent, messages, event, cont
         expect(trace.assistantSummary).toBe('Completed reply in /output.md');
         expect(trace.taskId).toBe('task_42');
         expect(trace.hasRollbackableRound).toBe(true);
+    });
+
+    it('supports ctx.output bidirectional text/content sync, reasoningContent & toolCalls cloning/write-back, and atomic rollback on uncloneable values', async () => {
+        // 1. Initializes from hostOutput.content when provided, and editing only content syncs both content and text
+        const contentFirstOutput: ToolPostprocessOutput = {
+            text: 'stale text',
+            content: 'canonical content',
+            originalText: 'canonical content',
+            reasoningContent: 'initial thought',
+            toolCalls: [{ id: 'tc_1', name: 'read_file', arguments: '{"path":"/a.md"}' }],
+            stage: 'turn_finish',
+            round: 2,
+        };
+
+        const initSnapshot = (await sandbox.evaluateScript(
+            `
+            const before = {
+                text: output.text,
+                content: output.content,
+                reasoningContent: output.reasoningContent,
+                toolCalls: output.toolCalls.map((c) => ({ ...c })),
+            };
+            output.content = 'edited via content';
+            output.reasoningContent = 'refined thought';
+            output.toolCalls.push({
+                id: 'tc_2',
+                name: 'write_file',
+                arguments: '{"path":"/b.md"}',
+                thoughtSignature: 'sig_2',
+            });
+            return before;
+            `,
+            createBaseCtx({ output: contentFirstOutput }),
+            { id: 'output_edit_content', allowNetwork: false },
+        )) as Record<string, unknown>;
+
+        expect(initSnapshot).toEqual({
+            text: 'canonical content',
+            content: 'canonical content',
+            reasoningContent: 'initial thought',
+            toolCalls: [{ id: 'tc_1', name: 'read_file', arguments: '{"path":"/a.md"}' }],
+        });
+        expect(contentFirstOutput.content).toBe('edited via content');
+        expect(contentFirstOutput.text).toBe('edited via content');
+        expect(contentFirstOutput.reasoningContent).toBe('refined thought');
+        expect(contentFirstOutput.toolCalls).toEqual([
+            { id: 'tc_1', name: 'read_file', arguments: '{"path":"/a.md"}' },
+            {
+                id: 'tc_2',
+                name: 'write_file',
+                arguments: '{"path":"/b.md"}',
+                thoughtSignature: 'sig_2',
+            },
+        ]);
+
+        // 2. Initializes from hostOutput.text when content is omitted, and editing only text syncs both text and content
+        const textOnlyOutput: ToolPostprocessOutput = {
+            text: 'initial text',
+            originalText: 'initial text',
+            reasoningContent: 'remove me',
+            toolCalls: [{ id: 'tc_del', name: 'glob', arguments: '{}' }],
+        };
+
+        const textOnlySeen = (await sandbox.evaluateScript(
+            `
+            const seen = { text: output.text, content: output.content };
+            output.text = 'edited via text';
+            output.reasoningContent = undefined;
+            output.toolCalls = undefined;
+            return seen;
+            `,
+            createBaseCtx({ output: textOnlyOutput }),
+            { id: 'output_edit_text', allowNetwork: false },
+        )) as Record<string, unknown>;
+
+        expect(textOnlySeen).toEqual({ text: 'initial text', content: 'initial text' });
+        expect(textOnlyOutput.text).toBe('edited via text');
+        expect(textOnlyOutput.content).toBe('edited via text');
+        expect(textOnlyOutput.reasoningContent).toBeUndefined();
+        expect(textOnlyOutput.toolCalls).toBeUndefined();
+
+        // 3. Atomic rollback: uncloneable toolCalls prevents partial writes to text/content/reasoningContent/toolCalls
+        const atomicOutput: ToolPostprocessOutput = {
+            text: 'safe text',
+            content: 'safe text',
+            originalText: 'safe text',
+            reasoningContent: 'safe reasoning',
+            toolCalls: [{ id: 'tc_keep', name: 'read_file', arguments: '{"path":"/keep.md"}' }],
+        };
+
+        await expect(
+            sandbox.evaluateScript(
+                `
+                output.content = 'dirty content';
+                output.reasoningContent = 'dirty reasoning';
+                output.toolCalls[0].arguments = '{"mutated":true}';
+                output.toolCalls.push({
+                    id: 'tc_bad',
+                    name: 'broken',
+                    arguments: '{}',
+                    extraFields: { fn: () => 'not cloneable' },
+                });
+                `,
+                createBaseCtx({ output: atomicOutput }),
+                { id: 'output_atomic_uncloneable_toolcalls', allowNetwork: false },
+            ),
+        ).rejects.toThrow(SandboxExecutionError);
+
+        expect(atomicOutput).toEqual({
+            text: 'safe text',
+            content: 'safe text',
+            originalText: 'safe text',
+            reasoningContent: 'safe reasoning',
+            toolCalls: [{ id: 'tc_keep', name: 'read_file', arguments: '{"path":"/keep.md"}' }],
+        });
+
+        // 4. Atomic rollback on invalid field types (non-string reasoningContent / non-array toolCalls / non-string content)
+        await expect(
+            sandbox.evaluateScript(
+                `
+                output.text = 'dirty';
+                output.reasoningContent = 12345;
+                `,
+                createBaseCtx({ output: atomicOutput }),
+                { id: 'output_atomic_bad_reasoning', allowNetwork: false },
+            ),
+        ).rejects.toThrow(SandboxExecutionError);
+
+        await expect(
+            sandbox.evaluateScript(
+                `
+                output.text = 'dirty';
+                output.toolCalls = 'not-an-array';
+                `,
+                createBaseCtx({ output: atomicOutput }),
+                { id: 'output_atomic_bad_toolcalls', allowNetwork: false },
+            ),
+        ).rejects.toThrow(SandboxExecutionError);
+
+        expect(atomicOutput).toEqual({
+            text: 'safe text',
+            content: 'safe text',
+            originalText: 'safe text',
+            reasoningContent: 'safe reasoning',
+            toolCalls: [{ id: 'tc_keep', name: 'read_file', arguments: '{"path":"/keep.md"}' }],
+        });
+    });
+
+    it('proxies extended ctx.control.retry options (connectionId, temperature, maxTokens, mode, rollbackToolRounds), exposes frozen retryOptions, and validates/blocks bad args', async () => {
+        let action: ToolErrorRecoveryControl['action'] = 'none';
+        let reason: string | undefined;
+        let capturedOpts: ToolErrorRecoveryRetryOptions | undefined;
+
+        const retrySpy = vi.fn((r?: string, opts?: ToolErrorRecoveryRetryOptions) => {
+            action = 'retry';
+            reason = r;
+            capturedOpts = opts;
+        });
+
+        const hostControl: ToolErrorRecoveryControl = {
+            retry: retrySpy,
+            abort(r?: string) {
+                action = 'abort';
+                reason = r;
+            },
+            get action() {
+                return action;
+            },
+            get reason() {
+                return reason;
+            },
+            get connectionId() {
+                return capturedOpts?.connectionId;
+            },
+            get temperature() {
+                return capturedOpts?.temperature;
+            },
+            get maxTokens() {
+                return capturedOpts?.maxTokens;
+            },
+            get mode() {
+                return capturedOpts?.mode;
+            },
+            get rollbackToolRounds() {
+                return capturedOpts?.rollbackToolRounds;
+            },
+            get retryOptions() {
+                return capturedOpts;
+            },
+        };
+
+        const out = (await sandbox.evaluateScript(
+            `
+            control.retry('fallback to backup route', {
+                connectionId: 'conn_backup',
+                temperature: 0.2,
+                maxTokens: 2048,
+                mode: 'round',
+                rollbackToolRounds: 1,
+                delayMs: 150,
+            });
+
+            let retryOptsFrozen = false;
+            try {
+                control.retryOptions.mode = 'turn';
+            } catch {
+                retryOptsFrozen = true;
+            }
+
+            return {
+                action: control.action,
+                reason: control.reason,
+                connectionId: control.connectionId,
+                temperature: control.temperature,
+                maxTokens: control.maxTokens,
+                mode: control.mode,
+                rollbackToolRounds: control.rollbackToolRounds,
+                retryOptions: control.retryOptions,
+                retryOptsFrozen,
+            };
+            `,
+            createBaseCtx({ control: hostControl }),
+            { id: 'control_retry_extended', allowNetwork: false },
+        )) as Record<string, unknown>;
+
+        expect(capturedOpts).toEqual({
+            connectionId: 'conn_backup',
+            temperature: 0.2,
+            maxTokens: 2048,
+            mode: 'round',
+            rollbackToolRounds: 1,
+            delayMs: 150,
+        });
+        expect(out).toEqual({
+            action: 'retry',
+            reason: 'fallback to backup route',
+            connectionId: 'conn_backup',
+            temperature: 0.2,
+            maxTokens: 2048,
+            mode: 'round',
+            rollbackToolRounds: 1,
+            retryOptions: {
+                connectionId: 'conn_backup',
+                temperature: 0.2,
+                maxTokens: 2048,
+                mode: 'round',
+                rollbackToolRounds: 1,
+                delayMs: 150,
+            },
+            retryOptsFrozen: true,
+        });
+
+        // Reject invalid types and non-cloneable objects without invoking host retry
+        retrySpy.mockClear();
+        const invalidCalls = [
+            `control.retry('bad mode', { mode: 'invalid' });`,
+            `control.retry('bad temp', { temperature: -0.5 });`,
+            `control.retry('bad maxTokens', { maxTokens: 0 });`,
+            `control.retry('bad conn', { connectionId: 123 });`,
+            `control.retry('uncloneable', { connectionId: 'ok', fn: () => {} });`,
+        ];
+
+        for (let i = 0; i < invalidCalls.length; i += 1) {
+            await expect(
+                sandbox.evaluateScript(
+                    invalidCalls[i],
+                    createBaseCtx({ control: hostControl }),
+                    { id: `control_retry_invalid_${i}`, allowNetwork: false },
+                ),
+            ).rejects.toThrow(SandboxExecutionError);
+        }
+        expect(retrySpy).not.toHaveBeenCalled();
+    });
+
+    it('maps defensive profile/tools aliases in ctx.agent.run only when canonical agentId/enabledTools are omitted', async () => {
+        const receivedCalls: Array<Record<string, unknown>> = [];
+        const hostAgent: ToolAgentApi = {
+            run: vi.fn(async (opts: ToolAgentRunOptions) => {
+                receivedCalls.push({ ...(opts as unknown as Record<string, unknown>) });
+                return {
+                    agentId: opts.agentId ?? 'default',
+                    content: `ran:${opts.agentId ?? 'default'}:${(opts.enabledTools ?? []).join(',')}`,
+                    ok: true,
+                };
+            }),
+            runTrigger: vi.fn(async () => ({ agentId: 'main', content: '', ok: true })),
+        };
+
+        const ctx = createBaseCtx({ agent: hostAgent });
+
+        const res = (await sandbox.evaluateScript(
+            `
+            const aliasRun = await ctx.agent.run({
+                profile: 'archivist',
+                tools: ['read_file', 'search_files'],
+                prompt: 'Summarize clues',
+            });
+            const canonicalWinsRun = await agent.run({
+                agentId: 'primary_agent',
+                profile: 'ignored_alias',
+                enabledTools: ['write_file'],
+                tools: ['ignored_tool'],
+                prompt: 'Canonical precedence',
+            });
+            return { aliasRun, canonicalWinsRun };
+            `,
+            ctx,
+            { id: 'agent_alias_compat', allowNetwork: false },
+        )) as Record<string, unknown>;
+
+        expect(res.aliasRun).toEqual({
+            agentId: 'archivist',
+            content: 'ran:archivist:read_file,search_files',
+            ok: true,
+        });
+        expect(res.canonicalWinsRun).toEqual({
+            agentId: 'primary_agent',
+            content: 'ran:primary_agent:write_file',
+            ok: true,
+        });
+
+        expect(receivedCalls).toHaveLength(2);
+        expect(receivedCalls[0].agentId).toBe('archivist');
+        expect(receivedCalls[0].enabledTools).toEqual(['read_file', 'search_files']);
+        expect('profile' in receivedCalls[0]).toBe(false);
+        expect('tools' in receivedCalls[0]).toBe(false);
+
+        expect(receivedCalls[1].agentId).toBe('primary_agent');
+        expect(receivedCalls[1].enabledTools).toEqual(['write_file']);
+        expect('profile' in receivedCalls[1]).toBe(false);
+        expect('tools' in receivedCalls[1]).toBe(false);
+
+        // Invalid alias types throw structured AGENT_INVALID_ARGS
+        await expect(
+            sandbox.evaluateScript(
+                `return await ctx.agent.run({ profile: 42, prompt: 'bad' });`,
+                ctx,
+                { id: 'agent_bad_profile_alias', allowNetwork: false },
+            ),
+        ).rejects.toSatisfy(
+            (err: unknown) =>
+                err instanceof SandboxAgentError
+                && err.code === 'AGENT_INVALID_ARGS'
+                && err.method === 'agent.run',
+        );
+
+        await expect(
+            sandbox.evaluateScript(
+                `return await ctx.agent.run({ tools: 'read_file', prompt: 'bad' });`,
+                ctx,
+                { id: 'agent_bad_tools_alias', allowNetwork: false },
+            ),
+        ).rejects.toSatisfy(
+            (err: unknown) =>
+                err instanceof SandboxAgentError
+                && err.code === 'AGENT_INVALID_ARGS'
+                && err.method === 'agent.run',
+        );
     });
 });

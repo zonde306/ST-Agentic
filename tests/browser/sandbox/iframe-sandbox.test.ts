@@ -1,9 +1,20 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import type {
+    ToolAgentApi,
+    ToolErrorRecoveryControl,
+    ToolErrorRecoveryRetryOptions,
+    ToolPostprocessOutput,
+} from '@/core/bridge';
 import {
     ToolRegistry,
     createToolExecutionContext,
 } from '@/core/tools';
-import { IframeJsSandbox, SandboxLifecycleManager, SandboxSecurityError } from '@/sandbox';
+import {
+    IframeJsSandbox,
+    SandboxExecutionError,
+    SandboxLifecycleManager,
+    SandboxSecurityError,
+} from '@/sandbox';
 import { MemoryHostBridge } from '../../mocks';
 
 function createBrowserBridge() {
@@ -319,5 +330,141 @@ describe('IframeJsSandbox & SandboxLifecycleManager (Chromium Browser)', () => {
         const postDisposeSnapshot = bridge.emittedEvents.length;
         await new Promise((r) => setTimeout(r, 150));
         expect(bridge.emittedEvents.length).toBe(postDisposeSnapshot);
+    });
+
+    it('bridges cross-realm ctx.output, ctx.control.retry options, and ctx.agent.run aliases cleanly inside Chromium iframe', async () => {
+        const bridge = createBrowserBridge();
+        const hostOutput: ToolPostprocessOutput = {
+            text: 'initial browser text',
+            content: 'initial browser content',
+            originalText: 'initial browser content',
+            reasoningContent: 'thought A',
+            toolCalls: [{ id: 'tc_1', name: 'read_file', arguments: '{}' }],
+        };
+
+        let retryAction: ToolErrorRecoveryControl['action'] = 'none';
+        let retryReason: string | undefined;
+        let retryOpts: ToolErrorRecoveryRetryOptions | undefined;
+        const hostControl: ToolErrorRecoveryControl = {
+            retry(r, opts) {
+                retryAction = 'retry';
+                retryReason = r;
+                retryOpts = opts;
+            },
+            abort(r) {
+                retryAction = 'abort';
+                retryReason = r;
+            },
+            get action() {
+                return retryAction;
+            },
+            get reason() {
+                return retryReason;
+            },
+            get retryOptions() {
+                return retryOpts;
+            },
+        };
+
+        const capturedAgentOpts: Array<Record<string, unknown>> = [];
+        const hostAgent: ToolAgentApi = {
+            async run(opts) {
+                capturedAgentOpts.push({ ...(opts as unknown as Record<string, unknown>) });
+                return {
+                    agentId: opts.agentId ?? 'default',
+                    content: `browser:${opts.agentId ?? 'default'}`,
+                    ok: true,
+                };
+            },
+            async runTrigger() {
+                return { agentId: 'main', content: '', ok: true };
+            },
+        };
+
+        const baseCtx = createToolExecutionContext({
+            bridge,
+            target: { messageId: 1, swipeId: 0 },
+            permissions: { read: ['/**'], write: ['/**'] },
+        });
+
+        const res = (await sandbox.evaluateScript(
+            `
+            const agentOut = await ctx.agent.run({
+                profile: 'browser_scout',
+                tools: ['read_file'],
+                prompt: 'inspect',
+            });
+            ctx.control.retry('switch backup', {
+                connectionId: 'backup_1',
+                temperature: 0.3,
+                maxTokens: 1024,
+                mode: 'turn',
+                rollbackToolRounds: 2,
+            });
+            ctx.output.content = 'iframe updated content';
+            ctx.output.reasoningContent = 'thought B';
+            ctx.output.toolCalls = [
+                { id: 'tc_iframe', name: 'write_file', arguments: '{"ok":true}' },
+            ];
+            return {
+                agentOut,
+                retryOptions: ctx.control.retryOptions,
+            };
+            `,
+            {
+                ...baseCtx,
+                output: hostOutput,
+                control: hostControl,
+                agent: hostAgent,
+            },
+            { id: 'browser_extended_bridge', allowNetwork: false },
+        )) as Record<string, unknown>;
+
+        expect(hostOutput.content).toBe('iframe updated content');
+        expect(hostOutput.text).toBe('iframe updated content');
+        expect(hostOutput.reasoningContent).toBe('thought B');
+        expect(hostOutput.toolCalls).toEqual([
+            { id: 'tc_iframe', name: 'write_file', arguments: '{"ok":true}' },
+        ]);
+        expect(retryOpts).toEqual({
+            connectionId: 'backup_1',
+            temperature: 0.3,
+            maxTokens: 1024,
+            mode: 'turn',
+            rollbackToolRounds: 2,
+        });
+        expect(res.retryOptions).toEqual(retryOpts);
+        expect(capturedAgentOpts[0].agentId).toBe('browser_scout');
+        expect(capturedAgentOpts[0].enabledTools).toEqual(['read_file']);
+        expect('profile' in capturedAgentOpts[0]).toBe(false);
+        expect('tools' in capturedAgentOpts[0]).toBe(false);
+
+        // Cross-realm uncloneable function inside iframe toolCalls rolls back atomically
+        const guardedOutput: ToolPostprocessOutput = {
+            text: 'keep',
+            content: 'keep',
+            originalText: 'keep',
+            reasoningContent: 'keep thought',
+            toolCalls: [{ id: 'tc_orig', name: 'read_file', arguments: '{}' }],
+        };
+        await expect(
+            sandbox.evaluateScript(
+                `
+                ctx.output.content = 'mutated';
+                ctx.output.reasoningContent = 'mutated thought';
+                ctx.output.toolCalls = [{ id: 'tc_x', name: 'bad', arguments: '{}', extraFields: { f: () => 1 } }];
+                `,
+                { ...baseCtx, output: guardedOutput },
+                { id: 'browser_output_atomic', allowNetwork: false },
+            ),
+        ).rejects.toThrow(SandboxExecutionError);
+
+        expect(guardedOutput).toEqual({
+            text: 'keep',
+            content: 'keep',
+            originalText: 'keep',
+            reasoningContent: 'keep thought',
+            toolCalls: [{ id: 'tc_orig', name: 'read_file', arguments: '{}' }],
+        });
     });
 });

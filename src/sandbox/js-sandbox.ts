@@ -6,6 +6,7 @@ import type {
     ToolAgentRunTriggerOptions,
     ToolEphemeralMessagesApi,
     ToolErrorRecoveryControl,
+    ToolErrorRecoveryRetryOptions,
     ToolEventPayload,
     ToolExecutionContext,
     ToolPostprocessControl,
@@ -29,6 +30,7 @@ import {
 } from '@/core/tools';
 import type {
     CanonicalMessage,
+    CanonicalToolCall,
     CreateSideSessionOptions,
     ExportWorldInfoOptions,
     MessageTarget,
@@ -901,11 +903,49 @@ function createSandboxAgentProxy(
             assertReady(method, parentSignal);
             const { options: cleanOpts, callerSignal } =
                 extractAgentSignalAndCloneOptions<ToolAgentRunOptions>(opts, method, true);
+            const normalizedRecord: Record<string, unknown> = {
+                ...(cleanOpts as Record<string, unknown>),
+            };
+
+            if ('profile' in normalizedRecord) {
+                const rawProfile = normalizedRecord.profile;
+                delete normalizedRecord.profile;
+                if (normalizedRecord.agentId === undefined && rawProfile !== undefined) {
+                    if (typeof rawProfile !== 'string') {
+                        throw new SandboxAgentError(
+                            'AGENT_INVALID_ARGS',
+                            method,
+                            `ctx.${method}() requires "profile" / "agentId" to be a string.`,
+                        );
+                    }
+                    normalizedRecord.agentId = rawProfile;
+                }
+            }
+
+            if ('tools' in normalizedRecord) {
+                const rawTools = normalizedRecord.tools;
+                delete normalizedRecord.tools;
+                if (normalizedRecord.enabledTools === undefined && rawTools !== undefined) {
+                    if (
+                        !Array.isArray(rawTools)
+                        || !rawTools.every((item) => typeof item === 'string')
+                    ) {
+                        throw new SandboxAgentError(
+                            'AGENT_INVALID_ARGS',
+                            method,
+                            `ctx.${method}() requires "tools" / "enabledTools" to be an array of strings.`,
+                        );
+                    }
+                    normalizedRecord.enabledTools = rawTools;
+                }
+            }
+
+            const normalizedOpts = normalizedRecord as Omit<ToolAgentRunOptions, 'signal'>;
             const linked = combineAbortSignals(parentSignal, callerSignal);
             try {
                 return await invokeHost(method, linked.signal, (api) =>
                     api.run({
-                        ...cleanOpts,
+                        ...normalizedOpts,
                         signal: linked.signal,
                     }),
                 );
@@ -1081,12 +1121,83 @@ const CONTROL_READONLY_FIELDS = [
     'delayMs',
     'rollbackToolRounds',
     'dropHistoryTurns',
+    'connectionId',
+    'temperature',
+    'maxTokens',
+    'mode',
+    'retryOptions',
     'fallbackContent',
     'retryReason',
     'fixMessage',
     'rejectWrite',
     'abortReason',
 ] as const;
+
+function sanitizeControlRetryOptions(
+    rawOpts: unknown,
+    method: string,
+): ToolErrorRecoveryRetryOptions {
+    if (!rawOpts || typeof rawOpts !== 'object' || Array.isArray(rawOpts)) {
+        throw new SandboxExecutionError(`ctx.${method}() requires "opts" to be a plain object.`);
+    }
+
+    const record = rawOpts as Record<string, unknown>;
+    const stripped: Record<string, unknown> = {};
+    for (const key of Object.keys(record)) {
+        if (FORBIDDEN_BOUNDARY_KEYS.has(key)) {
+            continue;
+        }
+        if (record[key] !== undefined) {
+            stripped[key] = record[key];
+        }
+    }
+
+    const cloned = cloneExecutionBoundaryValue(stripped, method);
+
+    const assertNonNegativeFiniteNumber = (field: string, value: unknown): void => {
+        if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+            throw new SandboxExecutionError(
+                `ctx.${method}() requires "opts.${field}" to be a non-negative finite number.`,
+            );
+        }
+    };
+
+    if (cloned.delayMs !== undefined) {
+        assertNonNegativeFiniteNumber('delayMs', cloned.delayMs);
+    }
+    if (cloned.rollbackToolRounds !== undefined) {
+        assertNonNegativeFiniteNumber('rollbackToolRounds', cloned.rollbackToolRounds);
+    }
+    if (cloned.dropHistoryTurns !== undefined) {
+        assertNonNegativeFiniteNumber('dropHistoryTurns', cloned.dropHistoryTurns);
+    }
+    if (cloned.connectionId !== undefined && typeof cloned.connectionId !== 'string') {
+        throw new SandboxExecutionError(
+            `ctx.${method}() requires "opts.connectionId" to be a string.`,
+        );
+    }
+    if (cloned.temperature !== undefined) {
+        assertNonNegativeFiniteNumber('temperature', cloned.temperature);
+    }
+    if (cloned.maxTokens !== undefined) {
+        if (
+            typeof cloned.maxTokens !== 'number'
+            || !Number.isFinite(cloned.maxTokens)
+            || cloned.maxTokens <= 0
+        ) {
+            throw new SandboxExecutionError(
+                `ctx.${method}() requires "opts.maxTokens" to be a positive finite number.`,
+            );
+        }
+    }
+    if (cloned.mode !== undefined && cloned.mode !== 'round' && cloned.mode !== 'turn') {
+        throw new SandboxExecutionError(
+            `ctx.${method}() requires "opts.mode" to be "round" or "turn".`,
+        );
+    }
+
+    return cloned as ToolErrorRecoveryRetryOptions;
+}
 
 function createSandboxControlProxy(
     hostControl: ToolErrorRecoveryControl | ToolPostprocessControl,
@@ -1111,16 +1222,7 @@ function createSandboxControlProxy(
                 throw new SandboxExecutionError(`ctx.${method}() requires "reason" to be a string.`);
             }
             const safeOpts =
-                opts === undefined
-                    ? undefined
-                    : (() => {
-                        if (!opts || typeof opts !== 'object' || Array.isArray(opts)) {
-                            throw new SandboxExecutionError(
-                                `ctx.${method}() requires "opts" to be a plain object.`,
-                            );
-                        }
-                        return cloneExecutionBoundaryValue(opts, method);
-                    })();
+                opts === undefined ? undefined : sanitizeControlRetryOptions(opts, method);
             (record.retry as (r?: string, o?: unknown) => void).call(hostControl, reason, safeOpts);
         };
     }
@@ -1188,15 +1290,19 @@ function createSandboxControlProxy(
         };
     }
 
+    const isErrorRecoveryControl =
+        typeof record.retry === 'function' && typeof record.requestFix !== 'function';
     for (const prop of CONTROL_READONLY_FIELDS) {
-        if (prop in record) {
+        if (prop in record || (prop === 'retryOptions' && isErrorRecoveryControl)) {
             Object.defineProperty(proxyObj, prop, {
                 enumerable: true,
                 configurable: false,
                 get: () => {
                     const val = record[prop];
                     return typeof val === 'object' && val !== null
-                        ? cloneExecutionBoundaryValue(val, `control.${prop}`)
+                        ? deepFreezeBoundaryValue(
+                            cloneExecutionBoundaryValue(val, `control.${prop}`),
+                        )
                         : val;
                 },
             });
@@ -1261,8 +1367,33 @@ function createSandboxOutputBridge(hostOutput: ToolPostprocessOutput): {
     workingOutput: ToolPostprocessOutput;
     syncBack: () => void;
 } {
+    const initialText =
+        typeof hostOutput.content === 'string'
+            ? hostOutput.content
+            : typeof hostOutput.text === 'string'
+                ? hostOutput.text
+                : '';
+
+    const hasInitialReasoning = hostOutput.reasoningContent !== undefined;
+    if (hasInitialReasoning && typeof hostOutput.reasoningContent !== 'string') {
+        throw new SandboxExecutionError('ctx.output.reasoningContent must be a string or undefined.');
+    }
+    const initialReasoning = hostOutput.reasoningContent;
+
+    const hasInitialToolCalls = hostOutput.toolCalls !== undefined;
+    let initialToolCalls: CanonicalToolCall[] | undefined;
+    if (hasInitialToolCalls) {
+        if (!Array.isArray(hostOutput.toolCalls)) {
+            throw new SandboxExecutionError('ctx.output.toolCalls must be an array or undefined.');
+        }
+        initialToolCalls = cloneExecutionBoundaryValue(hostOutput.toolCalls, 'output.toolCalls');
+    }
+
     const workingOutput: Record<string, unknown> = {
-        text: typeof hostOutput.text === 'string' ? hostOutput.text : '',
+        text: initialText,
+        content: initialText,
+        reasoningContent: initialReasoning,
+        toolCalls: initialToolCalls,
     };
 
     const hostRecord = hostOutput as unknown as Record<string, unknown>;
@@ -1280,8 +1411,102 @@ function createSandboxOutputBridge(hostOutput: ToolPostprocessOutput): {
     return {
         workingOutput: workingOutput as unknown as ToolPostprocessOutput,
         syncBack: () => {
-            if (typeof workingOutput.text === 'string') {
-                hostOutput.text = workingOutput.text;
+            // Phase 1: Validate and clone all writable fields atomically before mutating hostOutput.
+            const rawText = workingOutput.text;
+            const rawContent = workingOutput.content;
+
+            if (rawText !== undefined && typeof rawText !== 'string') {
+                throw new SandboxExecutionError('ctx.output.text must be a string.');
+            }
+            if (rawContent !== undefined && typeof rawContent !== 'string') {
+                throw new SandboxExecutionError('ctx.output.content must be a string.');
+            }
+            if (rawText === undefined && rawContent === undefined) {
+                throw new SandboxExecutionError('ctx.output.text must be a string.');
+            }
+
+            let applyTextContent = false;
+            let stagedText: string | undefined;
+            let stagedContent: string | undefined;
+
+            if (typeof rawText === 'string' && typeof rawContent === 'string') {
+                const textChanged = rawText !== initialText;
+                const contentChanged = rawContent !== initialText;
+                if (contentChanged && !textChanged) {
+                    applyTextContent = true;
+                    stagedText = rawContent;
+                    stagedContent = rawContent;
+                } else if (textChanged && !contentChanged) {
+                    applyTextContent = true;
+                    stagedText = rawText;
+                    stagedContent = rawText;
+                } else if (textChanged && contentChanged) {
+                    applyTextContent = true;
+                    stagedText = rawText;
+                    stagedContent = rawContent;
+                }
+            } else if (typeof rawContent === 'string') {
+                applyTextContent = true;
+                stagedText = rawContent;
+                stagedContent = rawContent;
+            } else if (typeof rawText === 'string') {
+                applyTextContent = true;
+                stagedText = rawText;
+                stagedContent = rawText;
+            }
+
+            const rawReasoning = workingOutput.reasoningContent;
+            if (rawReasoning !== undefined && typeof rawReasoning !== 'string') {
+                throw new SandboxExecutionError(
+                    'ctx.output.reasoningContent must be a string or undefined.',
+                );
+            }
+            let reasoningOp: 'noop' | 'set' | 'delete' = 'noop';
+            if (rawReasoning !== initialReasoning) {
+                reasoningOp = rawReasoning === undefined ? 'delete' : 'set';
+            }
+
+            const rawToolCalls = workingOutput.toolCalls;
+            let toolCallsOp: 'noop' | 'set' | 'delete' = 'noop';
+            let stagedToolCalls: CanonicalToolCall[] | undefined;
+            if (rawToolCalls === undefined) {
+                if (hasInitialToolCalls) {
+                    toolCallsOp = 'delete';
+                }
+            } else if (Array.isArray(rawToolCalls)) {
+                const clonedToolCalls = cloneExecutionBoundaryValue(
+                    rawToolCalls,
+                    'output.toolCalls',
+                ) as unknown[];
+                for (const item of clonedToolCalls) {
+                    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+                        throw new SandboxExecutionError(
+                            'ctx.output.toolCalls entries must be plain objects.',
+                        );
+                    }
+                }
+                toolCallsOp = 'set';
+                stagedToolCalls = clonedToolCalls as CanonicalToolCall[];
+            } else {
+                throw new SandboxExecutionError(
+                    'ctx.output.toolCalls must be an array or undefined.',
+                );
+            }
+
+            // Phase 2: Commit validated updates atomically to hostOutput.
+            if (applyTextContent) {
+                hostOutput.text = stagedText!;
+                hostOutput.content = stagedContent!;
+            }
+            if (reasoningOp === 'set') {
+                hostOutput.reasoningContent = rawReasoning;
+            } else if (reasoningOp === 'delete') {
+                delete hostOutput.reasoningContent;
+            }
+            if (toolCallsOp === 'set') {
+                hostOutput.toolCalls = stagedToolCalls;
+            } else if (toolCallsOp === 'delete') {
+                delete hostOutput.toolCalls;
             }
         },
     };
