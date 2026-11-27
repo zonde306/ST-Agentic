@@ -92,6 +92,7 @@ const OUTPUT_MUTATION_TOOLS = new Set([
     'write_file',
     'append_file',
     'edit_file',
+    'delete_file',
     'append_reply_view',
     'replace_reply_view',
 ]);
@@ -798,16 +799,21 @@ export class StreamRenderer {
             this.cancelScheduledFlush();
             const msg = this.getChatMessage();
             if (msg) {
+                const activeSwipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
                 const swipes = Array.isArray(msg.swipes) ? (msg.swipes as unknown[]) : undefined;
                 const latest =
                     swipes && this.target.swipeId >= 0 && this.target.swipeId < swipes.length
                         ? swipes[this.target.swipeId]
                         : msg.mes;
                 if (typeof latest === 'string') {
-                    this.domSyncedHostText = latest;
+                    if (activeSwipeId === this.target.swipeId) {
+                        this.domSyncedHostText = latest;
+                    }
                     if (latest.length > 0) {
                         this.outputPreviewText = latest;
                         this.hasOutputPreview = true;
+                    } else if (this.hasOutputPreview) {
+                        this.outputPreviewText = '';
                     }
                 }
             }
@@ -1006,6 +1012,7 @@ export class StreamRenderer {
                 chat.pop();
             }
             removeMesElement(this.target.messageId);
+            this.detachEventListener();
             this.detachStoreListener();
             this.capsuleEl?.remove();
             this.capsuleEl = null;

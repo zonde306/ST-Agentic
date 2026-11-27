@@ -993,11 +993,15 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
     };
 
     const onGenerationStarted = (
-        _type: unknown,
+        type: unknown,
         _genOptions: unknown,
         dryRun?: unknown,
     ) => {
         if (dryRun === true) {
+            return;
+        }
+        const genType = typeof type === 'string' && type ? type : 'normal';
+        if (genType === 'quiet' || isTakeoverActive?.()) {
             return;
         }
         if (pendingCompanionTurn && !pendingCompanionTurn.receivedResponse) {

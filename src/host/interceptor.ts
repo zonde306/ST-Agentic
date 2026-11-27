@@ -493,10 +493,9 @@ export function createAgenticInterceptor(
                   : 'regenerate';
             const rendererAction: GenerationAction = floorWasPopped ? 'normal' : 'regenerate';
 
-            if (floorWasPopped) {
-                orchestrator.store.rollbackStagedData(target);
-                orchestrator.trajectoryStore?.clearInterruptedCheckpoint?.(target);
-            }
+            // Clear any stale staged writes and interrupted checkpoint for both popped and in-place retries.
+            orchestrator.store.rollbackStagedData(target);
+            orchestrator.trajectoryStore?.clearInterruptedCheckpoint?.(target);
 
             const rendererDeps = createRendererDeps();
             const activeRenderer = StreamRenderer.bindExisting(target, rendererDeps, {

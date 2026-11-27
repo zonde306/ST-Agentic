@@ -1715,7 +1715,26 @@ describe('Companion Hooks /side/* Bridge & Zero-Residue Cleanup', () => {
             expect(errorEvents).toHaveLength(0);
             expect(store.listPending(target1)).toHaveLength(0);
 
-            // Scenario 4: Next GENERATION_STARTED fallback catches orphaned pendingCompanionTurn even if lock was never observed
+            // Scenario 4a: Background GENERATION_STARTED('quiet') during active companion turn must NOT abort, roll back staged data, or emit agentic_generation_error
+            errorEvents.length = 0;
+            store.set(DATA_NAMESPACES.FILES, 'keep-during-quiet.md', 'before_turn', 'staged-keep', {
+                target: target1,
+                staged: true,
+            });
+            await vfs.writeFile('/output.md', 'keep-buf', { target: target1 });
+            stMocks.state.is_send_press = true;
+            await stMocks.eventSource.emit(stMocks.event_types.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+            await stMocks.eventSource.emit(stMocks.event_types.GENERATION_STARTED, 'quiet', {}, false);
+            expect(errorEvents).toHaveLength(0);
+            expect(store.listPending(target1)).toHaveLength(1);
+            expect(vfs.peekPreCreateBuffer(target1)).toBe('keep-buf');
+            await stMocks.eventSource.emit(stMocks.event_types.MESSAGE_RECEIVED, 1, 'normal');
+            await stMocks.eventSource.emit(stMocks.event_types.GENERATION_ENDED, 2);
+            stMocks.state.is_send_press = false;
+            store.rollbackStagedData(target1);
+            vfs.flushPreCreateBuffer(target1);
+
+            // Scenario 4b: Next non-quiet GENERATION_STARTED fallback catches orphaned pendingCompanionTurn even if lock was never observed
             errorEvents.length = 0;
             store.set(DATA_NAMESPACES.FILES, 'orphan.md', 'before_turn', 'staged-orphan', {
                 target: target1,

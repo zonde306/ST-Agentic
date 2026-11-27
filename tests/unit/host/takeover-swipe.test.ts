@@ -894,6 +894,7 @@ describe('Takeover swipe lifecycle and consistency', () => {
                 if (selector === '.mes_block') return fakeMesBlock;
                 return null;
             }),
+            remove: vi.fn(),
         };
         (globalThis as { document?: unknown }).document = {
             querySelector: vi.fn((selector: string) =>
@@ -955,7 +956,53 @@ describe('Takeover swipe lifecycle and consistency', () => {
             expect(mesTextEl.innerHTML).toBe('<iframe data-js-slash-runner="mounted"></iframe>');
             expect(stMocks.fns.updateReasoningUI).toHaveBeenCalled();
 
+            // 4. Deleting /output.md clears outputPreviewText so a subsequent reasoning frame does not revive stale text
+            stMocks.state.chat[0].mes = '';
+            (stMocks.state.chat[0].swipes as string[])[0] = '';
+            mesTextEl.innerHTML = '';
+            renderer.onToolStart('delete_file');
+            renderer.onToolComplete('delete_file');
+            expect(renderer.getAccumulatedText()).toBe('');
+            renderer.appendReasoningDelta('rethinking after delete...');
+            const postDeleteCallbacks = Array.from(rafQueue.values());
+            rafQueue.clear();
+            for (const cb of postDeleteCallbacks) {
+                cb(Date.now());
+            }
+            expect(mesTextEl.innerHTML).toBe('');
+
             await renderer.abort({ wasUserStop: true });
+
+            // 5. Round-0 empty abort on a createdNewMessage detaches all eventSource & store listeners cleanly
+            const unsubscribeEventsSpy = vi.fn();
+            const appStoreWithUnsub = {
+                ...createMinimalAppStore(),
+                services: {
+                    subscribeEvents: vi.fn(() => unsubscribeEventsSpy),
+                },
+            } as unknown as AppStore;
+            const emptyRenderer = StreamRenderer.beginPlaceholder('normal', {
+                getSettings: () => settings,
+                getStore: () => undefined,
+                getAppStore: () => appStoreWithUnsub,
+                substituteMacros: (t) => t,
+                identity: {
+                    userName: 'Tester',
+                    charName: 'Alice',
+                    characterAvatar: 'alice.png',
+                    personaAvatar: 'tester.png',
+                },
+            });
+            expect(stMocks.eventListeners.get(stMocks.event_types.MESSAGE_UPDATED)?.size).toBe(1);
+            expect(
+                stMocks.eventListeners.get(stMocks.event_types.CHARACTER_MESSAGE_RENDERED)?.size,
+            ).toBe(1);
+            await emptyRenderer.abort({ wasUserStop: true });
+            expect(stMocks.eventListeners.get(stMocks.event_types.MESSAGE_UPDATED)?.size ?? 0).toBe(0);
+            expect(
+                stMocks.eventListeners.get(stMocks.event_types.CHARACTER_MESSAGE_RENDERED)?.size ?? 0,
+            ).toBe(0);
+            expect(unsubscribeEventsSpy).toHaveBeenCalledTimes(1);
         } finally {
             globalThis.requestAnimationFrame = originalRaf;
             globalThis.cancelAnimationFrame = originalCancelRaf;
@@ -1065,8 +1112,12 @@ describe('Takeover swipe lifecycle and consistency', () => {
         expect(runTurnCalls[0]?.userInput).toBe('Hello Alice');
         expect(stMocks.state.chat[1]?.mes).toBe('Retried (normal)');
 
-        // 3. Retry existing floor #1 in-place -> resets content and runs 'regenerate' without adding floor #2
+        // 3. Retry existing floor #1 in-place -> resets content, clears staged/checkpoint state, and runs 'regenerate' without adding floor #2
+        clearCheckpointSpy.mockClear();
+        (orchestrator.store.rollbackStagedData as ReturnType<typeof vi.fn>).mockClear();
         await handle.retryTakeoverTurn({ messageId: 1, swipeId: 0 });
+        expect(orchestrator.store.rollbackStagedData).toHaveBeenCalledWith({ messageId: 1, swipeId: 0 });
+        expect(clearCheckpointSpy).toHaveBeenCalledWith({ messageId: 1, swipeId: 0 });
         expect(stMocks.state.chat).toHaveLength(2);
         expect(runTurnCalls[1]?.action).toBe('regenerate');
         expect(stMocks.state.chat[1]?.mes).toBe('Retried (regenerate)');
