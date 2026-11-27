@@ -28,6 +28,7 @@ const stMocks = vi.hoisted(() => {
         selectedPresetName: 'Default',
         registeredSlashCommands: {} as Record<string, Record<string, unknown>>,
         registeredMacros: new Map<string, unknown>(),
+        is_send_press: false,
     };
 
     const fns = {
@@ -144,12 +145,14 @@ const stMocks = vi.hoisted(() => {
     };
 
     const event_types = {
+        GENERATION_STARTED: 'generation_started',
         GENERATION_AFTER_COMMANDS: 'generation_after_commands',
         WORLDINFO_ENTRIES_LOADED: 'worldinfo_entries_loaded',
         USER_MESSAGE_RENDERED: 'user_message_rendered',
         CHARACTER_MESSAGE_RENDERED: 'character_message_rendered',
         GENERATION_STOPPED: 'generation_stopped',
         GENERATION_ENDED: 'generation_ended',
+        IMPERSONATE_READY: 'impersonate_ready',
         MESSAGE_SWIPED: 'message_swiped',
         MESSAGE_DELETED: 'message_deleted',
         MESSAGE_SWIPE_DELETED: 'message_swipe_deleted',
@@ -193,6 +196,9 @@ vi.mock('@st/script.js', () => ({
     },
     get name2() {
         return stMocks.state.name2;
+    },
+    get is_send_press() {
+        return stMocks.state.is_send_press;
     },
     extension_prompt_types: { NONE: -1, IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 },
     extension_prompt_roles: { SYSTEM: 0, USER: 1, ASSISTANT: 2 },
@@ -369,7 +375,9 @@ import type { PipelineOrchestrator } from '@/core/triggers';
 import type { Settings } from '@/core/types';
 import { VirtualFileSystem } from '@/core/vfs';
 import {
+    AGENTIC_GENERATION_ERROR_EVENT,
     COMPANION_SIDE_BRIDGE_PROMPT_KEY,
+    type CompanionGenerationErrorPayload,
     setupCompanionHooks,
 } from '@/host/companion-hooks';
 import {
@@ -477,6 +485,7 @@ function resetStState() {
     stMocks.state.selectedPresetName = 'Default';
     stMocks.state.registeredSlashCommands = {};
     stMocks.state.registeredMacros.clear();
+    stMocks.state.is_send_press = false;
 
     vi.clearAllMocks();
 }
@@ -1549,6 +1558,217 @@ describe('Companion Hooks /side/* Bridge & Zero-Residue Cleanup', () => {
 
         handle.dispose();
     });
+
+    it('clears cached lorebooks via STHostBridge.clearLorebookCache() and reads host send_if_empty safely via getSendIfEmpty()', async () => {
+        const bridge = new STHostBridge();
+        await bridge.listEnabledLorebooks();
+        expect(bridge.getCachedLorebooks().size).toBe(1);
+
+        expect(bridge.clearLorebookCache()).toBe(1);
+        expect(bridge.getCachedLorebooks().size).toBe(0);
+        expect(bridge.clearLorebookCache()).toBe(0);
+
+        // 1. Returns '' when no host settings exist
+        vi.stubGlobal('SillyTavern', undefined);
+        vi.stubGlobal('oai_settings', undefined);
+        expect(bridge.getSendIfEmpty()).toBe('');
+
+        // 2. Reads trimmed value from SillyTavern.getContext().chatCompletionSettings.send_if_empty
+        vi.stubGlobal('SillyTavern', {
+            getContext: () => ({
+                chatCompletionSettings: { send_if_empty: '  Continue the story.  ' },
+            }),
+        });
+        expect(bridge.getSendIfEmpty()).toBe('Continue the story.');
+
+        // 3. Explicit empty send_if_empty on context does not fall back to stale global/DOM
+        vi.stubGlobal('oai_settings', { send_if_empty: 'fallback ignored' });
+        vi.stubGlobal('SillyTavern', {
+            getContext: () => ({
+                chatCompletionSettings: { send_if_empty: '   ' },
+            }),
+        });
+        expect(bridge.getSendIfEmpty()).toBe('');
+
+        // 4. Falls back to globalThis.oai_settings when SillyTavern.getContext() is absent
+        vi.stubGlobal('SillyTavern', undefined);
+        vi.stubGlobal('oai_settings', { send_if_empty: '  *nods silently*  ' });
+        expect(bridge.getSendIfEmpty()).toBe('*nods silently*');
+
+        // 5. Falls back to #send_if_empty_textarea in DOM when settings objects are absent
+        vi.stubGlobal('oai_settings', undefined);
+        vi.stubGlobal('document', {
+            querySelector: (selector: string) =>
+                selector === '#send_if_empty_textarea' ? { value: '  DOM fallback  ' } : null,
+        });
+        expect(bridge.getSendIfEmpty()).toBe('DOM fallback');
+    });
+
+    it('detects native generation error in companion mode (lock release, unhandledrejection, and GENERATION_STARTED fallback), cleans staged data/prompts, and emits agentic_generation_error', async () => {
+        vi.useFakeTimers();
+        try {
+            const settings: Settings = createDefaultSettings({ runMode: 'companion' });
+            const bridge = new STHostBridge({ getSettings: () => settings });
+            const store = new ChatDataStore(bridge);
+            bridge.setStore(store);
+            const vfs = new VirtualFileSystem({ bridge, store });
+
+            const errorEvents: CompanionGenerationErrorPayload[] = [];
+            stMocks.eventSource.on(AGENTIC_GENERATION_ERROR_EVENT, (payload) => {
+                errorEvents.push(payload as CompanionGenerationErrorPayload);
+            });
+
+            const rollbackSpy = vi.spyOn(store, 'rollbackStagedData');
+            const mockOrchestrator = {
+                store,
+                vfs,
+                barrierCoordinator: {
+                    awaitTurnBarriers: vi.fn(async () => undefined),
+                    abortFromMessage: vi.fn(),
+                    abortTarget: vi.fn(),
+                },
+                decoratorCompiler: {
+                    compile: vi.fn(() => ({ triggers: [] })),
+                },
+                rerunAfterTurn: vi.fn(async () => []),
+                trajectoryStore: {
+                    listInterruptedCheckpoints: vi.fn(() => new Map()),
+                    pruneFromMessage: vi.fn(() => 0),
+                    pruneSwipe: vi.fn(() => 0),
+                    saveToHost: vi.fn(),
+                },
+            } as unknown as PipelineOrchestrator;
+
+            const handle = setupCompanionHooks({
+                bridge,
+                orchestrator: mockOrchestrator,
+                getSettings: () => settings,
+                errorCheckGraceMs: 40,
+                errorCheckPollMs: 30,
+            });
+
+            // Scenario 1: ST Generate() acquires lock (is_send_press=true) then hits onError -> unblockGeneration (is_send_press=false) without MESSAGE_RECEIVED/GENERATION_ENDED
+            const target1 = { messageId: 1, swipeId: 0 };
+            store.set(DATA_NAMESPACES.FILES, 'draft.md', 'before_turn', 'staged-content', {
+                target: target1,
+                staged: true,
+            });
+            await vfs.writeFile('/output.md', 'pre-create-buf', { target: target1 });
+
+            stMocks.state.is_send_press = true;
+            await stMocks.eventSource.emit(stMocks.event_types.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+            stMocks.fns.setExtensionPrompt.mockClear();
+
+            // Native ST hits onError -> unblockGeneration sets is_send_press = false without emitting stop/end events
+            stMocks.state.is_send_press = false;
+            await vi.advanceTimersByTimeAsync(100);
+
+            expect(errorEvents).toHaveLength(1);
+            expect(errorEvents[0]).toMatchObject({
+                mode: 'companion',
+                target: target1,
+                genType: 'normal',
+                source: 'unblock_timeout',
+            });
+            expect(rollbackSpy).toHaveBeenCalledWith(target1);
+            expect(store.listPending(target1)).toHaveLength(0);
+            expect(vfs.peekPreCreateBuffer(target1)).toBeUndefined();
+            expect(stMocks.fns.setExtensionPrompt).toHaveBeenCalledWith(
+                'agentic_companion_before',
+                '',
+                1,
+                0,
+                false,
+                0,
+            );
+            expect(stMocks.fns.setExtensionPrompt).toHaveBeenCalledWith(
+                COMPANION_SIDE_BRIDGE_PROMPT_KEY,
+                '',
+                1,
+                0,
+                false,
+                0,
+            );
+
+            // Scenario 2: Streaming normal completion releases lock right before MESSAGE_RECEIVED within grace window -> NO error event
+            errorEvents.length = 0;
+            stMocks.state.is_send_press = true;
+            await stMocks.eventSource.emit(stMocks.event_types.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+            stMocks.state.is_send_press = false;
+            await vi.advanceTimersByTimeAsync(35);
+            await stMocks.eventSource.emit(stMocks.event_types.MESSAGE_RECEIVED, 1, 'normal');
+            await vi.advanceTimersByTimeAsync(200);
+            expect(errorEvents).toHaveLength(0);
+            await stMocks.eventSource.emit(stMocks.event_types.GENERATION_ENDED, 2);
+
+            // Scenario 3: Explicit GENERATION_STOPPED cleans up pending turn & disarms error detection (NO error event)
+            errorEvents.length = 0;
+            store.set(DATA_NAMESPACES.FILES, 'stopped.md', 'before_turn', 'staged-stop', {
+                target: target1,
+                staged: true,
+            });
+            stMocks.state.is_send_press = true;
+            await stMocks.eventSource.emit(stMocks.event_types.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+            await stMocks.eventSource.emit(stMocks.event_types.GENERATION_STOPPED);
+            stMocks.state.is_send_press = false;
+            await vi.advanceTimersByTimeAsync(200);
+            expect(errorEvents).toHaveLength(0);
+            expect(store.listPending(target1)).toHaveLength(0);
+
+            // Scenario 4: Next GENERATION_STARTED fallback catches orphaned pendingCompanionTurn even if lock was never observed
+            errorEvents.length = 0;
+            store.set(DATA_NAMESPACES.FILES, 'orphan.md', 'before_turn', 'staged-orphan', {
+                target: target1,
+                staged: true,
+            });
+            await vfs.writeFile('/output.md', 'orphan-buf', { target: target1 });
+            stMocks.state.is_send_press = false;
+            await stMocks.eventSource.emit(stMocks.event_types.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+            await stMocks.eventSource.emit(stMocks.event_types.GENERATION_STARTED, 'normal', {}, false);
+
+            expect(errorEvents).toHaveLength(1);
+            expect(errorEvents[0]).toMatchObject({
+                mode: 'companion',
+                target: target1,
+                source: 'superseded_generation_started',
+            });
+            expect(store.listPending(target1)).toHaveLength(0);
+            expect(vfs.peekPreCreateBuffer(target1)).toBeUndefined();
+
+            // Scenario 5: unhandledrejection while lock is released captures error message and emits agentic_generation_error
+            errorEvents.length = 0;
+            const rejectionListeners = new Set<(event: Event) => void>();
+            vi.stubGlobal('addEventListener', (type: string, fn: (event: Event) => void) => {
+                if (type === 'unhandledrejection') {
+                    rejectionListeners.add(fn);
+                }
+            });
+            vi.stubGlobal('removeEventListener', (type: string, fn: (event: Event) => void) => {
+                if (type === 'unhandledrejection') {
+                    rejectionListeners.delete(fn);
+                }
+            });
+
+            stMocks.state.is_send_press = false;
+            await stMocks.eventSource.emit(stMocks.event_types.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+            for (const listener of Array.from(rejectionListeners)) {
+                listener({ reason: { error: { message: '429 Rate limit exceeded' } } } as unknown as Event);
+            }
+            await vi.advanceTimersByTimeAsync(60);
+
+            expect(errorEvents).toHaveLength(1);
+            expect(errorEvents[0]).toMatchObject({
+                mode: 'companion',
+                target: target1,
+                source: 'unhandled_rejection',
+                errorMessage: '429 Rate limit exceeded',
+            });
+
+            handle.dispose();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
 });
 
 describe('/sidegen-* Slash Commands', () => {
@@ -2068,11 +2288,12 @@ describe('/sidegen-* Slash Commands', () => {
         bridge.setStore(store);
         const vfs = new VirtualFileSystem({ bridge, store });
 
-        // 1. Assistant /output.md write/edit/append updates DOM and emits CHARACTER_MESSAGE_RENDERED
+        // 1. Assistant /output.md write/edit/append updates DOM and emits MESSAGE_UPDATED + CHARACTER_MESSAGE_RENDERED
         await vfs.writeFile('/output.md', '<div>html panel</div>', {
             target: { messageId: 1, swipeId: 0 },
         });
         expect(stMocks.fns.updateMessageBlock).toHaveBeenCalledTimes(1);
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(stMocks.event_types.MESSAGE_UPDATED, 1);
         expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(
             stMocks.event_types.CHARACTER_MESSAGE_RENDERED,
             1,
@@ -2083,24 +2304,33 @@ describe('/sidegen-* Slash Commands', () => {
         await vfs.editFile('/output.md', 'html panel', 'updated panel', {
             target: { messageId: 1, swipeId: 0 },
         });
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(stMocks.event_types.MESSAGE_UPDATED, 1);
         expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(
             stMocks.event_types.CHARACTER_MESSAGE_RENDERED,
             1,
             AGENTIC_RERENDER_EVENT_TYPE,
         );
 
-        // 2. Inactive swipe write does NOT emit CHARACTER_MESSAGE_RENDERED
+        // 2. Inactive swipe write emits MESSAGE_UPDATED but does NOT emit CHARACTER_MESSAGE_RENDERED
         stMocks.fns.eventEmit.mockClear();
+        stMocks.fns.updateMessageBlock.mockClear();
         await vfs.writeFile('/output.md', '次选更新', {
             target: { messageId: 1, swipeId: 1 },
         });
-        expect(stMocks.fns.eventEmit).not.toHaveBeenCalled();
+        expect(stMocks.fns.updateMessageBlock).not.toHaveBeenCalled();
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(stMocks.event_types.MESSAGE_UPDATED, 1);
+        expect(stMocks.fns.eventEmit).not.toHaveBeenCalledWith(
+            stMocks.event_types.CHARACTER_MESSAGE_RENDERED,
+            expect.anything(),
+            expect.anything(),
+        );
 
-        // 3. User message /output.md write emits USER_MESSAGE_RENDERED; hidden system message emits neither
+        // 3. User message /output.md write emits MESSAGE_UPDATED + USER_MESSAGE_RENDERED; hidden system message emits no render event
         stMocks.fns.eventEmit.mockClear();
         await vfs.writeFile('/output.md', '修改后的用户消息', {
             target: { messageId: 0, swipeId: 0 },
         });
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(stMocks.event_types.MESSAGE_UPDATED, 0);
         expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(
             stMocks.event_types.USER_MESSAGE_RENDERED,
             0,
@@ -2110,15 +2340,29 @@ describe('/sidegen-* Slash Commands', () => {
         await vfs.writeFile('/output.md', '修改后的系统注记', {
             target: { messageId: 2, swipeId: 0 },
         });
-        expect(stMocks.fns.eventEmit).not.toHaveBeenCalled();
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(stMocks.event_types.MESSAGE_UPDATED, 2);
+        expect(stMocks.fns.eventEmit).not.toHaveBeenCalledWith(
+            stMocks.event_types.CHARACTER_MESSAGE_RENDERED,
+            expect.anything(),
+            expect.anything(),
+        );
+        expect(stMocks.fns.eventEmit).not.toHaveBeenCalledWith(
+            stMocks.event_types.USER_MESSAGE_RENDERED,
+            expect.anything(),
+        );
 
-        // 4. Suppressed emitRenderEvent: false (e.g. main_turn / before_turn) does NOT emit render event
+        // 4. Explicit emitRenderEvent: false emits MESSAGE_UPDATED only without render event
         stMocks.fns.eventEmit.mockClear();
         await vfs.writeFile('/output.md', '草稿正文', {
             target: { messageId: 1, swipeId: 0 },
             emitRenderEvent: false,
         });
-        expect(stMocks.fns.eventEmit).not.toHaveBeenCalled();
+        expect(stMocks.fns.eventEmit).toHaveBeenCalledWith(stMocks.event_types.MESSAGE_UPDATED, 1);
+        expect(stMocks.fns.eventEmit).not.toHaveBeenCalledWith(
+            stMocks.event_types.CHARACTER_MESSAGE_RENDERED,
+            expect.anything(),
+            expect.anything(),
+        );
 
         // 5. Companion hooks guard against internal re-render recursion & preserve iframes when no display regex matches
         const rerunAfterTurn = vi.fn(async () => []);

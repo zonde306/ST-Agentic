@@ -2,6 +2,7 @@ import {
     chat,
     extension_prompt_roles,
     extension_prompt_types,
+    is_send_press,
     setExtensionPrompt,
 } from '@st/script.js';
 import { eventSource, event_types } from '@st/scripts/events.js';
@@ -54,6 +55,20 @@ import {
 
 const COMPANION_PROMPT_KEY = 'agentic_companion_before';
 export const COMPANION_SIDE_BRIDGE_PROMPT_KEY = 'agentic_side_bridge';
+export const AGENTIC_GENERATION_ERROR_EVENT = 'agentic_generation_error';
+
+const DEFAULT_GENERATION_ERROR_GRACE_MS = 120;
+const DEFAULT_GENERATION_ERROR_POLL_MS = 150;
+
+export interface CompanionGenerationErrorPayload {
+    mode: 'companion';
+    target: MessageTarget;
+    genType: string;
+    reason: string;
+    errorMessage?: string;
+    source: 'unblock_timeout' | 'unhandled_rejection' | 'superseded_generation_started';
+    timestamp: number;
+}
 
 export interface CompanionHooksOptions {
     bridge: STHostBridge;
@@ -62,6 +77,12 @@ export interface CompanionHooksOptions {
     getAppStore?: () => AppStore | undefined;
     isTakeoverActive?: () => boolean;
     tailRadar?: TailRadar;
+    /** Optional override for host generation lock inspection (primarily for testing). */
+    isHostGenerating?: () => boolean;
+    /** Grace period (ms) after lock release before confirming native generation failure. */
+    errorCheckGraceMs?: number;
+    /** Poll interval (ms) while awaiting native generation completion. */
+    errorCheckPollMs?: number;
 }
 
 export interface CompanionHooksHandle {
@@ -74,7 +95,31 @@ export interface CompanionHooksHandle {
 interface PendingCompanionTurn {
     target: MessageTarget;
     controller: AbortController;
+    genType: string;
+    startedAt: number;
+    beforeTurnCompleted: boolean;
+    sawGeneratingLock: boolean;
+    receivedResponse: boolean;
     pendingSideBriefPaths?: string[];
+}
+
+function extractRejectionMessage(reason: unknown): string {
+    if (typeof reason === 'string' && reason.trim()) {
+        return reason.trim();
+    }
+    if (reason && typeof reason === 'object') {
+        const record = reason as {
+            message?: unknown;
+            error?: { message?: unknown };
+        };
+        if (typeof record.error?.message === 'string' && record.error.message.trim()) {
+            return record.error.message.trim();
+        }
+        if (typeof record.message === 'string' && record.message.trim()) {
+            return record.message.trim();
+        }
+    }
+    return '';
 }
 
 function getLatestMessageTarget(): MessageTarget {
@@ -699,6 +744,53 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
     let activeGenType: string | null = null;
     let pendingCompanionTurn: PendingCompanionTurn | null = null;
     const sideTailRadar = options.tailRadar ?? TailRadar.fromBridge(bridge);
+    const errorCheckGraceMs =
+        typeof options.errorCheckGraceMs === 'number' && options.errorCheckGraceMs >= 0
+            ? options.errorCheckGraceMs
+            : DEFAULT_GENERATION_ERROR_GRACE_MS;
+    const errorCheckPollMs =
+        typeof options.errorCheckPollMs === 'number' && options.errorCheckPollMs > 0
+            ? options.errorCheckPollMs
+            : DEFAULT_GENERATION_ERROR_POLL_MS;
+
+    let monitorObserver: MutationObserver | null = null;
+    let monitorPollTimer: ReturnType<typeof setInterval> | null = null;
+    let monitorGraceTimer: ReturnType<typeof setTimeout> | null = null;
+    let monitorRejectionCleanup: (() => void) | null = null;
+    let capturedRejectionMessage = '';
+
+    const readIsHostGenerating = (): boolean => {
+        if (typeof options.isHostGenerating === 'function') {
+            return Boolean(options.isHostGenerating());
+        }
+        const domGenerating =
+            typeof document !== 'undefined' && document.body?.dataset?.generating === 'true';
+        return domGenerating || Boolean(is_send_press);
+    };
+
+    const cancelMonitorGraceTimer = (): void => {
+        if (monitorGraceTimer !== null) {
+            clearTimeout(monitorGraceTimer);
+            monitorGraceTimer = null;
+        }
+    };
+
+    const stopGenerationFailureMonitor = (): void => {
+        cancelMonitorGraceTimer();
+        if (monitorPollTimer !== null) {
+            clearInterval(monitorPollTimer);
+            monitorPollTimer = null;
+        }
+        if (monitorObserver) {
+            monitorObserver.disconnect();
+            monitorObserver = null;
+        }
+        if (monitorRejectionCleanup) {
+            monitorRejectionCleanup();
+            monitorRejectionCleanup = null;
+        }
+        capturedRejectionMessage = '';
+    };
 
     const clearCompanionPrompt = () => {
         if (typeof setExtensionPrompt === 'function') {
@@ -726,6 +818,158 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         }
     };
 
+    const cleanupPendingCompanionTurn = (
+        reason: string,
+        errorEmit?: {
+            source: CompanionGenerationErrorPayload['source'];
+            errorMessage?: string;
+        },
+    ): void => {
+        stopGenerationFailureMonitor();
+        activeGenType = null;
+        clearCompanionPrompt();
+        clearSideBridgePrompt();
+
+        const turn = pendingCompanionTurn;
+        pendingCompanionTurn = null;
+        if (!turn) {
+            return;
+        }
+        if (!turn.controller.signal.aborted) {
+            turn.controller.abort(reason);
+        }
+        orchestrator.store.rollbackStagedData(turn.target);
+        orchestrator.vfs.flushPreCreateBuffer(turn.target);
+
+        if (errorEmit && typeof eventSource?.emit === 'function') {
+            const payload: CompanionGenerationErrorPayload = {
+                mode: 'companion',
+                target: { messageId: turn.target.messageId, swipeId: turn.target.swipeId },
+                genType: turn.genType,
+                reason,
+                ...(errorEmit.errorMessage ? { errorMessage: errorEmit.errorMessage } : {}),
+                source: errorEmit.source,
+                timestamp: Date.now(),
+            };
+            void eventSource.emit(AGENTIC_GENERATION_ERROR_EVENT, payload);
+        }
+    };
+
+    const scheduleLockReleaseErrorCheck = (
+        turn: PendingCompanionTurn,
+        source: CompanionGenerationErrorPayload['source'],
+        errorMessage?: string,
+    ): void => {
+        if (
+            pendingCompanionTurn !== turn
+            || turn.receivedResponse
+            || monitorGraceTimer !== null
+        ) {
+            return;
+        }
+        monitorGraceTimer = setTimeout(() => {
+            monitorGraceTimer = null;
+            if (
+                pendingCompanionTurn !== turn
+                || turn.receivedResponse
+                || readIsHostGenerating()
+            ) {
+                return;
+            }
+            const resolvedErr = errorMessage || capturedRejectionMessage || undefined;
+            cleanupPendingCompanionTurn(
+                resolvedErr
+                    ? `Native generation failed: ${resolvedErr}`
+                    : 'Native generation unlocked without MESSAGE_RECEIVED or GENERATION_ENDED',
+                {
+                    source,
+                    ...(resolvedErr ? { errorMessage: resolvedErr } : {}),
+                },
+            );
+        }, errorCheckGraceMs);
+        (monitorGraceTimer as { unref?: () => void }).unref?.();
+    };
+
+    const startGenerationFailureMonitor = (turn: PendingCompanionTurn): void => {
+        stopGenerationFailureMonitor();
+        if (pendingCompanionTurn !== turn || turn.receivedResponse) {
+            return;
+        }
+
+        const inspectGenerationLock = () => {
+            if (pendingCompanionTurn !== turn || turn.receivedResponse) {
+                stopGenerationFailureMonitor();
+                return;
+            }
+            if (readIsHostGenerating()) {
+                turn.sawGeneratingLock = true;
+                cancelMonitorGraceTimer();
+            } else if (turn.sawGeneratingLock) {
+                scheduleLockReleaseErrorCheck(
+                    turn,
+                    capturedRejectionMessage ? 'unhandled_rejection' : 'unblock_timeout',
+                    capturedRejectionMessage || undefined,
+                );
+            }
+        };
+
+        inspectGenerationLock();
+
+        if (
+            typeof MutationObserver === 'function'
+            && typeof document !== 'undefined'
+            && document.body
+        ) {
+            try {
+                monitorObserver = new MutationObserver(() => {
+                    inspectGenerationLock();
+                });
+                monitorObserver.observe(document.body, {
+                    attributes: true,
+                    attributeFilter: ['data-generating'],
+                });
+            } catch {
+                monitorObserver = null;
+            }
+        }
+
+        if (
+            typeof globalThis.addEventListener === 'function'
+            && typeof globalThis.removeEventListener === 'function'
+        ) {
+            const onUnhandledRejection = (event: Event) => {
+                if (
+                    pendingCompanionTurn !== turn
+                    || !turn.beforeTurnCompleted
+                    || turn.receivedResponse
+                ) {
+                    return;
+                }
+                const rejectionReason = (event as { reason?: unknown }).reason;
+                const extracted = extractRejectionMessage(rejectionReason);
+                if (extracted) {
+                    capturedRejectionMessage = extracted;
+                }
+                if (!readIsHostGenerating()) {
+                    scheduleLockReleaseErrorCheck(
+                        turn,
+                        'unhandled_rejection',
+                        capturedRejectionMessage || undefined,
+                    );
+                }
+            };
+            globalThis.addEventListener('unhandledrejection', onUnhandledRejection);
+            monitorRejectionCleanup = () => {
+                globalThis.removeEventListener('unhandledrejection', onUnhandledRejection);
+            };
+        }
+
+        monitorPollTimer = setInterval(() => {
+            inspectGenerationLock();
+        }, errorCheckPollMs);
+        (monitorPollTimer as { unref?: () => void }).unref?.();
+    };
+
     const syncSideBridgePrompt = async (targetOverride?: MessageTarget): Promise<string> => {
         const settings = getSettings();
         if (!settings || settings.runMode !== 'companion') {
@@ -748,6 +992,23 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         return sideBridge.content;
     };
 
+    const onGenerationStarted = (
+        _type: unknown,
+        _genOptions: unknown,
+        dryRun?: unknown,
+    ) => {
+        if (dryRun === true) {
+            return;
+        }
+        if (pendingCompanionTurn && !pendingCompanionTurn.receivedResponse) {
+            const isCompanion = getSettings()?.runMode === 'companion';
+            cleanupPendingCompanionTurn(
+                'Previous native generation did not finish before next GENERATION_STARTED',
+                isCompanion ? { source: 'superseded_generation_started' } : undefined,
+            );
+        }
+    };
+
     const onGenerationAfterCommands = async (
         type: unknown,
         _genOptions: unknown,
@@ -762,8 +1023,7 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
 
         const settings = getSettings();
         if (!settings || settings.runMode !== 'companion') {
-            clearCompanionPrompt();
-            clearSideBridgePrompt();
+            cleanupPendingCompanionTurn('Companion mode inactive');
             return;
         }
 
@@ -771,11 +1031,27 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
             return;
         }
 
-        pendingCompanionTurn?.controller.abort('Superseded by new generation');
+        if (pendingCompanionTurn) {
+            const shouldEmitStaleError =
+                pendingCompanionTurn.sawGeneratingLock && !pendingCompanionTurn.receivedResponse;
+            cleanupPendingCompanionTurn(
+                'Superseded by new generation',
+                shouldEmitStaleError ? { source: 'superseded_generation_started' } : undefined,
+            );
+        }
         const controller = new AbortController();
         const target = resolveUpcomingTarget(genType);
         const pendingUserInput = genType === 'normal' ? readPendingSendTextareaText() : '';
-        pendingCompanionTurn = { target, controller };
+        const turn: PendingCompanionTurn = {
+            target,
+            controller,
+            genType,
+            startedAt: Date.now(),
+            beforeTurnCompleted: false,
+            sawGeneratingLock: readIsHostGenerating(),
+            receivedResponse: false,
+        };
+        pendingCompanionTurn = turn;
 
         try {
             await orchestrator.barrierCoordinator.awaitTurnBarriers({
@@ -802,8 +1078,8 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
                 return;
             }
 
-            if (pendingCompanionTurn?.controller === controller) {
-                pendingCompanionTurn.pendingSideBriefPaths = sideBridge.briefPaths;
+            if (pendingCompanionTurn === turn) {
+                turn.pendingSideBriefPaths = sideBridge.briefPaths;
             }
 
             if (typeof setExtensionPrompt === 'function') {
@@ -827,6 +1103,11 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         } catch (error) {
             if (!controller.signal.aborted) {
                 console.warn('[ST-Agentic] Companion before_turn hook failed:', error);
+            }
+        } finally {
+            if (pendingCompanionTurn === turn && !controller.signal.aborted) {
+                turn.beforeTurnCompleted = true;
+                startGenerationFailureMonitor(turn);
             }
         }
     };
@@ -911,6 +1192,7 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
             return;
         }
 
+        stopGenerationFailureMonitor();
         clearCompanionPrompt();
         clearSideBridgePrompt();
 
@@ -1028,20 +1310,27 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         }
     };
 
-    const onGenerationStopped = () => {
-        activeGenType = null;
-        clearCompanionPrompt();
-        clearSideBridgePrompt();
+    const onMessageReceived = () => {
         if (pendingCompanionTurn) {
-            pendingCompanionTurn.controller.abort('Generation stopped');
-            orchestrator.store.rollbackStagedData(pendingCompanionTurn.target);
-            orchestrator.vfs.flushPreCreateBuffer(pendingCompanionTurn.target);
-            pendingCompanionTurn = null;
+            pendingCompanionTurn.receivedResponse = true;
+            stopGenerationFailureMonitor();
         }
+    };
+
+    const onImpersonateReady = () => {
+        cleanupPendingCompanionTurn('Impersonate completed');
+    };
+
+    const onGenerationStopped = () => {
+        cleanupPendingCompanionTurn('Generation stopped');
     };
 
     const onGenerationEnded = () => {
         activeGenType = null;
+        if (pendingCompanionTurn) {
+            pendingCompanionTurn.receivedResponse = true;
+            stopGenerationFailureMonitor();
+        }
     };
 
     const onMessageSwiped = (messageId: unknown) => {
@@ -1100,16 +1389,20 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         orchestrator.vfs.clearPreCreateBuffersFrom(0);
     };
 
-    const registrations: Array<[string, (...args: unknown[]) => unknown]> = [
-        [event_types.GENERATION_AFTER_COMMANDS, onGenerationAfterCommands],
-        [event_types.WORLDINFO_ENTRIES_LOADED, onWorldInfoEntriesLoaded],
-        [event_types.CHARACTER_MESSAGE_RENDERED, onCharacterMessageRendered],
-        [event_types.GENERATION_STOPPED, onGenerationStopped],
-        [event_types.GENERATION_ENDED, onGenerationEnded],
-        [event_types.MESSAGE_SWIPED, onMessageSwiped],
-        [event_types.MESSAGE_DELETED, onMessageDeleted],
-        [event_types.MESSAGE_SWIPE_DELETED, onMessageSwipeDeleted],
-        [event_types.CHAT_CHANGED, onChatChanged],
+    const eventsMap = event_types as Record<string, string | undefined>;
+    const registrations: Array<[string | undefined, (...args: unknown[]) => unknown]> = [
+        [eventsMap.GENERATION_STARTED, onGenerationStarted],
+        [eventsMap.GENERATION_AFTER_COMMANDS, onGenerationAfterCommands],
+        [eventsMap.WORLDINFO_ENTRIES_LOADED, onWorldInfoEntriesLoaded],
+        [eventsMap.MESSAGE_RECEIVED, onMessageReceived],
+        [eventsMap.IMPERSONATE_READY, onImpersonateReady],
+        [eventsMap.CHARACTER_MESSAGE_RENDERED, onCharacterMessageRendered],
+        [eventsMap.GENERATION_STOPPED, onGenerationStopped],
+        [eventsMap.GENERATION_ENDED, onGenerationEnded],
+        [eventsMap.MESSAGE_SWIPED, onMessageSwiped],
+        [eventsMap.MESSAGE_DELETED, onMessageDeleted],
+        [eventsMap.MESSAGE_SWIPE_DELETED, onMessageSwipeDeleted],
+        [eventsMap.CHAT_CHANGED, onChatChanged],
     ];
 
     const maybeMakeFirst = (
@@ -1142,8 +1435,7 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
                   if (nextRunMode !== lastObservedRunMode) {
                       lastObservedRunMode = nextRunMode;
                       if (nextRunMode !== 'companion') {
-                          clearCompanionPrompt();
-                          clearSideBridgePrompt();
+                          cleanupPendingCompanionTurn('Companion mode disabled');
                       }
                   }
               })
@@ -1154,8 +1446,7 @@ export function setupCompanionHooks(options: CompanionHooksOptions): CompanionHo
         clearSideBridgePrompt,
         syncSideBridgePrompt,
         dispose() {
-            clearCompanionPrompt();
-            clearSideBridgePrompt();
+            cleanupPendingCompanionTurn('Companion hooks disposed');
             unsubscribeAppStore?.();
             for (const [eventName, handler] of registrations) {
                 if (eventName && typeof eventSource.removeListener === 'function') {

@@ -82,6 +82,20 @@ export interface StreamSessionRetryingOptions {
     rollbackPreviewText?: string;
 }
 
+export interface StreamBindExistingOptions {
+    action?: GenerationAction;
+    /** Clear existing text/reasoning on the bound swipe slot before streaming/retrying. */
+    resetContent?: boolean;
+}
+
+const OUTPUT_MUTATION_TOOLS = new Set([
+    'write_file',
+    'append_file',
+    'edit_file',
+    'append_reply_view',
+    'replace_reply_view',
+]);
+
 interface ExtractedDisplayParts {
     visibleText: string;
     reasoningText: string;
@@ -245,10 +259,12 @@ export class StreamRenderer {
     private rafHandle: number | null = null;
     private needsFlush = false;
     private finalized = false;
+    private domSyncedHostText: string | null = null;
 
     private capsuleEl: AgenticCapsuleElement | null = null;
     private capsuleDisconnect?: () => void;
     private eventsUnsubscribe?: () => void;
+    private hostMessageEventUnsubscribe?: () => void;
 
     private constructor(
         deps: StreamRendererDependencies,
@@ -466,38 +482,141 @@ export class StreamRenderer {
     }
 
     /**
-     * Bind to an existing SillyTavern message & swipe in-place (for interrupted checkpoint resume)
-     * without pushing a new message or incrementing `swipe_id`.
+     * Bind to an existing SillyTavern message & swipe in-place (for interrupted checkpoint resume or retry).
+     * If the target floor was popped after a round-0 empty error (`target.messageId === chat.length`),
+     * automatically recreates the assistant placeholder floor before binding.
      */
     static bindExisting(
         target: MessageTarget,
         deps: StreamRendererDependencies,
+        options: StreamBindExistingOptions = {},
     ): StreamRenderer {
         const chatList = Array.isArray(chat) ? chat : [];
+
+        if (
+            Number.isInteger(target.messageId)
+            && target.messageId === chatList.length
+            && Number.isInteger(target.swipeId)
+            && target.swipeId >= 0
+        ) {
+            const settings = deps.getSettings();
+            const modelTag = resolveModelLabel(settings);
+            const apiTag =
+                (typeof getGeneratingApi === 'function' ? getGeneratingApi() : '') || 'agentic';
+            const timestamp =
+                typeof getMessageTimeStamp === 'function' ? getMessageTimeStamp() : Date.now();
+            const extra = {
+                api: apiTag,
+                model: modelTag,
+            };
+            const swipes = Array.from({ length: target.swipeId + 1 }, () => '');
+            const swipeInfo = Array.from({ length: target.swipeId + 1 }, (_, idx) =>
+                idx === target.swipeId
+                    ? {
+                          send_date: timestamp,
+                          gen_started: new Date().toISOString(),
+                          extra: { ...extra },
+                      }
+                    : {},
+            );
+            const placeholder: Record<string, unknown> = {
+                name: deps.identity.charName || 'Assistant',
+                is_user: false,
+                is_system: false,
+                send_date: timestamp,
+                mes: '',
+                swipes,
+                swipe_id: target.swipeId,
+                swipe_info: swipeInfo,
+                extra,
+            };
+
+            chatList.push(placeholder);
+            if (typeof addOneMessage === 'function') {
+                addOneMessage(placeholder, {
+                    type: 'normal',
+                    showSwipes: false,
+                    scroll: true,
+                });
+            }
+
+            const renderer = new StreamRenderer(
+                deps,
+                { messageId: target.messageId, swipeId: target.swipeId },
+                options.action ?? 'normal',
+                true,
+                '',
+            );
+            renderer.renderToDom(placeholder, '', '', false, false);
+            return renderer;
+        }
+
         const msg =
             target.messageId >= 0 && target.messageId < chatList.length
                 ? (chatList[target.messageId] as Record<string, unknown> | undefined)
                 : undefined;
+
+        if (msg && Number.isInteger(target.swipeId) && target.swipeId >= 0) {
+            if (Array.isArray(msg.swipes) && target.swipeId >= msg.swipes.length) {
+                const swipesArr = msg.swipes as unknown[];
+                while (swipesArr.length <= target.swipeId) {
+                    swipesArr.push('');
+                }
+                const swipeInfoArr = Array.isArray(msg.swipe_info)
+                    ? (msg.swipe_info as Array<Record<string, unknown>>)
+                    : ((msg.swipe_info = []) as Array<Record<string, unknown>>);
+                while (swipeInfoArr.length <= target.swipeId) {
+                    swipeInfoArr.push({});
+                }
+            }
+        }
+
         const swipes = msg && Array.isArray(msg.swipes) ? (msg.swipes as unknown[]) : undefined;
         const swipeRaw =
             swipes && target.swipeId >= 0 && target.swipeId < swipes.length
                 ? swipes[target.swipeId]
                 : undefined;
-        const existingContent =
+        const rawExistingContent =
             typeof swipeRaw === 'string'
                 ? swipeRaw
                 : typeof msg?.mes === 'string'
                   ? msg.mes
                   : '';
 
+        if (msg && options.resetContent) {
+            if (swipes && target.swipeId >= 0 && target.swipeId < swipes.length) {
+                swipes[target.swipeId] = '';
+            }
+            const activeSwipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
+            if (activeSwipeId === target.swipeId) {
+                msg.mes = '';
+                const msgExtra = ((msg.extra ??= {}) as Record<string, unknown>);
+                delete msgExtra.display_text;
+                delete msgExtra.reasoning;
+                delete msgExtra.reasoning_type;
+                delete msgExtra.reasoning_duration;
+                if (typeof updateReasoningUI === 'function') {
+                    const mesEl = getMesElement(target.messageId);
+                    if (mesEl) {
+                        (updateReasoningUI as (el: HTMLElement, opts?: { reset?: boolean }) => void)(
+                            mesEl,
+                            { reset: true },
+                        );
+                    }
+                }
+            }
+        }
+
+        const existingContent = options.resetContent ? '' : rawExistingContent;
+        const activeSwipeId = typeof msg?.swipe_id === 'number' ? msg.swipe_id : 0;
         const renderer = new StreamRenderer(
             deps,
             { messageId: target.messageId, swipeId: target.swipeId },
-            'continue',
+            options.action ?? 'continue',
             false,
             existingContent,
         );
-        if (msg && !existingContent) {
+        if (msg && activeSwipeId === target.swipeId && (options.resetContent || !existingContent)) {
             renderer.renderToDom(msg, '', '', false, false);
         }
         return renderer;
@@ -563,6 +682,7 @@ export class StreamRenderer {
         if (options.rollbackPreviewText !== undefined) {
             this.outputPreviewText = options.rollbackPreviewText;
             this.hasOutputPreview = true;
+            this.domSyncedHostText = null;
         }
 
         this.capsuleEl?.setState({
@@ -593,6 +713,10 @@ export class StreamRenderer {
             retryMaxAttempts: undefined,
             retryReason: undefined,
         });
+        if (this.domSyncedHostText !== null && fullPreviewText === this.domSyncedHostText) {
+            return;
+        }
+        this.domSyncedHostText = null;
         this.scheduleFlush();
     }
 
@@ -606,6 +730,9 @@ export class StreamRenderer {
             this.pendingToolReset = false;
         }
         this.currentRoundText += delta;
+        if (!this.hasOutputPreview) {
+            this.domSyncedHostText = null;
+        }
         this.capsuleEl?.setState({
             status: 'streaming',
             currentStep: 'Streaming response',
@@ -645,6 +772,9 @@ export class StreamRenderer {
         if (this.finalized) {
             return;
         }
+        if (OUTPUT_MUTATION_TOOLS.has(toolName)) {
+            this.cancelScheduledFlush();
+        }
         this.stepCount += 1;
         this.pendingToolReset = true;
         this.capsuleEl?.setState({
@@ -663,13 +793,9 @@ export class StreamRenderer {
         if (this.finalized) {
             return;
         }
-        if (
-            toolName === 'write_file'
-            || toolName === 'append_file'
-            || toolName === 'edit_file'
-            || toolName === 'append_reply_view'
-            || toolName === 'replace_reply_view'
-        ) {
+        if (OUTPUT_MUTATION_TOOLS.has(toolName)) {
+            // Cancel any queued streaming preview frame so it cannot overwrite freshly rendered host DOM/iframes.
+            this.cancelScheduledFlush();
             const msg = this.getChatMessage();
             if (msg) {
                 const swipes = Array.isArray(msg.swipes) ? (msg.swipes as unknown[]) : undefined;
@@ -677,9 +803,12 @@ export class StreamRenderer {
                     swipes && this.target.swipeId >= 0 && this.target.swipeId < swipes.length
                         ? swipes[this.target.swipeId]
                         : msg.mes;
-                if (typeof latest === 'string' && latest.length > 0) {
-                    this.outputPreviewText = latest;
-                    this.hasOutputPreview = true;
+                if (typeof latest === 'string') {
+                    this.domSyncedHostText = latest;
+                    if (latest.length > 0) {
+                        this.outputPreviewText = latest;
+                        this.hasOutputPreview = true;
+                    }
                 }
             }
         }
@@ -988,13 +1117,56 @@ export class StreamRenderer {
     }
 
     private attachEventListener(): void {
-        this.eventsUnsubscribe?.();
-        this.eventsUnsubscribe = undefined;
+        this.detachEventListener();
         const appStore = this.deps.getAppStore?.();
         if (appStore?.services?.subscribeEvents) {
             this.eventsUnsubscribe = appStore.services.subscribeEvents((event) => {
                 this.handleGenerationEvent(event);
             });
+        }
+
+        if (typeof eventSource?.on === 'function') {
+            const onHostMessageEvent = (messageId: unknown) => {
+                if (this.finalized || messageId !== this.target.messageId) {
+                    return;
+                }
+                // Drop any queued rAF streaming preview frame so it never clobbers host/extension renders (e.g. JS-Slash-Runner iframes).
+                this.cancelScheduledFlush();
+                const msg = this.getChatMessage();
+                if (msg) {
+                    const activeSwipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
+                    if (activeSwipeId === this.target.swipeId) {
+                        const swipes = Array.isArray(msg.swipes) ? (msg.swipes as unknown[]) : undefined;
+                        const latest =
+                            swipes && this.target.swipeId >= 0 && this.target.swipeId < swipes.length
+                                ? swipes[this.target.swipeId]
+                                : msg.mes;
+                        if (typeof latest === 'string') {
+                            this.domSyncedHostText = latest;
+                        }
+                    }
+                }
+            };
+            const registeredEvents: string[] = [];
+            for (const eventName of [
+                event_types.MESSAGE_UPDATED,
+                event_types.CHARACTER_MESSAGE_RENDERED,
+            ]) {
+                if (eventName) {
+                    eventSource.on(eventName, onHostMessageEvent);
+                    registeredEvents.push(eventName);
+                }
+            }
+            if (registeredEvents.length > 0) {
+                this.hostMessageEventUnsubscribe = () => {
+                    if (typeof eventSource?.removeListener !== 'function') {
+                        return;
+                    }
+                    for (const eventName of registeredEvents) {
+                        eventSource.removeListener(eventName, onHostMessageEvent);
+                    }
+                };
+            }
         }
     }
 
@@ -1042,6 +1214,8 @@ export class StreamRenderer {
     private detachEventListener(): void {
         this.eventsUnsubscribe?.();
         this.eventsUnsubscribe = undefined;
+        this.hostMessageEventUnsubscribe?.();
+        this.hostMessageEventUnsubscribe = undefined;
     }
 
     private detachStoreListener(): void {
@@ -1098,6 +1272,16 @@ export class StreamRenderer {
             this.explicitReasoningText,
         );
         this.commitReasoningFields(msg, reasoningText);
+        if (this.domSyncedHostText !== null && visibleText === this.domSyncedHostText) {
+            if (reasoningText && typeof updateReasoningUI === 'function') {
+                const mesElement = getMesElement(this.target.messageId);
+                if (mesElement) {
+                    updateReasoningUI(mesElement);
+                }
+            }
+            return;
+        }
+        this.domSyncedHostText = null;
         this.renderToDom(msg, visibleText, reasoningText, false, false);
     }
 

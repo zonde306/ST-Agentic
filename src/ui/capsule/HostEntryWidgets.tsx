@@ -238,12 +238,7 @@ export function mountExtensionsSettingsCard(
     };
 }
 
-export type ExtensionsMenuActionId =
-    | 'assistant'
-    | 'sidegen'
-    | 'files'
-    | 'logs'
-    | 'rerun_after_turn';
+export type ExtensionsMenuActionId = 'assistant' | 'rerun_after_turn';
 
 export interface ExtensionsMenuOptions {
     target?: MessageTarget;
@@ -254,9 +249,6 @@ export interface ExtensionsMenuOptions {
  * Pure DOM helper building SillyTavern `#extensionsMenu` wand menu items
  * matching native `.list-group-item` / `fa-solid` / `.extensionsMenuExtensionButton` markup:
  * - `打开 Agentic 助手` -> opens console directly on `'assistant'`
- * - `线外会话与线索` -> opens console directly on `'sidegen'`
- * - `文件与内容覆盖` -> opens console at `'files'`
- * - `查看生成日志` -> opens console at `'logs'`
  * - `重新运行后置触发` -> calls `services.rerunAfterTurn()` via `store.rerunAfterTurn()`
  */
 export function buildExtensionsMenuItems(
@@ -284,51 +276,6 @@ export function buildExtensionsMenuItems(
                     swipeId: target.swipeId,
                 });
                 options.onAction?.('assistant');
-            },
-        },
-        {
-            id: 'agentic_menu_sidegen',
-            action: 'sidegen',
-            iconClass: 'fa-satellite-dish',
-            label: '线外会话与线索',
-            title: '打开 ST-Agentic 线外会话与 /side/* 线索控制台',
-            run: () => {
-                const target = options.target ?? store.getSnapshot().activeTarget;
-                store.openConsole('sidegen', {
-                    messageId: target.messageId,
-                    swipeId: target.swipeId,
-                });
-                options.onAction?.('sidegen');
-            },
-        },
-        {
-            id: 'agentic_menu_files',
-            action: 'files',
-            iconClass: 'fa-folder-open',
-            label: '文件与内容覆盖',
-            title: '打开 ST-Agentic 控制台查看工作区、变量与世界书 Diff',
-            run: () => {
-                const target = options.target ?? store.getSnapshot().activeTarget;
-                store.openConsole('files', {
-                    messageId: target.messageId,
-                    swipeId: target.swipeId,
-                });
-                options.onAction?.('files');
-            },
-        },
-        {
-            id: 'agentic_menu_logs',
-            action: 'logs',
-            iconClass: 'fa-terminal',
-            label: '查看生成日志',
-            title: '打开 ST-Agentic 控制台查看生成与工具调用日志',
-            run: () => {
-                const target = options.target ?? store.getSnapshot().activeTarget;
-                store.openConsole('logs', {
-                    messageId: target.messageId,
-                    swipeId: target.swipeId,
-                });
-                options.onAction?.('logs');
             },
         },
         {
