@@ -1403,7 +1403,98 @@ textarea:focus-visible {
     transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
 
-/* Cards & Empty States */
+/* Code Editor · lightweight syntax highlight overlay
+ * The textarea keeps input / IME / selection; its glyphs go transparent and an
+ * aria-hidden <pre> mirror (same metrics, pointer-events: none) paints colored tokens.
+ * Token styles must never change glyph advance (no font-weight / padding) to stay aligned. */
+.ag-code-surface {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.ag-code-textarea-hl,
+.ag-code-highlight {
+    font-family: var(--font-mono);
+    font-size: 16px;
+    line-height: 1.6;
+    letter-spacing: normal;
+    tab-size: 2;
+    font-variant-ligatures: none;
+    font-kerning: none;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    word-break: normal;
+}
+
+.ag-code-textarea-hl {
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    caret-color: var(--foreground);
+}
+
+.ag-code-textarea-hl::placeholder {
+    color: var(--subtle-foreground);
+    -webkit-text-fill-color: var(--subtle-foreground);
+}
+
+.ag-code-highlight {
+    position: absolute;
+    top: 1px;
+    left: 1px;
+    z-index: 1;
+    margin: 0;
+    padding: 12px 14px;
+    border: 0;
+    border-radius: calc(var(--radius-lg) - 1px);
+    background: transparent;
+    color: var(--foreground);
+    overflow: hidden;
+    pointer-events: none;
+    user-select: none;
+}
+
+.ag-code-highlight code {
+    font: inherit;
+    background: none;
+    padding: 0;
+    color: inherit;
+}
+
+.ag-code-textarea-hl:disabled + .ag-code-highlight {
+    opacity: .6;
+}
+
+.ag-tok-comment { color: var(--subtle-foreground); font-style: italic; }
+.ag-tok-string { color: var(--success); }
+.ag-tok-number,
+.ag-tok-constant { color: var(--warning); }
+.ag-tok-keyword { color: var(--primary); }
+.ag-tok-function { color: color-mix(in srgb, var(--primary) 55%, var(--foreground)); }
+.ag-tok-property,
+.ag-tok-tag { color: color-mix(in srgb, var(--error) 72%, var(--foreground)); }
+.ag-tok-regex { color: color-mix(in srgb, var(--success) 55%, var(--warning)); }
+.ag-tok-operator,
+.ag-tok-punctuation,
+.ag-tok-meta { color: var(--muted-foreground); }
+.ag-tok-heading {
+    color: var(--primary);
+    -webkit-text-stroke: 0.4px currentColor;
+}
+.ag-tok-strong { -webkit-text-stroke: 0.4px currentColor; }
+.ag-tok-emphasis { font-style: italic; }
+.ag-tok-strike { color: var(--muted-foreground); text-decoration: line-through; }
+.ag-tok-code { color: var(--success); }
+.ag-tok-link { color: var(--primary); }
+.ag-tok-url { color: var(--subtle-foreground); text-decoration: underline; text-underline-offset: 2px; }
+.ag-tok-list { color: var(--warning); }
+.ag-tok-quote { color: var(--muted-foreground); }
+.ag-tok-macro {
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
+    border-radius: var(--radius-xs);
+}
 .ag-card {
     background: var(--card);
     border: 1px solid var(--border);

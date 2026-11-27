@@ -1,11 +1,18 @@
 import type {
+    ComponentChild,
     TargetedCompositionEvent,
     TargetedEvent,
     TargetedKeyboardEvent,
 } from 'preact';
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Button } from './CommonControls';
 import { IconCheck, IconCopy, IconKeyboard } from './Icons';
+import {
+    MAX_HIGHLIGHT_CHARS,
+    isHighlightLanguage,
+    tokenizeCode,
+    type HighlightLanguage,
+} from './syntax-highlight';
 
 export interface CodeSnippet {
     label: string;
@@ -36,6 +43,27 @@ export interface CodeEditorProps {
     snippets?: readonly CodeSnippet[];
     ariaLabel?: string;
     className?: string;
+    /**
+     * Syntax highlight overlay for `javascript` / `json` / `markdown` hints (default `true`).
+     * Uses a zero-dependency tokenizer rendered into an `aria-hidden` `<pre>` behind-the-glass;
+     * the real `<textarea>` stays in charge of input, IME, selection and accessibility.
+     */
+    highlight?: boolean;
+}
+
+function renderHighlightedNodes(code: string, lang: HighlightLanguage): ComponentChild[] {
+    const nodes: ComponentChild[] = tokenizeCode(code, lang).map((token, index) =>
+        token.type ? (
+            <span key={index} class={`ag-tok-${token.type}`}>
+                {token.text}
+            </span>
+        ) : (
+            token.text
+        ),
+    );
+    // A trailing space keeps the final (possibly empty) line box so scroll heights match the textarea.
+    nodes.push(' ');
+    return nodes;
 }
 
 /**
@@ -43,6 +71,7 @@ export interface CodeEditorProps {
  * - Avoids Monaco Editor for zero bundle bloat and full mobile IME fidelity.
  * - Never overwrites DOM value mid-IME composition (`compositionstart` .. `compositionend`).
  * - Enforces `>= 16px` font size and `>= 40x40px` toolbar touch targets.
+ * - Lightweight syntax highlighting: transparent-text textarea over a glyph-aligned `<pre>` mirror.
  */
 export function CodeEditor({
     id,
@@ -59,20 +88,70 @@ export function CodeEditor({
     snippets = DEFAULT_CODE_SNIPPETS,
     ariaLabel,
     className,
+    highlight = true,
 }: CodeEditorProps) {
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+    const highlightRef = useRef<HTMLPreElement | null>(null);
     const isComposingRef = useRef<boolean>(false);
     const [copied, setCopied] = useState(false);
+    // Live mirror of the DOM value (including in-flight IME composition text) for the overlay.
+    const [mirror, setMirror] = useState<string>(value);
 
-    // Sync external `value` prop only when user is NOT mid-IME composition.
-    useEffect(() => {
+    const highlightLang: HighlightLanguage | null =
+        highlight && isHighlightLanguage(languageHint) && mirror.length <= MAX_HIGHLIGHT_CHARS
+            ? languageHint
+            : null;
+
+    const highlightedNodes = useMemo(
+        () => (highlightLang ? renderHighlightedNodes(mirror, highlightLang) : null),
+        [mirror, highlightLang],
+    );
+
+    /** Keeps the overlay box equal to the textarea's padding box (excludes scrollbars) and scroll-locked. */
+    const syncOverlay = useCallback(() => {
         const el = textareaRef.current;
-        if (!el || isComposingRef.current) {
+        const pre = highlightRef.current;
+        if (!el || !pre) {
             return;
         }
+        pre.style.width = `${el.clientWidth}px`;
+        pre.style.height = `${el.clientHeight}px`;
+        pre.style.top = `${el.clientTop}px`;
+        pre.style.left = `${el.clientLeft}px`;
+        pre.scrollTop = el.scrollTop;
+        pre.scrollLeft = el.scrollLeft;
+    }, []);
+
+    useLayoutEffect(() => {
+        if (highlightLang) {
+            syncOverlay();
+        }
+    }, [highlightLang, highlightedNodes, syncOverlay]);
+
+    useEffect(() => {
+        const el = textareaRef.current;
+        if (!highlightLang || !el || typeof ResizeObserver === 'undefined') {
+            return undefined;
+        }
+        const observer = new ResizeObserver(() => syncOverlay());
+        observer.observe(el);
+        return () => observer.disconnect();
+    }, [highlightLang, syncOverlay]);
+
+    // Sync external `value` prop only when user is NOT mid-IME composition.
+    // The mount pass is skipped (`defaultValue` already seeded the DOM): Preact runs pending
+    // effects lazily, so a mount-time sync could otherwise clobber keystrokes typed before it ran.
+    const lastSyncedValueRef = useRef<string>(value);
+    useEffect(() => {
+        const el = textareaRef.current;
+        if (!el || isComposingRef.current || value === lastSyncedValueRef.current) {
+            return;
+        }
+        lastSyncedValueRef.current = value;
         if (el.value !== value) {
             el.value = value;
         }
+        setMirror(el.value);
     }, [value]);
 
     const handleCompositionStart = () => {
@@ -81,10 +160,14 @@ export function CodeEditor({
 
     const handleCompositionEnd = (event: TargetedCompositionEvent<HTMLTextAreaElement>) => {
         isComposingRef.current = false;
+        setMirror(event.currentTarget.value);
         onChange(event.currentTarget.value);
     };
 
     const handleInput = (event: TargetedEvent<HTMLTextAreaElement, Event>) => {
+        // The overlay must follow every keystroke, including uncommitted IME text,
+        // because the textarea's own glyphs are transparent while highlighting.
+        setMirror(event.currentTarget.value);
         const nativeEvt = event as unknown as { isComposing?: boolean };
         if (isComposingRef.current || nativeEvt.isComposing) {
             return;
@@ -109,6 +192,7 @@ export function CodeEditor({
             el.value = nextText;
             el.focus();
             el.setSelectionRange(nextStart, nextEnd);
+            setMirror(nextText);
             onChange(nextText);
         },
         [disabled, onChange, readOnly],
@@ -278,25 +362,37 @@ export function CodeEditor({
                 </div>
             ) : null}
 
-            <textarea
-                ref={textareaRef}
-                id={id}
-                defaultValue={value}
-                rows={rows}
-                placeholder={placeholder}
-                readOnly={readOnly}
-                disabled={disabled}
-                spellcheck={false}
-                autocapitalize="off"
-                autocomplete="off"
-                aria-label={ariaLabel ?? label ?? '代码编辑区'}
-                class="ag-code-textarea ag-thin-scroll"
-                style={{ minHeight }}
-                onCompositionStart={handleCompositionStart}
-                onCompositionEnd={handleCompositionEnd}
-                onInput={handleInput}
-                onKeyDown={handleKeyDown}
-            />
+            <div class="ag-code-surface" data-highlight={highlightLang ?? undefined}>
+                <textarea
+                    ref={textareaRef}
+                    id={id}
+                    defaultValue={value}
+                    rows={rows}
+                    placeholder={placeholder}
+                    readOnly={readOnly}
+                    disabled={disabled}
+                    spellcheck={false}
+                    autocapitalize="off"
+                    autocomplete="off"
+                    aria-label={ariaLabel ?? label ?? '代码编辑区'}
+                    class={
+                        highlightLang
+                            ? 'ag-code-textarea ag-code-textarea-hl ag-thin-scroll'
+                            : 'ag-code-textarea ag-thin-scroll'
+                    }
+                    style={{ minHeight }}
+                    onCompositionStart={handleCompositionStart}
+                    onCompositionEnd={handleCompositionEnd}
+                    onInput={handleInput}
+                    onKeyDown={handleKeyDown}
+                    onScroll={highlightLang ? syncOverlay : undefined}
+                />
+                {highlightLang ? (
+                    <pre ref={highlightRef} class="ag-code-highlight" aria-hidden="true">
+                        <code>{highlightedNodes}</code>
+                    </pre>
+                ) : null}
+            </div>
         </div>
     );
 }

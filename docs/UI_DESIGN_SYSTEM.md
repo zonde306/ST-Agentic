@@ -307,6 +307,13 @@ Dark 主题阴影以**内描边高光 + 深阴影**组合呈现（`inset 0 1px 0
 - 文本区：`--content` 底、`--font-mono` 16px（移动端红线）、行高 1.6、圆角 `--radius-lg`。
 - 工具栏：透明底 + ghost 小按钮，置于文本区上方，横向可滚动。
 - 语言标签：Caption 级等宽徽章。
+- **语法高亮**（`languageHint` 为 `javascript` / `json` / `markdown` 时默认开启，`highlight={false}` 可关闭）：
+  - 零依赖：`src/ui/components/syntax-highlight.ts` 单遍正则分词器，禁止引入 Prism / highlight.js / CodeMirror / Monaco。
+  - 结构：`.ag-code-surface` 内，`<textarea class="ag-code-textarea-hl">` 负责输入 / IME / 选区 / 可访问性（文字透明、保留光标色）；其上叠一层 `aria-hidden` 的 `<pre class="ag-code-highlight">`（`pointer-events: none`）绘制着色 token，尺寸与滚动由 JS 与 textarea 内框同步。
+  - 对齐红线：token 样式只允许改 `color / font-style / text-decoration / background`，**禁止改 `font-weight`、padding、letter-spacing**（加粗用 `-webkit-text-stroke` 模拟）；双方关闭连字与字距调整。
+  - 配色全部引用令牌：关键字 `--primary`、字符串 / 行内代码 `--success`、数字与常量 / 列表符 / `{{宏}}` `--warning`、键名与 XML 标签为 `--error` 与前景混色、注释 `--subtle-foreground` 斜体、标点 `--muted-foreground`。
+  - Markdown 额外识别 SillyTavern `{{macro}}`、XML 风格提示词标签，围栏代码块按语言（js/ts/json）嵌套高亮。
+  - 超过 `MAX_HIGHLIGHT_CHARS`（60k 字符）自动退回普通 textarea，保证输入延迟恒定。
 
 ### 3.14 空状态 `EmptyState`
 
