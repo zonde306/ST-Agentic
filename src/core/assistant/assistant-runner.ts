@@ -26,13 +26,18 @@ import {
     estimateMessageTokens,
     extractAutoPromptMacroKeys,
     isSpillPath,
+    refreshNonCacheableInFlightMessages,
     renderPromptBlocks,
     renderPromptBlockSync,
     resolveEffectiveContextBudget,
+    resolveTrajectoryLayer1Messages,
     TrajectoryStore,
+    transformCanonicalContent,
+    transformToolResultBeforeSend,
     TransientToolSpillStore,
     type EffectiveContextBudget,
     type SurfaceGenerationType,
+    type TrajectoryMessageTransformState,
 } from '@/core/context';
 import {
     type BuiltinDocEntry,
@@ -2071,6 +2076,8 @@ export class AssistantRunner {
                       content: buildAssistantUserContent(prompt, attachments),
                   },
               ];
+        const inFlightTransformStates: Array<TrajectoryMessageTransformState | undefined> =
+            inFlightMessages.map(() => ({ cached: true }));
         const toolCallRecords: AssistantToolCallRecord[] = resume?.existingAssistantMessage.toolCalls
             ? canonicalClone(resume.existingAssistantMessage.toolCalls)
             : [];
@@ -2253,6 +2260,57 @@ export class AssistantRunner {
             const activeTailMessages: CanonicalMessage[] = canonicalClone(
                 presetPrompts.tailMessages,
             );
+            if (!resume && inFlightMessages.length > 0 && this.bridge.transformPromptText) {
+                const rawUserContent = canonicalClone(inFlightMessages[0].content);
+                const transformedUser = await transformCanonicalContent(
+                    this.bridge,
+                    rawUserContent,
+                    () => ({
+                        source: 'user_input',
+                        layer: 'layer2_tail',
+                        role: 'user',
+                        meta: {
+                            sessionId,
+                            phase: 'assistant',
+                            target,
+                            messageId: target.messageId,
+                            swipeId: target.swipeId,
+                            isChatMessage: false,
+                            isUser: true,
+                        },
+                        signal: controller.signal,
+                    }),
+                );
+                inFlightMessages[0].content = transformedUser.content;
+                inFlightTransformStates[0] =
+                    transformedUser.cacheable && Object.keys(transformedUser.cacheKeys).length === 0
+                        ? { cached: true }
+                        : {
+                              cached: false,
+                              rawContent: rawUserContent,
+                              meta: {
+                                  source: 'user_input',
+                                  isChatMessage: false,
+                                  messageId: target.messageId,
+                                  swipeId: target.swipeId,
+                                  isUser: true,
+                              },
+                          };
+            }
+            const refreshLayer1Messages = async () =>
+                this.bridge.transformPromptText
+                    ? await resolveTrajectoryLayer1Messages({
+                          bridge: this.bridge,
+                          trajectoryStore: this.trajectoryStore,
+                          threadId,
+                          sessionId,
+                          phase: 'assistant',
+                          target,
+                          defaultIsChatMessage: false,
+                          signal: controller.signal,
+                      })
+                    : undefined;
+            let resolvedLayer1Messages = await refreshLayer1Messages();
             const useStream = options.stream ?? connection.stream ?? this.defaultStream;
             const archiveWriter = this.createArchiveWriter(target);
 
@@ -2265,6 +2323,9 @@ export class AssistantRunner {
                     {
                         extraPrefixMessages: effectivePrefixMessages,
                         tailMessages: activeTailMessages,
+                        ...(resolvedLayer1Messages !== undefined
+                            ? { overrideLayer1Messages: resolvedLayer1Messages }
+                            : {}),
                         prefixFingerprint,
                         omitSystemMessage: suppressAutoSystemPrompt,
                     },
@@ -2279,10 +2340,27 @@ export class AssistantRunner {
                     content: finalContentForTrajectory,
                     ...(finalReasoningContent ? { reasoningContent: finalReasoningContent } : {}),
                 };
-                this.sessionStore.appendTrajectoryTurn(sessionId, [
-                    ...inFlightMessages,
-                    finalCanonicalAssistant,
-                ]);
+                const finalTransformStates: Array<TrajectoryMessageTransformState | undefined> = [
+                    ...inFlightMessages.map((_, idx) => inFlightTransformStates[idx]),
+                    this.bridge.transformPromptText
+                        ? {
+                              cached: false,
+                              rawContent: finalContentForTrajectory,
+                              meta: {
+                                  source: 'chat_message',
+                                  isChatMessage: false,
+                                  messageId: target.messageId,
+                                  swipeId: target.swipeId,
+                                  isUser: false,
+                              },
+                          }
+                        : { cached: true },
+                ];
+                this.sessionStore.appendTrajectoryTurn(
+                    sessionId,
+                    [...inFlightMessages, finalCanonicalAssistant],
+                    finalTransformStates,
+                );
                 this.sessionStore.setInterruptedCheckpoint(sessionId, undefined);
                 const autoReport = await this.sessionStore.compactSession(sessionId, {
                     mode: 'auto',
@@ -2339,6 +2417,18 @@ export class AssistantRunner {
                 throwIfAssistantAborted(controller.signal);
                 rounds += 1;
 
+                if (rounds > 1 && this.bridge.transformPromptText) {
+                    await refreshNonCacheableInFlightMessages({
+                        bridge: this.bridge,
+                        messages: inFlightMessages,
+                        states: inFlightTransformStates,
+                        sessionId,
+                        phase: 'assistant',
+                        target,
+                        signal: controller.signal,
+                    });
+                }
+
                 let assembled = assembleCurrentRequest();
 
                 // Pre-flight Context Check (§3.3): compact history & fold earlier in-flight tool outputs
@@ -2363,6 +2453,9 @@ export class AssistantRunner {
                         attachNotice: false,
                     });
 
+                    if (preflightReport.compacted) {
+                        resolvedLayer1Messages = await refreshLayer1Messages();
+                    }
                     assembled = assembleCurrentRequest();
                     let foldedInFlight = 0;
                     if (assembled.estimatedTokens >= budget.preFlightThreshold) {
@@ -2721,6 +2814,9 @@ export class AssistantRunner {
                                 throw llmError;
                             }
 
+                            if (recoveryReport.compacted) {
+                                resolvedLayer1Messages = await refreshLayer1Messages();
+                            }
                             assembled = assembleCurrentRequest();
                             turnCompactionNotice = {
                                 tokensBefore: tokensBeforeRecovery,
@@ -2857,6 +2953,9 @@ export class AssistantRunner {
                     activeTailMessages,
                     inFlightMessages,
                 );
+                if (inFlightTransformStates.length > inFlightMessages.length) {
+                    inFlightTransformStates.length = inFlightMessages.length;
+                }
                 if (consumedPrefillText) {
                     turnOutput.content = `${consumedPrefillText}${turnOutput.content}`;
                 }
@@ -2922,6 +3021,7 @@ export class AssistantRunner {
                                 }),
                             },
                         );
+                        inFlightTransformStates.push({ cached: true }, { cached: true });
                         continue;
                     }
 
@@ -3032,6 +3132,7 @@ export class AssistantRunner {
                                 content: feedback,
                             },
                         );
+                        inFlightTransformStates.push({ cached: true }, { cached: true });
                         continue;
                     }
 
@@ -3077,6 +3178,7 @@ export class AssistantRunner {
                     toolCalls: canonicalClone(turnOutput.toolCalls),
                 };
                 const roundExecutedTools: CanonicalMessage[] = [];
+                const roundToolTransformStates: Array<TrajectoryMessageTransformState | undefined> = [];
                 const roundPendingApprovalIds: string[] = [];
                 const roundPendingMeta = new Map<
                     string,
@@ -3098,6 +3200,7 @@ export class AssistantRunner {
                             toolName: FINISH_TURN_TOOL_NAME,
                             content: DEFERRED_FINISH_TURN_PAYLOAD,
                         });
+                        roundToolTransformStates.push({ cached: true });
                         continue;
                     }
 
@@ -3140,6 +3243,7 @@ export class AssistantRunner {
                             toolName: toolCall.name,
                             content: deniedPayload,
                         });
+                        roundToolTransformStates.push({ cached: true });
                         syncAssistantBubble();
                         continue;
                     }
@@ -3162,6 +3266,7 @@ export class AssistantRunner {
                             toolName: toolCall.name,
                             content: JSON.stringify({ ok: false, error: missingMsg }),
                         });
+                        roundToolTransformStates.push({ cached: true });
                         syncAssistantBubble();
                         continue;
                     }
@@ -3200,6 +3305,7 @@ export class AssistantRunner {
                                 toolName: toolCall.name,
                                 content: errResult.output,
                             });
+                            roundToolTransformStates.push({ cached: true });
                             syncAssistantBubble();
                             continue;
                         }
@@ -3260,12 +3366,28 @@ export class AssistantRunner {
                         ...(execResult.undoId ? { undoId: execResult.undoId } : {}),
                     });
 
+                    const preSendTool = await transformToolResultBeforeSend({
+                        bridge: this.bridge,
+                        toolName: toolCall.name,
+                        toolCallId: toolCall.id,
+                        toolArgs: parsedArgs,
+                        outputText: execResult.output,
+                        ok: execResult.ok,
+                        sessionId,
+                        phase: 'assistant',
+                        target,
+                        canEditVariables: liveSession.mode !== 'chat',
+                        alreadyTransformedByVfs: liveSession.mode === 'chat',
+                        signal: controller.signal,
+                    });
+
                     roundExecutedTools.push({
                         role: 'tool',
                         toolCallId: toolCall.id,
                         toolName: toolCall.name,
-                        content: execResult.output,
+                        content: preSendTool.text,
                     });
+                    roundToolTransformStates.push(preSendTool.transformState);
                     syncAssistantBubble();
                 }
 
@@ -3295,6 +3417,7 @@ export class AssistantRunner {
                 }
 
                 inFlightMessages.push(assistantToolMessage, ...roundExecutedTools);
+                inFlightTransformStates.push({ cached: true }, ...roundToolTransformStates);
                 committedContentPrefixLen = contentBuffer.length;
                 currentRoundThinkBuffer = '';
 

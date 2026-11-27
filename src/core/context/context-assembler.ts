@@ -81,7 +81,12 @@ import {
     extractReferencedInjectKeys,
     extractReferencedOutletKeys,
 } from './prompt-injection-session';
-import { type FrozenStaticPrefix, TrajectoryStore } from './trajectory-store';
+import { type FrozenStaticPrefix, TrajectoryStore, type TrajectoryMessageTransformState } from './trajectory-store';
+import {
+    hashString64Hex,
+    resolveTrajectoryLayer1Messages,
+    transformCanonicalContent,
+} from './pre-send-transform';
 import { estimateRequestTokens, groupLayer1Turns } from './watermark-compactor';
 
 export interface StaticPrefixResult {
@@ -130,6 +135,10 @@ export interface AssembledContext {
     nonCacheableFloatingBlockIds?: readonly string[];
     /** Ephemeral chat history messages after prompt transform hooks (reused across in-flight rounds). */
     transformedRecentChatMessages?: readonly (CanonicalMessage | ChatMessageSnapshot)[];
+    /** Persistent Layer 1 messages after pre-send prompt transform hooks (reused across in-flight rounds). */
+    overrideLayer1Messages?: readonly CanonicalMessage[];
+    /** Prompt-transform cache state for the primary user_input message produced in this turn. */
+    userInputTransformState?: TrajectoryMessageTransformState;
 }
 
 export interface SideClueProvider {
@@ -174,6 +183,8 @@ export interface ContextAssembleInput {
 
     // Layer 1 inputs
     trajectoryStore?: TrajectoryStore;
+    /** Optional pre-resolved Layer 1 messages when non-cacheable history entries differ from stored raw content. */
+    overrideLayer1Messages?: readonly CanonicalMessage[];
     /** Recent chat turns/messages used when `agent.sessionMode === 'ephemeral'`. */
     recentChatMessages?: readonly (CanonicalMessage | ChatMessageSnapshot)[];
 
@@ -244,8 +255,12 @@ export interface FinalizeTurnInput {
     target: MessageTarget;
     /** Messages produced during the turn before the final assistant reply (Layer 2 + tool call/result chain). */
     turnMessages: readonly CanonicalMessage[];
+    /** Parallel transform cache states aligned with `turnMessages`. */
+    turnTransformStates?: ReadonlyArray<TrajectoryMessageTransformState | undefined>;
     /** Final assistant reply for the turn (will run `ingest` regex once before freezing). */
     finalAssistantMessage?: CanonicalMessage;
+    /** Transform cache state aligned with `finalAssistantMessage`. */
+    finalAssistantTransformState?: TrajectoryMessageTransformState;
     regex?: RegexSource;
 }
 
@@ -966,20 +981,6 @@ const PREFIX_MACRO_SIDE_EFFECT_RE =
 const PREFIX_EJS_SIDE_EFFECT_RE =
     /\b(?:setvar|setLocalVar|setGlobalVar|setMessageVar|incvar|incLocalVar|incGlobalVar|incMessageVar|decvar|decLocalVar|decGlobalVar|decMessageVar|delvar|delLocalVar|delGlobalVar|delMessageVar|insvar|insertLocalVar|insertGlobalVar|insertMessageVar|patchVariables|injectPrompt|define)\s*\(/;
 
-function hashString64Hex(input: string): string {
-    let h1 = 0x811c9dc5;
-    let h2 = 0x9e3779b9;
-    for (let i = 0; i < input.length; i += 1) {
-        const code = input.charCodeAt(i);
-        h1 ^= code;
-        h1 = Math.imul(h1, 0x01000193) >>> 0;
-        h2 ^= code;
-        h2 = Math.imul(h2, 0x85ebca6b) >>> 0;
-    }
-    const lenHex = input.length.toString(16);
-    return `${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}_${lenHex}`;
-}
-
 /**
  * Compute deterministic `v2:` fingerprint over Layer 0 static configuration
  * (`systemBasePrompt`, `system_base`, matching `prefix` blocks, canonicalized `tools`, sorted `presetFiles` keys).
@@ -1114,9 +1115,19 @@ export function shouldFloatTailPromptBlocks(
  */
 export class ContextAssembler {
     private readonly defaultSystemBase: string;
+    private readonly ephemeralChatTransformCache = new WeakMap<object, Map<string, string>>();
 
     constructor(options: { defaultSystemBase?: string } = {}) {
         this.defaultSystemBase = options.defaultSystemBase ?? createDefaultPromptBlocks()[0].content;
+    }
+
+    private getEphemeralCacheForBridge(hostBridge: object): Map<string, string> {
+        let map = this.ephemeralChatTransformCache.get(hostBridge);
+        if (!map) {
+            map = new Map<string, string>();
+            this.ephemeralChatTransformCache.set(hostBridge, map);
+        }
+        return map;
     }
 
     /**
@@ -1311,7 +1322,7 @@ export class ContextAssembler {
         // Layer 1: Frozen trajectory (persistent) or sliding recent turns (ephemeral)
         let layer1Messages: CanonicalMessage[];
         if (isPersistent) {
-            const stored = input.trajectoryStore?.getMessages(input.agent.id) ?? [];
+            const stored = input.overrideLayer1Messages ?? input.trajectoryStore?.getMessages(input.agent.id) ?? [];
             layer1Messages = stored.map((m) => canonicalClone(m));
         } else {
             const windowSize = Math.max(0, input.agent.ephemeralWindowSize ?? 6);
@@ -3057,6 +3068,7 @@ export class ContextAssembler {
             .map((meta) => meta.blockId);
 
         let effectiveUserInput = rest.userInput;
+        let userInputTransformState: TrajectoryMessageTransformState | undefined;
         if (
             rest.inFlightMessages === undefined
             && rest.userInput !== undefined
@@ -3121,23 +3133,50 @@ export class ContextAssembler {
                     ...userMeta,
                 });
                 effectiveUserInput = res.text;
+                userInputTransformState =
+                    res.cacheable && Object.keys(res.cacheKeys).length === 0
+                        ? { cached: true }
+                        : {
+                              cached: false,
+                              rawContent: rest.userInput,
+                              meta: {
+                                  source: 'user_input',
+                                  isChatMessage,
+                                  ...userMeta,
+                              },
+                          };
             } else if (Array.isArray(rest.userInput)) {
-                const nextParts: CanonicalContentPart[] = [];
-                for (const part of rest.userInput) {
-                    if (part.type === 'text') {
-                        const res = await transformTextWithTurnSync(part.text, liveVars, {
-                            source: 'user_input',
-                            layer: 'layer2_tail',
-                            role: 'user',
-                            isChatMessage,
-                            ...userMeta,
-                        });
-                        nextParts.push({ ...part, text: res.text });
-                    } else {
-                        nextParts.push({ ...part });
-                    }
-                }
-                effectiveUserInput = nextParts;
+                const res = await transformCanonicalContent(hostBridge, rest.userInput, () => ({
+                    source: 'user_input',
+                    layer: 'layer2_tail',
+                    role: 'user',
+                    meta: {
+                        sessionId: transformSessionId,
+                        agentId: rest.agent.id,
+                        phase: transformPhase,
+                        ...(transformTarget ? { target: transformTarget } : {}),
+                        isChatMessage,
+                        ...userMeta,
+                        vars: liveVars,
+                        injectionSession: session,
+                        ejsSession,
+                    },
+                    sessionBag: transformSessionBag,
+                    signal: rest.signal,
+                }));
+                effectiveUserInput = res.content;
+                userInputTransformState =
+                    res.cacheable && Object.keys(res.cacheKeys).length === 0
+                        ? { cached: true }
+                        : {
+                              cached: false,
+                              rawContent: canonicalClone(rest.userInput),
+                              meta: {
+                                  source: 'user_input',
+                                  isChatMessage,
+                                  ...userMeta,
+                              },
+                          };
             }
         }
 
@@ -3156,12 +3195,23 @@ export class ContextAssembler {
                     windowSize,
                 );
                 if (windowIndices.size > 0) {
+                    const ephCache = this.getEphemeralCacheForBridge(hostBridge);
                     const nextHistory: (CanonicalMessage | ChatMessageSnapshot)[] = [];
                     for (let idx = 0; idx < rest.recentChatMessages.length; idx += 1) {
                         const item = rest.recentChatMessages[idx];
                         if (windowIndices.has(idx) && isChatMessageSnapshot(item) && !item.isSystem) {
+                            const rawMes = item.mes ?? '';
+                            const cacheKey = `${rest.agent.id}\0${item.id}\0${item.swipeId ?? 0}\0${hashString64Hex(rawMes)}`;
+                            const cachedText = ephCache.get(cacheKey);
+                            if (cachedText !== undefined) {
+                                nextHistory.push({
+                                    ...canonicalClone(item),
+                                    mes: cachedText,
+                                });
+                                continue;
+                            }
                             const role: PromptTransformRole = item.isUser ? 'user' : 'assistant';
-                            const res = await transformTextWithTurnSync(item.mes ?? '', liveVars, {
+                            const res = await transformTextWithTurnSync(rawMes, liveVars, {
                                 source: 'chat_message',
                                 layer: 'layer1_ephemeral',
                                 role,
@@ -3171,6 +3221,15 @@ export class ContextAssembler {
                                 name: item.name,
                                 isUser: item.isUser,
                             });
+                            if (res.cacheable && Object.keys(res.cacheKeys).length === 0) {
+                                if (ephCache.size >= 512) {
+                                    const oldest = ephCache.keys().next().value;
+                                    if (oldest !== undefined) {
+                                        ephCache.delete(oldest);
+                                    }
+                                }
+                                ephCache.set(cacheKey, res.text);
+                            }
                             nextHistory.push({
                                 ...canonicalClone(item),
                                 mes: res.text,
@@ -3183,6 +3242,31 @@ export class ContextAssembler {
                     transformedRecentChatMessages = nextHistory;
                 }
             }
+        }
+
+        let overrideLayer1Messages = rest.overrideLayer1Messages;
+        if (
+            overrideLayer1Messages === undefined
+            && rest.inFlightMessages === undefined
+            && rest.agent.sessionMode === 'persistent'
+            && rest.trajectoryStore
+            && hostBridge.transformPromptText
+        ) {
+            overrideLayer1Messages = await resolveTrajectoryLayer1Messages({
+                bridge: hostBridge,
+                trajectoryStore: rest.trajectoryStore,
+                threadId: rest.agent.id,
+                sessionId: transformSessionId,
+                agentId: rest.agent.id,
+                phase: transformPhase,
+                target: transformTarget,
+                defaultIsChatMessage:
+                    rest.promptTriggerContext === undefined
+                    || rest.promptTriggerContext.kind === 'main',
+                vars: liveVars,
+                sessionBag: transformSessionBag,
+                signal: rest.signal,
+            });
         }
 
         const finalDynamicFingerprint = computePrefixDynamicFingerprint(
@@ -3204,6 +3288,7 @@ export class ContextAssembler {
             ...(effectiveRecentChatMessages !== undefined
                 ? { recentChatMessages: effectiveRecentChatMessages }
                 : {}),
+            ...(overrideLayer1Messages !== undefined ? { overrideLayer1Messages } : {}),
             vars: liveVars,
             forceRecompilePrefix: effectiveForceRecompilePrefix,
             loreEntries,
@@ -3242,6 +3327,8 @@ export class ContextAssembler {
             ...(transformedRecentChatMessages !== undefined
                 ? { transformedRecentChatMessages }
                 : {}),
+            ...(overrideLayer1Messages !== undefined ? { overrideLayer1Messages } : {}),
+            ...(userInputTransformState ? { userInputTransformState } : {}),
         };
         } finally {
             await hostBridge.notifyPromptTransformTurnEnd?.({
@@ -3273,14 +3360,28 @@ export class ContextAssembler {
         const messagesToAppend: CanonicalMessage[] = input.turnMessages.map((m) =>
             ingestTurnOutputMessage(m, input.regex),
         );
+        const transformStates: Array<TrajectoryMessageTransformState | undefined> =
+            input.turnMessages.map((_, idx) => input.turnTransformStates?.[idx]);
 
         if (input.finalAssistantMessage) {
-            messagesToAppend.push(
-                ingestCanonicalMessage(input.finalAssistantMessage, input.regex),
+            const ingestedFinal = ingestCanonicalMessage(input.finalAssistantMessage, input.regex);
+            messagesToAppend.push(ingestedFinal);
+            const finalState = input.finalAssistantTransformState;
+            transformStates.push(
+                finalState && !finalState.cached
+                    ? {
+                          ...finalState,
+                          rawContent: canonicalClone(ingestedFinal.content),
+                      }
+                    : finalState,
             );
         }
 
-        input.trajectoryStore.appendTurn(messagesToAppend, agentId);
+        input.trajectoryStore.appendTurn(
+            messagesToAppend,
+            agentId,
+            transformStates.some((s) => s !== undefined) ? transformStates : undefined,
+        );
         input.trajectoryStore.recordCheckpoint(input.target, agentId);
     }
 

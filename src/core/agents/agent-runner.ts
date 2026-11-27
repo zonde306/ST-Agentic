@@ -38,13 +38,17 @@ import {
     estimateMessageTokens,
     estimateRequestTokens,
     prerenderPromptBlocks,
+    refreshNonCacheableInFlightMessages,
     resolveEffectiveContextBudget,
+    resolveTrajectoryLayer1Messages,
     shouldFloatTailPromptBlocks,
     TrajectoryStore,
+    transformToolResultBeforeSend,
     TransientToolSpillStore,
     WatermarkCompactor,
     type InterruptedTurnCheckpoint,
     type RegexSource,
+    type TrajectoryMessageTransformState,
 } from '@/core/context';
 import {
     computeRoundRetryDelayMs,
@@ -1436,6 +1440,10 @@ export class AgentRunner {
         const turnMessages: CanonicalMessage[] = input.resumeMessages
             ? canonicalClone([...input.resumeMessages])
             : [];
+        const turnTransformStates: Array<TrajectoryMessageTransformState | undefined> =
+            input.resumeMessages
+                ? input.resumeMessages.map(() => ({ cached: true }))
+                : [];
         const completedTurnMessages: CanonicalMessage[] = input.resumeMessages
             ? canonicalClone([...input.resumeMessages])
             : [];
@@ -1805,6 +1813,7 @@ export class AgentRunner {
                 preRenderedBlocks?: ReadonlyMap<string, CanonicalMessage[]>;
                 preRenderedSystemRules?: readonly string[];
                 trajectoryStore?: TrajectoryStore;
+                overrideLayer1Messages?: readonly CanonicalMessage[];
                 recentChatMessages?: readonly (CanonicalMessage | ChatMessageSnapshot)[];
                 hostBridge: HostBridge;
                 regex?: RegexSource;
@@ -1892,6 +1901,9 @@ export class AgentRunner {
             if (currentAssembled.transformedRecentChatMessages) {
                 activeRecentChatMessages = [...currentAssembled.transformedRecentChatMessages];
             }
+            if (currentAssembled.overrideLayer1Messages !== undefined) {
+                baseAssembleInput.overrideLayer1Messages = currentAssembled.overrideLayer1Messages;
+            }
             const nonCacheableFloatingBlockIds = new Set(
                 currentAssembled.nonCacheableFloatingBlockIds ?? [],
             );
@@ -1906,7 +1918,16 @@ export class AgentRunner {
 
             if (input.resumeMessages === undefined) {
                 const initialLayer2 = canonicalClone(currentAssembled.layer2Messages);
+                const startIdx = turnMessages.length;
                 turnMessages.push(...initialLayer2);
+                for (let i = 0; i < initialLayer2.length; i += 1) {
+                    turnTransformStates.push(
+                        i === 0 && currentAssembled.userInputTransformState
+                            ? currentAssembled.userInputTransformState
+                            : { cached: true },
+                    );
+                }
+                void startIdx;
                 completedTurnMessages.push(...canonicalClone(initialLayer2));
             }
 
@@ -1918,6 +1939,27 @@ export class AgentRunner {
                 });
 
             const refreshFloatingAndReassembleInFlight = async () => {
+                if (this.bridge.transformPromptText) {
+                    const rawMetaVars = this.bridge.getMetadata()?.variables;
+                    const roundVars: Record<string, unknown> = {
+                        ...(rawMetaVars && typeof rawMetaVars === 'object' && !Array.isArray(rawMetaVars)
+                            ? (rawMetaVars as Record<string, unknown>)
+                            : {}),
+                        ...workingVars,
+                    };
+                    await refreshNonCacheableInFlightMessages({
+                        bridge: this.bridge,
+                        messages: turnMessages,
+                        states: turnTransformStates,
+                        sessionId: runId,
+                        agentId: agent.id,
+                        phase: input.phase,
+                        target,
+                        vars: roundVars,
+                        sessionBag: transformSessionBag,
+                        signal,
+                    });
+                }
                 if (nonCacheableFloatingBlockIds.size > 0) {
                     const floatTailBlocks = shouldFloatTailPromptBlocks(promptTriggerContext);
                     const blocksToRefresh = (effectiveAgent.promptBlocks ?? []).filter(
@@ -1998,6 +2040,27 @@ export class AgentRunner {
                     if (result.evictedReadPaths.length > 0) {
                         for (const evictedPath of result.evictedReadPaths) {
                             effectiveReadSet.delete(evictedPath);
+                        }
+                    }
+                    if (result.compacted) {
+                        if (this.bridge.transformPromptText) {
+                            baseAssembleInput.overrideLayer1Messages = await resolveTrajectoryLayer1Messages({
+                                bridge: this.bridge,
+                                trajectoryStore: this.trajectoryStore,
+                                threadId: agent.id,
+                                sessionId: runId,
+                                agentId: agent.id,
+                                phase: input.phase,
+                                target,
+                                defaultIsChatMessage:
+                                    promptTriggerContext === undefined
+                                    || promptTriggerContext.kind === 'main',
+                                vars: workingVars,
+                                sessionBag: transformSessionBag,
+                                signal,
+                            });
+                        } else {
+                            delete baseAssembleInput.overrideLayer1Messages;
                         }
                     }
                     return result.compacted;
@@ -2224,6 +2287,7 @@ export class AgentRunner {
                         agentId: agent.id,
                         target,
                         turnMessages,
+                        turnTransformStates,
                         finalAssistantMessage: {
                             role: 'assistant',
                             content: params.persistedAssistantContent,
@@ -2231,6 +2295,20 @@ export class AgentRunner {
                                 ? { reasoningContent: params.reasoningContent }
                                 : {}),
                         },
+                        finalAssistantTransformState: this.bridge.transformPromptText
+                            ? {
+                                  cached: false,
+                                  rawContent: params.persistedAssistantContent,
+                                  meta: {
+                                      source: 'chat_message',
+                                      isChatMessage: isMainOutputMode,
+                                      messageId: target.messageId,
+                                      swipeId: target.swipeId,
+                                      name: this.bridge.getActiveIdentity().charName,
+                                      isUser: false,
+                                  },
+                              }
+                            : { cached: true },
                         regex,
                     });
                 }
@@ -2795,6 +2873,7 @@ export class AgentRunner {
                 if (isPrefillAssistantMessage(trailingTurnMsg)) {
                     const prefixText = extractMessageText(trailingTurnMsg.content);
                     turnMessages.pop();
+                    turnTransformStates.pop();
                     if (
                         isPrefillAssistantMessage(
                             completedTurnMessages[completedTurnMessages.length - 1],
@@ -2848,6 +2927,7 @@ export class AgentRunner {
                                     content: EMPTY_OUTPUT_CHECK_PROMPT,
                                 };
                                 turnMessages.push(emptyAssistantMsg, systemCheckMsg);
+                                turnTransformStates.push({ cached: true }, { cached: true });
                                 completedTurnMessages.push(
                                     canonicalClone(emptyAssistantMsg),
                                     canonicalClone(systemCheckMsg),
@@ -2900,6 +2980,7 @@ export class AgentRunner {
                                 content: feedbackMsg,
                             };
                             turnMessages.push(rejectedAssistantMsg, feedbackUserMsg);
+                            turnTransformStates.push({ cached: true }, { cached: true });
                             completedTurnMessages.push(
                                 canonicalClone(rejectedAssistantMsg),
                                 canonicalClone(feedbackUserMsg),
@@ -3084,6 +3165,7 @@ export class AgentRunner {
                     toolCalls: canonicalClone(turnOutput.toolCalls),
                 };
                 turnMessages.push(assistantToolMsg);
+                turnTransformStates.push({ cached: true });
                 const roundToolResults: CanonicalMessage[] = [];
                 const hasOtherToolsInRound = turnOutput.toolCalls.some(
                     (tc) => tc.name !== FINISH_TURN_TOOL_NAME,
@@ -3377,7 +3459,7 @@ export class AgentRunner {
                     input.onToolComplete?.(completedStep);
 
                     // Append tool result (including structured self-healing errors & strict `_turn_state`)
-                    const toolResultContent = strictToolLoop
+                    const rawToolResultContent = strictToolLoop
                         ? decorateStrictToolResult(
                             execResult.output,
                             await buildTurnState(),
@@ -3385,13 +3467,35 @@ export class AgentRunner {
                         )
                         : execResult.output;
 
+                    const canEditVariables =
+                        allCanonicalToolNames.includes('patch_variables')
+                        || canWritePath('/state/variables.json');
+                    const preSendTool = await transformToolResultBeforeSend({
+                        bridge: this.bridge,
+                        toolName: toolCall.name,
+                        toolCallId: toolCall.id,
+                        toolArgs: parsedArgs,
+                        outputText: rawToolResultContent,
+                        ok: execResult.ok,
+                        sessionId: runId,
+                        agentId: agent.id,
+                        phase: input.phase,
+                        target,
+                        canEditVariables,
+                        alreadyTransformedByVfs: true,
+                        vars: workingVars,
+                        sessionBag: transformSessionBag,
+                        signal,
+                    });
+
                     const toolResultMsg: CanonicalMessage = {
                         role: 'tool',
                         toolCallId: toolCall.id,
                         toolName: toolCall.name,
-                        content: toolResultContent,
+                        content: preSendTool.text,
                     };
                     turnMessages.push(toolResultMsg);
+                    turnTransformStates.push(preSendTool.transformState);
                     roundToolResults.push(toolResultMsg);
                 }
 

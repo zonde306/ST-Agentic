@@ -1,7 +1,8 @@
-import type { HostBridge } from '@/core/bridge';
+import type { HostBridge, PromptTransformSource } from '@/core/bridge';
 import { DEFAULT_MAIN_AGENT_ID } from '@/core/config';
 import {
     type BranchKey,
+    type CanonicalContentPart,
     type CanonicalMessage,
     type CanonicalToolSchema,
     type InterruptedReason,
@@ -30,6 +31,27 @@ export interface FrozenStaticPrefix {
     prefixHookCacheKeys?: Readonly<Record<string, string>>;
 }
 
+export interface TrajectoryMessageTransformMeta {
+    source?: PromptTransformSource;
+    isChatMessage?: boolean;
+    messageId?: number;
+    swipeId?: number;
+    name?: string;
+    isUser?: boolean;
+    toolName?: string;
+    toolCallId?: string;
+    path?: string;
+    mount?: string;
+    editable?: boolean;
+    writable?: boolean;
+}
+
+export interface TrajectoryMessageTransformState {
+    cached: boolean;
+    rawContent?: string | CanonicalContentPart[];
+    meta?: TrajectoryMessageTransformMeta;
+}
+
 /** Causal branch checkpoint bound to a `(messageId, swipeId)` coordinate. */
 export interface BranchCheckpoint {
     messageCount: number;
@@ -41,6 +63,8 @@ export interface BranchCheckpoint {
     compactionHeaderCount: number;
     /** Immutable snapshot of messages at this branch for lossless swipe switching. */
     messagesSnapshot?: readonly CanonicalMessage[];
+    /** Parallel prompt-transform cache states aligned with `messagesSnapshot`. */
+    transformStatesSnapshot?: ReadonlyArray<TrajectoryMessageTransformState | undefined>;
 }
 
 export interface CompactionUpdateInput {
@@ -58,12 +82,14 @@ export interface SerializedBranchCheckpoint {
     turnEndCounts: number[];
     compactionHeaderCount: number;
     messageIndices?: number[];
+    transformStates?: Array<TrajectoryMessageTransformState | null>;
 }
 
 export interface SerializedAgentTrajectory {
     agentId: string;
     messagePool: CanonicalMessage[];
     activeMessageIndices: number[];
+    transformStates?: Array<TrajectoryMessageTransformState | null>;
     readSet: Record<string, string>;
     archivedUpToChunk: number;
     turnEndCounts: number[];
@@ -102,6 +128,7 @@ export interface SerializedTrajectoryStore {
 interface InternalTrajectoryState {
     agentId: string;
     messages: CanonicalMessage[];
+    transformStates: Array<TrajectoryMessageTransformState | undefined>;
     readSet: Map<string, string>;
     checkpoints: Map<BranchKey, BranchCheckpoint>;
     archivedUpToChunk: number;
@@ -181,6 +208,7 @@ function createEmptyThreadState(agentId: string): InternalTrajectoryState {
     return {
         agentId,
         messages: [],
+        transformStates: [],
         readSet: new Map<string, string>(),
         checkpoints: new Map<BranchKey, BranchCheckpoint>(),
         archivedUpToChunk: 0,
@@ -188,6 +216,32 @@ function createEmptyThreadState(agentId: string): InternalTrajectoryState {
         compactionHeaderCount: 0,
         frozenPrefix: null,
     };
+}
+
+function cloneTransformState(
+    state: TrajectoryMessageTransformState | undefined,
+): TrajectoryMessageTransformState | undefined {
+    if (!state) {
+        return undefined;
+    }
+    return {
+        cached: Boolean(state.cached),
+        ...(state.rawContent !== undefined
+            ? { rawContent: canonicalClone(state.rawContent) }
+            : {}),
+        ...(state.meta ? { meta: { ...state.meta } } : {}),
+    };
+}
+
+function alignTransformStates(
+    states: ReadonlyArray<TrajectoryMessageTransformState | undefined> | undefined,
+    length: number,
+): Array<TrajectoryMessageTransformState | undefined> {
+    const out: Array<TrajectoryMessageTransformState | undefined> = [];
+    for (let i = 0; i < length; i += 1) {
+        out.push(cloneTransformState(states?.[i]));
+    }
+    return out;
 }
 
 function normalizeTurnEndCounts(
@@ -251,6 +305,36 @@ export class TrajectoryStore {
     getMessages(agentId: string = DEFAULT_MAIN_AGENT_ID): readonly CanonicalMessage[] {
         const state = this.threads.get(agentId);
         return state ? [...state.messages] : [];
+    }
+
+    /** Return defensive copies of per-message prompt-transform cache states for `agentId`. */
+    getTransformStates(
+        agentId: string = DEFAULT_MAIN_AGENT_ID,
+    ): ReadonlyArray<TrajectoryMessageTransformState | undefined> {
+        const state = this.threads.get(agentId);
+        return state ? alignTransformStates(state.transformStates, state.messages.length) : [];
+    }
+
+    /** Update prompt-transform state (and optional promoted content) for a single Layer 1 message. */
+    updateMessageTransformState(
+        index: number,
+        nextState: TrajectoryMessageTransformState,
+        nextContent?: string | CanonicalContentPart[],
+        agentId: string = DEFAULT_MAIN_AGENT_ID,
+    ): void {
+        const state = this.threads.get(agentId);
+        if (!state || index < 0 || index >= state.messages.length) {
+            return;
+        }
+        if (nextContent !== undefined) {
+            const current = canonicalClone(state.messages[index]);
+            current.content = canonicalClone(nextContent);
+            state.messages[index] = freezeCanonicalMessage(current);
+        }
+        while (state.transformStates.length < state.messages.length) {
+            state.transformStates.push(undefined);
+        }
+        state.transformStates[index] = cloneTransformState(nextState);
     }
 
     /** Return current Layer 1 message count for `agentId`. */
@@ -365,13 +449,18 @@ export class TrajectoryStore {
     appendMessages(
         messages: readonly CanonicalMessage[],
         agentId: string = DEFAULT_MAIN_AGENT_ID,
+        transformStates?: ReadonlyArray<TrajectoryMessageTransformState | undefined>,
     ): void {
         if (messages.length === 0) {
             return;
         }
         const state = this.getOrCreateThread(agentId);
-        for (const msg of messages) {
-            state.messages.push(freezeCanonicalMessage(msg));
+        while (state.transformStates.length < state.messages.length) {
+            state.transformStates.push(undefined);
+        }
+        for (let i = 0; i < messages.length; i += 1) {
+            state.messages.push(freezeCanonicalMessage(messages[i]));
+            state.transformStates.push(cloneTransformState(transformStates?.[i]));
         }
         const newEnd = state.messages.length;
         const lastBoundary = state.turnEndCounts[state.turnEndCounts.length - 1] ?? state.compactionHeaderCount;
@@ -384,8 +473,9 @@ export class TrajectoryStore {
     appendTurn(
         messages: readonly CanonicalMessage[],
         agentId: string = DEFAULT_MAIN_AGENT_ID,
+        transformStates?: ReadonlyArray<TrajectoryMessageTransformState | undefined>,
     ): void {
-        this.appendMessages(messages, agentId);
+        this.appendMessages(messages, agentId, transformStates);
     }
 
     /**
@@ -397,10 +487,39 @@ export class TrajectoryStore {
         agentId: string = DEFAULT_MAIN_AGENT_ID,
     ): string[] {
         const state = this.getOrCreateThread(agentId);
+        const oldMessages = state.messages;
+        const oldStates = state.transformStates;
         const frozenCompacted = update.compactedMessages.map(freezeCanonicalMessage);
         const headerCount = Math.max(0, Math.min(frozenCompacted.length, update.compactionHeaderCount ?? 0));
 
+        const nextStates: Array<TrajectoryMessageTransformState | undefined> = new Array(
+            frozenCompacted.length,
+        ).fill(undefined);
+        for (let i = 0; i < headerCount; i += 1) {
+            nextStates[i] = { cached: true };
+        }
+        const tailCount = frozenCompacted.length - headerCount;
+        const oldOffset = oldMessages.length - tailCount;
+        const oldSerialized = oldMessages.map((m) => canonicalStringify(m));
+        let scanStart = 0;
+        for (let j = 0; j < tailCount; j += 1) {
+            const newIdx = headerCount + j;
+            const targetKey = canonicalStringify(frozenCompacted[newIdx]);
+            const suffixIdx = oldOffset + j;
+            if (suffixIdx >= scanStart && suffixIdx < oldMessages.length && oldSerialized[suffixIdx] === targetKey) {
+                nextStates[newIdx] = cloneTransformState(oldStates[suffixIdx]);
+                scanStart = suffixIdx + 1;
+                continue;
+            }
+            const matchedIdx = oldSerialized.indexOf(targetKey, scanStart);
+            if (matchedIdx >= 0) {
+                nextStates[newIdx] = cloneTransformState(oldStates[matchedIdx]);
+                scanStart = matchedIdx + 1;
+            }
+        }
+
         state.messages = frozenCompacted;
+        state.transformStates = nextStates;
         state.archivedUpToChunk = Math.max(state.archivedUpToChunk, update.archivedUpToChunk);
         state.compactionHeaderCount = headerCount;
         state.turnEndCounts = update.turnEndCounts
@@ -429,6 +548,10 @@ export class TrajectoryStore {
             turnEndCounts: [...state.turnEndCounts],
             compactionHeaderCount: state.compactionHeaderCount,
             messagesSnapshot: [...state.messages],
+            transformStatesSnapshot: alignTransformStates(
+                state.transformStates,
+                state.messages.length,
+            ),
         };
 
         state.checkpoints.set(key, checkpoint);
@@ -483,10 +606,16 @@ export class TrajectoryStore {
             && (!cp.messagesSnapshot || messagesPrefixMatches(state.messages, cp.messagesSnapshot, cp.messageCount))
         ) {
             state.messages = state.messages.slice(0, cp.messageCount);
+            state.transformStates = alignTransformStates(state.transformStates, cp.messageCount);
         } else if (cp.messagesSnapshot) {
             state.messages = cp.messagesSnapshot.slice(0, cp.messageCount);
+            state.transformStates = alignTransformStates(cp.transformStatesSnapshot, cp.messageCount);
         } else {
             state.messages = state.messages.slice(0, Math.min(state.messages.length, cp.messageCount));
+            state.transformStates = alignTransformStates(
+                cp.transformStatesSnapshot ?? state.transformStates,
+                state.messages.length,
+            );
         }
 
         state.readSet = new Map(cp.readSetSnapshot);
@@ -525,6 +654,7 @@ export class TrajectoryStore {
         }
 
         state.messages = [];
+        state.transformStates = [];
         state.readSet.clear();
         state.archivedUpToChunk = 0;
         state.compactionHeaderCount = 0;
@@ -747,6 +877,10 @@ export class TrajectoryStore {
             this.threads.set(agentId, {
                 agentId: sourceState.agentId,
                 messages: [...sourceState.messages],
+                transformStates: alignTransformStates(
+                    sourceState.transformStates,
+                    sourceState.messages.length,
+                ),
                 readSet: new Map(sourceState.readSet),
                 checkpoints: clonedCheckpoints,
                 archivedUpToChunk: sourceState.archivedUpToChunk,
@@ -852,6 +986,14 @@ function cloneCheckpoint(cp: BranchCheckpoint): BranchCheckpoint {
         turnEndCounts: [...cp.turnEndCounts],
         compactionHeaderCount: cp.compactionHeaderCount,
         ...(cp.messagesSnapshot ? { messagesSnapshot: [...cp.messagesSnapshot] } : {}),
+        ...(cp.transformStatesSnapshot
+            ? {
+                  transformStatesSnapshot: alignTransformStates(
+                      cp.transformStatesSnapshot,
+                      cp.messagesSnapshot?.length ?? cp.messageCount,
+                  ),
+              }
+            : {}),
     };
 }
 
@@ -1044,6 +1186,14 @@ function serializeThread(state: InternalTrajectoryState): SerializedAgentTraject
             ...(cp.messagesSnapshot
                 ? { messageIndices: cp.messagesSnapshot.map(internMessage) }
                 : {}),
+            ...(cp.transformStatesSnapshot?.some((s) => s !== undefined)
+                ? {
+                      transformStates: alignTransformStates(
+                          cp.transformStatesSnapshot,
+                          cp.messagesSnapshot?.length ?? cp.messageCount,
+                      ).map((s) => s ?? null),
+                  }
+                : {}),
         };
     }
 
@@ -1058,6 +1208,14 @@ function serializeThread(state: InternalTrajectoryState): SerializedAgentTraject
         agentId: state.agentId,
         messagePool: pool,
         activeMessageIndices,
+        ...(state.transformStates.some((s) => s !== undefined)
+            ? {
+                  transformStates: alignTransformStates(
+                      state.transformStates,
+                      state.messages.length,
+                  ).map((s) => s ?? null),
+              }
+            : {}),
         readSet,
         archivedUpToChunk: state.archivedUpToChunk,
         turnEndCounts: [...state.turnEndCounts],
@@ -1116,6 +1274,12 @@ function deserializeThread(agentId: string, raw: SerializedAgentTrajectory): Int
     };
 
     state.messages = resolveIndices(raw.activeMessageIndices);
+    state.transformStates = alignTransformStates(
+        Array.isArray(raw.transformStates)
+            ? raw.transformStates.map((s) => (s && typeof s === 'object' ? s : undefined))
+            : undefined,
+        state.messages.length,
+    );
     state.archivedUpToChunk = typeof raw.archivedUpToChunk === 'number' ? Math.max(0, raw.archivedUpToChunk) : 0;
     state.compactionHeaderCount = typeof raw.compactionHeaderCount === 'number'
         ? Math.max(0, Math.min(state.messages.length, raw.compactionHeaderCount))
@@ -1167,6 +1331,16 @@ function deserializeThread(agentId: string, raw: SerializedAgentTrajectory): Int
                     : [],
                 compactionHeaderCount,
                 ...(snapshotMsgs ? { messagesSnapshot: snapshotMsgs } : {}),
+                ...(Array.isArray(rawCp.transformStates)
+                    ? {
+                          transformStatesSnapshot: alignTransformStates(
+                              rawCp.transformStates.map((s) =>
+                                  s && typeof s === 'object' ? s : undefined,
+                              ),
+                              snapshotMsgs?.length ?? messageCount,
+                          ),
+                      }
+                    : {}),
             });
         }
     }

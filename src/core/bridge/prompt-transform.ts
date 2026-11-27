@@ -14,6 +14,8 @@ export type PromptTransformSource =
     | 'dynamic_reminder'
     | 'user_input'
     | 'chat_message'
+    | 'history_read'
+    | 'variables_read'
     | 'trigger_prompt'
     | 'vfs_read'
     | 'lore_radar'
@@ -54,6 +56,8 @@ export interface PromptTransformMeta {
     readonly mount?: string;
     readonly editable?: boolean;
     readonly writable?: boolean;
+    readonly toolName?: string;
+    readonly toolCallId?: string;
     readonly lore?: PromptTransformLoreMeta;
     readonly vars?: Readonly<Record<string, unknown>>;
     readonly isPrivate?: boolean;
@@ -279,6 +283,8 @@ export function createNoopPromptTransformResult(text: string): PromptTransformRe
 export interface EjsPromptTransformListenerOptions {
     includeUserInput?: boolean;
     includeChatMessages?: boolean;
+    includeHistoryRead?: boolean;
+    includeVariablesRead?: boolean;
     extId?: string;
 }
 
@@ -305,6 +311,12 @@ export function createEjsPromptTransformListener(
             return;
         }
         if (payload.source === 'chat_message' && !options.includeChatMessages) {
+            return;
+        }
+        if (payload.source === 'history_read' && !options.includeHistoryRead) {
+            return;
+        }
+        if (payload.source === 'variables_read' && !options.includeVariablesRead) {
             return;
         }
         if (payload.source === 'vfs_read' && payload.meta.editable === true) {

@@ -22,13 +22,16 @@ import {
     type RegexSource,
     type Layer1TurnGroup,
     TrajectoryStore,
+    type TrajectoryMessageTransformState,
     applyIngestRegexText,
     buildAutoPromptMacroOverrides,
     buildSideGenMacroOverrides,
     estimateRequestTokens,
     extractAutoPromptMacroKeys,
     groupLayer1Turns,
+    hashString64Hex,
     renderPromptBlocks,
+    resolveTrajectoryLayer1Messages,
 } from '@/core/context';
 import {
     RegexPipeline,
@@ -505,6 +508,7 @@ export class SideGenService implements ToolSideGenApi {
 
     private serviceAbortController = new AbortController();
     private readonly inFlightControllers = new Set<AbortController>();
+    private readonly chatTailTransformCache = new Map<string, string>();
     private idCounter = 0;
 
     constructor(options: SideGenServiceOptions) {
@@ -631,15 +635,17 @@ export class SideGenService implements ToolSideGenApi {
                 baseMessages.push(canonicalClone(msg));
             }
 
-            const userContent = this.composeUserContent(
+            const composedUser = await this.composeUserContent(
                 ingestedPrompt,
                 opts.mainChatDepth,
                 opts.includeVars,
                 startAnchor,
+                'sidegen_once',
+                signal,
             );
             baseMessages.push({
                 role: 'user',
-                content: userContent,
+                content: composedUser.content,
             });
 
             const turnResult = await this.executeSideGenTurn({
@@ -799,9 +805,21 @@ export class SideGenService implements ToolSideGenApi {
             );
             const ingestedPrompt = this.applyIngestRegex(prompt, 'user');
             const hasFrozenPrefix = Boolean(this.trajectoryStore.getFrozenPrefix(threadId));
-            const layer1Messages = this.trajectoryStore
+            const rawLayer1Messages = this.trajectoryStore
                 .getMessages(threadId)
                 .map((m) => canonicalClone(m));
+            const layer1Messages = this.bridge.transformPromptText
+                ? await resolveTrajectoryLayer1Messages({
+                      bridge: this.bridge,
+                      trajectoryStore: this.trajectoryStore,
+                      threadId,
+                      sessionId,
+                      phase: 'sidegen',
+                      target: startAnchor,
+                      defaultIsChatMessage: false,
+                      signal,
+                  })
+                : rawLayer1Messages;
             const presetPrompts = await this.resolvePresetPromptMessages('session', startAnchor, {
                 skipPrefix: hasFrozenPrefix,
                 historyMessages: layer1Messages,
@@ -818,15 +836,17 @@ export class SideGenService implements ToolSideGenApi {
                 connection,
             );
 
-            const userContent = this.composeUserContent(
+            const composedUser = await this.composeUserContent(
                 ingestedPrompt,
                 opts.mainChatDepth,
                 opts.includeVars,
                 startAnchor,
+                sessionId,
+                signal,
             );
             const userMessage: CanonicalMessage = {
                 role: 'user',
-                content: userContent,
+                content: composedUser.content,
             };
 
             const baseMessages: CanonicalMessage[] = [
@@ -878,7 +898,20 @@ export class SideGenService implements ToolSideGenApi {
             };
 
             // Append finalized turn to TrajectoryStore (immutable Layer 1 append).
-            this.trajectoryStore.appendTurn([userMessage, assistantMessage], threadId);
+            this.trajectoryStore.appendTurn([userMessage, assistantMessage], threadId, [
+                composedUser.userTransformState ?? { cached: true },
+                {
+                    cached: false,
+                    rawContent: ingestedText,
+                    meta: {
+                        source: 'chat_message',
+                        isChatMessage: false,
+                        messageId: startAnchor.messageId,
+                        swipeId: startAnchor.swipeId,
+                        isUser: false,
+                    },
+                },
+            ]);
 
             let estimatedTokens = estimateRequestTokens(
                 [...layer0Messages, ...this.trajectoryStore.getMessages(threadId)],
@@ -1897,16 +1930,26 @@ export class SideGenService implements ToolSideGenApi {
         };
     }
 
-    private composeUserContent(
+    private async composeUserContent(
         prompt: string,
         mainChatDepth: number | undefined,
         includeVars: boolean | undefined,
         anchor: MessageTarget,
-    ): string {
+        sessionId: string,
+        signal?: AbortSignal,
+    ): Promise<{
+        content: string;
+        userTransformState?: TrajectoryMessageTransformState;
+    }> {
         const blocks: string[] = [];
 
         if (typeof mainChatDepth === 'number' && Number.isFinite(mainChatDepth) && mainChatDepth > 0) {
-            const chatContext = this.buildReadOnlyChatTail(Math.floor(mainChatDepth));
+            const chatContext = await this.buildReadOnlyChatTail(
+                Math.floor(mainChatDepth),
+                anchor,
+                sessionId,
+                signal,
+            );
             if (chatContext) {
                 blocks.push(chatContext);
             }
@@ -1919,11 +1962,57 @@ export class SideGenService implements ToolSideGenApi {
             }
         }
 
-        blocks.push(prompt);
-        return blocks.join('\n\n');
+        let effectivePrompt = prompt;
+        let userTransformState: TrajectoryMessageTransformState | undefined;
+        if (this.bridge.transformPromptText) {
+            const res = await this.bridge.transformPromptText({
+                text: prompt,
+                source: 'user_input',
+                layer: 'layer2_tail',
+                role: 'user',
+                dryRun: false,
+                meta: {
+                    sessionId,
+                    phase: 'sidegen',
+                    target: anchor,
+                    messageId: anchor.messageId,
+                    swipeId: anchor.swipeId,
+                    isChatMessage: false,
+                    isUser: true,
+                },
+                ...(signal ? { signal } : {}),
+            });
+            effectivePrompt = res.text;
+            if (res.cacheable && Object.keys(res.cacheKeys).length === 0) {
+                userTransformState = { cached: true };
+            } else if (blocks.length === 0) {
+                userTransformState = {
+                    cached: false,
+                    rawContent: prompt,
+                    meta: {
+                        source: 'user_input',
+                        isChatMessage: false,
+                        messageId: anchor.messageId,
+                        swipeId: anchor.swipeId,
+                        isUser: true,
+                    },
+                };
+            }
+        }
+
+        blocks.push(effectivePrompt);
+        return {
+            content: blocks.join('\n\n'),
+            ...(userTransformState ? { userTransformState } : {}),
+        };
     }
 
-    private buildReadOnlyChatTail(depth: number): string {
+    private async buildReadOnlyChatTail(
+        depth: number,
+        anchor: MessageTarget,
+        sessionId: string,
+        signal?: AbortSignal,
+    ): Promise<string> {
         const chat = this.bridge.getChat();
         if (!chat.length || depth <= 0) {
             return '';
@@ -1935,15 +2024,54 @@ export class SideGenService implements ToolSideGenApi {
             return '';
         }
 
-        const lines = tail.map((msg) => {
+        const lines: string[] = [];
+        for (const msg of tail) {
             const sender: Extract<RegexSender, 'user' | 'assistant'> = msg.isUser
                 ? 'user'
                 : 'assistant';
             const roleLabel = msg.isUser ? 'User' : 'Assistant';
             const speaker = msg.name?.trim() ? `${roleLabel} (${msg.name.trim()})` : roleLabel;
-            const cleanedMes = this.applyIngestRegex(msg.mes ?? '', sender);
-            return `[#${msg.id} ${speaker}]: ${cleanedMes}`;
-        });
+            let cleanedMes = this.applyIngestRegex(msg.mes ?? '', sender);
+
+            if (this.bridge.transformPromptText) {
+                const cacheKey = `${msg.id}\0${msg.swipeId ?? 0}\0${hashString64Hex(cleanedMes)}`;
+                const cached = this.chatTailTransformCache.get(cacheKey);
+                if (cached !== undefined) {
+                    cleanedMes = cached;
+                } else {
+                    const res = await this.bridge.transformPromptText({
+                        text: cleanedMes,
+                        source: 'chat_message',
+                        layer: 'layer1_ephemeral',
+                        role: msg.isUser ? 'user' : 'assistant',
+                        dryRun: false,
+                        meta: {
+                            sessionId,
+                            phase: 'sidegen',
+                            target: anchor,
+                            isChatMessage: true,
+                            messageId: msg.id,
+                            swipeId: msg.swipeId,
+                            name: msg.name,
+                            isUser: msg.isUser,
+                        },
+                        ...(signal ? { signal } : {}),
+                    });
+                    cleanedMes = res.text;
+                    if (res.cacheable && Object.keys(res.cacheKeys).length === 0) {
+                        if (this.chatTailTransformCache.size >= 512) {
+                            const oldest = this.chatTailTransformCache.keys().next().value;
+                            if (oldest !== undefined) {
+                                this.chatTailTransformCache.delete(oldest);
+                            }
+                        }
+                        this.chatTailTransformCache.set(cacheKey, cleanedMes);
+                    }
+                }
+            }
+
+            lines.push(`[#${msg.id} ${speaker}]: ${cleanedMes}`);
+        }
         return `<main-chat-context>\n${lines.join('\n')}\n</main-chat-context>`;
     }
 

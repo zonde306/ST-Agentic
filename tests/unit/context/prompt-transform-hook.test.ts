@@ -1,19 +1,27 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AgentRunner } from '@/core/agents';
+import { AssistantRunner } from '@/core/assistant';
 import {
     PROMPT_TRANSFORM_EVENTS,
     type PromptTransformListener,
     type PromptTransformPayload,
     runPromptTransform,
 } from '@/core/bridge';
-import { createDefaultMainAgent, createDefaultSettings } from '@/core/config';
+import {
+    createDefaultConnection,
+    createDefaultMainAgent,
+    createDefaultPreset,
+    createDefaultSettings,
+} from '@/core/config';
 import { ContextAssembler, TrajectoryStore } from '@/core/context';
 import { LoreReadEvaluator, TailRadar } from '@/core/lore';
+import { SideGenService } from '@/core/sidegen';
 import { ChatDataStore } from '@/core/store';
 import { createBuiltinToolRegistry, createToolExecutionContext } from '@/core/tools';
 import type { RawLoreEntry } from '@/core/types';
 import { VirtualFileSystem } from '@/core/vfs';
 import { registerBuiltinEjsPromptTransformHook } from '@/host/ejs-adapter';
+import { createOffMainlineTestBridge } from '../../fixtures/off-mainline-fixtures';
 import { MemoryHostBridge, ScriptedLLMTransport, assertAppendOnlyPrefix } from '../../mocks';
 
 describe('Prompt Transform Hook Mechanism', () => {
@@ -721,7 +729,23 @@ describe('Prompt Transform Hook Mechanism', () => {
             { messageId: 1, swipeId: 2 },
         ]);
 
-        // Persistent Layer 1 history is NEVER passed to the hook across turns
+        // Ephemeral second pass with identical un-disabled chat message hits cache (no re-eval)
+        captured.length = 0;
+        await assembler.assembleWithHost({
+            agent: ephemeralAgent,
+            hostBridge: bridge,
+            target: { messageId: 2, swipeId: 0 },
+            promptTriggerContext: { kind: 'main', action: 'normal' },
+            recentChatMessages: [
+                { id: 0, name: '爱丽丝', isUser: false, mes: '开场白 [[H]]', swipeId: 1 },
+            ],
+            userInput: '你好 [[U]]',
+            userName: '莫布',
+        });
+        expect(captured.some((p) => p.source === 'chat_message')).toBe(false);
+
+        // Persistent Layer 1 history: transformed ONCE when uncached (promotes to cache),
+        // then NEVER re-processed on subsequent turns; if cache.disable() is called, re-runs until cacheable.
         const persistentAgent = createDefaultMainAgent({
             sessionMode: 'persistent',
             promptBlocks: [
@@ -735,31 +759,319 @@ describe('Prompt Transform Hook Mechanism', () => {
                 },
             ],
         });
+        const persistBridge = new MemoryHostBridge({
+            identity: { userName: '莫布', charName: '爱丽丝' },
+        });
+        let dynamicHistFlag = true;
+        const persistSeen: Array<{ source: string; text: string; isChatMessage: boolean }> = [];
+        persistBridge.onPromptTransform((payload) => {
+            persistSeen.push({
+                source: payload.source,
+                text: payload.text,
+                isChatMessage: payload.meta.isChatMessage,
+            });
+            if (payload.text.includes('[[DYNAMIC_HIST]]')) {
+                if (dynamicHistFlag) {
+                    payload.cache.disable('volatile', 'ext');
+                    payload.text = 'DYNAMIC_V1';
+                } else {
+                    payload.text = 'DYNAMIC_CACHED';
+                }
+                return;
+            }
+            payload.text = payload.text.replace('[[U]]', '[USER]').replace('[[H]]', '[HIST]');
+        });
+
         const t1 = await assembler.assembleWithHost({
             agent: persistentAgent,
-            hostBridge: bridge,
+            hostBridge: persistBridge,
             trajectoryStore: store,
             target: { messageId: 1, swipeId: 0 },
             userInput: 'Turn 1 [[U]]',
         });
+        expect(t1.userInputTransformState?.cached).toBe(true);
         assembler.finalizeTurn({
             trajectoryStore: store,
             agentId: persistentAgent.id,
             target: { messageId: 1, swipeId: 0 },
             turnMessages: t1.layer2Messages,
-            finalAssistantMessage: { role: 'assistant', content: 'Reply 1' },
+            turnTransformStates: [t1.userInputTransformState],
+            finalAssistantMessage: { role: 'assistant', content: 'Reply 1 [[H]]' },
+            finalAssistantTransformState: {
+                cached: false,
+                rawContent: 'Reply 1 [[H]]',
+                meta: { source: 'chat_message', isChatMessage: true, messageId: 1, swipeId: 0, isUser: false },
+            },
         });
-        captured.length = 0;
+
+        // Turn 2: Turn 1 user is already cached (skipped); Reply 1 [[H]] runs ONCE & promotes to cached!
+        persistSeen.length = 0;
         const t2 = await assembler.assembleWithHost({
             agent: persistentAgent,
-            hostBridge: bridge,
+            hostBridge: persistBridge,
             trajectoryStore: store,
             target: { messageId: 3, swipeId: 0 },
-            userInput: 'Turn 2 [[U]]',
+            userInput: 'Turn 2 [[DYNAMIC_HIST]]',
         });
-        expect(captured.some((p) => p.source === 'chat_message')).toBe(false);
-        expect(captured.some((p) => p.rawText.includes('Reply 1'))).toBe(false);
-        assertAppendOnlyPrefix(t1.request, t2.request);
+        expect(persistSeen.filter((e) => e.source === 'chat_message')).toEqual([
+            { source: 'chat_message', text: 'Reply 1 [[H]]', isChatMessage: true },
+        ]);
+        expect(t2.layer1Messages[1]?.content).toBe('Reply 1 [HIST]');
+        expect(t2.userInputTransformState?.cached).toBe(false);
+
+        assembler.finalizeTurn({
+            trajectoryStore: store,
+            agentId: persistentAgent.id,
+            target: { messageId: 3, swipeId: 0 },
+            turnMessages: t2.layer2Messages,
+            turnTransformStates: [t2.userInputTransformState],
+            finalAssistantMessage: { role: 'assistant', content: 'Reply 2' },
+            finalAssistantTransformState: {
+                cached: true,
+            },
+        });
+
+        // Turn 3: Reply 1 is now cached (NOT called); Turn 2 dynamic user STILL re-runs while disabled
+        persistSeen.length = 0;
+        dynamicHistFlag = false; // This pass does NOT call cache.disable() -> promotes Turn 2!
+        const t3 = await assembler.assembleWithHost({
+            agent: persistentAgent,
+            hostBridge: persistBridge,
+            trajectoryStore: store,
+            target: { messageId: 5, swipeId: 0 },
+            userInput: 'Turn 3',
+        });
+        expect(persistSeen.filter((e) => e.text.includes('Reply 1'))).toHaveLength(0);
+        expect(persistSeen.some((e) => e.text === 'Turn 2 [[DYNAMIC_HIST]]')).toBe(true);
+        expect(t3.layer1Messages[2]?.content).toBe('DYNAMIC_CACHED');
+        assembler.finalizeTurn({
+            trajectoryStore: store,
+            agentId: persistentAgent.id,
+            target: { messageId: 5, swipeId: 0 },
+            turnMessages: t3.layer2Messages,
+            turnTransformStates: [t3.userInputTransformState],
+            finalAssistantMessage: { role: 'assistant', content: 'Reply 3' },
+            finalAssistantTransformState: { cached: true },
+        });
+
+        // Turn 4: Turn 2 has now been promoted to cached -> zero Layer 1 re-evaluations!
+        persistSeen.length = 0;
+        const t4 = await assembler.assembleWithHost({
+            agent: persistentAgent,
+            hostBridge: persistBridge,
+            trajectoryStore: store,
+            target: { messageId: 7, swipeId: 0 },
+            userInput: 'Turn 4',
+        });
+        expect(persistSeen.some((e) => e.source === 'chat_message' || e.text.includes('DYNAMIC_HIST'))).toBe(false);
+        assertAppendOnlyPrefix(t3.request, t4.request);
+    });
+
+    it('transforms read_history (whole text) and read_variables (raw JSON, no JSON validation) across AgentRunner, AssistantRunner, and SideGenService', async () => {
+        // 1. AgentRunner: read_history + read_variables (with invalid JSON pass-through)
+        const agentBridge = new MemoryHostBridge({
+            identity: { userName: 'Player', charName: 'Aria' },
+        });
+        agentBridge.pushMessage({ id: 0, name: 'Player', isUser: true, mes: 'Hi' });
+        agentBridge.pushMessage({ id: 1, name: 'Aria', isUser: false, mes: '', swipeId: 0 });
+        agentBridge.setVariable('hp', 50);
+
+        const store = new ChatDataStore(agentBridge);
+        const vfs = new VirtualFileSystem({ bridge: agentBridge, store });
+        await vfs.writeHistoryInternal(
+            '/history/chunk-001.md',
+            'Archived [[HIST_VAR]] line 1\nArchived line 2',
+        );
+
+        const agentHooks: Array<{ source: string; toolName?: string; editable?: boolean }> = [];
+        agentBridge.onPromptTransform((payload) => {
+            if (payload.source === 'history_read' || payload.source === 'variables_read') {
+                agentHooks.push({
+                    source: payload.source,
+                    toolName: payload.meta.toolName,
+                    editable: payload.meta.editable,
+                });
+            }
+            if (payload.source === 'history_read') {
+                payload.text = payload.text.replace('[[HIST_VAR]]', 'EXPANDED_HIST');
+            }
+            if (payload.source === 'variables_read') {
+                // Deliberately return non-JSON text to verify raw JSON string pass-through without repair/error
+                payload.text = '<<BROKEN_JSON_FROM_EXT>>';
+            }
+        });
+
+        const conn = createDefaultConnection({
+            id: 'conn_tools',
+            model: 'gemini-2.5-pro',
+            stream: false,
+            strictToolLoop: false,
+            roundMaxRetries: 0,
+        });
+        const agent = createDefaultMainAgent({
+            id: 'main',
+            connectionId: conn.id,
+            sessionMode: 'persistent',
+            enabledTools: ['read_history', 'read_variables', 'patch_variables', 'write_file'],
+            permissions: {
+                read: ['/**'],
+                write: ['/memory/**', '/notes/**', '/state/variables.json'],
+            },
+        });
+        const preset = createDefaultPreset({
+            id: 'p_tools',
+            mainAgentId: 'main',
+            agents: { main: agent },
+        });
+        const settings = createDefaultSettings({
+            connections: { [conn.id]: conn },
+            currentConnectionId: conn.id,
+            presets: { [preset.id]: preset },
+            currentPresetId: preset.id,
+        });
+        const transport = new ScriptedLLMTransport([
+            {
+                toolCalls: [
+                    { id: 'rh_1', name: 'read_history', arguments: JSON.stringify({ chunk: 'chunk-001.md' }) },
+                    { id: 'rv_1', name: 'read_variables', arguments: JSON.stringify({ scope: 'message' }) },
+                ],
+            },
+            (req) => {
+                const toolMsgs = req.messages.filter((m) => m.role === 'tool');
+                expect(String(toolMsgs[0]?.content)).toContain('EXPANDED_HIST');
+                expect(toolMsgs[1]?.content).toBe('<<BROKEN_JSON_FROM_EXT>>');
+                return {
+                    toolCalls: [
+                        { id: 'wo_1', name: 'write_file', arguments: JSON.stringify({ path: '/output.md', content: 'Agent ok' }) },
+                    ],
+                };
+            },
+            { content: 'Done' },
+        ]);
+        const agentRunner = new AgentRunner({ bridge: agentBridge, transport, settings, vfs });
+        const agentRes = await agentRunner.run({
+            agent,
+            target: { messageId: 1, swipeId: 0 },
+            phase: 'main_turn',
+        });
+        expect(agentRes.content).toBe('Agent ok');
+        expect(agentHooks).toEqual([
+            { source: 'history_read', toolName: 'read_history', editable: false },
+            { source: 'variables_read', toolName: 'read_variables', editable: true },
+        ]);
+
+        // 2. AssistantRunner (Workbench): user prompt + Layer 1 once-cache + read_history + read_variables + read_file in adjust mode
+        const astBridge = createOffMainlineTestBridge();
+        astBridge.setVariable('gold', 77);
+        const astStore = new ChatDataStore(astBridge);
+        const astSeen: Array<{ source: string; text: string; editable?: boolean }> = [];
+        astBridge.onPromptTransform((payload) => {
+            astSeen.push({
+                source: payload.source,
+                text: payload.text,
+                editable: payload.meta.editable,
+            });
+            payload.text = payload.text
+                .replace('[[WB_U]]', 'WORKBENCH_USER')
+                .replace('[[WH]]', 'WB_HIST')
+                .replace('[[WB_FILE]]', 'WB_FILE_EXPANDED');
+        });
+        const astTransport = new ScriptedLLMTransport([
+            {
+                toolCalls: [
+                    { id: 'a_rh', name: 'read_history', arguments: JSON.stringify({ chunk: 'chunk-002.md' }) },
+                    { id: 'a_rv', name: 'read_variables', arguments: JSON.stringify({ scope: 'message' }) },
+                    { id: 'a_rf', name: 'read_file', arguments: JSON.stringify({ path: '/workspace/wb.md' }) },
+                ],
+            },
+            (req) => {
+                expect(req.messages.some((m) => m.role === 'user' && String(m.content).includes('WORKBENCH_USER'))).toBe(true);
+                const tMsgs = req.messages.filter((m) => m.role === 'tool');
+                expect(String(tMsgs[0]?.content)).toContain('WB_HIST');
+                expect(String(tMsgs[1]?.content)).toContain('77');
+                expect(String(tMsgs[2]?.content)).toContain('WB_FILE_EXPANDED');
+                return { content: 'Assistant first reply' };
+            },
+            (req) => {
+                // Turn 2: Turn 1's user/tool msgs were already cached -> ONLY Assistant first reply + Turn 2 user run!
+                expect(req.messages.some((m) => m.role === 'assistant' && m.content === 'Assistant first reply')).toBe(true);
+                return { content: 'Assistant second reply' };
+            },
+        ]);
+        const astSettings = createDefaultSettings();
+        astSettings.connections.default = {
+            ...astSettings.connections.default,
+            strictToolLoop: false,
+            stream: false,
+        };
+        const astRunner = new AssistantRunner({
+            bridge: astBridge,
+            transport: astTransport,
+            store: astStore,
+            trajectoryStore: new TrajectoryStore(),
+            settings: astSettings,
+            stream: false,
+        });
+        await astRunner.vfs.writeHistoryInternal('/history/chunk-002.md', 'Workbench [[WH]] archive');
+        await astRunner.vfs.writeFile('/workspace/wb.md', 'Workspace [[WB_FILE]]', {
+            target: { messageId: 1, swipeId: 0 },
+            staged: false,
+        });
+        const wbSession = await astRunner.createSession({ mode: 'adjust', title: 'WB Hooks' });
+        await astRunner.sendPrompt(wbSession.id, 'Check [[WB_U]]');
+        expect(astSeen.some((e) => e.source === 'vfs_read' && e.editable === true)).toBe(true);
+        expect(astSeen.some((e) => e.source === 'variables_read' && e.editable === true)).toBe(true);
+
+        astSeen.length = 0;
+        await astRunner.sendPrompt(wbSession.id, 'Follow-up');
+        expect(astSeen.some((e) => e.text === 'Assistant first reply' && e.source === 'chat_message')).toBe(true);
+        expect(astSeen.some((e) => e.source === 'history_read' || e.source === 'variables_read' || e.source === 'vfs_read')).toBe(false);
+
+        // 3. SideGenService: ST chat tail (Rule #2 cached) + user prompt + session Layer 1 history
+        const sideBridge = createOffMainlineTestBridge();
+        const sideSeen: Array<{ source: string; text: string; messageId?: number }> = [];
+        sideBridge.onPromptTransform((payload) => {
+            sideSeen.push({
+                source: payload.source,
+                text: payload.text,
+                messageId: payload.meta.messageId,
+            });
+            payload.text = payload.text.replace('[[SIDE_M]]', 'SIDE_EXPANDED');
+        });
+        const sideTransport = new ScriptedLLMTransport([
+            (req) => {
+                const u = req.messages.find((m) => m.role === 'user');
+                expect(String(u?.content)).toContain('SIDE_EXPANDED');
+                return { content: 'Side reply 1 [[SIDE_M]]' };
+            },
+            () => ({ content: 'Side reply 2' }),
+        ]);
+        const sideSettings = createDefaultSettings();
+        sideSettings.connections['side-c'] = createDefaultConnection({
+            id: 'side-c',
+            model: 'gemini-2.5-flash',
+            strictToolLoop: false,
+            stream: false,
+        });
+        const sideService = new SideGenService({
+            bridge: sideBridge,
+            transport: sideTransport,
+            trajectoryStore: new TrajectoryStore(),
+            getDefaultConnectionId: () => 'side-c',
+            getSettings: () => sideSettings,
+            resolveConnection: (id) => sideSettings.connections[id],
+        });
+        await sideService.createSession({ id: 'side:t', title: 'Side T', systemPrompt: 'sys' });
+        await sideService.send('side:t', 'Analyze [[SIDE_M]]', { mainChatDepth: 2 });
+        const chatTailCountTurn1 = sideSeen.filter((e) => e.source === 'chat_message').length;
+        expect(chatTailCountTurn1).toBeGreaterThan(0);
+
+        sideSeen.length = 0;
+        await sideService.send('side:t', 'Next', { mainChatDepth: 2 });
+        // Turn 1's unchanged ST chat tail messages hit cache (skipped), while Turn 1's SideGen reply runs once!
+        expect(sideSeen.filter((e) => e.source === 'chat_message')).toEqual([
+            { source: 'chat_message', text: 'Side reply 1 [[SIDE_M]]', messageId: 1 },
+        ]);
     });
 
     it('registers built-in EJS hook via makeLast on eventSource and yields to external ejs handlers', async () => {

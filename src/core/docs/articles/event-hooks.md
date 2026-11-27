@@ -40,7 +40,7 @@ ST-Agentic 通过 SillyTavern 原生 `eventSource` 向 `JS-Slash-Runner`（酒�
 | :--- | :--- | :--- |
 | `text` | `string` | **可写**，当前待发送/待读取的文本；改写请直接赋值给 `payload.text` |
 | `rawText` | `string` | 只读，宏展开后、进入本次钩子管线前的原始文本 |
-| `source` | `PromptTransformSource` | `'prompt_block'` \| `'system_rule'` \| `'dynamic_reminder'` \| `'user_input'` \| `'chat_message'` \| `'trigger_prompt'` \| `'vfs_read'` \| `'lore_radar'` \| `'lore_outlet'` \| `'lore_precollect'` |
+| `source` | `PromptTransformSource` | `'prompt_block'` \| `'system_rule'` \| `'dynamic_reminder'` \| `'user_input'` \| `'chat_message'` \| `'history_read'` \| `'variables_read'` \| `'trigger_prompt'` \| `'vfs_read'` \| `'lore_radar'` \| `'lore_outlet'` \| `'lore_precollect'` |
 | `layer` | `PromptTransformLayer` | `'layer0_prefix'` \| `'layer1_ephemeral'` \| `'layer2_tail'` \| `'layer2_floating'` \| `'tool_read'` \| `'trigger'` |
 | `role` | `'system' \| 'user' \| 'assistant' \| 'tool'` | 当前消息角色（按区块适用时提供） |
 | `dryRun` | `boolean` | 只读；如 `TailRadar` 触发预览扫描时为 `true`，此时外部逻辑应避免产生持久化副作用 |
@@ -61,20 +61,21 @@ ST-Agentic 通过 SillyTavern 原生 `eventSource` 向 `JS-Slash-Runner`（酒�
 | `isChatMessage` | `boolean` | 区分当前文本是否属于 ST 聊天消息楼层（`chat_message` 或主回合 `user_input`） |
 | `name` | `string?` | 发送者或消息块自定义 `name` |
 | `isUser` | `boolean?` | `isChatMessage === true` 时标明是否为用户消息 |
-| `editable` | `boolean?` | `vfs_read` / `lore_radar` 专属：`read_file` 目标路径允许当前 Agent `edit_file` 时为 `true`。**重要约定**：若你的扩展会转换自定义语法且想兼容模型 `edit_file`，看到 `editable === true` 时请跳过展开或保留原文，避免搜索片段失配 |
-| `writable` | `boolean?` | 当前路径是否允许写入 |
-| `path` / `mount` | `string?` | VFS 文件路径与挂载点（`vfs_read` / `lore_radar` 时提供） |
+| `editable` | `boolean?` | `vfs_read` / `lore_radar` / `variables_read` 专属：`read_file` 目标路径允许当前 Agent `edit_file` 时（或工作台可写模式 `read_variables` 时）为 `true`。**重要约定**：若你的扩展会转换自定义语法且想兼容模型 `edit_file`，看到 `editable === true` 时请跳过展开或保留原文，避免搜索片段失配 |
+| `writable` | `boolean?` | 当前路径或变量作用域是否允许写入 |
+| `toolName` / `toolCallId` | `string?` | 工具返回送入上下文前的拦截标识（如 `'read_history'`、`'read_variables'`、`'read_file'`） |
+| `path` / `mount` | `string?` | VFS 文件路径与挂载点（`vfs_read` / `history_read` / `variables_read` / `lore_radar` 时提供） |
 | `blockId` / `blockName` / `placement` | `string?` | 预设 `PromptBlock` 元数据 |
 | `lore` | `{ world, uid, comment, overridden }?` | 世界书条目元数据 |
 | `vars` | `Readonly<Record<string, unknown>>?` | 当前可用变量只读快照 |
 
-### 缓存控制（KV Cache 友好）
-- **默认可缓存**：若脚本改写结果对固定前置输入确定（或仅改静态内容），无需额外操作；ST-Agentic 会冻结 Layer 0 / 静态块，保持前缀 KV Cache 稳定。
-- **标记为不可缓存（仅重算该块/该条目）**：如果你的脚本支持**依赖运行时变量的动态分支**，调用：
+### 缓存控制（KV Cache 友好 + 历史/工具/工作台统一规则）
+- **「一次未禁缓存即可入缓存」原则**：对于所有文本消息——包括 **ST 聊天/历史消息**（`ephemeral`、`persistent` Layer 1 轨迹、工作台 `AssistantRunner` 对话与 `SideGenService` 主聊天参考/会话历史）、预设积木、以及 **`read_history`（整段文本）** 和 **`read_variables`（原始 JSON 字符串，不做强修解析）**——只要任意一次经过 `agentic_prompt_transform` **未调用 `payload.cache.disable()`**，结果就会自动进入缓存并固化到上下文中，**后续回合不再重复触发钩子**，保证 KV Cache 命中率。
+- **标记为不可缓存（动态分支）**：如果你的脚本支持**依赖运行时变量的动态分支**，调用：
   ```js
   payload.cache.disable('depends on runtime hp', 'my-ext');
   ```
-  ST-Agentic 会仅对该 `PromptBlock` 或该 `system_rule` 在后续回合/轮次中**选择性重算**，不会破坏其他静态缓存块。
+  ST-Agentic 会保留原文并仅对该 `PromptBlock`、`system_rule`、历史消息或工具结果在后续回合/轮次中**选择性重算**（直到某次不再禁缓存后才入缓存），不会破坏其他静态缓存块。
 - 若结果仅随特定键值变化，也可调用 `payload.cache.addKey('my-ext', String(keyValue))` 将该键纳入分支指纹。
 
 ### 生命周期事件：`agentic_turn_transform_start` & `agentic_turn_transform_end`

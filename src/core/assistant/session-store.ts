@@ -6,6 +6,7 @@ import {
     type EffectiveContextBudget,
     type FrozenStaticPrefix,
     type Layer1TurnGroup,
+    type TrajectoryMessageTransformState,
 } from '@/core/context';
 import type {
     AssistantAttachment,
@@ -1392,6 +1393,7 @@ export class AssistantSessionStore {
         options?: {
             extraPrefixMessages?: readonly CanonicalMessage[];
             tailMessages?: readonly CanonicalMessage[];
+            overrideLayer1Messages?: readonly CanonicalMessage[];
             prefixFingerprint?: string;
             omitSystemMessage?: boolean;
         },
@@ -1407,7 +1409,9 @@ export class AssistantSessionStore {
             Boolean(options?.omitSystemMessage),
         );
         const layer0 = canonicalClone([...frozen.messages]);
-        const layer1 = canonicalClone([...this.trajectoryStore.getMessages(threadId)]);
+        const layer1 = canonicalClone([
+            ...(options?.overrideLayer1Messages ?? this.trajectoryStore.getMessages(threadId)),
+        ]);
         const inFlight = canonicalClone([...inFlightMessages]);
         const tail = canonicalClone([...(options?.tailMessages ?? [])]);
 
@@ -1435,12 +1439,13 @@ export class AssistantSessionStore {
     public appendTrajectoryTurn(
         sessionId: string,
         messages: readonly CanonicalMessage[],
+        transformStates?: ReadonlyArray<TrajectoryMessageTransformState | undefined>,
     ): void {
         if (messages.length === 0) {
             return;
         }
         const threadId = toAssistantThreadId(sessionId);
-        this.trajectoryStore.appendTurn(messages, threadId);
+        this.trajectoryStore.appendTurn(messages, threadId, transformStates);
     }
 
     /**
