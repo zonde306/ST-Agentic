@@ -12,7 +12,7 @@
 | `agentic_settings_patch` | 修改全局设置、切换/新建/重命名/删除预设、改预设全局字段 | `runMode`、`themeMode`、`capsulePosition`、`capsulePersistMode`、`currentPresetId`、`currentConnectionId`、`storage`、`offMainline`、`createPreset`、`renamePreset`、`deletePresetId`、`presetPatch` |
 | `agentic_preset_component_upsert` | 新增或按 ID/名称合并更新预设组件 | `presetId?`、`kind`、`agentId?`、`insertAt?`、`item`、`reloadMessages?` |
 | `agentic_preset_component_delete` | 删除预设组件 | `presetId?`、`kind`、`id`、`agentId?`、`reloadMessages?` |
-| `agentic_connection_upsert` | 新增或更新 API 连接（不传 `apiKey` 自动保留原密钥） | `id`、`name`、`providerFormat`、`baseUrl`、`apiKey`、`clearApiKey`、`model`、`contextSize`、`maxTokens`、`cachePolicy`、`strictToolLoop`、`roundMaxRetries`、`setAsCurrent` |
+| `agentic_connection_upsert` | 新增或更新 API 连接（不传 `apiKey` 自动保留原密钥） | `id`、`name`、`providerFormat`、`baseUrl`、`apiKey`、`clearApiKey`、`model`、`contextSize`、`maxTokens`、`cachePolicy`、`systemInstructionMode`、`strictToolLoop`、`roundMaxRetries`、`setAsCurrent` |
 
 > **最佳实践**：修改前先调 `agentic_config_read({ section: 'summary' })` 或 targeted `section + itemId` 查看现有 ID，再做局部 `upsert`（`item` 会与同 ID 现有项合并，只需传变更字段或完整新项）。
 

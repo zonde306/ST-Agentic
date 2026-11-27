@@ -7,6 +7,7 @@ export type CapsulePosition = 'top' | 'bottom';
 export type CapsulePersistMode = 'keep' | 'auto_hide';
 export type CachePolicy = 'auto_prefix' | 'anthropic_explicit' | 'none';
 export type ApiProviderFormat = 'openai' | 'anthropic' | 'gemini';
+export type SystemInstructionMode = 'native' | 'user' | 'model';
 
 export interface ApiConnection {
     id: string;
@@ -30,6 +31,8 @@ export interface ApiConnection {
     cachePolicy: CachePolicy;
     maxCacheBreakpoints?: number;
     promptPostProcessing?: 'none' | 'merge' | 'semi' | 'strict' | 'single';
+    /** How to emit `system` messages when an upstream rejects native system instructions: 'native' (default) | 'user' | 'model' (assistant). */
+    systemInstructionMode?: SystemInstructionMode;
     linkedPreset?: string;
     /** Enable strict tool loop (forced tool decoding + finish_turn gate + repeated read breaker; default false). */
     strictToolLoop?: boolean;

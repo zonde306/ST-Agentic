@@ -10,6 +10,7 @@ import type {
     ApiProviderFormat,
     CachePolicy,
     Settings,
+    SystemInstructionMode,
 } from '@/core/types';
 import {
     Badge,
@@ -1124,6 +1125,24 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                                 />
                             </FormField>
                         </div>
+
+                        <FormField
+                            label="系统指令兼容模式 (systemInstructionMode)"
+                            hint="部分 API 上游不支持 system / systemInstruction 时，可将全部系统指令转换为 user 或 model (assistant) 消息"
+                        >
+                            <SelectInput<SystemInstructionMode>
+                                ariaLabel="系统指令兼容模式"
+                                value={activeConn.systemInstructionMode ?? 'native'}
+                                options={[
+                                    { value: 'native', label: '默认（保留原生 system / systemInstruction）' },
+                                    { value: 'user', label: '全部转换为 user 消息' },
+                                    { value: 'model', label: '全部转换为 model / assistant 消息' },
+                                ]}
+                                onChange={(systemInstructionMode) =>
+                                    mutateActiveConn((c) => ({ ...c, systemInstructionMode }))
+                                }
+                            />
+                        </FormField>
 
                         <ToggleSwitch
                             checked={Boolean(activeConn.strictToolLoop)}

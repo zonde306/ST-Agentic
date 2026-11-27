@@ -6,6 +6,7 @@ import type {
     CanonicalMessage,
     CanonicalToolCall,
     CanonicalToolSchema,
+    SystemInstructionMode,
 } from '../types';
 import { canonicalClone, canonicalStringify } from '../utils';
 import { LLMTransportError } from './errors';
@@ -340,6 +341,41 @@ function squashConsecutiveRoles(
 }
 
 /**
+ * Rewrites `system` messages into `user` or `assistant` (`model`) when `mode !== 'native'`,
+ * preserving 1:1 message index alignment and stripping `name` on converted system messages.
+ */
+export function applySystemInstructionMode(
+    messages: CanonicalMessage[],
+    mode: SystemInstructionMode = 'native',
+): CanonicalMessage[] {
+    if (mode === 'native') {
+        return messages;
+    }
+    const targetRole = mode === 'model' ? 'assistant' : 'user';
+    return messages.map((msg) => {
+        if (msg.role !== 'system') {
+            return msg;
+        }
+        const cloned = cloneMessage(msg);
+        cloned.role = targetRole;
+        delete cloned.name;
+        return cloned;
+    });
+}
+
+function findLastLeadingSystemIndex(messages: readonly CanonicalMessage[]): number {
+    let last = -1;
+    for (let i = 0; i < messages.length; i += 1) {
+        if (messages[i].role === 'system') {
+            last = i;
+        } else {
+            break;
+        }
+    }
+    return last;
+}
+
+/**
  * Applies SillyTavern-compatible prompt post-processing (`none`/`merge`/`semi`/`strict`/`single`)
  * while preserving `tool` messages, `toolCalls`, and original->output breakpoint index mappings.
  */
@@ -638,6 +674,7 @@ function selectBreakpointIndices(
     indexMap: Map<number, number>,
     processedMessages: CanonicalMessage[],
     maxBreakpoints: number,
+    origLastLeadingSystemIdx?: number,
 ): number[] {
     if (maxBreakpoints <= 0 || processedMessages.length === 0) {
         return [];
@@ -661,16 +698,17 @@ function selectBreakpointIndices(
     }
 
     if (candidates.length === 0) {
-        // Default to Layer 0 end: last leading system message, or message 0 if no system prefix.
-        let lastLeadingSystem = -1;
-        for (let i = 0; i < processedMessages.length; i += 1) {
-            if (processedMessages[i].role === 'system') {
-                lastLeadingSystem = i;
-            } else {
-                break;
-            }
+        // Default to Layer 0 end: original leading system end (even if role-converted), or processed leading system, or message 0.
+        const origMapped =
+            origLastLeadingSystemIdx !== undefined && origLastLeadingSystemIdx >= 0
+                ? indexMap.get(origLastLeadingSystemIdx)
+                : undefined;
+        if (origMapped !== undefined && origMapped >= 0 && origMapped < processedMessages.length) {
+            candidates = [origMapped];
+        } else {
+            const lastLeadingSystem = findLastLeadingSystemIndex(processedMessages);
+            candidates = [lastLeadingSystem >= 0 ? lastLeadingSystem : 0];
         }
-        candidates = [lastLeadingSystem >= 0 ? lastLeadingSystem : 0];
     }
 
     if (candidates.length <= maxBreakpoints) {
@@ -845,6 +883,7 @@ function compileOpenAIPayload(
     connection: ApiConnection,
     processed: PostProcessResult,
     useStream: boolean,
+    origLastLeadingSystemIdx?: number,
 ): { body: Record<string, unknown>; cacheBreakpointsApplied: number } {
     const compiledMessages = processed.messages.map((msg) => {
         const out: Record<string, unknown> = {
@@ -894,6 +933,7 @@ function compileOpenAIPayload(
             processed.indexMap,
             processed.messages,
             maxBreakpoints,
+            origLastLeadingSystemIdx,
         );
         for (const idx of targetIndices) {
             if (attachCacheControlToOpenAIMessage(compiledMessages[idx])) {
@@ -962,6 +1002,7 @@ function compileAnthropicPayload(
     connection: ApiConnection,
     processed: PostProcessResult,
     useStream: boolean,
+    origLastLeadingSystemIdx?: number,
 ): { body: Record<string, unknown>; cacheBreakpointsApplied: number } {
     const msgs = processed.messages;
     const systemBlocks: Array<Record<string, unknown>> = [];
@@ -1105,6 +1146,7 @@ function compileAnthropicPayload(
             processed.indexMap,
             msgs,
             maxBreakpoints,
+            origLastLeadingSystemIdx,
         );
 
         // If tools exist and we have spare breakpoint budget after message/system targets,
@@ -1736,15 +1778,19 @@ export class PayloadCompiler {
         });
         const headers = buildHeaders(connection, this.anthropicVersion);
 
+        const origLastLeadingSystemIdx = findLastLeadingSystemIndex(request.messages);
+        const systemMode = connection.systemInstructionMode ?? 'native';
+        const roleNormalizedMessages = applySystemInstructionMode(request.messages, systemMode);
+
         const postMode = connection.promptPostProcessing ?? 'none';
-        const processed = postProcessCanonicalMessages(request.messages, postMode);
+        const processed = postProcessCanonicalMessages(roleNormalizedMessages, postMode);
 
         const compiled =
             providerFormat === 'anthropic'
-                ? compileAnthropicPayload(request, connection, processed, useStream)
+                ? compileAnthropicPayload(request, connection, processed, useStream, origLastLeadingSystemIdx)
                 : providerFormat === 'gemini'
                     ? compileGeminiPayload(request, connection, processed)
-                    : compileOpenAIPayload(request, connection, processed, useStream);
+                    : compileOpenAIPayload(request, connection, processed, useStream, origLastLeadingSystemIdx);
 
         const body = compiled.body;
 

@@ -407,6 +407,13 @@ describe('Studio UI: custom JSON prompt blocks & strict tool loop controls', () 
                 activeHarness.store.getSnapshot().settings.connections.conn_claude;
             expect(initialConn.strictToolLoop).toBe(false);
             expect(initialConn.roundMaxRetries).toBe(2);
+            expect(initialConn.systemInstructionMode).toBe('native');
+
+            const sysModeSelect = shadowRoot.querySelector(
+                'select[aria-label="系统指令兼容模式"]',
+            ) as HTMLSelectElement | null;
+            expect(sysModeSelect, `${vp.label}: expected systemInstructionMode select`).toBeTruthy();
+            expect(sysModeSelect!.value).toBe('native');
 
             const strictSwitch = shadowRoot.querySelector(
                 'button[role="switch"][aria-label*="强约束工具闭环"]',
@@ -444,6 +451,21 @@ describe('Studio UI: custom JSON prompt blocks & strict tool loop controls', () 
             expect(
                 activeHarness.store.getSnapshot().settings.connections.conn_claude.roundMaxRetries,
             ).toBe(10);
+
+            // Update systemInstructionMode to 'user' and 'model'
+            setSelectValue(sysModeSelect!, 'user');
+            await settleLayout(3);
+            expect(
+                activeHarness.store.getSnapshot().settings.connections.conn_claude
+                    .systemInstructionMode,
+            ).toBe('user');
+
+            setSelectValue(sysModeSelect!, 'model');
+            await settleLayout(3);
+            expect(
+                activeHarness.store.getSnapshot().settings.connections.conn_claude
+                    .systemInstructionMode,
+            ).toBe('model');
 
             activeHarness.cleanup();
             activeHarness = null;

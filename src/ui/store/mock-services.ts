@@ -73,6 +73,7 @@ export function createMockSettings(): Settings {
         cachePolicy: 'anthropic_explicit',
         maxCacheBreakpoints: 4,
         stream: true,
+        systemInstructionMode: 'native',
         strictToolLoop: false,
         roundMaxRetries: 2,
         includeHeaders: { 'HTTP-Referer': 'https://sillytavern.local' },
@@ -90,6 +91,7 @@ export function createMockSettings(): Settings {
         maxConcurrency: 6,
         cachePolicy: 'auto_prefix',
         stream: false,
+        systemInstructionMode: 'native',
         strictToolLoop: false,
         roundMaxRetries: 2,
     });
@@ -106,6 +108,7 @@ export function createMockSettings(): Settings {
         maxConcurrency: 1,
         cachePolicy: 'auto_prefix',
         stream: true,
+        systemInstructionMode: 'native',
         strictToolLoop: false,
         roundMaxRetries: 2,
     });

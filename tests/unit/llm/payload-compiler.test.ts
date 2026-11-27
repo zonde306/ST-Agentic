@@ -962,4 +962,231 @@ describe('PayloadCompiler', () => {
         );
         expect(outA.serializedBody).toBe(outB.serializedBody);
     });
+
+    it('converts all system messages to user or model/assistant across Gemini, Anthropic, and OpenAI when systemInstructionMode is set', () => {
+        const rawMessages: CanonicalMessage[] = [
+            { role: 'system', name: 'SysA', content: 'Leading system 1' },
+            { role: 'system', content: 'Leading system 2' },
+            { role: 'user', content: 'Hello' },
+            { role: 'system', name: 'SysMid', content: 'Mid system rule' },
+            { role: 'assistant', content: 'Hi there' },
+            { role: 'system', content: 'Tail system reminder' },
+        ];
+        const snapshotBefore = JSON.stringify(rawMessages);
+
+        // 1. Gemini + systemInstructionMode: 'user'
+        const geminiUser = compiler.compile(
+            { connectionId: 'gem-u', messages: rawMessages, tools: [], stream: false },
+            makeConnection({
+                providerFormat: 'gemini',
+                baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+                model: 'gemini-2.5-pro',
+                systemInstructionMode: 'user',
+                cachePolicy: 'auto_prefix',
+            }),
+        );
+        expect(geminiUser.body.systemInstruction).toBeUndefined();
+        expect(geminiUser.body.contents).toEqual([
+            {
+                role: 'user',
+                parts: [
+                    { text: 'Leading system 1' },
+                    { text: 'Leading system 2' },
+                    { text: 'Hello' },
+                    { text: 'Mid system rule' },
+                ],
+            },
+            { role: 'model', parts: [{ text: 'Hi there' }] },
+            { role: 'user', parts: [{ text: 'Tail system reminder' }] },
+        ]);
+
+        // auto_prefix determinism with systemInstructionMode: 'user'
+        const geminiUserReordered = compiler.compile(
+            {
+                connectionId: 'gem-u',
+                messages: rawMessages.map((m) => ({ content: m.content, role: m.role, ...(m.name ? { name: m.name } : {}) })),
+                tools: [],
+                stream: false,
+            },
+            makeConnection({
+                providerFormat: 'gemini',
+                baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+                model: 'gemini-2.5-pro',
+                systemInstructionMode: 'user',
+                cachePolicy: 'auto_prefix',
+            }),
+        );
+        expect(geminiUser.serializedBody).toBe(geminiUserReordered.serializedBody);
+
+        // 2. Gemini + systemInstructionMode: 'model' (leading system -> model triggers user placeholder; preceding user avoids placeholder)
+        const geminiModel = compiler.compile(
+            { connectionId: 'gem-m', messages: rawMessages, tools: [], stream: false },
+            makeConnection({
+                providerFormat: 'gemini',
+                baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+                model: 'gemini-2.5-pro',
+                systemInstructionMode: 'model',
+            }),
+        );
+        expect(geminiModel.body.systemInstruction).toBeUndefined();
+        expect(geminiModel.body.contents).toEqual([
+            { role: 'user', parts: [{ text: "Let's get started." }] },
+            { role: 'model', parts: [{ text: 'Leading system 1' }, { text: 'Leading system 2' }] },
+            { role: 'user', parts: [{ text: 'Hello' }] },
+            {
+                role: 'model',
+                parts: [
+                    { text: 'Mid system rule' },
+                    { text: 'Hi there' },
+                    { text: 'Tail system reminder' },
+                ],
+            },
+        ]);
+
+        const geminiModelUserFirst = compiler.compile(
+            {
+                connectionId: 'gem-m2',
+                messages: [
+                    { role: 'user', content: 'First user' },
+                    { role: 'system', content: 'Mid system' },
+                ],
+                tools: [],
+                stream: false,
+            },
+            makeConnection({
+                providerFormat: 'gemini',
+                baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+                model: 'gemini-2.5-pro',
+                systemInstructionMode: 'model',
+            }),
+        );
+        expect(geminiModelUserFirst.body.systemInstruction).toBeUndefined();
+        expect(geminiModelUserFirst.body.contents).toEqual([
+            { role: 'user', parts: [{ text: 'First user' }] },
+            { role: 'model', parts: [{ text: 'Mid system' }] },
+        ]);
+
+        // 3. Anthropic + 'user' & 'model' with anthropic_explicit cache_control
+        const antUser = compiler.compile(
+            {
+                connectionId: 'ant-u',
+                messages: [
+                    { role: 'system', name: 'Sys', content: 'Layer 0 A' },
+                    { role: 'system', content: 'Layer 0 B' },
+                    { role: 'user', content: 'Turn 1' },
+                ],
+                tools: [],
+                stream: false,
+            },
+            makeConnection({
+                providerFormat: 'anthropic',
+                baseUrl: 'https://api.anthropic.com/v1',
+                cachePolicy: 'anthropic_explicit',
+                systemInstructionMode: 'user',
+            }),
+        );
+        expect(antUser.body.system).toBeUndefined();
+        expect(antUser.cacheBreakpointsApplied).toBe(1);
+        expect(antUser.body.messages).toEqual([
+            {
+                role: 'user',
+                content: [
+                    { type: 'text', text: 'Layer 0 A' },
+                    { type: 'text', text: 'Layer 0 B', cache_control: { type: 'ephemeral' } },
+                    { type: 'text', text: 'Turn 1' },
+                ],
+            },
+        ]);
+
+        const antModel = compiler.compile(
+            {
+                connectionId: 'ant-m',
+                messages: rawMessages,
+                tools: [],
+                stream: false,
+                cacheBreakpoints: [1, 5],
+            },
+            makeConnection({
+                providerFormat: 'anthropic',
+                baseUrl: 'https://api.anthropic.com/v1',
+                cachePolicy: 'anthropic_explicit',
+                systemInstructionMode: 'model',
+            }),
+        );
+        expect(antModel.body.system).toBeUndefined();
+        expect(antModel.cacheBreakpointsApplied).toBe(2);
+        expect(antModel.body.messages).toEqual([
+            { role: 'user', content: [{ type: 'text', text: "Let's get started." }] },
+            {
+                role: 'assistant',
+                content: [
+                    { type: 'text', text: 'Leading system 1' },
+                    { type: 'text', text: 'Leading system 2', cache_control: { type: 'ephemeral' } },
+                ],
+            },
+            { role: 'user', content: [{ type: 'text', text: 'Hello' }] },
+            {
+                role: 'assistant',
+                content: [
+                    { type: 'text', text: 'Mid system rule' },
+                    { type: 'text', text: 'Hi there' },
+                    { type: 'text', text: 'Tail system reminder', cache_control: { type: 'ephemeral' } },
+                ],
+            },
+        ]);
+
+        // 4. OpenAI + 'user' & 'model' + promptPostProcessing & explicit breakpoints
+        const openaiUserMerged = compiler.compile(
+            { connectionId: 'oai-u', messages: rawMessages, tools: [], stream: false },
+            makeConnection({
+                providerFormat: 'openai',
+                systemInstructionMode: 'user',
+                promptPostProcessing: 'merge',
+                cachePolicy: 'none',
+            }),
+        );
+        expect(
+            (openaiUserMerged.body.messages as Array<{ role: string }>).some((m) => m.role === 'system'),
+        ).toBe(false);
+        expect(openaiUserMerged.body.messages).toEqual([
+            {
+                role: 'user',
+                content: 'Leading system 1\n\nLeading system 2\n\nHello\n\nMid system rule',
+            },
+            { role: 'assistant', content: 'Hi there' },
+            { role: 'user', content: 'Tail system reminder' },
+        ]);
+
+        const openaiModelStrict = compiler.compile(
+            { connectionId: 'oai-m', messages: rawMessages, tools: [], stream: false },
+            makeConnection({
+                providerFormat: 'openai',
+                systemInstructionMode: 'model',
+                promptPostProcessing: 'strict',
+                cachePolicy: 'anthropic_explicit',
+            }),
+        );
+        expect(
+            (openaiModelStrict.body.messages as Array<{ role: string }>).some((m) => m.role === 'system'),
+        ).toBe(false);
+        expect(openaiModelStrict.cacheBreakpointsApplied).toBe(1);
+        expect(openaiModelStrict.body.messages).toEqual([
+            { role: 'user', content: "Let's get started." },
+            {
+                role: 'assistant',
+                content: [
+                    {
+                        type: 'text',
+                        text: 'Leading system 1\n\nLeading system 2',
+                        cache_control: { type: 'ephemeral' },
+                    },
+                ],
+            },
+            { role: 'user', content: 'Hello' },
+            { role: 'assistant', content: 'Mid system rule\n\nHi there\n\nTail system reminder' },
+        ]);
+
+        // Input messages must remain completely unmutated
+        expect(JSON.stringify(rawMessages)).toBe(snapshotBefore);
+    });
 });

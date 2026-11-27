@@ -48,6 +48,7 @@ describe('src/core/config defaults, normalization, and secret-free exports', () 
         expect(mainAgent.promptBlocks.some((b) => b.placement === 'prefix' && b.enabled)).toBe(true);
         expect(conn.id).toBe('default');
         expect(conn.cachePolicy).toBe('auto_prefix');
+        expect(conn.systemInstructionMode).toBe('native');
     });
 
     it('normalizes malformed inputs and clamps bounds safely', () => {
@@ -74,6 +75,12 @@ describe('src/core/config defaults, normalization, and secret-free exports', () 
         });
         expect(geminiConn.providerFormat).toBe('gemini');
         expect(geminiConn.cachePolicy).toBe('auto_prefix');
+        expect(geminiConn.systemInstructionMode).toBe('native');
+
+        expect(normalizeConnection({ systemInstructionMode: 'user' }).systemInstructionMode).toBe('user');
+        expect(normalizeConnection({ systemInstructionMode: 'model' }).systemInstructionMode).toBe('model');
+        expect(normalizeConnection({ systemInstructionMode: 'assistant' }).systemInstructionMode).toBe('model');
+        expect(normalizeConnection({ systemInstructionMode: 'invalid' }).systemInstructionMode).toBe('native');
 
         const preset = normalizePreset({
             id: 'p1',
@@ -190,7 +197,11 @@ describe('src/core/config defaults, normalization, and secret-free exports', () 
 
     it('validates imports and rejects malformed payloads cleanly', () => {
         const preset = createDefaultPreset({ id: 'p_export', name: 'Exported' });
-        const conn = createDefaultConnection({ id: 'c_export', apiKey: 'sk-must-be-stripped' });
+        const conn = createDefaultConnection({
+            id: 'c_export',
+            apiKey: 'sk-must-be-stripped',
+            systemInstructionMode: 'model',
+        });
         const presetPayload = exportPreset(preset, { includeConnection: conn });
 
         const importedPreset = importPreset(presetPayload);
@@ -206,6 +217,7 @@ describe('src/core/config defaults, normalization, and secret-free exports', () 
         const importedConns = importConnections(connsPayload);
         expect(importedConns.currentConnectionId).toBe('c_export');
         expect(importedConns.connections.c_export.apiKey).toBe('');
+        expect(importedConns.connections.c_export.systemInstructionMode).toBe('model');
 
         const settingsPayload = exportSettings(createDefaultSettings());
         const importedSettings = importSettings(settingsPayload);

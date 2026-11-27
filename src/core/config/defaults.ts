@@ -94,6 +94,7 @@ export function createDefaultConnection(overrides: Partial<ApiConnection> = {}):
         cachePolicy: 'auto_prefix',
         maxCacheBreakpoints: 4,
         promptPostProcessing: 'none',
+        systemInstructionMode: 'native',
         linkedPreset: '',
         strictToolLoop: false,
         roundMaxRetries: 2,

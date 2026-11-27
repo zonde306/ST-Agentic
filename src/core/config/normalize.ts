@@ -20,6 +20,7 @@ import type {
     SlashToolParamType,
     StorageSettings,
     StrictToolLoopOverride,
+    SystemInstructionMode,
     ThemeMode,
     TriggerCondition,
     TriggerRule,
@@ -178,6 +179,16 @@ const VALID_POST_PROCESSING = new Set<NonNullable<ApiConnection['promptPostProce
     'single',
 ]);
 
+function normalizeSystemInstructionMode(raw: unknown): SystemInstructionMode {
+    if (raw === 'user') {
+        return 'user';
+    }
+    if (raw === 'model' || raw === 'assistant') {
+        return 'model';
+    }
+    return 'native';
+}
+
 /** Normalize an untrusted API connection object into a complete `ApiConnection`. */
 export function normalizeConnection(
     input: unknown,
@@ -246,6 +257,7 @@ export function normalizeConnection(
             true,
         ),
         promptPostProcessing,
+        systemInstructionMode: normalizeSystemInstructionMode(raw.systemInstructionMode),
         linkedPreset: typeof raw.linkedPreset === 'string' ? raw.linkedPreset.trim() : '',
         strictToolLoop:
             raw.strictToolLoop === undefined

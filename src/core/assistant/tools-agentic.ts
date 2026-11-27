@@ -344,6 +344,12 @@ const AGENTIC_CONNECTION_UPSERT_SCHEMA = z.object({
     cachePolicy: z.enum(['auto_prefix', 'anthropic_explicit', 'none']).optional(),
     maxCacheBreakpoints: z.number().int().min(0).max(4).optional(),
     promptPostProcessing: z.enum(['none', 'merge', 'semi', 'strict', 'single']).optional(),
+    systemInstructionMode: z
+        .enum(['native', 'user', 'model'])
+        .optional()
+        .describe(
+            "System instruction handling: 'native' (keep system/systemInstruction), 'user' (convert all system messages to user), or 'model' (convert all system messages to model/assistant).",
+        ),
     linkedPreset: z.string().optional(),
     strictToolLoop: z.boolean().optional(),
     roundMaxRetries: z.number().int().min(0).max(10).optional(),
