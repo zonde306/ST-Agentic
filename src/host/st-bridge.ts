@@ -44,10 +44,12 @@ import {
     type HostAuthorBridge,
     type HostBridge,
     type HostIdentity,
+    type OutputPostprocessHookPayload,
     type OutputProcessInput,
     type OutputProcessResult,
     PROMPT_TRANSFORM_EVENTS,
     type PromptInjectionSession,
+    type PromptPreprocessHookPayload,
     type PromptTransformInput,
     type PromptTransformResult,
     type PromptTransformTurnLifecyclePayload,
@@ -408,6 +410,8 @@ export class STHostBridge implements HostBridge {
     private cachedLorebooks = new Map<string, RawLoreEntry[]>();
     private promptTransformDepth = 0;
     private outputProcessDepth = 0;
+    private promptPreprocessDepth = 0;
+    private outputPostprocessDepth = 0;
 
     evaluateOptionalEjs?: EvaluateOptionalEjsHook;
     createPromptInjectionSession?: CreatePromptInjectionSessionHook;
@@ -1640,6 +1644,44 @@ export class STHostBridge implements HostBridge {
             this.outputProcessDepth -= 1;
         }
         return finalizeOutputProcessPayload(payload, input.text);
+    }
+
+    hasPromptPreprocessListeners(): boolean {
+        return this.hasHostEventListeners(PROMPT_TRANSFORM_EVENTS.PROMPT_PREPROCESS);
+    }
+
+    async preprocessPromptMessages(payload: PromptPreprocessHookPayload): Promise<void> {
+        if (!this.hasPromptPreprocessListeners()) {
+            return;
+        }
+        if (this.promptPreprocessDepth >= 8) {
+            return;
+        }
+        this.promptPreprocessDepth += 1;
+        try {
+            await eventSource.emit(PROMPT_TRANSFORM_EVENTS.PROMPT_PREPROCESS, payload);
+        } finally {
+            this.promptPreprocessDepth -= 1;
+        }
+    }
+
+    hasOutputPostprocessListeners(): boolean {
+        return this.hasHostEventListeners(PROMPT_TRANSFORM_EVENTS.OUTPUT_POSTPROCESS);
+    }
+
+    async postprocessOutputResponse(payload: OutputPostprocessHookPayload): Promise<void> {
+        if (!this.hasOutputPostprocessListeners()) {
+            return;
+        }
+        if (this.outputPostprocessDepth >= 8) {
+            return;
+        }
+        this.outputPostprocessDepth += 1;
+        try {
+            await eventSource.emit(PROMPT_TRANSFORM_EVENTS.OUTPUT_POSTPROCESS, payload);
+        } finally {
+            this.outputPostprocessDepth -= 1;
+        }
     }
 
     async notifyPromptTransformTurnStart(

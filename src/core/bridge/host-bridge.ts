@@ -22,6 +22,10 @@ import type {
     OutputProcessInput,
     OutputProcessResult,
 } from './output-process';
+import type {
+    OutputPostprocessHookPayload,
+    PromptPreprocessHookPayload,
+} from './message-hooks';
 
 export interface HostIdentity {
     userName: string;
@@ -181,6 +185,10 @@ export interface HostBridge {
     ): Promise<string>;
     transformPromptText?(input: PromptTransformInput): Promise<PromptTransformResult>;
     processOutputText?(input: OutputProcessInput): Promise<OutputProcessResult>;
+    hasPromptPreprocessListeners?(): boolean;
+    preprocessPromptMessages?(payload: PromptPreprocessHookPayload): Promise<void>;
+    hasOutputPostprocessListeners?(): boolean;
+    postprocessOutputResponse?(payload: OutputPostprocessHookPayload): Promise<void>;
     notifyPromptTransformTurnStart?(payload: PromptTransformTurnLifecyclePayload): Promise<void>;
     notifyPromptTransformTurnEnd?(payload: PromptTransformTurnLifecyclePayload): Promise<void>;
     createPromptInjectionSession?(initialSnapshot?: SerializedPromptInjected): {

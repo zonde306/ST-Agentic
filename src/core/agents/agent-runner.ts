@@ -18,9 +18,13 @@ import type {
     ToolSideGenApi,
 } from '@/core/bridge';
 import {
+    createOutputPostprocessPayload,
+    createPromptPreprocessPayload,
     DEFAULT_MAX_OUTPUT_FIX_ATTEMPTS,
     formatOutputFixFeedback,
+    runOutputPostprocessHook,
     runOutputProcess,
+    runPromptPreprocessHook,
 } from '@/core/bridge';
 import {
     createDefaultMainAgent,
@@ -2684,6 +2688,28 @@ export class AgentRunner {
                 : { noticeXml: '' };
             throwIfAborted(signal);
 
+            if (
+                input.resumeMessages !== undefined
+                && agent.sessionMode === 'persistent'
+                && this.bridge.transformPromptText
+            ) {
+                baseAssembleInput.overrideLayer1Messages = await resolveTrajectoryLayer1Messages({
+                    bridge: this.bridge,
+                    trajectoryStore: this.trajectoryStore,
+                    threadId: agent.id,
+                    sessionId: runId,
+                    agentId: agent.id,
+                    phase: input.phase,
+                    target,
+                    defaultIsChatMessage:
+                        promptTriggerContext === undefined
+                        || promptTriggerContext.kind === 'main',
+                    vars: workingVars,
+                    sessionBag: transformSessionBag,
+                    signal,
+                });
+            }
+
             let currentAssembled = input.resumeMessages !== undefined
                 ? this.contextAssembler.assemble({
                     ...baseAssembleInput,
@@ -3345,8 +3371,16 @@ export class AgentRunner {
                         && matchesPromptTriggers(presetPreprocess.triggers, promptTriggerContext),
                     );
                     const shouldRunCallbackPreprocess = typeof effectiveOnPreprocess === 'function';
+                    const shouldRunHostPreprocess = Boolean(
+                        this.bridge.preprocessPromptMessages
+                        && (this.bridge.hasPromptPreprocessListeners?.() ?? true),
+                    );
 
-                    if (shouldRunPresetPreprocess || shouldRunCallbackPreprocess) {
+                    if (
+                        shouldRunPresetPreprocess
+                        || shouldRunCallbackPreprocess
+                        || shouldRunHostPreprocess
+                    ) {
                         const preprocessTracker = createLayerTrackingEphemeralController(
                             attemptMessages,
                             attemptLayers,
@@ -3413,6 +3447,45 @@ export class AgentRunner {
                                 signal,
                                 toolContext: preprocessToolCtx,
                             });
+                            throwIfAborted(signal);
+                        }
+
+                        if (shouldRunHostPreprocess) {
+                            const currentLayers = preprocessTracker.getLayers();
+                            const hostPreprocessEvent: ToolEventPayload = {
+                                ...preprocessEvent,
+                                data: {
+                                    ...(preprocessEvent.data ?? {}),
+                                    layers: { ...currentLayers },
+                                },
+                            };
+                            const hostPreprocessPayload = createPromptPreprocessPayload({
+                                messages: preprocessController,
+                                body: workingBody,
+                                layers: currentLayers,
+                                getLayers: () => preprocessTracker.getLayers(),
+                                event: hostPreprocessEvent,
+                                meta: {
+                                    runner: 'agent',
+                                    runId,
+                                    phase: input.phase,
+                                    agentId: agent.id,
+                                    agentName: agent.name,
+                                    ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                                    target: { ...target },
+                                    messageId: target.messageId,
+                                    swipeId: target.swipeId,
+                                    round: roundIndexForTurn + 1,
+                                    attempt: roundRetriesUsed,
+                                    maxRetries: maxRoundRetries,
+                                    model: attemptConnection.model,
+                                    connectionId: attemptConnection.id,
+                                    providerFormat: attemptConnection.providerFormat,
+                                    vars: workingVars,
+                                },
+                                signal,
+                            });
+                            await runPromptPreprocessHook(this.bridge, hostPreprocessPayload);
                             throwIfAborted(signal);
                         }
 
@@ -3531,9 +3604,17 @@ export class AgentRunner {
                         );
                         const shouldRunCallbackPostprocess =
                             typeof effectiveOnPostprocess === 'function';
+                        const shouldRunHostPostprocess = Boolean(
+                            this.bridge.postprocessOutputResponse
+                            && (this.bridge.hasOutputPostprocessListeners?.() ?? true),
+                        );
 
                         if (
-                            (shouldRunPresetPostprocess || shouldRunCallbackPostprocess)
+                            (
+                                shouldRunPresetPostprocess
+                                || shouldRunCallbackPostprocess
+                                || shouldRunHostPostprocess
+                            )
                             && !(isMainOutputMode && isLengthFinishReason(turnOutput.finishReason))
                         ) {
                             const origContent = turnOutput.content ?? '';
@@ -3672,6 +3753,55 @@ export class AgentRunner {
                                     signal,
                                     toolContext: postToolCtx,
                                 });
+                                throwIfAborted(signal);
+                                reconcileInPlaceOutput(prevText, prevContent);
+                            }
+
+                            if (shouldRunHostPostprocess) {
+                                const prevText = postOutput.text;
+                                const prevContent = postOutput.content;
+                                const hostPostEvent: ToolEventPayload = {
+                                    ...postEvent,
+                                    output: postOutput.content,
+                                    data: {
+                                        ...(postEvent.data ?? {}),
+                                        content: postOutput.content,
+                                        ...(postOutput.reasoningContent !== undefined
+                                            ? { reasoningContent: postOutput.reasoningContent }
+                                            : {}),
+                                        toolCalls: canonicalClone(postOutput.toolCalls),
+                                    },
+                                };
+                                const hostPostPayload = createOutputPostprocessPayload({
+                                    output: postOutput,
+                                    control: postControl,
+                                    event: hostPostEvent,
+                                    meta: {
+                                        runner: 'agent',
+                                        runId,
+                                        phase: input.phase,
+                                        agentId: agent.id,
+                                        agentName: agent.name,
+                                        ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                                        target: { ...target },
+                                        messageId: target.messageId,
+                                        swipeId: target.swipeId,
+                                        round: roundIndexForTurn + 1,
+                                        attempt: roundRetriesUsed,
+                                        maxRetries: maxRoundRetries,
+                                        fixAttempt: postprocessFixAttempts,
+                                        maxFixAttempts: maxPostprocessFixAttempts,
+                                        model: attemptConnection.model,
+                                        connectionId: attemptConnection.id,
+                                        providerFormat: attemptConnection.providerFormat,
+                                        ...(turnOutput.finishReason
+                                            ? { finishReason: turnOutput.finishReason }
+                                            : {}),
+                                        vars: workingVars,
+                                    },
+                                    signal,
+                                });
+                                await runOutputPostprocessHook(this.bridge, hostPostPayload);
                                 throwIfAborted(signal);
                                 reconcileInPlaceOutput(prevText, prevContent);
                             }

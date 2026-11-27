@@ -6,6 +6,11 @@ export const PROMPT_TRANSFORM_EVENTS = {
     TURN_START: 'agentic_turn_transform_start',
     TURN_END: 'agentic_turn_transform_end',
     OUTPUT_PROCESS: 'agentic_output_process',
+    PROMPT_PREPROCESS: 'agentic_prompt_preprocess',
+    OUTPUT_POSTPROCESS: 'agentic_output_postprocess',
+    GENERATION_ERROR: 'agentic_generation_error',
+    TURN_INTERRUPTED: 'agentic_turn_interrupted',
+    TURN_ABORTED: 'agentic_turn_aborted',
 } as const;
 
 export type PromptTransformSource =

@@ -1,25 +1,28 @@
 # 提示词变换与输出校验事件钩子指南（`JS-Slash-Runner` & 扩展）
 
-ST-Agentic 通过 SillyTavern 原生 `eventSource` 向 `JS-Slash-Runner`（酒馆助手脚本）与第三方扩展开放三类事件钩子：
-1. **输入侧**：`agentic_prompt_transform`（及回合生命周期 `agentic_turn_transform_start` / `agentic_turn_transform_end`）
-2. **输出侧**：`agentic_output_process`
-3. **异常与中止生命周期**：`agentic_generation_error`、`agentic_turn_interrupted`、`agentic_turn_aborted`
+ST-Agentic 通过 SillyTavern 原生 `eventSource` 向 `JS-Slash-Runner`（酒馆助手脚本）与第三方扩展开放四类事件钩子：
+1. **输入文本变换侧**：`agentic_prompt_transform`（及回合生命周期 `agentic_turn_transform_start` / `agentic_turn_transform_end`）
+2. **发模前消息预处理 & 收包后响应后处理**：`agentic_prompt_preprocess`、`agentic_output_postprocess`
+3. **输出落盘与收尾校验侧**：`agentic_output_process`
+4. **异常与中止生命周期**：`agentic_generation_error`、`agentic_turn_interrupted`、`agentic_turn_aborted`
 
 ---
 
 ## 1. 事件总览
 
-提示词与输出变换事件常量挂载在 `globalThis.Agentic.events`（`PROMPT_TRANSFORM_EVENTS`）上；所有事件均推荐直接使用事件字符串字面量以脱离扩展加载顺序耦合：
+全部事件常量均挂载在 `globalThis.Agentic.events`（`PROMPT_TRANSFORM_EVENTS`）上；所有事件均推荐直接使用事件字符串字面量以脱离扩展加载顺序耦合：
 
 | 事件常量（`Agentic.events.*`） | 事件名字符串 | 触发时机 | 常见用途 |
 | :--- | :--- | :--- | :--- |
 | `TRANSFORM` | `'agentic_prompt_transform'` | ST `{{...}}` 宏展开**之后**、进入协议编译之前 | 解析自定义模板语法、条件分支重写、按楼层/变量动态注入 |
 | `TURN_START` | `'agentic_turn_transform_start'` | 单次生成（`assembleWithHost`）开始时 | 初始化回合级 `sessionBag` 上下文或预加载脚本状态 |
 | `TURN_END` | `'agentic_turn_transform_end'` | 单次生成（`assembleWithHost`）结束时（`finally`） | 清理回合状态或回写统计结果 |
+| `PROMPT_PREPROCESS` | `'agentic_prompt_preprocess'` | 每轮 LLM 请求发出**之前**（预设预处理脚本与 `@@script on=prompt_preprocess` 之后） | 临时修改发模 `messages` 数组、裁剪历史/工具轮次或覆写请求体 `body`（不污染原楼层与冻结历史） |
+| `OUTPUT_POSTPROCESS` | `'agentic_output_postprocess'` | 收到单轮 LLM 原始返回**之时**（预设后处理脚本与 `@@script on=output_postprocess` 之后，工具分派前） | 清洗/改写 `content` / `reasoningContent` / `toolCalls`，或调用 `control.retry` / `requestFix` / `abort` |
 | `OUTPUT_PROCESS` | `'agentic_output_process'` | `/output.md` 写入/编辑或回合结束输出校验时 | 正文格式化/清洗、语法检查、要求模型修正或触发重生成 |
-| —（直接监听字符串） | `'agentic_generation_error'` | 接管模式生成出错且恢复未绕过，或伴生模式检测到酒馆原生 `Generate()` 失败释放生成锁时 | 外部告警提示、错误日志上报、清理扩展临时状态或触发外部补救 |
-| —（直接监听字符串） | `'agentic_turn_interrupted'` | 回合因 `user_stop` / `length` / `error` / `empty_output` 中断并保存可恢复断点时 | 更新外部状态指示、提示用户可「继续」或「回退并重试」 |
-| —（直接监听字符串） | `'agentic_turn_aborted'` | 回合被取消中止（手动停止、Swipe/重生成/删楼/切聊天或脚本调用 `ctx.control.abort()`）时 | 立即回收外部扩展为本次回合创建的临时 UI、定时器或未提交状态 |
+| `GENERATION_ERROR` | `'agentic_generation_error'` | 接管模式生成出错且恢复未绕过，或伴生模式检测到酒馆原生 `Generate()` 失败释放生成锁时 | 外部告警提示、错误日志上报、清理扩展临时状态或触发外部补救 |
+| `TURN_INTERRUPTED` | `'agentic_turn_interrupted'` | 回合因 `user_stop` / `length` / `error` / `empty_output` 中断并保存可恢复断点时 | 更新外部状态指示、提示用户可「继续」或「回退并重试」 |
+| `TURN_ABORTED` | `'agentic_turn_aborted'` | 回合被取消中止（手动停止、Swipe/重生成/删楼/切聊天或脚本调用 `ctx.control.abort()`）时 | 立即回收外部扩展为本次回合创建的临时 UI、定时器或未提交状态 |
 
 ---
 
@@ -133,6 +136,38 @@ ST-Agentic 通过 SillyTavern 原生 `eventSource` 向 `JS-Slash-Runner`（酒�
    - 触发后在 `output_mutation` 会在写入 `/output.md` 或追加对话历史前直接丢弃该次尝试，走各 Runner 原生指数退避 + `roundMaxRetries` 重试循环重新生成。
    - **上限兜底**：严格遵守 `roundMaxRetries`；一旦达到 `meta.retryAttempt >= meta.maxRetries`，**不再继续重试**，直接放行当前输出。
    - 补充：`AgentRunner` 的 `main_output` 模式在 `turn_finish` 阶段（此时 `/output.md` 已在上一轮写完，纯重摇 `finish_turn` 工具调用无法改动文件内容）若触发 `retry()`，会自动转为打回修正请求，引导模型去 `edit_file`/`write_file` 修改 `/output.md`（若额度已满同样直接放行）。
+
+---
+
+## 4b. 发模前预处理 & 收包后响应后处理（`agentic_prompt_preprocess` / `agentic_output_postprocess`）
+
+除了预设内建脚本与世界书 `@@script on=prompt_preprocess` / `on=output_postprocess`，ST-Agentic 也将这两处扩展点直接通过 `eventSource` 导出，便于外部扩展与 `JS-Slash-Runner` 脚本参与每轮 LLM 请求的临时消息预处理和原始响应后处理（无监听器时自动零开销跳过）。
+
+### 执行顺序与安全隔离
+- **预处理链路**：预设 `preprocessScript` → `@@script on=prompt_preprocess` → `eventSource.emit('agentic_prompt_preprocess', payload)`（共享同一份临时 `messages` 控制器与 `body` 覆写对象）。修改**仅作用于当前单次 LLM 请求**，绝不写回酒馆原消息或污染 `TrajectoryStore` 冻结历史，且发出前自动校验并清洗 `tool_call_id` 成对完整性。
+- **后处理链路**：预设 `postprocessScript` → `@@script on=output_postprocess` → `eventSource.emit('agentic_output_postprocess', payload)`（共享同一份 `output` 与单调控制器 `control`，优先级 `abort > retry > fix > accept`）。
+- **异常隔离**：外部监听器抛出非中止异常会被捕获并记录到 `payload.errors`，不会中断整轮生成。
+
+### `agentic_prompt_preprocess` 的 `payload` 字段
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `payload.messages` | `ToolEphemeralMessagesApi` | 安全临时消息控制器：`list()`、`set(next)`、`rollbackToolRounds(n)`、`dropHistoryTurns(n, { from })`、`replaceContent(selector, replacer)`、`appendHint(content, role?)`、`toMessages()` |
+| `payload.body` | `Record<string, unknown>` | 可变请求体参数覆写（如 `temperature`、`max_tokens`、`stream` 或供应商自定义字段） |
+| `payload.layers` | `{ layer0End, layer1End, turnStart, floatingTailStart }` | 实时分层边界索引（随 `dropHistoryTurns` / `rollbackToolRounds` 动态更新） |
+| `payload.event` | `ToolEventPayload` | 规范事件快照（`type: 'prompt_preprocess'`，`event.data.layers` 同上） |
+| `payload.meta` | `PromptPreprocessHookMeta` | `{ runner, runId, phase, agentId, agentName, triggerId, target, messageId, swipeId, round, attempt, maxRetries, model, connectionId, providerFormat, vars }` |
+| `payload.signal` | `AbortSignal?` | 中止信号 |
+| `payload.reportError(err, extId?)` | `(unknown, string?) => void` | 记录非致命错误 |
+
+### `agentic_output_postprocess` 的 `payload` 字段
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `payload.output` | `ToolPostprocessOutput` | 可写对象：`content` / `text`（双向同步）、`reasoningContent`、`toolCalls`（以及只读 `originalText`、`round`、`fixAttempt`、`maxFixAttempts`） |
+| `payload.control` | `ToolPostprocessControl` | 单调流控：`retry(reason?)`、`requestFix(message, { rejectWrite? })`、`accept()`、`abort(reason?)`（自动受 `roundMaxRetries` 与 `maxFixAttempts` 上限保护） |
+| `payload.event` | `ToolEventPayload` | 规范事件快照（`type: 'output_postprocess'`） |
+| `payload.meta` | `OutputPostprocessHookMeta` | `{ runner, runId, phase, agentId, agentName, triggerId, target, messageId, swipeId, round, attempt, maxRetries, fixAttempt, maxFixAttempts, model, connectionId, providerFormat, finishReason, vars }` |
+| `payload.signal` | `AbortSignal?` | 中止信号 |
+| `payload.reportError(err, extId?)` | `(unknown, string?) => void` | 记录非致命错误 |
 
 ---
 
@@ -269,5 +304,27 @@ eventOn('agentic_turn_aborted', (ev) => {
     `[my-ext] 回合已中止 msg=#${ev.messageId ?? '?'} reason=${ev.reason ?? 'aborted'}`,
   );
   // 清理外部脚本为该楼层创建的临时状态或定时器
+});
+```
+
+### 模板 5：外部扩展参与发模前预处理与收包后响应后处理
+```js
+// 发给 LLM 前：临时附加提示或动态微调采样参数（绝不改写原聊天与历史缓存）
+eventOn('agentic_prompt_preprocess', (payload) => {
+  if (payload.meta.phase !== 'main_turn') return;
+  if (payload.meta.round === 1) {
+    payload.messages.appendHint('[External Ext] 保持对话简洁自然。', 'user');
+    payload.body.temperature = 0.85;
+  }
+});
+
+// 收到 LLM 原始返回时：清洗多余包裹标签，或触发单轮重试/修正
+eventOn('agentic_output_postprocess', (payload) => {
+  if (payload.output.content?.includes('<UNWANTED_TAG>')) {
+    payload.output.content = payload.output.content.replace(/<UNWANTED_TAG>[\s\S]*?<\/UNWANTED_TAG>/g, '').trim();
+  }
+  if (payload.output.toolCalls?.length === 0 && !payload.output.content?.trim()) {
+    payload.control.retry('模型返回空内容');
+  }
 });
 ```
