@@ -1115,10 +1115,28 @@ export function shouldFloatTailPromptBlocks(
  */
 export class ContextAssembler {
     private readonly defaultSystemBase: string;
-    private readonly ephemeralChatTransformCache = new WeakMap<object, Map<string, string>>();
+    private ephemeralChatTransformCache = new WeakMap<object, Map<string, string>>();
 
     constructor(options: { defaultSystemBase?: string } = {}) {
         this.defaultSystemBase = options.defaultSystemBase ?? createDefaultPromptBlocks()[0].content;
+    }
+
+    /**
+     * Clear cached ephemeral chat-message transform results (optionally scoped to one `HostBridge`).
+     * Next generation re-evaluates those messages once via `agentic_prompt_transform`.
+     */
+    clearEphemeralChatTransformCache(hostBridge?: object): number {
+        if (hostBridge) {
+            const map = this.ephemeralChatTransformCache.get(hostBridge);
+            if (!map) {
+                return 0;
+            }
+            const cleared = map.size;
+            map.clear();
+            return cleared;
+        }
+        this.ephemeralChatTransformCache = new WeakMap<object, Map<string, string>>();
+        return 0;
     }
 
     private getEphemeralCacheForBridge(hostBridge: object): Map<string, string> {
@@ -3135,7 +3153,15 @@ export class ContextAssembler {
                 effectiveUserInput = res.text;
                 userInputTransformState =
                     res.cacheable && Object.keys(res.cacheKeys).length === 0
-                        ? { cached: true }
+                        ? {
+                              cached: true,
+                              ...(res.changed ? { rawContent: rest.userInput } : {}),
+                              meta: {
+                                  source: 'user_input',
+                                  isChatMessage,
+                                  ...userMeta,
+                              },
+                          }
                         : {
                               cached: false,
                               rawContent: rest.userInput,
@@ -3167,7 +3193,15 @@ export class ContextAssembler {
                 effectiveUserInput = res.content;
                 userInputTransformState =
                     res.cacheable && Object.keys(res.cacheKeys).length === 0
-                        ? { cached: true }
+                        ? {
+                              cached: true,
+                              ...(res.changed ? { rawContent: canonicalClone(rest.userInput) } : {}),
+                              meta: {
+                                  source: 'user_input',
+                                  isChatMessage,
+                                  ...userMeta,
+                              },
+                          }
                         : {
                               cached: false,
                               rawContent: canonicalClone(rest.userInput),

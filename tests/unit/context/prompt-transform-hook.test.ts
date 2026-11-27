@@ -1144,4 +1144,196 @@ describe('Prompt Transform Hook Mechanism', () => {
         dispose();
         expect(listeners[PROMPT_TRANSFORM_EVENTS.TRANSFORM]).toEqual([extListener]);
     });
+
+    it('re-evaluates Layer 0 prefix, Layer 1 persistent messages (user/assistant/read_file/checkpoints), ephemeral history, and SideGen tail after cache clear', async () => {
+        let rev = 1;
+        const seenEvents: Array<{ source: string; text: string }> = [];
+        const bridge = new MemoryHostBridge({
+            identity: { userName: 'Player', charName: 'Aria' },
+            chat: [
+                { id: 0, name: 'Player', isUser: true, mes: 'Ephemeral [[TAG]]', swipeId: 0 },
+                { id: 1, name: 'Aria', isUser: false, mes: '', swipeId: 0 },
+            ],
+        });
+        bridge.onPromptTransform((payload) => {
+            seenEvents.push({ source: payload.source, text: payload.text });
+            payload.text = payload.text.replace('[[TAG]]', `REV_${rev}`);
+        });
+
+        const vfs = new VirtualFileSystem({ bridge });
+        await vfs.writeFile('/workspace/doc.md', 'Doc [[TAG]]', {
+            target: { messageId: 1, swipeId: 0 },
+            staged: false,
+        });
+
+        const assembler = new ContextAssembler();
+        const trajectoryStore = new TrajectoryStore();
+        const persistentAgent = createDefaultMainAgent({
+            sessionMode: 'persistent',
+            promptBlocks: [
+                {
+                    id: 'system_base',
+                    name: 'Base',
+                    role: 'system',
+                    placement: 'prefix',
+                    content: 'Prefix [[TAG]]',
+                    enabled: true,
+                },
+            ],
+        });
+
+        // Turn 1: evaluates prefix + user_input -> caches both
+        const r1 = await assembler.assembleWithHost({
+            agent: persistentAgent,
+            hostBridge: bridge,
+            trajectoryStore,
+            target: { messageId: 1, swipeId: 0 },
+            userInput: 'User1 [[TAG]]',
+        });
+        expect(r1.layer0Messages.some((m) => String(m.content).includes('REV_1'))).toBe(true);
+        expect(r1.layer2Messages[0]?.content).toBe('User1 REV_1');
+
+        const readResult = await vfs.readFile('/workspace/doc.md', {
+            target: { messageId: 1, swipeId: 0 },
+            editable: false,
+            writable: false,
+        });
+        assembler.finalizeTurn({
+            trajectoryStore,
+            agentId: persistentAgent.id,
+            target: { messageId: 1, swipeId: 0 },
+            turnMessages: [
+                ...r1.layer2Messages,
+                { role: 'assistant', content: '', toolCalls: [{ id: 'tc1', name: 'read_file', arguments: '{"path":"/workspace/doc.md"}' }] },
+                { role: 'tool', toolCallId: 'tc1', toolName: 'read_file', content: readResult },
+            ],
+            turnTransformStates: [
+                r1.userInputTransformState,
+                { cached: true },
+                {
+                    cached: true,
+                    rawContent: 'Doc [[TAG]]',
+                    meta: {
+                        source: 'vfs_read',
+                        isChatMessage: false,
+                        toolName: 'read_file',
+                        toolCallId: 'tc1',
+                        path: '/workspace/doc.md',
+                        mount: 'workspace',
+                        editable: false,
+                        writable: false,
+                    },
+                },
+            ],
+            finalAssistantMessage: { role: 'assistant', content: 'Reply1 [[TAG]]' },
+            finalAssistantTransformState: {
+                cached: true,
+                rawContent: 'Reply1 [[TAG]]',
+                meta: {
+                    source: 'chat_message',
+                    isChatMessage: true,
+                    messageId: 1,
+                    swipeId: 0,
+                    isUser: false,
+                },
+            },
+        });
+
+        // Ephemeral + SideGen Turn 1 (populate their caches)
+        const ephemeralAgent = createDefaultMainAgent({ id: 'eph', sessionMode: 'ephemeral', ephemeralWindowSize: 4 });
+        await assembler.assembleWithHost({
+            agent: ephemeralAgent,
+            hostBridge: bridge,
+            recentChatMessages: [{ id: 0, name: 'Player', isUser: true, mes: 'Ephemeral [[TAG]]', swipeId: 0 }],
+            userInput: 'Ping',
+        });
+
+        const sideTransport = new ScriptedLLMTransport([{ content: 'Side1' }, { content: 'Side2' }]);
+        const sideSettings = createDefaultSettings();
+        sideSettings.connections['s-c'] = createDefaultConnection({ id: 's-c', strictToolLoop: false, stream: false });
+        const sideService = new SideGenService({
+            bridge,
+            transport: sideTransport,
+            trajectoryStore: new TrajectoryStore(),
+            getDefaultConnectionId: () => 's-c',
+            getSettings: () => sideSettings,
+            resolveConnection: (id) => sideSettings.connections[id],
+        });
+        await sideService.createSession({ id: 'side:clr', title: 'Clr', systemPrompt: 'sys' });
+        await sideService.send('side:clr', 'SidePrompt', { mainChatDepth: 2 });
+
+        // Without cache clear: persistent Layer 0, cached Layer 1, ephemeral, and SideGen tail stay cached (REV_1)
+        rev = 2;
+        seenEvents.length = 0;
+        const rCached = await assembler.assembleWithHost({
+            agent: persistentAgent,
+            hostBridge: bridge,
+            trajectoryStore,
+            target: { messageId: 3, swipeId: 0 },
+            userInput: 'User2',
+        });
+        expect(seenEvents.some((e) => e.source === 'prompt_block' && e.text.includes('Prefix [[TAG]]'))).toBe(false);
+        expect(seenEvents.some((e) => e.source === 'user_input' && e.text === 'User1 [[TAG]]')).toBe(false);
+        expect(seenEvents.some((e) => e.source === 'vfs_read')).toBe(false);
+        expect(seenEvents.some((e) => e.source === 'chat_message')).toBe(false);
+        expect(rCached.layer1Messages[0]?.content).toBe('User1 REV_1');
+
+        // Clear all prompt caches -> bump transform rev=2 -> every single prompt layer re-evaluates!
+        expect(trajectoryStore.clearAllFrozenPrefixes()).toBe(1);
+        expect(trajectoryStore.clearAllTransformCaches()).toBe(4);
+        expect(assembler.clearEphemeralChatTransformCache(bridge)).toBeGreaterThanOrEqual(1);
+        expect(sideService.clearChatTailTransformCache()).toBeGreaterThanOrEqual(1);
+        expect(vfs.clearReadTransformCache()).toBeGreaterThanOrEqual(1);
+
+        // Even after restoreBranch from checkpoint (e.g. Swipe), cleared cache flags stay cleared
+        expect(trajectoryStore.restoreBranch({ messageId: 1, swipeId: 0 }, persistentAgent.id)).toBe(true);
+
+        seenEvents.length = 0;
+        const rReeval = await assembler.assembleWithHost({
+            agent: persistentAgent,
+            hostBridge: bridge,
+            trajectoryStore,
+            target: { messageId: 3, swipeId: 0 },
+            userInput: 'User2',
+        });
+        expect(seenEvents.some((e) => e.source === 'prompt_block' && e.text.includes('Prefix [[TAG]]'))).toBe(true);
+        expect(seenEvents.some((e) => e.source === 'user_input' && e.text === 'User1 [[TAG]]')).toBe(true);
+        expect(seenEvents.some((e) => e.source === 'vfs_read' && e.text === 'Doc [[TAG]]')).toBe(true);
+        expect(seenEvents.some((e) => e.source === 'chat_message' && e.text === 'Reply1 [[TAG]]')).toBe(true);
+        expect(rReeval.layer0Messages.some((m) => String(m.content).includes('REV_2'))).toBe(true);
+        expect(rReeval.layer1Messages[0]?.content).toBe('User1 REV_2');
+        expect(rReeval.layer1Messages[2]?.content).toBe('Doc REV_2');
+        expect(rReeval.layer1Messages[3]?.content).toBe('Reply1 REV_2');
+
+        // Ephemeral & SideGen chat tail also re-evaluate after cache clear
+        seenEvents.length = 0;
+        const rEphReeval = await assembler.assembleWithHost({
+            agent: ephemeralAgent,
+            hostBridge: bridge,
+            recentChatMessages: [{ id: 0, name: 'Player', isUser: true, mes: 'Ephemeral [[TAG]]', swipeId: 0 }],
+            userInput: 'Ping2',
+        });
+        expect(seenEvents.some((e) => e.source === 'chat_message' && e.text === 'Ephemeral [[TAG]]')).toBe(true);
+        expect(rEphReeval.layer1Messages[0]?.content).toBe('Ephemeral REV_2');
+
+        seenEvents.length = 0;
+        await sideService.send('side:clr', 'SidePrompt2', { mainChatDepth: 2 });
+        expect(seenEvents.some((e) => e.source === 'chat_message' && e.text === 'Ephemeral [[TAG]]')).toBe(true);
+
+        // Next turn after re-evaluation uses newly cached REV_2 without calling hooks again
+        rev = 3;
+        seenEvents.length = 0;
+        const rRecached = await assembler.assembleWithHost({
+            agent: persistentAgent,
+            hostBridge: bridge,
+            trajectoryStore,
+            target: { messageId: 3, swipeId: 0 },
+            userInput: 'User3',
+        });
+        expect(seenEvents.some((e) => e.source === 'prompt_block' && e.text.includes('Prefix [[TAG]]'))).toBe(false);
+        expect(seenEvents.some((e) => e.source === 'user_input' && e.text === 'User1 [[TAG]]')).toBe(false);
+        expect(seenEvents.some((e) => e.source === 'vfs_read')).toBe(false);
+        expect(seenEvents.some((e) => e.source === 'chat_message')).toBe(false);
+        expect(rRecached.layer1Messages[0]?.content).toBe('User1 REV_2');
+    });
 });

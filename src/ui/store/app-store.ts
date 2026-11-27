@@ -308,6 +308,7 @@ export interface ClearPromptCachesResult {
     clearedPrefixes: number;
     clearedVfsCache: number;
     clearedLorebooks: number;
+    clearedMessageCaches?: number;
 }
 
 /**

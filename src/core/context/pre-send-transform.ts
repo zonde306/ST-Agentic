@@ -139,6 +139,32 @@ export async function transformCanonicalContent(
     };
 }
 
+function inferReadFileHeaderMeta(
+    content: string | CanonicalContentPart[],
+): { path?: string; mount?: string } | undefined {
+    const firstText =
+        typeof content === 'string'
+            ? content
+            : content.find((p): p is { type: 'text'; text: string } => p.type === 'text')?.text;
+    if (!firstText) {
+        return undefined;
+    }
+    const match = firstText.match(/^\[File:\s*(\/[^|\r\n\]]+?)\s*(?:\||])/m);
+    if (!match?.[1]) {
+        return undefined;
+    }
+    try {
+        const norm = normalizeVfsPath(match[1].trim());
+        const seg = norm.split('/').filter(Boolean)[0];
+        return {
+            path: norm,
+            ...(seg ? { mount: seg } : {}),
+        };
+    } catch {
+        return undefined;
+    }
+}
+
 function resolveDefaultSourceForLayer1(
     msg: CanonicalMessage,
     meta?: TrajectoryMessageTransformMeta,
@@ -166,8 +192,8 @@ function resolveDefaultSourceForLayer1(
         if (msg.toolName === 'read_variables') {
             return { source: 'variables_read', layer: 'tool_read' };
         }
-        if (msg.toolName === 'read_file' && msg.toolName) {
-            return null;
+        if (msg.toolName === 'read_file') {
+            return { source: 'vfs_read', layer: 'tool_read' };
         }
     }
     return null;
@@ -225,6 +251,12 @@ export async function resolveTrajectoryLayer1Messages(params: {
 
         const rawContent = state?.rawContent !== undefined ? state.rawContent : msg.content;
         const coords = buildTargetMeta(params.target, meta);
+        const inferredVfs =
+            resolved.source === 'vfs_read' && (!meta?.path || !meta?.mount)
+                ? inferReadFileHeaderMeta(rawContent)
+                : undefined;
+        const resolvedPath = meta?.path ?? inferredVfs?.path;
+        const resolvedMount = meta?.mount ?? inferredVfs?.mount;
         const isChatMsg =
             meta?.isChatMessage
             ?? (resolved.source === 'chat_message'
@@ -235,6 +267,28 @@ export async function resolveTrajectoryLayer1Messages(params: {
                 ? msg.role
                 : 'user';
 
+        const nextMeta: TrajectoryMessageTransformMeta = {
+            ...(meta ? { ...meta } : {}),
+            source: resolved.source,
+            isChatMessage: isChatMsg,
+            ...(coords.messageId !== undefined ? { messageId: coords.messageId } : {}),
+            ...(coords.swipeId !== undefined ? { swipeId: coords.swipeId } : {}),
+            ...(meta?.name !== undefined ? { name: meta.name } : msg.name ? { name: msg.name } : {}),
+            ...(meta?.isUser !== undefined
+                ? { isUser: meta.isUser }
+                : msg.role === 'user'
+                    ? { isUser: true }
+                    : msg.role === 'assistant'
+                        ? { isUser: false }
+                        : {}),
+            ...(meta?.toolName ? { toolName: meta.toolName } : msg.toolName ? { toolName: msg.toolName } : {}),
+            ...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : msg.toolCallId ? { toolCallId: msg.toolCallId } : {}),
+            ...(resolvedPath ? { path: resolvedPath } : {}),
+            ...(resolvedMount ? { mount: resolvedMount } : {}),
+            ...(meta?.editable !== undefined ? { editable: meta.editable } : {}),
+            ...(meta?.writable !== undefined ? { writable: meta.writable } : {}),
+        };
+
         const transformed = await transformCanonicalContent(params.bridge, rawContent, () => ({
             source: resolved.source,
             layer: resolved.layer,
@@ -243,22 +297,8 @@ export async function resolveTrajectoryLayer1Messages(params: {
                 sessionId: params.sessionId,
                 ...(params.agentId ? { agentId: params.agentId } : {}),
                 ...(params.phase ? { phase: params.phase } : {}),
-                ...coords,
-                isChatMessage: isChatMsg,
-                ...(meta?.name !== undefined ? { name: meta.name } : msg.name ? { name: msg.name } : {}),
-                ...(meta?.isUser !== undefined
-                    ? { isUser: meta.isUser }
-                    : msg.role === 'user'
-                        ? { isUser: true }
-                        : msg.role === 'assistant'
-                            ? { isUser: false }
-                            : {}),
-                ...(meta?.toolName ? { toolName: meta.toolName } : msg.toolName ? { toolName: msg.toolName } : {}),
-                ...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : msg.toolCallId ? { toolCallId: msg.toolCallId } : {}),
-                ...(meta?.path ? { path: meta.path } : {}),
-                ...(meta?.mount ? { mount: meta.mount } : {}),
-                ...(meta?.editable !== undefined ? { editable: meta.editable } : {}),
-                ...(meta?.writable !== undefined ? { writable: meta.writable } : {}),
+                ...(coords.target ? { target: coords.target } : {}),
+                ...nextMeta,
                 ...(params.vars ? { vars: params.vars } : {}),
             },
             sessionBag: params.sessionBag,
@@ -273,7 +313,11 @@ export async function resolveTrajectoryLayer1Messages(params: {
         if (canPromoteToCache) {
             params.trajectoryStore.updateMessageTransformState(
                 i,
-                { cached: true },
+                {
+                    cached: true,
+                    ...(transformed.changed ? { rawContent: canonicalClone(rawContent) } : {}),
+                    meta: nextMeta,
+                },
                 transformed.content,
                 params.threadId,
             );
@@ -283,7 +327,7 @@ export async function resolveTrajectoryLayer1Messages(params: {
                 {
                     cached: false,
                     rawContent: canonicalClone(rawContent),
-                    ...(meta ? { meta: { ...meta } } : {}),
+                    meta: nextMeta,
                 },
                 undefined,
                 params.threadId,
@@ -400,11 +444,55 @@ export async function transformToolResultBeforeSend(params: {
     }
 
     if (!source) {
+        if (params.toolName === 'read_file') {
+            const headerMeta = filePath
+                ? { path: filePath, mount: filePath.split('/').filter(Boolean)[0] }
+                : inferReadFileHeaderMeta(params.outputText);
+            return {
+                text: params.outputText,
+                transformState: {
+                    cached: true,
+                    meta: {
+                        source: 'vfs_read',
+                        isChatMessage: false,
+                        ...(params.target
+                            ? {
+                                  messageId: params.target.messageId,
+                                  swipeId: params.target.swipeId,
+                              }
+                            : {}),
+                        toolName: params.toolName,
+                        toolCallId: params.toolCallId,
+                        ...(headerMeta?.path ? { path: headerMeta.path } : {}),
+                        ...(headerMeta?.mount ? { mount: headerMeta.mount } : {}),
+                        editable: false,
+                        writable: false,
+                    },
+                },
+            };
+        }
         return {
             text: params.outputText,
             transformState: { cached: true },
         };
     }
+
+    const resultMeta: TrajectoryMessageTransformMeta = {
+        source,
+        isChatMessage: false,
+        ...(params.target
+            ? {
+                  messageId: params.target.messageId,
+                  swipeId: params.target.swipeId,
+              }
+            : {}),
+        toolName: params.toolName,
+        toolCallId: params.toolCallId,
+        ...(filePath ? { path: filePath } : {}),
+        ...(mount ? { mount } : {}),
+        editable,
+        writable,
+    };
 
     const res = await params.bridge.transformPromptText({
         text: params.outputText,
@@ -423,13 +511,7 @@ export async function transformToolResultBeforeSend(params: {
                       swipeId: params.target.swipeId,
                   }
                 : {}),
-            isChatMessage: false,
-            toolName: params.toolName,
-            toolCallId: params.toolCallId,
-            ...(filePath ? { path: filePath } : {}),
-            ...(mount ? { mount } : {}),
-            editable,
-            writable,
+            ...resultMeta,
             ...(params.vars ? { vars: params.vars } : {}),
         },
         ...(params.sessionBag ? { sessionBag: params.sessionBag } : {}),
@@ -439,7 +521,11 @@ export async function transformToolResultBeforeSend(params: {
     if (res.cacheable && Object.keys(res.cacheKeys).length === 0) {
         return {
             text: res.text,
-            transformState: { cached: true },
+            transformState: {
+                cached: true,
+                ...(res.changed ? { rawContent: params.outputText } : {}),
+                meta: resultMeta,
+            },
         };
     }
 
@@ -448,22 +534,7 @@ export async function transformToolResultBeforeSend(params: {
         transformState: {
             cached: false,
             rawContent: params.outputText,
-            meta: {
-                source,
-                isChatMessage: false,
-                ...(params.target
-                    ? {
-                          messageId: params.target.messageId,
-                          swipeId: params.target.swipeId,
-                      }
-                    : {}),
-                toolName: params.toolName,
-                toolCallId: params.toolCallId,
-                ...(filePath ? { path: filePath } : {}),
-                ...(mount ? { mount } : {}),
-                editable,
-                writable,
-            },
+            meta: resultMeta,
         },
     };
 }

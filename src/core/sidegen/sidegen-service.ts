@@ -557,6 +557,13 @@ export class SideGenService implements ToolSideGenApi {
             });
     }
 
+    /** Clear cached read-only main chat tail transform results and return entry count. */
+    clearChatTailTransformCache(): number {
+        const cleared = this.chatTailTransformCache.size;
+        this.chatTailTransformCache.clear();
+        return cleared;
+    }
+
     /**
      * Abort all currently in-flight SideGen requests (used on cancel, swipe, regenerate,
      * or chat switch) and rotate the service-level controller for future requests.
@@ -1984,7 +1991,17 @@ export class SideGenService implements ToolSideGenApi {
             });
             effectivePrompt = res.text;
             if (res.cacheable && Object.keys(res.cacheKeys).length === 0) {
-                userTransformState = { cached: true };
+                userTransformState = {
+                    cached: true,
+                    ...(res.changed && blocks.length === 0 ? { rawContent: prompt } : {}),
+                    meta: {
+                        source: 'user_input',
+                        isChatMessage: false,
+                        messageId: anchor.messageId,
+                        swipeId: anchor.swipeId,
+                        isUser: true,
+                    },
+                };
             } else if (blocks.length === 0) {
                 userTransformState = {
                     cached: false,

@@ -1576,6 +1576,7 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
                 clearedPrefixes: watermarks.length,
                 clearedVfsCache: files.length,
                 clearedLorebooks: Math.max(1, loreWorlds.size),
+                clearedMessageCaches: watermarks.length * 2,
             };
         },
 

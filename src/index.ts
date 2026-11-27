@@ -434,6 +434,8 @@ export interface RuntimeServicesDeps {
     sandbox: IframeJsSandbox;
     toolRegistry: ToolRegistry;
     trajectoryStore: TrajectoryStore;
+    contextAssembler?: ContextAssembler;
+    sideGenService?: SideGenService;
     watermarkCompactor: WatermarkCompactor;
     transport: FetchLLMTransport;
     barrierCoordinator: BarrierCoordinator;
@@ -520,6 +522,8 @@ export function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServic
         sandbox,
         toolRegistry,
         trajectoryStore,
+        contextAssembler,
+        sideGenService,
         watermarkCompactor,
         transport,
         barrierCoordinator,
@@ -1540,13 +1544,19 @@ export function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServic
 
         async clearAllPromptCaches(): Promise<ClearPromptCachesResult> {
             const clearedPrefixes = trajectoryStore.clearAllFrozenPrefixes();
+            const clearedTrajectoryMsgCaches = trajectoryStore.clearAllTransformCaches();
             trajectoryStore.saveToHost(bridge);
+            const clearedEphemeralCaches =
+                contextAssembler?.clearEphemeralChatTransformCache(bridge) ?? 0;
+            const clearedSideGenCaches = sideGenService?.clearChatTailTransformCache() ?? 0;
             const clearedVfsCache = vfs.clearReadTransformCache();
             const clearedLorebooks = bridge.clearLorebookCache?.() ?? 0;
             return {
                 clearedPrefixes,
                 clearedVfsCache,
                 clearedLorebooks,
+                clearedMessageCaches:
+                    clearedTrajectoryMsgCaches + clearedEphemeralCaches + clearedSideGenCaches,
             };
         },
 
@@ -2839,6 +2849,8 @@ jQuery(async () => {
             sandbox,
             toolRegistry,
             trajectoryStore,
+            contextAssembler,
+            sideGenService,
             watermarkCompactor,
             transport,
             barrierCoordinator,

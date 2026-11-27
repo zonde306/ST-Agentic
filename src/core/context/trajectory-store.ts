@@ -542,6 +542,46 @@ export class TrajectoryStore {
     }
 
     /**
+     * Invalidate all cached `agentic_prompt_transform` Layer 1 message entries (and checkpoint
+     * snapshots so Swipe/Regenerate rollbacks also re-evaluate) across every thread without
+     * deleting conversation history or altering stored raw originals.
+     */
+    clearAllTransformCaches(): number {
+        let cleared = 0;
+        const resetState = (
+            prev: TrajectoryMessageTransformState | undefined,
+        ): TrajectoryMessageTransformState | undefined => {
+            if (!prev || !prev.cached) {
+                return prev;
+            }
+            return {
+                cached: false,
+                ...(prev.rawContent !== undefined
+                    ? { rawContent: canonicalClone(prev.rawContent) }
+                    : {}),
+                ...(prev.meta ? { meta: { ...prev.meta } } : {}),
+            };
+        };
+
+        for (const state of this.threads.values()) {
+            for (let i = 0; i < state.transformStates.length; i += 1) {
+                const prev = state.transformStates[i];
+                if (prev?.cached) {
+                    state.transformStates[i] = resetState(prev);
+                    cleared += 1;
+                }
+            }
+            for (const cp of state.checkpoints.values()) {
+                if (!cp.transformStatesSnapshot?.some((s) => s?.cached)) {
+                    continue;
+                }
+                cp.transformStatesSnapshot = cp.transformStatesSnapshot.map((s) => resetState(s));
+            }
+        }
+        return cleared;
+    }
+
+    /**
      * Append finalized messages to Layer 1 without mutating any existing element.
      * Records a turn-end checkpoint boundary at the resulting Layer 1 length.
      */

@@ -2284,7 +2284,17 @@ export class AssistantRunner {
                 inFlightMessages[0].content = transformedUser.content;
                 inFlightTransformStates[0] =
                     transformedUser.cacheable && Object.keys(transformedUser.cacheKeys).length === 0
-                        ? { cached: true }
+                        ? {
+                              cached: true,
+                              ...(transformedUser.changed ? { rawContent: rawUserContent } : {}),
+                              meta: {
+                                  source: 'user_input',
+                                  isChatMessage: false,
+                                  messageId: target.messageId,
+                                  swipeId: target.swipeId,
+                                  isUser: true,
+                              },
+                          }
                         : {
                               cached: false,
                               rawContent: rawUserContent,

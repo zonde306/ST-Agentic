@@ -225,11 +225,18 @@ describe('Entry Wiring: createLiveUiServices & emitOffMainlineGenerationError', 
         const traceLogger = new TraceLogger();
         const barrierCoordinator = new BarrierCoordinator({ traceLogger });
         const trajectoryStore = new TrajectoryStore();
-        trajectoryStore.appendMessages([{ role: 'user', content: 'keep-layer1-history' }], 'main');
+        trajectoryStore.appendMessages(
+            [{ role: 'user', content: 'keep-layer1-history' }],
+            'main',
+            [{ cached: true, rawContent: 'raw-layer1-history', meta: { source: 'chat_message', isChatMessage: true } }],
+        );
+        trajectoryStore.recordCheckpoint({ messageId: 1, swipeId: 0 }, 'main');
         trajectoryStore.setFrozenPrefix(
             { tools: [], messages: [{ role: 'system', content: 'sys' }], layer0EndIndex: 0 },
             'main',
         );
+        const clearEphemeralSpy = vi.fn(() => 2);
+        const clearSideTailSpy = vi.fn(() => 1);
         const saveToHostSpy = vi.spyOn(trajectoryStore, 'saveToHost');
 
         const transport = new ScriptedLLMTransport();
@@ -275,6 +282,12 @@ describe('Entry Wiring: createLiveUiServices & emitOffMainlineGenerationError', 
             sandbox: new IframeJsSandbox(),
             toolRegistry: createBuiltinToolRegistry(),
             trajectoryStore,
+            contextAssembler: {
+                clearEphemeralChatTransformCache: clearEphemeralSpy,
+            } as never,
+            sideGenService: {
+                clearChatTailTransformCache: clearSideTailSpy,
+            } as never,
             watermarkCompactor: new WatermarkCompactor({ vfs, bridge: bridgeWithClear }),
             transport: new FetchLLMTransport(),
             barrierCoordinator,
@@ -291,18 +304,31 @@ describe('Entry Wiring: createLiveUiServices & emitOffMainlineGenerationError', 
             isSuppressingSave: () => false,
         });
 
-        // 1. clearAllPromptCaches clears frozen prefixes + saves + clears VFS & lorebook caches without deleting Layer 1!
+        // 1. clearAllPromptCaches clears frozen prefixes + Layer 1/ephemeral/sidegen caches + VFS & lorebook caches without deleting Layer 1!
         const cacheRes = await services.clearAllPromptCaches!();
         expect(cacheRes).toEqual({
             clearedPrefixes: 1,
             clearedVfsCache: 4,
             clearedLorebooks: 3,
+            clearedMessageCaches: 4,
         });
         expect(saveToHostSpy).toHaveBeenCalledWith(bridgeWithClear);
         expect(clearVfsSpy).toHaveBeenCalledTimes(1);
         expect(clearLorebookCacheSpy).toHaveBeenCalledTimes(1);
+        expect(clearEphemeralSpy).toHaveBeenCalledWith(bridgeWithClear);
+        expect(clearSideTailSpy).toHaveBeenCalledTimes(1);
         expect(trajectoryStore.getFrozenPrefix('main')).toBeNull();
         expect(trajectoryStore.getMessages('main')).toHaveLength(1);
+        expect(trajectoryStore.getTransformStates('main')[0]).toEqual({
+            cached: false,
+            rawContent: 'raw-layer1-history',
+            meta: { source: 'chat_message', isChatMessage: true },
+        });
+        expect(trajectoryStore.getCheckpoint({ messageId: 1, swipeId: 0 }, 'main')?.transformStatesSnapshot?.[0]).toEqual({
+            cached: false,
+            rawContent: 'raw-layer1-history',
+            meta: { source: 'chat_message', isChatMessage: true },
+        });
 
         // 2. stopTrace across main_turn, after_turn (by taskId and fallback lookup), assistant, sidegen
         expect(services.stopTrace!(makeTrace({ phase: 'main_turn' }))).toBe(true);

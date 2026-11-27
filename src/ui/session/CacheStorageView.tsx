@@ -125,9 +125,9 @@ export function CacheStorageView({ store }: ConsoleViewProps) {
             const result = await store.services.clearAllPromptCaches();
             await loadTelemetry();
             store.pushToast(
-                `已清除所有提示词缓存（未删除聊天历史）：前缀缓存 ${result.clearedPrefixes} 条 · VFS 缓存 ${result.clearedVfsCache} 条 · 世界书缓存 ${result.clearedLorebooks} 条`,
+                `已清除所有提示词缓存（未删除聊天历史）：前缀缓存 ${result.clearedPrefixes} 条 · 消息/历史缓存 ${result.clearedMessageCaches ?? 0} 条 · VFS 缓存 ${result.clearedVfsCache} 条 · 世界书缓存 ${result.clearedLorebooks} 条`,
                 'success',
-                4000,
+                4500,
             );
         } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
@@ -219,7 +219,7 @@ export function CacheStorageView({ store }: ConsoleViewProps) {
                                 loading={clearingCaches}
                                 disabled={clearingCaches}
                                 className="ag-cache-clear-prompts-btn"
-                                title="仅清除前缀缓存、VFS 缓存与世界书缓存，不会删除聊天历史"
+                                title="仅清除前缀缓存、消息/历史处理缓存、VFS 缓存与世界书缓存，不会删除聊天历史"
                                 onClick={() => void handleClearPromptCaches()}
                             >
                                 清除所有提示词缓存
