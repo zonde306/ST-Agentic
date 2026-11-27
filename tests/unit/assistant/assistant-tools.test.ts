@@ -926,6 +926,421 @@ describe('Assistant 4-Tier Toolsets (TS2.1)', () => {
             );
         });
 
+        it('reads, previews line diffs, upserts, patches, deletes, and undoes preset prompt_scripts and trigger.events in full mode', async () => {
+            const env = setupToolEnv({ mode: 'full', stAdminEnabled: false });
+            const { undoStore, undoExecutor, ctx, allTools } = env;
+
+            const configRead = allTools.get('agentic_config_read')!;
+            const settingsPatch = allTools.get('agentic_settings_patch')!;
+            const componentUpsert = allTools.get('agentic_preset_component_upsert')!;
+            const componentDelete = allTools.get('agentic_preset_component_delete')!;
+
+            // 1. Initial prompt_scripts read and catalog summary show unconfigured scripts
+            const initialScripts = await executeAssistantTool(
+                configRead,
+                { section: 'prompt_scripts' },
+                ctx,
+            );
+            expect(initialScripts.ok).toBe(true);
+            expect((initialScripts.data as any).presetId).toBe(env.getSettings().currentPresetId);
+            expect((initialScripts.data as any).preprocessScript).toBeNull();
+            expect((initialScripts.data as any).postprocessScript).toBeNull();
+
+            const initialSummary = await executeAssistantTool(
+                configRead,
+                { section: 'summary' },
+                ctx,
+            );
+            expect(initialSummary.ok).toBe(true);
+            const activeSummary0 = (initialSummary.data as any).presets.find((p: any) => p.active);
+            expect(activeSummary0.preprocessScript).toMatchObject({
+                configured: false,
+                enabled: false,
+                hasCode: false,
+                codeLength: 0,
+                triggers: [],
+            });
+            expect(activeSummary0.postprocessScript).toMatchObject({
+                configured: false,
+                enabled: false,
+            });
+
+            // 2. Upsert preprocess prompt_script via id: 'preprocess' (with preview diff & undo)
+            const preCodeV1 = 'ctx.body.temperature = 0.6;\nctx.messages.appendHint("Keep concise.");';
+            const prePreviewV1 = await componentUpsert.preview!(
+                {
+                    kind: 'prompt_script',
+                    item: {
+                        id: 'preprocess',
+                        enabled: true,
+                        code: preCodeV1,
+                        triggers: ['main', 'main', 'invalid_trigger_ignored'],
+                    },
+                },
+                ctx,
+            );
+            expect(prePreviewV1.beforeText).toBe('');
+            expect(prePreviewV1.afterText).toBe(preCodeV1);
+            expect(prePreviewV1.diffLines).toEqual([
+                { type: 'add', text: 'ctx.body.temperature = 0.6;' },
+                { type: 'add', text: 'ctx.messages.appendHint("Keep concise.");' },
+            ]);
+
+            const preUpsertV1 = await executeAssistantTool(
+                componentUpsert,
+                {
+                    kind: 'prompt_script',
+                    item: {
+                        id: 'preprocess',
+                        enabled: true,
+                        code: preCodeV1,
+                        triggers: ['main', 'main', 'invalid_trigger_ignored'],
+                    },
+                },
+                ctx,
+            );
+            expect(preUpsertV1.ok).toBe(true);
+            expect(preUpsertV1.undoId).toBeDefined();
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]?.preprocessScript,
+            ).toEqual({
+                enabled: true,
+                code: preCodeV1,
+                triggers: ['main'],
+            });
+
+            // 3. Partial update to preprocess code produces line-level diff and preserves enabled/triggers
+            const preCodeV2 = 'ctx.body.temperature = 0.4;\nctx.messages.appendHint("Keep concise.");';
+            const prePreviewV2 = await componentUpsert.preview!(
+                {
+                    kind: 'prompt_script',
+                    item: {
+                        stage: 'preprocess',
+                        code: preCodeV2,
+                    },
+                },
+                ctx,
+            );
+            expect(prePreviewV2.beforeText).toBe(preCodeV1);
+            expect(prePreviewV2.afterText).toBe(preCodeV2);
+            expect(prePreviewV2.diffLines).toEqual([
+                { type: 'del', text: 'ctx.body.temperature = 0.6;' },
+                { type: 'add', text: 'ctx.body.temperature = 0.4;' },
+                { type: 'ctx', text: 'ctx.messages.appendHint("Keep concise.");' },
+            ]);
+
+            const preUpsertV2 = await executeAssistantTool(
+                componentUpsert,
+                {
+                    kind: 'prompt_script',
+                    item: {
+                        stage: 'preprocess',
+                        code: preCodeV2,
+                    },
+                },
+                ctx,
+            );
+            expect(preUpsertV2.ok).toBe(true);
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]?.preprocessScript,
+            ).toEqual({
+                enabled: true,
+                code: preCodeV2,
+                triggers: ['main'],
+            });
+
+            // Undo v2 restores v1 code verbatim
+            const undoPreV2 = await undoStore.revert(preUpsertV2.undoId!, undoExecutor);
+            expect(undoPreV2.ok).toBe(true);
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]?.preprocessScript?.code,
+            ).toBe(preCodeV1);
+
+            // 4. Upsert postprocess via stage: 'postprocess' and verify all config_read views
+            const postCode = 'if (ctx.output && ctx.output.text) { ctx.output.text = ctx.output.text.trim(); }';
+            const postUpsert = await executeAssistantTool(
+                componentUpsert,
+                {
+                    kind: 'prompt_script',
+                    item: {
+                        stage: 'postprocess',
+                        enabled: true,
+                        code: postCode,
+                        triggers: ['main_normal', 'trigger_after'],
+                    },
+                },
+                ctx,
+            );
+            expect(postUpsert.ok).toBe(true);
+
+            // Check prompt_scripts section (full + itemId filter + invalid itemId)
+            const readAllScripts = await executeAssistantTool(
+                configRead,
+                { section: 'prompt_scripts' },
+                ctx,
+            );
+            expect(readAllScripts.ok).toBe(true);
+            expect((readAllScripts.data as any).preprocessScript).toEqual({
+                enabled: true,
+                code: preCodeV1,
+                triggers: ['main'],
+            });
+            expect((readAllScripts.data as any).postprocessScript).toEqual({
+                enabled: true,
+                code: postCode,
+                triggers: ['main_normal', 'trigger_after'],
+            });
+
+            const readPostOnly = await executeAssistantTool(
+                configRead,
+                { section: 'prompt_scripts', itemId: 'postprocess' },
+                ctx,
+            );
+            expect(readPostOnly.ok).toBe(true);
+            expect((readPostOnly.data as any).stage).toBe('postprocess');
+            expect((readPostOnly.data as any).script).toEqual({
+                enabled: true,
+                code: postCode,
+                triggers: ['main_normal', 'trigger_after'],
+            });
+
+            const readBadStage = await executeAssistantTool(
+                configRead,
+                { section: 'prompt_scripts', itemId: 'invalid_stage' },
+                ctx,
+            );
+            expect(readBadStage.ok).toBe(false);
+
+            // Check summary, presets, preset, and prompts sections expose preprocess/postprocess scripts
+            const readPresets = await executeAssistantTool(configRead, { section: 'presets' }, ctx);
+            const activePresetSummary = (readPresets.data as any).presets.find((p: any) => p.active);
+            expect(activePresetSummary.preprocessScript).toEqual({
+                configured: true,
+                enabled: true,
+                hasCode: true,
+                codeLength: preCodeV1.length,
+                triggers: ['main'],
+            });
+            expect(activePresetSummary.postprocessScript).toEqual({
+                configured: true,
+                enabled: true,
+                hasCode: true,
+                codeLength: postCode.length,
+                triggers: ['main_normal', 'trigger_after'],
+            });
+
+            const readFullPreset = await executeAssistantTool(configRead, { section: 'preset' }, ctx);
+            expect((readFullPreset.data as any).preprocessScript.code).toBe(preCodeV1);
+            expect((readFullPreset.data as any).postprocessScript.code).toBe(postCode);
+
+            const readPrompts = await executeAssistantTool(configRead, { section: 'prompts' }, ctx);
+            expect((readPrompts.data as any).preprocessScript.code).toBe(preCodeV1);
+            expect((readPrompts.data as any).postprocessScript.code).toBe(postCode);
+
+            // Invalid/conflicting prompt_script stage fails cleanly
+            const badPromptScript = await executeAssistantTool(
+                componentUpsert,
+                {
+                    kind: 'prompt_script',
+                    item: { id: 'preprocess', stage: 'postprocess', code: 'x' },
+                },
+                ctx,
+            );
+            expect(badPromptScript.ok).toBe(false);
+
+            // 5. Delete prompt_script generates deletion diff and supports undo
+            const delPreview = await componentDelete.preview!(
+                { kind: 'prompt_script', id: 'preprocess' },
+                ctx,
+            );
+            expect(delPreview.beforeText).toBe(preCodeV1);
+            expect(delPreview.afterText).toBe('');
+            expect(delPreview.diffLines).toEqual([
+                { type: 'del', text: 'ctx.body.temperature = 0.6;' },
+                { type: 'del', text: 'ctx.messages.appendHint("Keep concise.");' },
+            ]);
+
+            const delPre = await executeAssistantTool(
+                componentDelete,
+                { kind: 'prompt_script', id: 'preprocess' },
+                ctx,
+            );
+            expect(delPre.ok).toBe(true);
+            expect(delPre.undoId).toBeDefined();
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]?.preprocessScript,
+            ).toBeUndefined();
+
+            // Deleting already-absent script returns error
+            const delAgain = await executeAssistantTool(
+                componentDelete,
+                { kind: 'prompt_script', id: 'preprocess' },
+                ctx,
+            );
+            expect(delAgain.ok).toBe(false);
+
+            // Undo restores deleted preprocessScript cleanly
+            const undoDelPre = await undoStore.revert(delPre.undoId!, undoExecutor);
+            expect(undoDelPre.ok).toBe(true);
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]?.preprocessScript,
+            ).toEqual({
+                enabled: true,
+                code: preCodeV1,
+                triggers: ['main'],
+            });
+
+            // Clearing triggers via [] removes triggers filter while keeping code & enabled
+            const clearTriggers = await executeAssistantTool(
+                componentUpsert,
+                {
+                    kind: 'prompt_script',
+                    item: { id: 'preprocess', triggers: [] },
+                },
+                ctx,
+            );
+            expect(clearTriggers.ok).toBe(true);
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]?.preprocessScript,
+            ).toEqual({
+                enabled: true,
+                code: preCodeV1,
+            });
+            await undoStore.revert(clearTriggers.undoId!, undoExecutor);
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]?.preprocessScript?.triggers,
+            ).toEqual(['main']);
+
+            // 6. agentic_settings_patch presetPatch toggles, rewrites, clears (null), and undoes
+            const togglePreview = await settingsPatch.preview!(
+                {
+                    presetPatch: {
+                        preprocessScript: { enabled: false },
+                        postprocessScript: null,
+                    },
+                },
+                ctx,
+            );
+            expect(togglePreview.diffLines.some((l) => l.type === 'del' || l.type === 'add')).toBe(
+                true,
+            );
+
+            const togglePatch = await executeAssistantTool(
+                settingsPatch,
+                {
+                    presetPatch: {
+                        preprocessScript: { enabled: false },
+                        postprocessScript: null,
+                    },
+                },
+                ctx,
+            );
+            expect(togglePatch.ok).toBe(true);
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]?.preprocessScript,
+            ).toEqual({
+                enabled: false,
+                code: preCodeV1,
+                triggers: ['main'],
+            });
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]?.postprocessScript,
+            ).toBeUndefined();
+
+            const undoTogglePatch = await undoStore.revert(togglePatch.undoId!, undoExecutor);
+            expect(undoTogglePatch.ok).toBe(true);
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]?.preprocessScript?.enabled,
+            ).toBe(true);
+            expect(
+                env.getSettings().presets[env.getSettings().currentPresetId]?.postprocessScript?.code,
+            ).toBe(postCode);
+
+            // 7. Trigger upsert preserves and normalizes TriggerRule.events (including partial update & catalog exposure)
+            const eventTriggerUpsert = await executeAssistantTool(
+                componentUpsert,
+                {
+                    kind: 'trigger',
+                    item: {
+                        id: 'err_recovery_script',
+                        label: '400 Recovery',
+                        kind: 'script',
+                        phase: 'after_turn',
+                        events: ['generation_error', 'turn_interrupted', 'generation_error', 'not_a_real_event'],
+                        scriptCode: 'ctx.messages?.rollbackToolRounds(1); ctx.control?.retry("retry");',
+                        enabled: true,
+                    },
+                },
+                ctx,
+            );
+            expect(eventTriggerUpsert.ok).toBe(true);
+            const savedTrigger = env
+                .getSettings()
+                .presets[env.getSettings().currentPresetId]?.triggers.find(
+                    (t) => t.id === 'err_recovery_script',
+                );
+            expect(savedTrigger?.events).toEqual(['generation_error', 'turn_interrupted']);
+
+            // Partial trigger update preserves existing events
+            const triggerLabelPatch = await executeAssistantTool(
+                componentUpsert,
+                {
+                    kind: 'trigger',
+                    item: {
+                        id: 'err_recovery_script',
+                        label: '400 Recovery Renamed',
+                    },
+                },
+                ctx,
+            );
+            expect(triggerLabelPatch.ok).toBe(true);
+            const patchedTrigger = env
+                .getSettings()
+                .presets[env.getSettings().currentPresetId]?.triggers.find(
+                    (t) => t.id === 'err_recovery_script',
+                );
+            expect(patchedTrigger?.label).toBe('400 Recovery Renamed');
+            expect(patchedTrigger?.events).toEqual(['generation_error', 'turn_interrupted']);
+
+            // Catalog summary exposes trigger.events
+            const summaryWithEvents = await executeAssistantTool(
+                configRead,
+                { section: 'summary' },
+                ctx,
+            );
+            const activeWithEvents = (summaryWithEvents.data as any).presets.find((p: any) => p.active);
+            const listedTrigger = activeWithEvents.triggerIds.find(
+                (t: any) => t.id === 'err_recovery_script',
+            );
+            expect(listedTrigger.events).toEqual(['generation_error', 'turn_interrupted']);
+
+            // Clearing trigger.events via [] removes events and supports undo
+            const clearTriggerEvents = await executeAssistantTool(
+                componentUpsert,
+                {
+                    kind: 'trigger',
+                    item: { id: 'err_recovery_script', events: [] },
+                },
+                ctx,
+            );
+            expect(clearTriggerEvents.ok).toBe(true);
+            expect(
+                env
+                    .getSettings()
+                    .presets[env.getSettings().currentPresetId]?.triggers.find(
+                        (t) => t.id === 'err_recovery_script',
+                    )?.events,
+            ).toBeUndefined();
+            await undoStore.revert(clearTriggerEvents.undoId!, undoExecutor);
+            expect(
+                env
+                    .getSettings()
+                    .presets[env.getSettings().currentPresetId]?.triggers.find(
+                        (t) => t.id === 'err_recovery_script',
+                    )?.events,
+            ).toEqual(['generation_error', 'turn_interrupted']);
+        });
+
         it('reloads displayed messages, manages JS-Slash-Runner scripts, and triggers st_sync_runtime with undo', async () => {
             const { bridge, undoStore, undoExecutor, ctx, allTools } = setupToolEnv({
                 mode: 'full',

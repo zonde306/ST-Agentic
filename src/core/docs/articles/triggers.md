@@ -53,8 +53,8 @@ ST-Agentic 的自动化逻辑可以放在**预设触发器规则（`TriggerRule`
 
 | 装饰器 | 常用参数 | 说明 |
 | :--- | :--- | :--- |
-| `@@trigger` | `[tag] phase=before\|after\|main\|maintenance order=1 barrier=turn\|self\|none profile=<agentId> group=<name> target=/state/variables.json\|/output.md tools="a,b" interval=3 regex="..." keys="a,b"` | 声明式触发器；可配合 `@@zod_schema` / `@@json_schema` 约束变量写回；`profile` 可绑定已有智能体，省略则自动生成最小权限专用智能体；`tools` 可显式追加跨世界书 `@@tool` 或预设自定义工具（同世界书内启用的 `@@tool` 会自动继承） |
-| `@@script` | `phase=... order=... barrier=... group=... target=... interval=... regex="..." keys="..."` | 零 Token 确定性 JS 脚本（正文写 JS，支持 ```` ```js ```` 代码块）；可与 `@@trigger` 同用 |
+| `@@trigger` | `[tag] phase=before\|after\|main\|maintenance on=<event[,event2]> order=1 barrier=turn\|self\|none profile=<agentId> group=<name> target=/state/variables.json\|/output.md tools="a,b" interval=3 regex="..." keys="a,b"` | 声明式触发器；支持传统管线阶段或通过 `on=<event>` 订阅事件；可配合 `@@zod_schema` / `@@json_schema` 约束变量写回；`profile` 可绑定已有智能体，省略则自动生成最小权限专用智能体；`tools` 可显式追加跨世界书 `@@tool` 或预设自定义工具（同世界书内启用的 `@@tool` 会自动继承） |
+| `@@script` | `phase=... on=<event[,event2]> order=... barrier=... group=... target=... interval=... regex="..." keys="..."` | 零 Token 确定性 JS 脚本（正文写 JS，支持 ```` ```js ```` 代码块）；支持 `on=<event>` 响应错误恢复/生命周期/宿主事件并可调用 `ctx.agent.run(...)` 启动 Agent；可与 `@@trigger` 同用 |
 | `@@tool` | `<toolName> allowNetwork=true\|false` | 把世界书条目编译为自定义 JS 工具（正文使用 `export default defineTool(...)`） |
 | `@@group` | `<groupName>` | 指定同 `phase`/`order`/`profile` 的 Agent 触发器合并分组名 |
 | `@@system` | — | 将该世界书条目标记为系统规则层（`system_rule`） |
@@ -86,7 +86,36 @@ ST-Agentic 的自动化逻辑可以放在**预设触发器规则（`TriggerRule`
 
 ---
 
-## 5. 可直接复制的实用模板
+## 5. 事件驱动触发器（`on=<event>` 与 `TriggerRule.events`）
+
+除按四阶段管线（`phase`）自动执行外，`@@script`、`@@trigger` 及预设 `TriggerRule` 均支持订阅具体运行时事件与宿主聊天事件：
+- **世界书语法**：`@@script on=<event>` 或 `@@trigger on=<event>`，多个事件用逗号分隔（例如 `@@script on=generation_error,turn_interrupted` 或 `@@trigger on="message_edited,message_swiped"`）。
+- **预设配置**：在 `TriggerRule` 上设置 `events: TriggerEventType[]`（如 `events: ['generation_error']`）。配置了非空 `events` 的规则按事件派发触发，不再当作普通每轮 `phase` 管线任务重复运行。
+
+### 支持的全部 14 种 `TriggerEventType`
+
+| 事件名（`TriggerEventType`） | 归类 | 触发时机与典型用途 |
+| :--- | :--- | :--- |
+| **`generation_error`** | 错误与恢复 | 单轮 LLM 请求耗尽自动重试或遇到 4xx/内容过滤/工具异常即将失败前；脚本可通过 `ctx.messages` 临时回退/改写消息并调用 `ctx.control.retry()` / `ctx.control.abort()` |
+| **`turn_interrupted`** | 回合生命周期 | 回合因 `user_stop`、`length`、`error` 或 `empty_output` 中断并保存断点时 |
+| **`turn_aborted`** | 回合生命周期 | 回合被中止取消时（含 Swipe/重新生成/手动停止导致的中止） |
+| **`turn_started`** | 回合生命周期 | 主回合或管线回合启动时 |
+| **`turn_completed`** | 回合生命周期 | 回合成功完成并提交结果时 |
+| **`output_updated`** | 输出变更 | `/output.md` 正文发生写入/编辑/刷新时 |
+| **`prompt_preprocess`** | 发模预/后处理 | 每轮消息发送给 LLM 前（与预设 `preprocessScript` 共享临时 `ctx.messages` / `ctx.body` 流程，绝不修改聊天原文与冻结历史） |
+| **`output_postprocess`** | 发模预/后处理 | 收到单轮 LLM 响应后（与预设 `postprocessScript` 共享 `ctx.output` / `ctx.control` 流程） |
+| **`chat_changed`** | 宿主聊天事件 | SillyTavern 切换聊天记录时 |
+| **`message_sent`** | 宿主聊天事件 | 用户发送新消息时 |
+| **`message_received`** | 宿主聊天事件 | 收到角色新回复消息时 |
+| **`message_edited`** | 宿主聊天事件 | 聊天楼层文本被编辑时 |
+| **`message_deleted`** | 宿主聊天事件 | 聊天楼层被删除时 |
+| **`message_swiped`** | 宿主聊天事件 | 用户切换回复 Swipe 分支时 |
+
+> 脚本内完整 `ctx.event` / `ctx.messages` / `ctx.control` / `ctx.agent` 写法与绕错实战范例详见 `/docs/scripts.md`。
+
+---
+
+## 6. 可直接复制的实用模板
 
 ### 示例 A：后置自动更新分支变量（带 Zod Schema 校验）
 ```markdown
@@ -107,6 +136,24 @@ ST-Agentic 的自动化逻辑可以放在**预设触发器规则（`TriggerRule`
 阅读最近 5 轮对话并更新 /memory/arc-summary.md。
 ```
 
+### 示例 D：事件触发脚本（`@@script on=generation_error` 临时回退重试）
+```markdown
+@@script on=generation_error order=1
+```js
+if (ctx.event?.statusCode === 400 && ctx.messages) {
+  ctx.messages.rollbackToolRounds(1);
+  ctx.messages.appendHint('上一次工具调用导致上游 400 拒绝，请改用更稳妥的步骤继续。', 'user');
+  ctx.control?.retry('rolled back failing tool round');
+}
+```
+```
+
+### 示例 E：事件触发 Agent（`@@trigger on=message_swiped`）
+```markdown
+@@trigger on=message_swiped order=1 barrier=self profile=main
+检测当前分支最新回复与 /state/variables.json 是否存在明显不一致，如有偏差则记录到 /workspace/shared/swipe-check.md。
+```
+
 ### 预设 `TriggerRule` 数据结构（用于 `agentic_preset_component_upsert`）
 ```json
 {
@@ -118,6 +165,7 @@ ST-Agentic 的自动化逻辑可以放在**预设触发器规则（`TriggerRule`
   "barrier": "turn",
   "agentProfileId": "main",
   "kind": "agent",
+  "events": ["turn_completed"],
   "condition": { "type": "always" },
   "instructionTemplate": "检查最新剧情并更新 /state/variables.json。",
   "targetPath": "/state/variables.json",

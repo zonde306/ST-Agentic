@@ -1,14 +1,15 @@
 # 提示词变换与输出校验事件钩子指南（`JS-Slash-Runner` & 扩展）
 
-ST-Agentic 通过 SillyTavern 原生 `eventSource` 向 `JS-Slash-Runner`（酒馆助手脚本）与第三方扩展开放两套**对底层 API 协议透明**的纯文本钩子：
+ST-Agentic 通过 SillyTavern 原生 `eventSource` 向 `JS-Slash-Runner`（酒馆助手脚本）与第三方扩展开放三类事件钩子：
 1. **输入侧**：`agentic_prompt_transform`（及回合生命周期 `agentic_turn_transform_start` / `agentic_turn_transform_end`）
 2. **输出侧**：`agentic_output_process`
+3. **异常与中止生命周期**：`agentic_generation_error`、`agentic_turn_interrupted`、`agentic_turn_aborted`
 
 ---
 
 ## 1. 事件总览
 
-所有事件常量统一挂载在 `globalThis.Agentic.events`（`PROMPT_TRANSFORM_EVENTS`）上，同时也推荐直接使用事件字符串字面量以脱离扩展加载顺序耦合：
+提示词与输出变换事件常量挂载在 `globalThis.Agentic.events`（`PROMPT_TRANSFORM_EVENTS`）上；所有事件均推荐直接使用事件字符串字面量以脱离扩展加载顺序耦合：
 
 | 事件常量（`Agentic.events.*`） | 事件名字符串 | 触发时机 | 常见用途 |
 | :--- | :--- | :--- | :--- |
@@ -16,6 +17,9 @@ ST-Agentic 通过 SillyTavern 原生 `eventSource` 向 `JS-Slash-Runner`（酒�
 | `TURN_START` | `'agentic_turn_transform_start'` | 单次生成（`assembleWithHost`）开始时 | 初始化回合级 `sessionBag` 上下文或预加载脚本状态 |
 | `TURN_END` | `'agentic_turn_transform_end'` | 单次生成（`assembleWithHost`）结束时（`finally`） | 清理回合状态或回写统计结果 |
 | `OUTPUT_PROCESS` | `'agentic_output_process'` | `/output.md` 写入/编辑或回合结束输出校验时 | 正文格式化/清洗、语法检查、要求模型修正或触发重生成 |
+| —（直接监听字符串） | `'agentic_generation_error'` | 接管模式生成出错且恢复未绕过，或伴生模式检测到酒馆原生 `Generate()` 失败释放生成锁时 | 外部告警提示、错误日志上报、清理扩展临时状态或触发外部补救 |
+| —（直接监听字符串） | `'agentic_turn_interrupted'` | 回合因 `user_stop` / `length` / `error` / `empty_output` 中断并保存可恢复断点时 | 更新外部状态指示、提示用户可「继续」或「回退并重试」 |
+| —（直接监听字符串） | `'agentic_turn_aborted'` | 回合被取消中止（手动停止、Swipe/重生成/删楼/切聊天或脚本调用 `ctx.control.abort()`）时 | 立即回收外部扩展为本次回合创建的临时 UI、定时器或未提交状态 |
 
 ---
 
@@ -132,7 +136,45 @@ ST-Agentic 通过 SillyTavern 原生 `eventSource` 向 `JS-Slash-Runner`（酒�
 
 ---
 
-## 5. `JS-Slash-Runner` 实战模板（可直接复制）
+## 5. 异常与中止生命周期事件（`agentic_generation_error` / `agentic_turn_interrupted` / `agentic_turn_aborted`）
+
+除了输入/输出文本变换外，ST-Agentic 会在生成报错、回合中断保存断点或回合中止取消时，向 SillyTavern 原生 `eventSource` 广播通知事件（只读通知，外部扩展或 `JS-Slash-Runner` 通过 `eventOn(...)` 直接监听；若需在沙箱内执行消息回退重试控制，请使用 `/docs/scripts.md` 中的 `@@script on=generation_error`）。
+
+### 触发时机对照
+
+| 事件名 | 触发时机 | 典型触发来源 |
+| :--- | :--- | :--- |
+| **`'agentic_generation_error'`** | 1. **接管模式**：单轮请求耗尽自动重试且错误恢复脚本未成功绕过，或发生不可恢复异常导致失败时；<br>2. **伴生模式**：检测到 ST 原生 `Generate()` 出错导致生成锁释放且未收到 `MESSAGE_RECEIVED` / `GENERATION_ENDED` 时（同步已清理残留暂存与注入提示词） | API HTTP 4xx/5xx、网络断流、内容审查、工具异常、原生 `Generate()` 失败 |
+| **`'agentic_turn_interrupted'`** | 回合非正常结束但已保存 `InterruptedTurnCheckpoint` 断点，可在控制台日志中点击「继续」或「回退并重试」时 | `reason` 为 `'user_stop'` \| `'length'` \| `'error'` \| `'empty_output'` |
+| **`'agentic_turn_aborted'`** | 回合被彻底中止取消时 | 用户手动停止、Swipe 切分支、Regenerate、删除楼层、切换聊天，或恢复脚本调用 `ctx.control.abort(...)` |
+
+### `payload` 字段说明（统一遵循 `ToolEventPayload`）
+
+三个事件对外派发的 `payload` 统一采用 `ToolEventPayload` 结构（未涉及的上下文可选字段为 `undefined`）：
+
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `type` | `TriggerEventType \| string` | 对应内部事件名：`'generation_error'` \| `'turn_interrupted'` \| `'turn_aborted'` |
+| `timestamp` | `number` | 事件触发时的 Unix 毫秒时间戳 |
+| `target` | `{ messageId: number; swipeId: number }?` | 本次生成锚定的 ST 聊天目标楼层与 Swipe |
+| `messageId` | `number?` | 目标楼层索引（便捷顶层字段，等同 `target.messageId`） |
+| `swipeId` | `number?` | 目标 Swipe 索引（便捷顶层字段，等同 `target.swipeId`） |
+| `phase` | `'before_turn' \| 'main_turn' \| 'after_turn' \| 'maintenance'?` | 所属四阶段管线阶段 |
+| `runId` | `string?` | 对应 `AgentRunTrace.runId`，可用于关联控制台日志 |
+| `agentId` | `string?` | 执行中的智能体 Profile ID |
+| `triggerId` | `string?` | 若由触发器发起，为对应的 `TriggerRule.id` |
+| `round` | `number?` | 发生事件时所在的工具循环轮次 |
+| `attempt` / `maxAttempts` | `number?` | 当前重试/恢复尝试次数及上限 |
+| `error` | `string?` | 错误描述文本（`agentic_generation_error` / `error` 中断时提供） |
+| `errorCode` | `string?` | 结构化错误码（如有，如上游错误码或内部异常码） |
+| `statusCode` | `number?` | 上游 HTTP 状态码（如 `400`、`429`、`500`，如有） |
+| `reason` | `'user_stop' \| 'length' \| 'error' \| 'empty_output' \| string?` | 中断或中止原因（`agentic_turn_interrupted` / `agentic_turn_aborted` 重点字段） |
+| `output` | `string?` | 中断或失败前已产生的部分输出预览（如有） |
+| `data` | `Record<string, unknown>?` | 附加结构化上下文（如 `layers`、模式标识、是否可回退等扩展信息） |
+
+---
+
+## 6. `JS-Slash-Runner` 实战模板（可直接复制）
 
 ### 模板 1：按楼层变量展开自定义语法（兼容 `edit_file` 与缓存控制）
 ```js
@@ -203,5 +245,29 @@ eventOn('agentic_turn_transform_start', (ev) => {
 eventOn('agentic_turn_transform_end', (ev) => {
   // 可在回合装配完成时查看本轮命中次数或清理临时状态
   // console.debug('[my-ext] msgId:', ev.messageId, 'hits:', ev.sessionBag.myExtHits);
+});
+```
+
+### 模板 4：监听 `agentic_generation_error` / `agentic_turn_interrupted` / `agentic_turn_aborted` 做外部状态同步与告警
+```js
+eventOn('agentic_generation_error', (ev) => {
+  console.warn(
+    `[my-ext] 生成失败 phase=${ev.phase ?? 'unknown'} msg=#${ev.messageId ?? '?'} HTTP=${ev.statusCode ?? '-'}:`,
+    ev.error,
+  );
+  // 可在此关闭自定义面板的 loading 指示器或写入外部故障记录
+});
+
+eventOn('agentic_turn_interrupted', (ev) => {
+  console.info(
+    `[my-ext] 回合已中断并保留断点 runId=${ev.runId ?? '-'} reason=${ev.reason ?? 'unknown'}`,
+  );
+});
+
+eventOn('agentic_turn_aborted', (ev) => {
+  console.info(
+    `[my-ext] 回合已中止 msg=#${ev.messageId ?? '?'} reason=${ev.reason ?? 'aborted'}`,
+  );
+  // 清理外部脚本为该楼层创建的临时状态或定时器
 });
 ```
