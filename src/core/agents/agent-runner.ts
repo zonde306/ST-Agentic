@@ -1620,6 +1620,115 @@ function clampLayerIndex(value: number, min: number, max: number): number {
     return Math.min(max, Math.max(min, Math.trunc(value)));
 }
 
+function clampLayerIndices(
+    layers: EphemeralMessageLayerIndices,
+    length: number,
+): EphemeralMessageLayerIndices {
+    const layer0End = clampLayerIndex(layers.layer0End, 0, length);
+    const layer1End = clampLayerIndex(layers.layer1End, layer0End, length);
+    const turnStart = clampLayerIndex(layers.turnStart, layer1End, length);
+    const floatingTailStart = clampLayerIndex(layers.floatingTailStart, turnStart, length);
+    return { layer0End, layer1End, turnStart, floatingTailStart };
+}
+
+function createLayerTrackingEphemeralController(
+    messages: readonly CanonicalMessage[],
+    initialLayers: EphemeralMessageLayerIndices,
+): {
+    controller: EphemeralMessagesController;
+    getLayers(): EphemeralMessageLayerIndices;
+    getRolledBackRounds(): number;
+    getDroppedHistoryTurns(): number;
+    wasMutated(): boolean;
+} {
+    const clampedInit = clampLayerIndices(initialLayers, messages.length);
+    const base = createEphemeralMessagesController(messages, clampedInit);
+    let layers = { ...clampedInit };
+    let rolledBackRounds = 0;
+    let droppedHistoryTurns = 0;
+    let mutated = false;
+
+    const controller: EphemeralMessagesController = {
+        list: () => base.list(),
+        set: (next) => {
+            mutated = true;
+            base.set(next);
+            layers = clampLayerIndices(layers, base.list().length);
+        },
+        rollbackToolRounds: (count) => {
+            const beforeLen = base.list().length;
+            const rolled = base.rollbackToolRounds(count);
+            if (rolled > 0) {
+                const afterLen = base.list().length;
+                const removedCount = Math.max(0, beforeLen - afterLen);
+                rolledBackRounds += rolled;
+                mutated = true;
+                layers = clampLayerIndices(
+                    {
+                        ...layers,
+                        floatingTailStart: Math.max(
+                            layers.turnStart,
+                            layers.floatingTailStart - removedCount,
+                        ),
+                    },
+                    afterLen,
+                );
+            }
+            return rolled;
+        },
+        dropHistoryTurns: (count, opts) => {
+            const beforeLen = base.list().length;
+            const dropped = base.dropHistoryTurns(count, opts);
+            if (dropped > 0) {
+                const afterLen = base.list().length;
+                const removedCount = Math.max(0, beforeLen - afterLen);
+                droppedHistoryTurns += dropped;
+                mutated = true;
+                const nextLayer1End = Math.max(layers.layer0End, layers.layer1End - removedCount);
+                const nextTurnStart = Math.max(nextLayer1End, layers.turnStart - removedCount);
+                const nextFloatingStart = Math.max(
+                    nextTurnStart,
+                    layers.floatingTailStart - removedCount,
+                );
+                layers = clampLayerIndices(
+                    {
+                        layer0End: layers.layer0End,
+                        layer1End: nextLayer1End,
+                        turnStart: nextTurnStart,
+                        floatingTailStart: nextFloatingStart,
+                    },
+                    afterLen,
+                );
+            }
+            return dropped;
+        },
+        replaceContent: (selector, replacer) => {
+            const replaced = base.replaceContent(selector, replacer);
+            if (replaced > 0) {
+                mutated = true;
+            }
+            return replaced;
+        },
+        appendHint: (content, role) => {
+            mutated = true;
+            base.appendHint(content, role);
+        },
+        toMessages: () => {
+            const sanitized = base.toMessages();
+            layers = clampLayerIndices(layers, sanitized.length);
+            return sanitized;
+        },
+    };
+
+    return {
+        controller,
+        getLayers: () => ({ ...layers }),
+        getRolledBackRounds: () => rolledBackRounds,
+        getDroppedHistoryTurns: () => droppedHistoryTurns,
+        wasMutated: () => mutated,
+    };
+}
+
 /**
  * Multi-round Agent runtime executing `LLMTransport` <-> `ToolRegistry` loops
  * over `ContextAssembler` + `TrajectoryStore`, emitting live events and recording
@@ -3156,6 +3265,7 @@ export class AgentRunner {
                 let pendingRecoveryOverride:
                     | {
                           messages?: CanonicalMessage[];
+                          layers?: EphemeralMessageLayerIndices;
                           connection?: ApiConnection;
                       }
                     | undefined;
@@ -3204,14 +3314,18 @@ export class AgentRunner {
                     const rawLayer0End = currentAssembled.layer0Messages.length;
                     const rawLayer1End = rawLayer0End + currentAssembled.layer1Messages.length;
                     const rawFloatingStart = rawLayer1End + currentAssembled.layer2Messages.length;
-                    const computeLayersForLength = (len: number): EphemeralMessageLayerIndices => {
-                        const layer0End = clampLayerIndex(rawLayer0End, 0, len);
-                        const layer1End = clampLayerIndex(rawLayer1End, layer0End, len);
-                        const turnStart = layer1End;
-                        const floatingTailStart = clampLayerIndex(rawFloatingStart, turnStart, len);
-                        return { layer0End, layer1End, turnStart, floatingTailStart };
-                    };
-                    let attemptLayers = computeLayersForLength(attemptMessages.length);
+                    const baseLayers: EphemeralMessageLayerIndices = recoveryOverride?.layers
+                        ? clampLayerIndices(recoveryOverride.layers, attemptMessages.length)
+                        : clampLayerIndices(
+                            {
+                                layer0End: rawLayer0End,
+                                layer1End: rawLayer1End,
+                                turnStart: rawLayer1End,
+                                floatingTailStart: rawFloatingStart,
+                            },
+                            attemptMessages.length,
+                        );
+                    let attemptLayers: EphemeralMessageLayerIndices = { ...baseLayers };
 
                     let llmRequest: LLMRequest = {
                         ...currentAssembled.request,
@@ -3233,10 +3347,11 @@ export class AgentRunner {
                     const shouldRunCallbackPreprocess = typeof effectiveOnPreprocess === 'function';
 
                     if (shouldRunPresetPreprocess || shouldRunCallbackPreprocess) {
-                        const preprocessController = createEphemeralMessagesController(
+                        const preprocessTracker = createLayerTrackingEphemeralController(
                             attemptMessages,
                             attemptLayers,
                         );
+                        const preprocessController = preprocessTracker.controller;
                         const { workingBody, baselineBody, baseIncludeKeys } =
                             buildPreprocessWorkingBody(attemptConnection, attemptStream);
                         const preprocessEvent: ToolEventPayload = {
@@ -3291,7 +3406,7 @@ export class AgentRunner {
                                 promptTriggerContext,
                                 messages: preprocessController,
                                 body: workingBody,
-                                layers: { ...attemptLayers },
+                                layers: preprocessTracker.getLayers(),
                                 request: llmRequest,
                                 connection: attemptConnection,
                                 vars: workingVars,
@@ -3302,7 +3417,7 @@ export class AgentRunner {
                         }
 
                         attemptMessages = preprocessController.toMessages();
-                        attemptLayers = computeLayersForLength(attemptMessages.length);
+                        attemptLayers = preprocessTracker.getLayers();
                         const bodyApplied = applyPreprocessBodyOverrides(
                             attemptConnection,
                             attemptStream,
@@ -3612,7 +3727,11 @@ export class AgentRunner {
                                     },
                                 );
                             }
-                            if (postControl.action === 'fix') {
+                            if (
+                                postControl.action === 'fix'
+                                && postprocessFixAttempts < maxPostprocessFixAttempts
+                                && (!hasToolRoundLimit || toolRoundsExecuted < maxToolRounds)
+                            ) {
                                 pendingPostprocessFixFeedback =
                                     postControl.fixMessage
                                     ?? 'Response postprocess requested a revision.';
@@ -3983,6 +4102,10 @@ export class AgentRunner {
                             });
                             input.onRetrying?.(canonicalClone(retryEntry));
 
+                            if (recoveryOverride) {
+                                pendingRecoveryOverride = recoveryOverride;
+                            }
+
                             await delayWithAbort(retryDelayMs, signal);
                             continue;
                         }
@@ -3993,48 +4116,11 @@ export class AgentRunner {
                             && errorRecoveryAttemptsUsed < maxErrorRecoveryAttempts
                         ) {
                             errorRecoveryAttemptsUsed += 1;
-                            const baseEphemeral = createEphemeralMessagesController(
+                            const recoveryTracker = createLayerTrackingEphemeralController(
                                 lastSentMessages,
                                 lastSentLayers,
                             );
-                            let rolledBackRoundsViaController = 0;
-                            let droppedHistoryViaController = 0;
-                            let messagesMutatedViaController = false;
-                            const trackedEphemeral: EphemeralMessagesController = {
-                                list: () => baseEphemeral.list(),
-                                set: (next) => {
-                                    messagesMutatedViaController = true;
-                                    baseEphemeral.set(next);
-                                },
-                                rollbackToolRounds: (count) => {
-                                    const rolled = baseEphemeral.rollbackToolRounds(count);
-                                    if (rolled > 0) {
-                                        rolledBackRoundsViaController += rolled;
-                                        messagesMutatedViaController = true;
-                                    }
-                                    return rolled;
-                                },
-                                dropHistoryTurns: (count, opts) => {
-                                    const dropped = baseEphemeral.dropHistoryTurns(count, opts);
-                                    if (dropped > 0) {
-                                        droppedHistoryViaController += dropped;
-                                        messagesMutatedViaController = true;
-                                    }
-                                    return dropped;
-                                },
-                                replaceContent: (selector, replacer) => {
-                                    const replaced = baseEphemeral.replaceContent(selector, replacer);
-                                    if (replaced > 0) {
-                                        messagesMutatedViaController = true;
-                                    }
-                                    return replaced;
-                                },
-                                appendHint: (content, role) => {
-                                    messagesMutatedViaController = true;
-                                    baseEphemeral.appendHint(content, role);
-                                },
-                                toMessages: () => baseEphemeral.toMessages(),
-                            };
+                            const trackedEphemeral = recoveryTracker.controller;
 
                             const errorInfo = extractGenerationErrorInfo(error);
                             const recoveryEvent: ToolEventPayload = {
@@ -4109,7 +4195,7 @@ export class AgentRunner {
 
                             if (decision?.action === 'retry') {
                                 if (
-                                    rolledBackRoundsViaController === 0
+                                    recoveryTracker.getRolledBackRounds() === 0
                                     && typeof decision.rollbackToolRounds === 'number'
                                     && decision.rollbackToolRounds > 0
                                 ) {
@@ -4118,30 +4204,38 @@ export class AgentRunner {
                                     );
                                 }
                                 if (
-                                    droppedHistoryViaController === 0
+                                    recoveryTracker.getDroppedHistoryTurns() === 0
                                     && typeof decision.dropHistoryTurns === 'number'
                                     && decision.dropHistoryTurns > 0
                                 ) {
                                     trackedEphemeral.dropHistoryTurns(decision.dropHistoryTurns);
                                 }
 
-                                if (rolledBackRoundsViaController > 0) {
+                                const totalRolledBackRounds = recoveryTracker.getRolledBackRounds();
+                                if (totalRolledBackRounds > 0) {
                                     rollbackTrailingToolRoundsInArray(
                                         turnMessages,
-                                        rolledBackRoundsViaController,
+                                        totalRolledBackRounds,
                                         turnTransformStates,
                                     );
                                     rollbackTrailingToolRoundsInArray(
                                         completedTurnMessages,
-                                        rolledBackRoundsViaController,
+                                        totalRolledBackRounds,
                                     );
+                                    currentAssembled = await refreshFloatingAndReassembleInFlight();
                                 }
 
                                 const nextRecoveryMessages = decision.messages
                                     ? sanitizeToolCallPairs(decision.messages)
-                                    : messagesMutatedViaController
+                                    : recoveryTracker.wasMutated()
                                         ? trackedEphemeral.toMessages()
                                         : undefined;
+                                const nextRecoveryLayers = nextRecoveryMessages
+                                    ? clampLayerIndices(
+                                        recoveryTracker.getLayers(),
+                                        nextRecoveryMessages.length,
+                                    )
+                                    : undefined;
 
                                 let nextRecoveryConn: ApiConnection | undefined;
                                 const hasConnOverride = Boolean(
@@ -4184,6 +4278,7 @@ export class AgentRunner {
                                     ...(nextRecoveryMessages
                                         ? { messages: nextRecoveryMessages }
                                         : {}),
+                                    ...(nextRecoveryLayers ? { layers: nextRecoveryLayers } : {}),
                                     ...(nextRecoveryConn ? { connection: nextRecoveryConn } : {}),
                                 };
 

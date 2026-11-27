@@ -1055,6 +1055,36 @@ describe('AgentRunner Wave 2 upgrades', () => {
                 }),
             ).rejects.toMatchObject({ name: 'AbortError' });
             expect(abortPostSetup.transport.requests).toHaveLength(1);
+
+            // 7. When postprocessScript requestFix hits maxFixAttempts ceiling, downstream processOutputText still runs on final output
+            const fixExhaustedSetup = makeUpgradeSetup({
+                sandbox,
+                postprocessScript: {
+                    enabled: true,
+                    code: `ctx.control.requestFix('永远要求再修正一次');`,
+                },
+            });
+            const processOutputCalls: string[] = [];
+            fixExhaustedSetup.bridge.onOutputProcess((payload) => {
+                processOutputCalls.push(payload.text);
+                payload.text = `${payload.text} [PROCESS_OUTPUT_APPLIED]`;
+            });
+            // DEFAULT_MAX_OUTPUT_FIX_ATTEMPTS === 3 -> rounds 1..3 enter fix loop, round 4 hits ceiling & must run processOutputText!
+            fixExhaustedSetup.transport.enqueue(
+                { content: 'draft 1' },
+                { content: 'draft 2' },
+                { content: 'draft 3' },
+                { content: 'draft 4 final' },
+            );
+            const fixExhaustedRes = await fixExhaustedSetup.runner.run({
+                agent: 'main',
+                target: { messageId: 1, swipeId: 0 },
+                phase: 'after_turn',
+                userInput: '测试 requestFix 耗尽上限后继续走输出校验。',
+            });
+            expect(fixExhaustedRes.rounds).toBe(4);
+            expect(processOutputCalls).toEqual(['draft 4 final']);
+            expect(fixExhaustedRes.content).toBe('draft 4 final [PROCESS_OUTPUT_APPLIED]');
         });
     });
 
@@ -1259,6 +1289,106 @@ describe('AgentRunner Wave 2 upgrades', () => {
                 }),
             ).rejects.toThrow(AgentExecutionError);
             expect(sanitizeHook).toHaveBeenCalledTimes(1);
+        });
+
+        it('keeps rolled-back tool rounds removed across transient retries and preserves accurate turnStart after dropHistoryTurns for subsequent rollbackToolRounds', async () => {
+            // Regression 2a + 2b combined:
+            // Layer 1 has 2 historical turns (4 messages).
+            // Round 1 executes list_dir (in-flight tool round).
+            // Round 2 attempt 1 -> HTTP 400 -> Recovery #1 drops 2 history turns (4 Layer 1 msgs) -> shifts turnStart cleanly.
+            // Round 2 attempt 2 -> HTTP 400 -> Recovery #2 rolls back 1 tool round (must return 1, NOT 0, and must NOT drop current user turn!).
+            // Round 2 attempt 3 -> HTTP 502 transient error -> built-in retry runs -> Round 2 attempt 4 MUST still exclude rolled-back tool call and dropped history!
+            const { transport, runner } = makeUpgradeSetup({
+                roundMaxRetries: 1,
+            });
+            runner.trajectoryStore.appendTurn(
+                [
+                    { role: 'user', content: '历史回合1用户' },
+                    { role: 'assistant', content: '历史回合1回复' },
+                ],
+                'main',
+            );
+            runner.trajectoryStore.appendTurn(
+                [
+                    { role: 'user', content: '历史回合2用户' },
+                    { role: 'assistant', content: '历史回合2回复' },
+                ],
+                'main',
+            );
+            const frozenBefore = canonicalClone(runner.trajectoryStore.getMessages('main'));
+
+            const recoveryLog: Array<{ attempt: number; dropped?: number; rolledBack?: number }> = [];
+
+            transport.enqueue(
+                // Round 1: calls list_dir
+                {
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'tc_r1_rollback_target',
+                            name: 'list_dir',
+                            arguments: JSON.stringify({ path: '/' }),
+                        },
+                    ],
+                },
+                // Round 2 attempt 1: 400 -> triggers Recovery #1 (dropHistoryTurns(2))
+                {
+                    error: new LLMTransportError('400 Too noisy', { status: 400, retryable: false }),
+                },
+                // Round 2 attempt 2: 400 -> triggers Recovery #2 (rollbackToolRounds(1))
+                (req) => {
+                    expect(req.messages.some((m) => String(m.content).includes('历史回合1用户'))).toBe(false);
+                    expect(req.messages.some((m) => String(m.content).includes('历史回合2用户'))).toBe(false);
+                    expect(req.messages.some((m) => String(m.content).includes('当前轮指令'))).toBe(true);
+                    expect(req.messages.some((m) => m.toolCallId === 'tc_r1_rollback_target')).toBe(true);
+                    throw new LLMTransportError('400 Tool call rejected', { status: 400, retryable: false });
+                },
+                // Round 2 attempt 3: 502 retryable -> triggers built-in transient retry
+                (req) => {
+                    expect(req.messages.some((m) => m.toolCallId === 'tc_r1_rollback_target')).toBe(false);
+                    expect(req.messages.some((m) => String(m.content).includes('当前轮指令'))).toBe(true);
+                    throw new LLMTransportError('502 Bad Gateway', { status: 502, retryable: true });
+                },
+                // Round 2 attempt 4 (after transient retry): MUST NOT resurrect rolled-back tool call or dropped history!
+                (req) => {
+                    expect(
+                        req.messages.some(
+                            (m) =>
+                                m.toolCallId === 'tc_r1_rollback_target'
+                                || m.toolCalls?.some((tc) => tc.id === 'tc_r1_rollback_target'),
+                        ),
+                    ).toBe(false);
+                    expect(req.messages.some((m) => String(m.content).includes('历史回合1用户'))).toBe(false);
+                    expect(req.messages.some((m) => String(m.content).includes('当前轮指令'))).toBe(true);
+                    return { content: '双重恢复加瞬时重试后成功收尾。' };
+                },
+            );
+
+            const res = await runner.run({
+                agent: 'main',
+                target: { messageId: 1, swipeId: 0 },
+                phase: 'after_turn',
+                userInput: '当前轮指令：请核查状态。',
+                maxErrorRecoveryAttempts: 2,
+                onGenerationError: async (ctx) => {
+                    if (ctx.attempt === 1) {
+                        const dropped = ctx.ephemeralMessages.dropHistoryTurns(2);
+                        recoveryLog.push({ attempt: 1, dropped });
+                        return { action: 'retry', reason: 'drop_old_history' };
+                    }
+                    const rolledBack = ctx.ephemeralMessages.rollbackToolRounds(1);
+                    recoveryLog.push({ attempt: 2, rolledBack });
+                    return { action: 'retry', reason: 'rollback_in_flight_tool' };
+                },
+            });
+
+            expect(recoveryLog).toEqual([
+                { attempt: 1, dropped: 2 },
+                { attempt: 2, rolledBack: 1 },
+            ]);
+            expect(res.content).toBe('双重恢复加瞬时重试后成功收尾。');
+            // TrajectoryStore Layer 1 history MUST remain completely intact!
+            expect(runner.trajectoryStore.getMessages('main').slice(0, 4)).toEqual(frozenBefore);
         });
     });
 
