@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import type { PendingApproval, UndoRecord } from '@/core/types';
+import { DiffViewer } from '@/ui/components';
 import { renderRedactedText } from './assistant-helpers';
 
 export interface AttachedApprovalCardProps {
@@ -271,21 +272,14 @@ export function AttachedApprovalCard({
             ) : null}
 
             {viewMode === 'diff' ? (
-                <div class="ag-diff-box ag-thin-scroll" data-approval-diff="true">
+                <div class="ag-diff-box" data-approval-diff="true">
                     {approval.diffLines.length > 0 ? (
-                        approval.diffLines.map((line, idx) => {
-                            const lineClass =
-                                line.type === 'add'
-                                    ? 'ag-diff-line ag-diff-line-add'
-                                    : line.type === 'del'
-                                        ? 'ag-diff-line ag-diff-line-del'
-                                        : 'ag-diff-line ag-diff-line-ctx';
-                            return (
-                                <div key={`${approval.id}-diff-${idx}`} class={lineClass}>
-                                    {renderRedactedText(line.text)}
-                                </div>
-                            );
-                        })
+                        <DiffViewer
+                            key={`${approval.id}-r${approval.revision}`}
+                            lines={approval.diffLines}
+                            renderText={renderRedactedText}
+                            maxHeight="360px"
+                        />
                     ) : (
                         <div class="ag-diff-line ag-diff-line-ctx">
                             {renderRedactedText(approval.rawContent || '（无差异预览）')}

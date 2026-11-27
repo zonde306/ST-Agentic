@@ -9,3 +9,4 @@ export * from './MasterDetailLayout';
 export * from './CodeEditor';
 export * from './markdown-parser';
 export * from './MarkdownContent';
+export * from './DiffViewer';

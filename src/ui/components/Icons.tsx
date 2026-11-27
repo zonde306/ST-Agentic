@@ -465,3 +465,25 @@ export function IconUndo(props: IconProps) {
         </SvgIcon>
     );
 }
+
+/** Expand vertically (GitHub "unfold"): chevrons pointing outward. */
+export function IconUnfold(props: IconProps) {
+    return (
+        <SvgIcon {...props}>
+            <polyline points="7 8 12 3 17 8" />
+            <polyline points="7 16 12 21 17 16" />
+            <line x1="12" y1="3" x2="12" y2="21" />
+        </SvgIcon>
+    );
+}
+
+/** Collapse vertically (GitHub "fold"): chevrons pointing inward. */
+export function IconFold(props: IconProps) {
+    return (
+        <SvgIcon {...props}>
+            <polyline points="7 3 12 8 17 3" />
+            <polyline points="7 21 12 16 17 21" />
+            <line x1="4" y1="12" x2="20" y2="12" />
+        </SvgIcon>
+    );
+}

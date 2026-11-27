@@ -7,6 +7,8 @@ import {
     Badge,
     Button,
     CodeEditor,
+    DiffViewer,
+    type DiffViewerLine,
     EmptyState,
     FormField,
     MasterDetailLayout,
@@ -43,12 +45,6 @@ import {
 type CategoryFilter = 'all' | FileOverrideCategory;
 type EditorViewMode = 'edit' | 'diff';
 type CreateUploadScope = 'workspace_docs' | 'workspace_shared' | 'preset' | 'global';
-
-interface DiffLineRow {
-    kind: 'add' | 'del' | 'context';
-    prefix: '+' | '-' | ' ';
-    text: string;
-}
 
 const CATEGORY_FILTERS: readonly { id: CategoryFilter; label: string }[] = [
     { id: 'all', label: '全部' },
@@ -212,12 +208,12 @@ function splitDiffChunkLines(value: string): string[] {
 }
 
 function buildDiffRows(baseContent: string, currentContent: string): {
-    rows: DiffLineRow[];
+    rows: DiffViewerLine[];
     addedCount: number;
     removedCount: number;
 } {
     const changes = diffLines(baseContent, currentContent, { stripTrailingCr: true });
-    const rows: DiffLineRow[] = [];
+    const rows: DiffViewerLine[] = [];
     let addedCount = 0;
     let removedCount = 0;
 
@@ -226,16 +222,16 @@ function buildDiffRows(baseContent: string, currentContent: string): {
         if (part.added) {
             addedCount += lines.length;
             for (const text of lines) {
-                rows.push({ kind: 'add', prefix: '+', text });
+                rows.push({ type: 'add', text });
             }
         } else if (part.removed) {
             removedCount += lines.length;
             for (const text of lines) {
-                rows.push({ kind: 'del', prefix: '-', text });
+                rows.push({ type: 'del', text });
             }
         } else {
             for (const text of lines) {
-                rows.push({ kind: 'context', prefix: ' ', text });
+                rows.push({ type: 'ctx', text });
             }
         }
     }
@@ -1237,63 +1233,18 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                                     : '无原书基线（展示新增/覆写内容）'}
                             </span>
                         </div>
-                        {diffSummary ? (
-                            <div class="ag-row-wrap">
-                                <Badge tone="success">+{diffSummary.addedCount} 行</Badge>
-                                <Badge tone="error">-{diffSummary.removedCount} 行</Badge>
-                            </div>
-                        ) : null}
                     </div>
-                    <div
-                        class="ag-card-body ag-thin-scroll"
-                        style={{
-                            flex: '1 1 auto',
-                            overflowY: 'auto',
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '2px',
-                        }}
-                    >
-                        {!diffSummary || diffSummary.rows.length === 0 ? (
-                            <div class="ag-banner ag-banner-neutral">
-                                当前内容与基线完全一致，暂无行级差异。
-                            </div>
-                        ) : (
-                            diffSummary.rows.map((row, idx) => {
-                                const rowClass =
-                                    row.kind === 'add'
-                                        ? 'ag-diff-add ag-mono'
-                                        : row.kind === 'del'
-                                            ? 'ag-diff-del ag-mono'
-                                            : 'ag-mono';
-                                return (
-                                    <div
-                                        key={idx}
-                                        class={rowClass}
-                                        style={{
-                                            fontSize: '12px',
-                                            lineHeight: 1.5,
-                                            padding: '2px 8px',
-                                            borderRadius: '4px',
-                                            whiteSpace: 'pre-wrap',
-                                            wordBreak: 'break-word',
-                                        }}
-                                    >
-                                        <span
-                                            style={{
-                                                display: 'inline-block',
-                                                width: '18px',
-                                                opacity: 0.75,
-                                                userSelect: 'none',
-                                            }}
-                                        >
-                                            {row.prefix}
-                                        </span>
-                                        <span>{row.text || ' '}</span>
-                                    </div>
-                                );
-                            })
-                        )}
+                    <div class="ag-card-body ag-diffv-host" data-files-diff="true">
+                        <DiffViewer
+                            key={selectedItem.id}
+                            class="ag-diffv-fill"
+                            lines={diffSummary?.rows ?? []}
+                            emptyText={
+                                <div class="ag-banner ag-banner-neutral">
+                                    当前内容与基线完全一致，暂无行级差异。
+                                </div>
+                            }
+                        />
                     </div>
                 </div>
             )}

@@ -2175,6 +2175,290 @@ textarea:focus-visible {
     color: var(--muted-foreground);
 }
 
+/* GitHub-style unified diff viewer (DiffViewer): gutters + collapsible unchanged regions */
+.ag-diffv {
+    --ag-diffv-num-w: calc(2ch + 12px);
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--foreground);
+}
+
+.ag-diffv-fill {
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.ag-card-body.ag-diffv-host {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+    overflow: hidden;
+}
+
+.ag-diffv-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--secondary) 55%, transparent);
+    font-family: var(--font-sans);
+}
+
+.ag-diffv-stats {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.ag-diffv-stat-add {
+    color: var(--success);
+}
+
+.ag-diffv-stat-del {
+    color: var(--error);
+}
+
+.ag-diffv-stat-hunks {
+    color: var(--muted-foreground);
+    font-size: 11px;
+    font-weight: 500;
+}
+
+.ag-diffv-statbar {
+    display: inline-flex;
+    gap: 2px;
+}
+
+.ag-diffv-statbar-cell {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    background: var(--border-strong);
+}
+
+.ag-diffv-statbar-add {
+    background: var(--success);
+}
+
+.ag-diffv-statbar-del {
+    background: var(--error);
+}
+
+.ag-diffv-toolbar-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.ag-diffv-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 26px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--card);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background var(--duration-fast, 120ms) ease, border-color var(--duration-fast, 120ms) ease;
+}
+
+.ag-diffv-toggle:hover {
+    background: var(--secondary);
+    border-color: var(--border-strong);
+}
+
+.ag-diffv-toggle[aria-pressed="true"] {
+    color: var(--primary);
+    border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
+}
+
+.ag-diffv-toggle:focus-visible,
+.ag-diffv-expand-btn:focus-visible,
+.ag-diffv-gap-label:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+}
+
+.ag-diffv-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+}
+
+.ag-diffv-empty {
+    padding: 12px;
+    font-family: var(--font-sans);
+}
+
+.ag-diffv-row {
+    display: grid;
+    grid-template-columns: var(--ag-diffv-num-w) var(--ag-diffv-num-w) 18px minmax(0, 1fr);
+    min-width: 0;
+}
+
+.ag-diffv-num {
+    padding: 0 6px;
+    text-align: right;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    color: var(--muted-foreground);
+    background: color-mix(in srgb, var(--secondary) 40%, transparent);
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.ag-diffv-num-new {
+    border-right: 1px solid var(--border);
+}
+
+.ag-diffv-sign {
+    text-align: center;
+    color: var(--muted-foreground);
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.ag-diffv-code {
+    min-width: 0;
+    padding: 0 10px 0 2px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+}
+
+.ag-diffv-row-ctx .ag-diffv-code {
+    color: color-mix(in srgb, var(--foreground) 80%, transparent);
+}
+
+.ag-diffv-row-add {
+    background: color-mix(in srgb, var(--success) 12%, transparent);
+}
+
+.ag-diffv-row-add .ag-diffv-num {
+    background: color-mix(in srgb, var(--success) 22%, transparent);
+    color: var(--success);
+}
+
+.ag-diffv-row-add .ag-diffv-sign {
+    color: var(--success);
+}
+
+.ag-diffv-row-del {
+    background: color-mix(in srgb, var(--error) 12%, transparent);
+}
+
+.ag-diffv-row-del .ag-diffv-num {
+    background: color-mix(in srgb, var(--error) 22%, transparent);
+    color: var(--error);
+}
+
+.ag-diffv-row-del .ag-diffv-sign {
+    color: var(--error);
+}
+
+.ag-diffv-gap {
+    display: grid;
+    grid-template-columns: calc(var(--ag-diffv-num-w) * 2) minmax(0, 1fr);
+    min-height: 28px;
+    background: color-mix(in srgb, var(--primary) 7%, transparent);
+    border-top: 1px solid color-mix(in srgb, var(--primary) 14%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--primary) 14%, transparent);
+    color: var(--muted-foreground);
+}
+
+.ag-diffv-gap-actions {
+    display: flex;
+    align-items: stretch;
+    border-right: 1px solid var(--border);
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+}
+
+.ag-diffv-expand-btn {
+    flex: 1 1 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 0;
+    min-height: 28px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--primary);
+    cursor: pointer;
+}
+
+.ag-diffv-expand-btn:hover {
+    background: var(--primary);
+    color: var(--primary-foreground);
+}
+
+.ag-diffv-gap-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 0 10px;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font-family: var(--font-sans);
+    font-size: 11.5px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.ag-diffv-gap-label:hover {
+    color: var(--primary);
+}
+
+.ag-diffv-gap-dots {
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+
+.ag-diffv-gap-range {
+    opacity: 0.7;
+    font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 767px) {
+    .ag-diffv-toggle {
+        min-height: 40px;
+        padding: 0 12px;
+    }
+
+    .ag-diffv-gap {
+        grid-template-columns: max-content minmax(0, 1fr);
+        min-height: 40px;
+    }
+
+    .ag-diffv-expand-btn {
+        min-width: 40px;
+        min-height: 40px;
+    }
+
+    .ag-diffv-gap-actions {
+        min-width: calc(var(--ag-diffv-num-w) * 2);
+    }
+}
+
 /* Soft Pills & Redaction Highlights */
 .ag-pill {
     display: inline-flex;
