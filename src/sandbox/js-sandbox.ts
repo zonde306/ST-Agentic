@@ -1,7 +1,15 @@
 import _ from 'lodash';
 import { z } from 'zod';
 import type {
+    ToolAgentApi,
+    ToolAgentRunOptions,
+    ToolAgentRunTriggerOptions,
+    ToolEphemeralMessagesApi,
+    ToolErrorRecoveryControl,
+    ToolEventPayload,
     ToolExecutionContext,
+    ToolPostprocessControl,
+    ToolPostprocessOutput,
     ToolSideCluesApi,
     ToolSideGenApi,
 } from '@/core/bridge';
@@ -20,6 +28,7 @@ import {
     throwIfAborted,
 } from '@/core/tools';
 import type {
+    CanonicalMessage,
     CreateSideSessionOptions,
     ExportWorldInfoOptions,
     MessageTarget,
@@ -50,6 +59,29 @@ export class SandboxSideGenError extends SandboxExecutionError {
     ) {
         super(message, causeError);
         this.name = 'SandboxSideGenError';
+        this.code = code;
+        this.method = method;
+    }
+}
+
+export type SandboxAgentErrorCode =
+    | 'AGENT_UNAVAILABLE'
+    | 'AGENT_DISPOSED'
+    | 'AGENT_INVALID_ARGS';
+
+/** Structured error thrown by the sandbox `ctx.agent` host proxy boundary. */
+export class SandboxAgentError extends SandboxExecutionError {
+    public readonly code: SandboxAgentErrorCode;
+    public readonly method: string;
+
+    constructor(
+        code: SandboxAgentErrorCode,
+        method: string,
+        message: string,
+        causeError?: unknown,
+    ) {
+        super(message, causeError);
+        this.name = 'SandboxAgentError';
         this.code = code;
         this.method = method;
     }
@@ -701,6 +733,555 @@ function createSandboxSideGenProxy(
     ) as ToolSideGenApi;
 }
 
+const FORBIDDEN_BOUNDARY_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function cloneBoundaryPayload<T>(
+    value: T,
+    method: string,
+    onError: (method: string, error: unknown) => Error,
+): T {
+    if (value === undefined || value === null) {
+        return value;
+    }
+    const kind = typeof value;
+    if (kind === 'string' || kind === 'number' || kind === 'boolean') {
+        return value;
+    }
+    try {
+        if (typeof globalThis.structuredClone === 'function') {
+            return globalThis.structuredClone(value);
+        }
+        return JSON.parse(JSON.stringify(value)) as T;
+    } catch (error) {
+        throw onError(method, error);
+    }
+}
+
+function deepFreezeBoundaryValue<T>(value: T, seen = new WeakSet<object>()): T {
+    if (value && typeof value === 'object') {
+        const obj = value as unknown as object;
+        if (seen.has(obj)) {
+            return value;
+        }
+        seen.add(obj);
+        if (Array.isArray(value)) {
+            for (const item of value) {
+                deepFreezeBoundaryValue(item, seen);
+            }
+        } else {
+            for (const propVal of Object.values(value as Record<string, unknown>)) {
+                deepFreezeBoundaryValue(propVal, seen);
+            }
+        }
+        Object.freeze(obj);
+    }
+    return value;
+}
+
+function cloneAgentBoundaryValue<T>(value: T, method: string): T {
+    return cloneBoundaryPayload(
+        value,
+        method,
+        (m, err) =>
+            new SandboxAgentError(
+                'AGENT_INVALID_ARGS',
+                m,
+                `ctx.${m}() received non-serializable data across the sandbox boundary.`,
+                err,
+            ),
+    );
+}
+
+function extractAgentSignalAndCloneOptions<T extends { signal?: AbortSignal }>(
+    rawOpts: unknown,
+    method: string,
+    required: boolean,
+): { options: Omit<T, 'signal'>; callerSignal?: AbortSignal } {
+    if (rawOpts === undefined) {
+        if (required) {
+            throw new SandboxAgentError(
+                'AGENT_INVALID_ARGS',
+                method,
+                `ctx.${method}() requires an options object.`,
+            );
+        }
+        return { options: {} as Omit<T, 'signal'> };
+    }
+
+    if (!rawOpts || typeof rawOpts !== 'object' || Array.isArray(rawOpts)) {
+        throw new SandboxAgentError(
+            'AGENT_INVALID_ARGS',
+            method,
+            `ctx.${method}() requires "options" to be a plain object.`,
+        );
+    }
+
+    const record = rawOpts as Record<string, unknown>;
+    let callerSignal: AbortSignal | undefined;
+    if (record.signal !== undefined) {
+        if (!isAbortSignalLike(record.signal)) {
+            throw new SandboxAgentError(
+                'AGENT_INVALID_ARGS',
+                method,
+                `ctx.${method}() received an invalid AbortSignal in options.signal.`,
+            );
+        }
+        callerSignal = record.signal;
+    }
+
+    const copy: Record<string, unknown> = {};
+    for (const key of Object.keys(record)) {
+        if (key === 'signal' || FORBIDDEN_BOUNDARY_KEYS.has(key)) {
+            continue;
+        }
+        copy[key] = record[key];
+    }
+
+    return {
+        options: cloneAgentBoundaryValue(copy, method) as Omit<T, 'signal'>,
+        callerSignal,
+    };
+}
+
+/**
+ * Create a frozen, null-prototype host-side proxy for `ctx.agent` inside the JS sandbox.
+ * Mirrors `createSandboxSideGenProxy`: enforces `isDisposed()` and linked `AbortSignal`,
+ * clones all cross-boundary inputs/outputs, and exposes only `run` and `runTrigger`.
+ */
+function createSandboxAgentProxy(
+    hostAgent: ToolAgentApi | undefined,
+    parentSignal: AbortSignal,
+    isDisposed: () => boolean,
+): ToolAgentApi {
+    const assertReady = (method: string, signal: AbortSignal): ToolAgentApi => {
+        if (isDisposed()) {
+            throw new SandboxAgentError(
+                'AGENT_DISPOSED',
+                method,
+                `ctx.${method}() failed: sandbox has been disposed.`,
+            );
+        }
+        throwIfAborted(signal, `ctx.${method}() aborted`);
+        if (!hostAgent) {
+            throw new SandboxAgentError(
+                'AGENT_UNAVAILABLE',
+                method,
+                `ctx.${method}() failed: agent execution service is not configured in this execution context.`,
+            );
+        }
+        return hostAgent;
+    };
+
+    const invokeHost = async <T>(
+        method: string,
+        signal: AbortSignal,
+        executor: (api: ToolAgentApi) => Promise<T>,
+    ): Promise<T> => {
+        const api = assertReady(method, signal);
+        const result = await raceWithSignalAndTimeout(
+            Promise.resolve().then(() => executor(api)),
+            signal,
+            undefined,
+            `ctx.${method}()`,
+        );
+        if (isDisposed()) {
+            throw new SandboxAgentError(
+                'AGENT_DISPOSED',
+                method,
+                `ctx.${method}() failed: sandbox was disposed during execution.`,
+            );
+        }
+        throwIfAborted(signal, `ctx.${method}() aborted`);
+        return cloneAgentBoundaryValue(result, method);
+    };
+
+    const agentMethods: ToolAgentApi = {
+        async run(opts: ToolAgentRunOptions) {
+            const method = 'agent.run';
+            assertReady(method, parentSignal);
+            const { options: cleanOpts, callerSignal } =
+                extractAgentSignalAndCloneOptions<ToolAgentRunOptions>(opts, method, true);
+            const linked = combineAbortSignals(parentSignal, callerSignal);
+            try {
+                return await invokeHost(method, linked.signal, (api) =>
+                    api.run({
+                        ...cleanOpts,
+                        signal: linked.signal,
+                    }),
+                );
+            } finally {
+                linked.cleanup();
+            }
+        },
+
+        async runTrigger(ruleId: string, opts?: ToolAgentRunTriggerOptions) {
+            const method = 'agent.runTrigger';
+            assertReady(method, parentSignal);
+            if (typeof ruleId !== 'string' || ruleId.trim().length === 0) {
+                throw new SandboxAgentError(
+                    'AGENT_INVALID_ARGS',
+                    method,
+                    `ctx.${method}() requires "ruleId" to be a non-empty string.`,
+                );
+            }
+            const safeRuleId = ruleId.trim();
+            const { options: cleanOpts, callerSignal } =
+                extractAgentSignalAndCloneOptions<ToolAgentRunTriggerOptions>(opts, method, false);
+            const linked = combineAbortSignals(parentSignal, callerSignal);
+            try {
+                return await invokeHost(method, linked.signal, (api) =>
+                    api.runTrigger(safeRuleId, {
+                        ...cleanOpts,
+                        signal: linked.signal,
+                    }),
+                );
+            } finally {
+                linked.cleanup();
+            }
+        },
+    };
+
+    return Object.freeze(
+        Object.assign(Object.create(null) as object, agentMethods),
+    ) as ToolAgentApi;
+}
+
+function cloneExecutionBoundaryValue<T>(value: T, method: string): T {
+    return cloneBoundaryPayload(
+        value,
+        method,
+        (m, err) =>
+            new SandboxExecutionError(
+                `ctx.${m}() received non-serializable data across the sandbox boundary.`,
+                err,
+            ),
+    );
+}
+
+function createSandboxMessagesProxy(
+    hostMessages: ToolEphemeralMessagesApi,
+    parentSignal: AbortSignal,
+    isDisposed: () => boolean,
+): ToolEphemeralMessagesApi {
+    const assertReady = (method: string): void => {
+        if (isDisposed()) {
+            throw new SandboxExecutionError(`ctx.${method}() failed: sandbox has been disposed.`);
+        }
+        throwIfAborted(parentSignal, `ctx.${method}() aborted`);
+    };
+
+    const messagesMethods: ToolEphemeralMessagesApi = {
+        list() {
+            const method = 'messages.list';
+            assertReady(method);
+            return cloneExecutionBoundaryValue(hostMessages.list(), method);
+        },
+
+        set(nextMessages: CanonicalMessage[]) {
+            const method = 'messages.set';
+            assertReady(method);
+            if (!Array.isArray(nextMessages)) {
+                throw new SandboxExecutionError(`ctx.${method}() requires an array of messages.`);
+            }
+            const cloned = cloneExecutionBoundaryValue(nextMessages, method);
+            hostMessages.set(cloned);
+        },
+
+        rollbackToolRounds(count?: number) {
+            const method = 'messages.rollbackToolRounds';
+            assertReady(method);
+            if (count !== undefined && typeof count !== 'number') {
+                throw new SandboxExecutionError(`ctx.${method}() requires "count" to be a number.`);
+            }
+            return hostMessages.rollbackToolRounds(count);
+        },
+
+        dropHistoryTurns(count?: number, opts?: { from?: 'newest' | 'oldest' }) {
+            const method = 'messages.dropHistoryTurns';
+            assertReady(method);
+            if (count !== undefined && typeof count !== 'number') {
+                throw new SandboxExecutionError(`ctx.${method}() requires "count" to be a number.`);
+            }
+            const safeOpts =
+                opts === undefined
+                    ? undefined
+                    : (() => {
+                        if (!opts || typeof opts !== 'object' || Array.isArray(opts)) {
+                            throw new SandboxExecutionError(
+                                `ctx.${method}() requires "opts" to be a plain object.`,
+                            );
+                        }
+                        return cloneExecutionBoundaryValue(opts, method);
+                    })();
+            return hostMessages.dropHistoryTurns(count, safeOpts);
+        },
+
+        replaceContent(selector, replacer) {
+            const method = 'messages.replaceContent';
+            assertReady(method);
+            if (typeof selector !== 'number' && typeof selector !== 'function') {
+                throw new SandboxExecutionError(
+                    `ctx.${method}() requires "selector" to be a number or function.`,
+                );
+            }
+            if (typeof replacer !== 'string' && typeof replacer !== 'function') {
+                throw new SandboxExecutionError(
+                    `ctx.${method}() requires "replacer" to be a string or function.`,
+                );
+            }
+            const wrappedSelector =
+                typeof selector === 'function'
+                    ? (msg: CanonicalMessage, idx: number) =>
+                        Boolean(selector(cloneExecutionBoundaryValue(msg, method), idx))
+                    : selector;
+            const wrappedReplacer =
+                typeof replacer === 'function'
+                    ? (content: string, msg: CanonicalMessage, idx: number) => {
+                        const out = replacer(content, cloneExecutionBoundaryValue(msg, method), idx);
+                        return typeof out === 'string' ? out : String(out ?? '');
+                    }
+                    : replacer;
+            return hostMessages.replaceContent(wrappedSelector, wrappedReplacer);
+        },
+
+        appendHint(content: string, role?: 'user' | 'system') {
+            const method = 'messages.appendHint';
+            assertReady(method);
+            if (typeof content !== 'string') {
+                throw new SandboxExecutionError(`ctx.${method}() requires "content" to be a string.`);
+            }
+            if (role !== undefined && role !== 'user' && role !== 'system') {
+                throw new SandboxExecutionError(
+                    `ctx.${method}() requires "role" to be "user" or "system".`,
+                );
+            }
+            hostMessages.appendHint(content, role);
+        },
+
+        toMessages() {
+            const method = 'messages.toMessages';
+            assertReady(method);
+            return cloneExecutionBoundaryValue(hostMessages.toMessages(), method);
+        },
+    };
+
+    return Object.freeze(
+        Object.assign(Object.create(null) as object, messagesMethods),
+    ) as ToolEphemeralMessagesApi;
+}
+
+function createSandboxEventSnapshot(hostEvent: ToolEventPayload): ToolEventPayload {
+    const cloned = cloneExecutionBoundaryValue(hostEvent, 'event');
+    return deepFreezeBoundaryValue(cloned);
+}
+
+const CONTROL_READONLY_FIELDS = [
+    'action',
+    'reason',
+    'delayMs',
+    'rollbackToolRounds',
+    'dropHistoryTurns',
+    'fallbackContent',
+    'retryReason',
+    'fixMessage',
+    'rejectWrite',
+    'abortReason',
+] as const;
+
+function createSandboxControlProxy(
+    hostControl: ToolErrorRecoveryControl | ToolPostprocessControl,
+    parentSignal: AbortSignal,
+    isDisposed: () => boolean,
+): ToolErrorRecoveryControl | ToolPostprocessControl {
+    const assertReady = (method: string): void => {
+        if (isDisposed()) {
+            throw new SandboxExecutionError(`ctx.${method}() failed: sandbox has been disposed.`);
+        }
+        throwIfAborted(parentSignal, `ctx.${method}() aborted`);
+    };
+
+    const record = hostControl as unknown as Record<string, unknown>;
+    const proxyObj = Object.create(null) as Record<string, unknown>;
+
+    if (typeof record.retry === 'function') {
+        proxyObj.retry = (reason?: string, opts?: Record<string, unknown>) => {
+            const method = 'control.retry';
+            assertReady(method);
+            if (reason !== undefined && typeof reason !== 'string') {
+                throw new SandboxExecutionError(`ctx.${method}() requires "reason" to be a string.`);
+            }
+            const safeOpts =
+                opts === undefined
+                    ? undefined
+                    : (() => {
+                        if (!opts || typeof opts !== 'object' || Array.isArray(opts)) {
+                            throw new SandboxExecutionError(
+                                `ctx.${method}() requires "opts" to be a plain object.`,
+                            );
+                        }
+                        return cloneExecutionBoundaryValue(opts, method);
+                    })();
+            (record.retry as (r?: string, o?: unknown) => void).call(hostControl, reason, safeOpts);
+        };
+    }
+
+    if (typeof record.requestFix === 'function') {
+        proxyObj.requestFix = (message: string, opts?: Record<string, unknown>) => {
+            const method = 'control.requestFix';
+            assertReady(method);
+            if (typeof message !== 'string') {
+                throw new SandboxExecutionError(`ctx.${method}() requires "message" to be a string.`);
+            }
+            const safeOpts =
+                opts === undefined
+                    ? undefined
+                    : (() => {
+                        if (!opts || typeof opts !== 'object' || Array.isArray(opts)) {
+                            throw new SandboxExecutionError(
+                                `ctx.${method}() requires "opts" to be a plain object.`,
+                            );
+                        }
+                        return cloneExecutionBoundaryValue(opts, method);
+                    })();
+            (record.requestFix as (m: string, o?: unknown) => void).call(
+                hostControl,
+                message,
+                safeOpts,
+            );
+        };
+    }
+
+    if (typeof record.abort === 'function') {
+        proxyObj.abort = (reason?: string) => {
+            const method = 'control.abort';
+            assertReady(method);
+            if (reason !== undefined && typeof reason !== 'string') {
+                throw new SandboxExecutionError(`ctx.${method}() requires "reason" to be a string.`);
+            }
+            (record.abort as (r?: string) => void).call(hostControl, reason);
+        };
+    }
+
+    if (typeof record.fallback === 'function') {
+        proxyObj.fallback = (content: string, reason?: string) => {
+            const method = 'control.fallback';
+            assertReady(method);
+            if (typeof content !== 'string') {
+                throw new SandboxExecutionError(`ctx.${method}() requires "content" to be a string.`);
+            }
+            if (reason !== undefined && typeof reason !== 'string') {
+                throw new SandboxExecutionError(`ctx.${method}() requires "reason" to be a string.`);
+            }
+            (record.fallback as (c: string, r?: string) => void).call(
+                hostControl,
+                content,
+                reason,
+            );
+        };
+    }
+
+    if (typeof record.accept === 'function') {
+        proxyObj.accept = () => {
+            const method = 'control.accept';
+            assertReady(method);
+            (record.accept as () => void).call(hostControl);
+        };
+    }
+
+    for (const prop of CONTROL_READONLY_FIELDS) {
+        if (prop in record) {
+            Object.defineProperty(proxyObj, prop, {
+                enumerable: true,
+                configurable: false,
+                get: () => {
+                    const val = record[prop];
+                    return typeof val === 'object' && val !== null
+                        ? cloneExecutionBoundaryValue(val, `control.${prop}`)
+                        : val;
+                },
+            });
+        }
+    }
+
+    return Object.freeze(proxyObj) as unknown as ToolErrorRecoveryControl | ToolPostprocessControl;
+}
+
+function createSandboxBodyBridge(hostBody: Record<string, unknown>): {
+    workingBody: Record<string, unknown>;
+    syncBack: () => void;
+} {
+    const workingBody: Record<string, unknown> = {};
+    for (const key of Object.keys(hostBody)) {
+        if (FORBIDDEN_BOUNDARY_KEYS.has(key)) {
+            continue;
+        }
+        workingBody[key] = cloneExecutionBoundaryValue(hostBody[key], 'body');
+    }
+
+    return {
+        workingBody,
+        syncBack: () => {
+            const nextKeys = new Set<string>();
+            for (const key of Object.keys(workingBody)) {
+                if (FORBIDDEN_BOUNDARY_KEYS.has(key)) {
+                    continue;
+                }
+                const val = workingBody[key];
+                if (val === undefined) {
+                    continue;
+                }
+                nextKeys.add(key);
+                hostBody[key] = cloneExecutionBoundaryValue(val, 'body');
+            }
+            for (const existingKey of Object.keys(hostBody)) {
+                if (!FORBIDDEN_BOUNDARY_KEYS.has(existingKey) && !nextKeys.has(existingKey)) {
+                    delete hostBody[existingKey];
+                }
+            }
+        },
+    };
+}
+
+const OUTPUT_READONLY_FIELDS = [
+    'originalText',
+    'stage',
+    'operation',
+    'filePath',
+    'round',
+    'fixAttempt',
+    'maxFixAttempts',
+] as const;
+
+function createSandboxOutputBridge(hostOutput: ToolPostprocessOutput): {
+    workingOutput: ToolPostprocessOutput;
+    syncBack: () => void;
+} {
+    const workingOutput: Record<string, unknown> = {
+        text: typeof hostOutput.text === 'string' ? hostOutput.text : '',
+    };
+
+    const hostRecord = hostOutput as unknown as Record<string, unknown>;
+    for (const field of OUTPUT_READONLY_FIELDS) {
+        if (hostRecord[field] !== undefined) {
+            Object.defineProperty(workingOutput, field, {
+                value: hostRecord[field],
+                writable: false,
+                enumerable: true,
+                configurable: false,
+            });
+        }
+    }
+
+    return {
+        workingOutput: workingOutput as unknown as ToolPostprocessOutput,
+        syncBack: () => {
+            if (typeof workingOutput.text === 'string') {
+                hostOutput.text = workingOutput.text;
+            }
+        },
+    };
+}
+
 interface RealmContext {
     handle: ManagedSandboxHandle;
     scopeProxy: object;
@@ -852,11 +1433,32 @@ export class IframeJsSandbox implements ScriptSandbox {
                     const prevSignal = activeSignal;
                     activeSignal = combined.signal;
 
+                    const isDisposed = () => realm.handle.isDisposed();
                     const scopedSideGen = createSandboxSideGenProxy(
                         ctx.sideGen,
                         combined.signal,
-                        () => realm.handle.isDisposed(),
+                        isDisposed,
                     );
+                    const scopedAgent = createSandboxAgentProxy(
+                        ctx.agent,
+                        combined.signal,
+                        isDisposed,
+                    );
+                    const scopedMessages = ctx.messages
+                        ? createSandboxMessagesProxy(ctx.messages, combined.signal, isDisposed)
+                        : undefined;
+                    const scopedEvent = ctx.event
+                        ? createSandboxEventSnapshot(ctx.event)
+                        : undefined;
+                    const scopedControl = ctx.control
+                        ? createSandboxControlProxy(ctx.control, combined.signal, isDisposed)
+                        : undefined;
+                    const bodyBridge = ctx.body
+                        ? createSandboxBodyBridge(ctx.body)
+                        : undefined;
+                    const outputBridge = ctx.output
+                        ? createSandboxOutputBridge(ctx.output)
+                        : undefined;
 
                     const scopedCtx: ToolExecutionContext = {
                         fs: ctx.fs,
@@ -864,6 +1466,12 @@ export class IframeJsSandbox implements ScriptSandbox {
                         message: ctx.message,
                         st: ctx.st,
                         sideGen: scopedSideGen,
+                        agent: scopedAgent,
+                        ...(scopedMessages ? { messages: scopedMessages } : {}),
+                        ...(scopedEvent ? { event: scopedEvent } : {}),
+                        ...(scopedControl ? { control: scopedControl } : {}),
+                        ...(bodyBridge ? { body: bodyBridge.workingBody } : {}),
+                        ...(outputBridge ? { output: outputBridge.workingOutput } : {}),
                         target: Object.freeze({ ...ctx.target }),
                         signal: combined.signal,
                         permissions: ctx.permissions,
@@ -876,12 +1484,17 @@ export class IframeJsSandbox implements ScriptSandbox {
                             this.defaultTimeoutMs,
                         );
                         const runPromise = Promise.resolve(def.execute(args, scopedCtx));
-                        return await raceWithSignalAndTimeout(
+                        const result = await raceWithSignalAndTimeout(
                             runPromise,
                             combined.signal,
                             executionTimeoutMs,
                             `Custom tool "${def.name}"`,
                         );
+                        if (!isDisposed() && !combined.signal.aborted) {
+                            bodyBridge?.syncBack();
+                            outputBridge?.syncBack();
+                        }
+                        return result;
                     } finally {
                         activeSignal = prevSignal;
                         combined.cleanup();
@@ -904,18 +1517,41 @@ export class IframeJsSandbox implements ScriptSandbox {
         options: SandboxRunOptions = {},
     ): Promise<unknown> {
         throwIfAborted(ctx.signal);
+        throwIfAborted(options.signal);
         const id = options.id ?? this.nextId('script');
         const allowNetwork = options.allowNetwork ?? true;
 
+        const callerLinked = combineAbortSignals(ctx.signal, options.signal);
         const runController = new AbortController();
-        const combined = combineAbortSignals(ctx.signal, runController.signal);
+        const combined = combineAbortSignals(callerLinked.signal, runController.signal);
 
         const handleBox: { current?: ManagedSandboxHandle } = {};
+        const isDisposed = () => handleBox.current?.isDisposed() ?? false;
         const scopedSideGen = createSandboxSideGenProxy(
             ctx.sideGen,
             combined.signal,
-            () => handleBox.current?.isDisposed() ?? false,
+            isDisposed,
         );
+        const scopedAgent = createSandboxAgentProxy(
+            ctx.agent,
+            combined.signal,
+            isDisposed,
+        );
+        const scopedMessages = ctx.messages
+            ? createSandboxMessagesProxy(ctx.messages, combined.signal, isDisposed)
+            : undefined;
+        const scopedEvent = ctx.event
+            ? createSandboxEventSnapshot(ctx.event)
+            : undefined;
+        const scopedControl = ctx.control
+            ? createSandboxControlProxy(ctx.control, combined.signal, isDisposed)
+            : undefined;
+        const bodyBridge = ctx.body
+            ? createSandboxBodyBridge(ctx.body)
+            : undefined;
+        const outputBridge = ctx.output
+            ? createSandboxOutputBridge(ctx.output)
+            : undefined;
 
         const scopedCtx: ToolExecutionContext = {
             fs: ctx.fs,
@@ -923,6 +1559,12 @@ export class IframeJsSandbox implements ScriptSandbox {
             message: ctx.message,
             st: ctx.st,
             sideGen: scopedSideGen,
+            agent: scopedAgent,
+            ...(scopedMessages ? { messages: scopedMessages } : {}),
+            ...(scopedEvent ? { event: scopedEvent } : {}),
+            ...(scopedControl ? { control: scopedControl } : {}),
+            ...(bodyBridge ? { body: bodyBridge.workingBody } : {}),
+            ...(outputBridge ? { output: outputBridge.workingOutput } : {}),
             target: Object.freeze({ ...ctx.target }),
             signal: combined.signal,
             permissions: ctx.permissions,
@@ -943,6 +1585,12 @@ export class IframeJsSandbox implements ScriptSandbox {
                 message: scopedCtx.message,
                 st: scopedCtx.st,
                 sideGen: scopedCtx.sideGen,
+                agent: scopedCtx.agent,
+                messages: scopedCtx.messages,
+                event: scopedCtx.event,
+                control: scopedCtx.control,
+                body: scopedCtx.body,
+                output: scopedCtx.output,
                 target: scopedCtx.target,
                 signal: scopedCtx.signal,
             },
@@ -951,14 +1599,20 @@ export class IframeJsSandbox implements ScriptSandbox {
         realm.handle.trackAbortController(runController);
 
         try {
-            return await raceWithSignalAndTimeout(
+            const result = await raceWithSignalAndTimeout(
                 realm.evaluateCode(code, 'script'),
                 combined.signal,
                 options.timeoutMs ?? this.defaultTimeoutMs,
                 `Script (${id})`,
             );
+            if (!isDisposed() && !combined.signal.aborted) {
+                bodyBridge?.syncBack();
+                outputBridge?.syncBack();
+            }
+            return result;
         } finally {
             combined.cleanup();
+            callerLinked.cleanup();
             realm.handle.untrackAbortController(runController);
             if (!options.keepAlive) {
                 this.lifecycle.dispose(id);

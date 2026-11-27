@@ -46,6 +46,16 @@ export interface RoundRetryLog {
     hasReasoning?: boolean;
 }
 
+export interface AssistantRoundLog {
+    roundIndex: number;
+    beforeStepIndex: number;
+    reasoning?: string;
+    content?: string;
+    isFinishTurn?: boolean;
+    finishTurnSummary?: string;
+    timestamp: number;
+}
+
 export interface AgentRunTrace {
     runId: string;
     target: MessageTarget;
@@ -64,6 +74,10 @@ export interface AgentRunTrace {
     durationMs: number;
     usage: TokenUsage;
     toolSteps: ToolStepLog[];
+    assistantRounds?: AssistantRoundLog[];
+    assistantSummary?: string;
+    taskId?: string;
+    hasRollbackableRound?: boolean;
     retryCount?: number;
     roundMaxRetries?: number;
     retryEvents?: RoundRetryLog[];

@@ -56,6 +56,7 @@ export interface SandboxRunOptions {
     allowNetwork?: boolean;
     timeoutMs?: number;
     keepAlive?: boolean;
+    signal?: AbortSignal;
 }
 
 /** Abstract schema evaluator for `@@zod_schema` expressions without DOM/host coupling. */

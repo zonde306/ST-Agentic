@@ -1,4 +1,4 @@
-import type { ApiConnection, Preset, PromptBlock, Settings } from '../types';
+import type { ApiConnection, Preset, PresetMessageScript, PromptBlock, Settings } from '../types';
 import {
     createDefaultMainAgent,
     createDefaultPreset,
@@ -9,6 +9,7 @@ import {
     normalizeConnection,
     normalizeConnectionsMap,
     normalizePreset,
+    normalizePresetMessageScript,
     normalizePromptBlock,
     normalizeSettings,
     sanitizeName,
@@ -40,6 +41,8 @@ export interface ExportedPromptsPayload {
     presetName?: string;
     agentId?: string;
     prompts: PromptBlock[];
+    preprocessScript?: PresetMessageScript;
+    postprocessScript?: PresetMessageScript;
 }
 
 export interface ExportedConnectionsPayload {
@@ -311,11 +314,13 @@ export interface ImportedPromptsData {
     prompts: PromptBlock[];
     presetName?: string;
     agentId?: string;
+    preprocessScript?: PresetMessageScript;
+    postprocessScript?: PresetMessageScript;
 }
 
 /**
  * Validate and normalize an imported `st-agentic-prompts` or `st-agentic-prompt` payload,
- * preserving `placement`, `role: 'custom'`, and `triggers` losslessly.
+ * preserving `placement`, `role: 'custom'`, `triggers`, and optional preset message scripts losslessly.
  */
 export function validatePromptsImport(
     raw: unknown,
@@ -344,12 +349,16 @@ export function validatePromptsImport(
             typeof raw.agentId === 'string' && raw.agentId.trim()
                 ? raw.agentId.trim()
                 : undefined;
+        const preprocessScript = normalizePresetMessageScript(raw.preprocessScript);
+        const postprocessScript = normalizePresetMessageScript(raw.postprocessScript);
         return {
             ok: true,
             data: {
                 prompts,
                 ...(presetName ? { presetName } : {}),
                 ...(agentId ? { agentId } : {}),
+                ...(preprocessScript ? { preprocessScript } : {}),
+                ...(postprocessScript ? { postprocessScript } : {}),
             },
         };
     }
@@ -390,6 +399,8 @@ export function buildPresetFromPromptsImport(
             name: presetName,
             mainAgentId: agentId,
             agents: { [agentId]: mainAgent },
+            ...(data.preprocessScript ? { preprocessScript: data.preprocessScript } : {}),
+            ...(data.postprocessScript ? { postprocessScript: data.postprocessScript } : {}),
         }),
         presetId,
     );

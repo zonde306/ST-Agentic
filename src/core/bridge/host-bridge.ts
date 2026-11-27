@@ -169,6 +169,8 @@ export interface HostBridge {
     getCharacterFields(): Record<string, string>;
     getPersonaDescription(): string;
     listEnabledLorebooks(): Promise<Map<string, RawLoreEntry[]>>;
+    /** Clear cached lorebook snapshots on the host bridge, returning the number of cleared entries. */
+    clearLorebookCache?(): number;
 
     // 3. Macro & optional template rendering
     substituteMacros(text: string, overrides?: Record<string, string>): string;
@@ -204,6 +206,8 @@ export interface HostBridge {
     // 6. Optional host UI luminance & event hooks
     getHostLuminance?(): 'dark' | 'light';
     emitHostEvent?(event: string, payload?: unknown): void;
+    /** Optional fallback prompt configured in SillyTavern (`oai_settings.send_if_empty`). */
+    getSendIfEmpty?(): string;
 
     // 7. Optional off-mainline authoring & ST global administration bridges
     author?: HostAuthorBridge;

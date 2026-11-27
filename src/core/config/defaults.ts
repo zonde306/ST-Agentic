@@ -3,6 +3,7 @@ import type {
     AgentProfile,
     ApiConnection,
     Preset,
+    PresetMessageScript,
     PromptBlock,
     ScopedPermissions,
     Settings,
@@ -145,6 +146,17 @@ export function createDefaultMainAgent(overrides: Partial<AgentProfile> = {}): A
     };
 }
 
+/** Create a default disabled `PresetMessageScript` snapshot. */
+export function createDefaultPresetMessageScript(
+    overrides: Partial<PresetMessageScript> = {},
+): PresetMessageScript {
+    return {
+        enabled: overrides.enabled ?? false,
+        code: overrides.code ?? '',
+        ...(overrides.triggers ? { triggers: [...overrides.triggers] } : {}),
+    };
+}
+
 /** Create a fresh default `Preset` containing the default main narrative agent. */
 export function createDefaultPreset(overrides: Partial<Preset> = {}): Preset {
     const mainAgentId = overrides.mainAgentId?.trim() || DEFAULT_MAIN_AGENT_ID;
@@ -164,6 +176,12 @@ export function createDefaultPreset(overrides: Partial<Preset> = {}): Preset {
         wiRouterOverrides: overrides.wiRouterOverrides ? { ...overrides.wiRouterOverrides } : {},
         ...(overrides.builtinToolSettings
             ? { builtinToolSettings: canonicalClone(overrides.builtinToolSettings) }
+            : {}),
+        ...(overrides.preprocessScript
+            ? { preprocessScript: canonicalClone(overrides.preprocessScript) }
+            : {}),
+        ...(overrides.postprocessScript
+            ? { postprocessScript: canonicalClone(overrides.postprocessScript) }
             : {}),
     };
 }

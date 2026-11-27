@@ -118,6 +118,28 @@ export interface AgentProfile {
     strictToolLoop?: StrictToolLoopOverride;
 }
 
+export type TriggerEventType =
+    | 'generation_error'
+    | 'turn_interrupted'
+    | 'turn_aborted'
+    | 'turn_started'
+    | 'turn_completed'
+    | 'output_updated'
+    | 'prompt_preprocess'
+    | 'output_postprocess'
+    | 'chat_changed'
+    | 'message_sent'
+    | 'message_received'
+    | 'message_edited'
+    | 'message_deleted'
+    | 'message_swiped';
+
+export interface PresetMessageScript {
+    enabled: boolean;
+    code: string;
+    triggers?: PromptTriggerType[];
+}
+
 export interface TriggerCondition {
     type: 'always' | 'interval' | 'regex' | 'keyword' | 'js_predicate';
     interval?: number;
@@ -146,6 +168,7 @@ export interface TriggerRule {
     schemaSource?: { kind: 'json' | 'zod'; raw: string };
     decorator?: string;
     ifConditions?: string[];
+    events?: TriggerEventType[];
     scriptCode?: string;
     findRegex?: string;
     enabled: boolean;
@@ -207,6 +230,8 @@ export interface Preset {
     files: Record<string, string>;
     wiRouterOverrides: Record<string, WICategory>;
     builtinToolSettings?: Record<string, BuiltinToolConfig>;
+    preprocessScript?: PresetMessageScript;
+    postprocessScript?: PresetMessageScript;
 }
 
 export interface StorageSettings {

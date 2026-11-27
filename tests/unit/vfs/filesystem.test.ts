@@ -822,4 +822,45 @@ describe('VirtualFileSystem', () => {
         expect(revertEdit.ok).toBe(true);
         expect(vfs.store.get('worldinfo', 'TemplateBook/11', { target })).toBeNull();
     });
+
+    it('clears cached read transforms via clearReadTransformCache and forces re-evaluation on subsequent reads', async () => {
+        const bridge = createFixtureBridge();
+        let transformCalls = 0;
+        bridge.transformPromptText = async (input) => {
+            transformCalls += 1;
+            return {
+                text: `[t${transformCalls}] ${input.text}`,
+                changed: true,
+                cacheable: true,
+                cacheKeys: {},
+                cacheDisableReasons: [],
+                handledSyntaxes: new Set<string>(),
+                errors: [],
+            };
+        };
+
+        const vfs = new VirtualFileSystem({ bridge });
+        await vfs.writeFile('/notes/cached.md', 'Hello {{user}}', {
+            target: { messageId: 1, swipeId: 0 },
+        });
+
+        const first = await vfs.readFile('/notes/cached.md', {
+            target: { messageId: 1, swipeId: 0 },
+        });
+        const second = await vfs.readFile('/notes/cached.md', {
+            target: { messageId: 1, swipeId: 0 },
+        });
+        expect(first).toBe('[t1] Hello 沈默');
+        expect(second).toBe('[t1] Hello 沈默');
+        expect(transformCalls).toBe(1);
+
+        expect(vfs.clearReadTransformCache()).toBe(1);
+        expect(vfs.clearReadTransformCache()).toBe(0);
+
+        const third = await vfs.readFile('/notes/cached.md', {
+            target: { messageId: 1, swipeId: 0 },
+        });
+        expect(third).toBe('[t2] Hello 沈默');
+        expect(transformCalls).toBe(2);
+    });
 });
