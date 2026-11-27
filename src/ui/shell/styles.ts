@@ -960,6 +960,22 @@ textarea:focus-visible {
     background: color-mix(in srgb, var(--error) 12%, transparent);
 }
 
+.ag-btn-danger.ag-log-stop-btn {
+    background: color-mix(in srgb, var(--error) 10%, var(--card));
+    color: var(--error);
+    border-color: color-mix(in srgb, var(--error) 36%, var(--border));
+    box-shadow: var(--shadow-xs);
+}
+
+.ag-btn-danger.ag-log-stop-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--error) 18%, var(--card));
+    border-color: color-mix(in srgb, var(--error) 52%, var(--border));
+}
+
+.ag-btn-danger.ag-log-stop-btn:active:not(:disabled) {
+    background: color-mix(in srgb, var(--error) 24%, var(--card));
+}
+
 .ag-btn-danger-solid,
 .ag-modal-footer .ag-btn-danger {
     background: var(--error);
