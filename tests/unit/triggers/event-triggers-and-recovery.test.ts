@@ -842,4 +842,58 @@ describe('Event Triggers, ctx.agent, Error Recovery & Full-Phase Rollback Resume
         expect((midGenErrEv!.payload as ToolEventPayload).phase).toBe('main_turn');
         expect((midGenErrEv!.payload as ToolEventPayload).error).toContain('Mid-turn network drop');
     });
+
+    it('still honors control.retry({ rollbackToolRounds: 1 }) after a no-op ctx.messages.rollbackToolRounds(0)', async () => {
+        const loreEntries: RawLoreEntry[] = [
+            makeLoreEntry({
+                uid: 45,
+                comment: '零回退后再由 control.retry 回退',
+                content: [
+                    '@@script on=generation_error order=1',
+                    'ctx.messages.rollbackToolRounds(0);',
+                    'ctx.control.retry("rollback_via_control", { rollbackToolRounds: 1, delayMs: 0 });',
+                ].join('\n'),
+            }),
+        ];
+
+        const { bridge, transport, orchestrator } = createFixture({
+            lorebooks: { EventBook: loreEntries },
+        });
+        bridge.pushMessage({ id: 0, name: '沈默', isUser: true, mes: '测试零回退边界' });
+        bridge.pushMessage({ id: 1, name: '林晚', isUser: false, mes: '', swipeId: 0 });
+
+        let retriedWithoutRound1 = false;
+        transport.enqueue(
+            {
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'tc_noop_check',
+                        name: 'read_variables',
+                        arguments: '{}',
+                    },
+                ],
+            },
+            () => {
+                throw new LLMTransportError('Upstream error after round 1', {
+                    status: 400,
+                    retryable: false,
+                });
+            },
+            (req) => {
+                retriedWithoutRound1 = !JSON.stringify(req.messages).includes('tc_noop_check');
+                return writeOutputTurn('回退后重试成功。', 'w_after_noop_rb');
+            },
+            { content: 'done' },
+        );
+
+        const res = await orchestrator.runTurn({
+            action: 'normal',
+            target: { messageId: 1, swipeId: 0 },
+            userInput: '测试零回退边界',
+        });
+
+        expect(retriedWithoutRound1).toBe(true);
+        expect(res.content).toBe('回退后重试成功。');
+    });
 });

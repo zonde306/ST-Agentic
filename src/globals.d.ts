@@ -30,7 +30,7 @@ import type { EjsTemplateGlobal } from '@/host/ejs-adapter';
 import type { STGenerateInterceptor } from '@/host/interceptor';
 import type { STHostBridge } from '@/host/st-bridge';
 import type { IframeJsSandbox } from '@/sandbox';
-import type { AppStore } from '@/ui/store';
+import type { AppStore, ClearPromptCachesResult } from '@/ui/store';
 
 /** Public off-mainline Assistant control & read handle exposed on `globalThis.Agentic.assistant`. */
 export interface AgenticAssistantPublicApi {
@@ -72,6 +72,7 @@ export interface AgenticPublicApi {
     closeConsole(): void;
     runTurn(input: RunTurnInput): Promise<RunTurnResult>;
     rerunAfterTurn(target?: MessageTarget, options?: { triggerIds?: string[]; force?: boolean }): Promise<void>;
+    clearPromptCaches(): Promise<ClearPromptCachesResult>;
     readonly sideGen: ToolSideGenApi;
     readonly assistant: AgenticAssistantPublicApi;
     readonly docs: AgenticDocsPublicApi;

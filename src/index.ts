@@ -3442,9 +3442,7 @@ jQuery(async () => {
             pendingDocs.length = 0;
         }
 
-        const publicApi: AgenticPublicApi & {
-            clearPromptCaches(): Promise<ClearPromptCachesResult>;
-        } = {
+        const publicApi: AgenticPublicApi = {
             version: AGENTIC_VERSION,
             events: PROMPT_TRANSFORM_EVENTS,
             getSettings: () => canonicalClone(currentSettings),

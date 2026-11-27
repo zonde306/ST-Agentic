@@ -2302,12 +2302,18 @@ export class PipelineOrchestrator {
             list: () => errCtx.ephemeralMessages.list(),
             set: (nextMessages) => errCtx.ephemeralMessages.set(nextMessages),
             rollbackToolRounds: (count?: number) => {
-                hookRolledBackDirectly = true;
-                return errCtx.ephemeralMessages.rollbackToolRounds(count);
+                const removed = errCtx.ephemeralMessages.rollbackToolRounds(count);
+                if (removed > 0) {
+                    hookRolledBackDirectly = true;
+                }
+                return removed;
             },
             dropHistoryTurns: (count?: number, opts?: { from?: 'newest' | 'oldest' }) => {
-                hookDroppedHistoryDirectly = true;
-                return errCtx.ephemeralMessages.dropHistoryTurns(count, opts);
+                const dropped = errCtx.ephemeralMessages.dropHistoryTurns(count, opts);
+                if (dropped > 0) {
+                    hookDroppedHistoryDirectly = true;
+                }
+                return dropped;
             },
             replaceContent: (selector, replacer) =>
                 errCtx.ephemeralMessages.replaceContent(selector, replacer),
