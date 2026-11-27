@@ -7,6 +7,7 @@ import type {
     PipelinePhase,
     Preset,
     TriggerCondition,
+    TriggerEventType,
     TriggerRule,
 } from '@/core/types';
 import {
@@ -17,12 +18,14 @@ import {
     EmptyState,
     FormField,
     MasterDetailLayout,
+    SegmentedControl,
     SelectInput,
     TextInput,
     ToggleSwitch,
     useIsMobileViewport,
 } from '@/ui/components';
 import {
+    IconCheck,
     IconGitBranch,
     IconPlay,
     IconPlus,
@@ -53,6 +56,135 @@ const PIPELINE_PHASES: readonly {
     { id: 'after_turn', title: 'Phase 3: After Turn', subtitle: '后置变量 / 摘要 / 媒体异步' },
     { id: 'maintenance', title: 'Phase 4: Maintenance', subtitle: '高低水位线分块压缩维护' },
 ];
+
+type PipelineListViewMode = 'all' | 'events_only' | 'by_event';
+
+interface TriggerEventOptionMeta {
+    id: TriggerEventType;
+    label: string;
+    desc: string;
+    tone: 'warning' | 'primary';
+}
+
+const TRIGGER_EVENT_GROUPS: readonly {
+    id: string;
+    title: string;
+    events: readonly TriggerEventOptionMeta[];
+}[] = [
+    {
+        id: 'recovery',
+        title: '错误与中断恢复',
+        events: [
+            {
+                id: 'generation_error',
+                label: '生成错误',
+                desc: '请求报错退出前拦截，可回退工具轮或切换连接重试',
+                tone: 'warning',
+            },
+            {
+                id: 'turn_interrupted',
+                label: '回合中断',
+                desc: '手动停止、输出截断或异常中断时触发',
+                tone: 'warning',
+            },
+            {
+                id: 'turn_aborted',
+                label: '回合中止',
+                desc: '切分支、重生成或任务取消中止时触发',
+                tone: 'warning',
+            },
+        ],
+    },
+    {
+        id: 'pipeline',
+        title: '回合与消息管线',
+        events: [
+            {
+                id: 'prompt_preprocess',
+                label: '发模前预处理',
+                desc: '向 LLM 发请求前拦截临时消息与请求体',
+                tone: 'primary',
+            },
+            {
+                id: 'output_postprocess',
+                label: '响应后处理',
+                desc: '收到 LLM 响应后改写输出或触发重试/修正',
+                tone: 'primary',
+            },
+            {
+                id: 'output_updated',
+                label: '输出更新',
+                desc: '写入或更新 /output.md 正文后触发',
+                tone: 'primary',
+            },
+            {
+                id: 'turn_started',
+                label: '回合开始',
+                desc: '主叙事回合开始执行时触发',
+                tone: 'primary',
+            },
+            {
+                id: 'turn_completed',
+                label: '回合完成',
+                desc: '主叙事回合正常完成时触发',
+                tone: 'primary',
+            },
+        ],
+    },
+    {
+        id: 'host',
+        title: '宿主聊天事件',
+        events: [
+            {
+                id: 'chat_changed',
+                label: '切换聊天',
+                desc: '切换角色卡或聊天会话时触发',
+                tone: 'primary',
+            },
+            {
+                id: 'message_sent',
+                label: '发送消息',
+                desc: '用户发送新消息时触发',
+                tone: 'primary',
+            },
+            {
+                id: 'message_received',
+                label: '收到回复',
+                desc: '聊天收到新的助手消息时触发',
+                tone: 'primary',
+            },
+            {
+                id: 'message_edited',
+                label: '编辑消息',
+                desc: '消息内容被编辑保存时触发',
+                tone: 'primary',
+            },
+            {
+                id: 'message_deleted',
+                label: '删除消息',
+                desc: '消息楼层被删除时触发',
+                tone: 'primary',
+            },
+            {
+                id: 'message_swiped',
+                label: '切换 Swipe',
+                desc: '切换楼层 Swipe 分支时触发',
+                tone: 'primary',
+            },
+        ],
+    },
+];
+
+const TRIGGER_EVENT_META_MAP = new Map<TriggerEventType, TriggerEventOptionMeta>(
+    TRIGGER_EVENT_GROUPS.flatMap((group) => group.events.map((ev) => [ev.id, ev] as const)),
+);
+
+const ALL_TRIGGER_EVENT_ORDER: readonly TriggerEventOptionMeta[] =
+    TRIGGER_EVENT_GROUPS.flatMap((group) => group.events);
+
+function getTriggerEventTone(eventType: TriggerEventType): 'warning' | 'primary' {
+    return TRIGGER_EVENT_META_MAP.get(eventType)?.tone ?? 'primary';
+}
 
 const TRIGGER_DECORATOR_PREFIXES = [
     '@@trigger',
@@ -170,6 +302,7 @@ export function PipelineView(props: Partial<ConsoleViewProps> = {}) {
     const [selection, setSelection] = useState<PipelineSelection | null>(null);
     const [detailOpen, setDetailOpen] = useState(false);
     const [runningRuleId, setRunningRuleId] = useState<string | null>(null);
+    const [listViewMode, setListViewMode] = useState<PipelineListViewMode>('all');
 
     const hasValidTarget =
         Number.isInteger(activeTarget.messageId)
@@ -522,6 +655,138 @@ export function PipelineView(props: Partial<ConsoleViewProps> = {}) {
         }
     };
 
+    const toggleRuleEvent = (eventType: TriggerEventType) => {
+        mutateActiveRule((rule) => {
+            const current = rule.events ?? [];
+            const exists = current.includes(eventType);
+            const nextEvents = exists
+                ? current.filter((ev) => ev !== eventType)
+                : [...current, eventType];
+            if (nextEvents.length === 0) {
+                const next = { ...rule };
+                delete next.events;
+                return next;
+            }
+            return {
+                ...rule,
+                events: nextEvents,
+            };
+        });
+    };
+
+    const allMasterEntries = useMemo(() => {
+        const presetItems = activePreset.triggers.map((rule) => ({
+            kind: 'preset_rule' as const,
+            key: rule.id,
+            order: rule.order,
+            rule,
+        }));
+        const wiItems = scannedVirtualEntries.map(({ lore, inferred }) => ({
+            kind: 'scanned_wi' as const,
+            key: lore.vfsPath,
+            order: inferred.order,
+            lore,
+            rule: inferred,
+        }));
+        return [...presetItems, ...wiItems];
+    }, [activePreset.triggers, scannedVirtualEntries]);
+
+    const eventSubscribedEntries = useMemo(
+        () => allMasterEntries.filter((entry) => (entry.rule.events?.length ?? 0) > 0),
+        [allMasterEntries],
+    );
+
+    const renderMasterRuleButton = (
+        entry: (typeof allMasterEntries)[number],
+        keyPrefix = '',
+    ) => {
+        const isSelected =
+            (entry.kind === 'preset_rule'
+                && selection?.kind === 'preset_rule'
+                && selection.ruleId === entry.rule.id)
+            || (entry.kind === 'scanned_wi'
+                && selection?.kind === 'scanned_wi'
+                && selection.vfsPath === entry.key);
+        const r = entry.rule;
+        const events = r.events ?? [];
+        return (
+            <button
+                key={`${keyPrefix}${entry.key}`}
+                type="button"
+                class={
+                    isSelected && !isMobile
+                        ? 'ag-list-item ag-list-item-active'
+                        : 'ag-list-item'
+                }
+                data-pipeline-rule-id={r.id}
+                data-pipeline-rule-events={events.length > 0 ? events.join(',') : undefined}
+                style={{
+                    opacity: r.enabled ? 1 : 0.55,
+                    minHeight: '48px',
+                }}
+                onClick={() => {
+                    if (entry.kind === 'preset_rule') {
+                        setSelection({
+                            kind: 'preset_rule',
+                            ruleId: r.id,
+                        });
+                    } else {
+                        setSelection({
+                            kind: 'scanned_wi',
+                            vfsPath: entry.key,
+                        });
+                    }
+                    if (isMobile) {
+                        setDetailOpen(true);
+                    }
+                }}
+            >
+                <div
+                    class="ag-row-wrap"
+                    style={{ justifyContent: 'space-between', width: '100%' }}
+                >
+                    <span class="ag-list-item-title">
+                        #{r.order} · {r.label}
+                    </span>
+                    <Badge tone={barrierTone(r.barrier)}>{r.barrier}</Badge>
+                </div>
+                {events.length > 0 ? (
+                    <div class="ag-row-wrap" style={{ gap: '4px', marginTop: '2px' }}>
+                        {events.slice(0, 2).map((ev) => (
+                            <Badge
+                                key={ev}
+                                tone={getTriggerEventTone(ev)}
+                                className="ag-mono"
+                                title={TRIGGER_EVENT_META_MAP.get(ev)?.desc ?? ev}
+                            >
+                                on:{ev}
+                            </Badge>
+                        ))}
+                        {events.length > 2 ? (
+                            <Badge
+                                tone="neutral"
+                                title={events.map((ev) => `on:${ev}`).join('、')}
+                            >
+                                +{events.length - 2}
+                            </Badge>
+                        ) : null}
+                    </div>
+                ) : null}
+                <div class="ag-list-item-meta">
+                    <span>
+                        {entry.kind === 'scanned_wi'
+                            ? '世界书 @@ (实时扫描)'
+                            : r.source === 'worldinfo'
+                                ? '世界书 @@ (已导入)'
+                                : '预设规则'}
+                        {r.groupName ? ` · @@group ${r.groupName}` : ''}
+                    </span>
+                    <span>{conditionSummary(r.condition)}</span>
+                </div>
+            </button>
+        );
+    };
+
     const masterPane = (
         <div class="ag-stack-v" style={{ padding: '10px' }}>
             <div class="ag-row-wrap" style={{ justifyContent: 'space-between' }}>
@@ -549,132 +814,136 @@ export function PipelineView(props: Partial<ConsoleViewProps> = {}) {
                 </div>
             </div>
 
-            {PIPELINE_PHASES.map((phaseMeta) => {
-                const presetItems = activePreset.triggers
-                    .filter((t) => t.phase === phaseMeta.id)
-                    .map((rule) => ({
-                        kind: 'preset_rule' as const,
-                        key: rule.id,
-                        order: rule.order,
-                        rule,
-                    }));
-                const wiItems = scannedVirtualEntries
-                    .filter(({ inferred }) => inferred.phase === phaseMeta.id)
-                    .map(({ lore, inferred }) => ({
-                        kind: 'scanned_wi' as const,
-                        key: lore.vfsPath,
-                        order: inferred.order,
-                        lore,
-                        rule: inferred,
-                    }));
+            <div class="ag-row-wrap" style={{ justifyContent: 'space-between', gap: '6px' }}>
+                <SegmentedControl<PipelineListViewMode>
+                    ariaLabel="触发管线筛选视图"
+                    value={listViewMode}
+                    options={[
+                        { value: 'all', label: '全部泳道' },
+                        { value: 'events_only', label: `仅事件 (${eventSubscribedEntries.length})` },
+                        { value: 'by_event', label: '按事件分组' },
+                    ]}
+                    onChange={setListViewMode}
+                />
+            </div>
 
-                const combined = [...presetItems, ...wiItems].sort(
-                    (a, b) => a.order - b.order || a.rule.label.localeCompare(b.rule.label),
-                );
-
-                return (
-                    <div
-                        key={phaseMeta.id}
-                        style={{
-                            border: '1px solid var(--border)',
-                            borderRadius: '10px',
-                            background: 'var(--card)',
-                            padding: '8px',
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '6px',
-                            minWidth: 0,
-                        }}
-                    >
-                        <div class="ag-row-wrap" style={{ justifyContent: 'space-between' }}>
-                            <div>
-                                <div style={{ fontSize: '12px', fontWeight: 700 }}>{phaseMeta.title}</div>
-                                <div class="ag-field-hint">{phaseMeta.subtitle}</div>
+            {listViewMode === 'by_event' ? (
+                eventSubscribedEntries.length === 0 ? (
+                    <EmptyState
+                        icon={<IconGitBranch size={18} />}
+                        title="暂无事件订阅规则"
+                        description="在任意触发器详情的「事件触发订阅 (events)」中勾选事件（如 on:generation_error），即可按事件分组查看。"
+                    />
+                ) : (
+                    ALL_TRIGGER_EVENT_ORDER.map((eventMeta) => {
+                        const grouped = eventSubscribedEntries
+                            .filter((entry) => entry.rule.events?.includes(eventMeta.id))
+                            .sort(
+                                (a, b) =>
+                                    a.order - b.order || a.rule.label.localeCompare(b.rule.label),
+                            );
+                        if (grouped.length === 0) {
+                            return null;
+                        }
+                        return (
+                            <div
+                                key={eventMeta.id}
+                                data-pipeline-event-group={eventMeta.id}
+                                style={{
+                                    border: '1px solid var(--border)',
+                                    borderRadius: '10px',
+                                    background: 'var(--card)',
+                                    padding: '8px',
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    gap: '6px',
+                                    minWidth: 0,
+                                }}
+                            >
+                                <div
+                                    class="ag-row-wrap"
+                                    style={{ justifyContent: 'space-between', alignItems: 'center' }}
+                                >
+                                    <div class="ag-row-wrap" style={{ gap: '6px' }}>
+                                        <Badge tone={eventMeta.tone} className="ag-mono">
+                                            on:{eventMeta.id}
+                                        </Badge>
+                                        <span style={{ fontSize: '12px', fontWeight: 700 }}>
+                                            {eventMeta.label}
+                                        </span>
+                                    </div>
+                                    <Badge tone="neutral">{grouped.length} 条</Badge>
+                                </div>
+                                <div class="ag-stack-v" style={{ gap: '6px' }}>
+                                    {grouped.map((entry) =>
+                                        renderMasterRuleButton(entry, `ev_${eventMeta.id}_`),
+                                    )}
+                                </div>
                             </div>
-                            <Button
-                                size="sm"
-                                variant="ghost"
-                                ariaLabel={`在 ${phaseMeta.title} 新增规则`}
-                                icon={<IconPlus size={13} />}
-                                onClick={() => handleAddRule(phaseMeta.id)}
-                            />
+                        );
+                    })
+                )
+            ) : listViewMode === 'events_only' && eventSubscribedEntries.length === 0 ? (
+                <EmptyState
+                    icon={<IconGitBranch size={18} />}
+                    title="当前没有配置事件订阅的规则"
+                    description="切换到「全部泳道」选择规则，并在右侧「事件触发订阅」中勾选事件。"
+                />
+            ) : (
+                PIPELINE_PHASES.map((phaseMeta) => {
+                    const sourceList =
+                        listViewMode === 'events_only' ? eventSubscribedEntries : allMasterEntries;
+                    const combined = sourceList
+                        .filter((entry) => entry.rule.phase === phaseMeta.id)
+                        .sort(
+                            (a, b) => a.order - b.order || a.rule.label.localeCompare(b.rule.label),
+                        );
+
+                    return (
+                        <div
+                            key={phaseMeta.id}
+                            style={{
+                                border: '1px solid var(--border)',
+                                borderRadius: '10px',
+                                background: 'var(--card)',
+                                padding: '8px',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '6px',
+                                minWidth: 0,
+                            }}
+                        >
+                            <div class="ag-row-wrap" style={{ justifyContent: 'space-between' }}>
+                                <div>
+                                    <div style={{ fontSize: '12px', fontWeight: 700 }}>
+                                        {phaseMeta.title}
+                                    </div>
+                                    <div class="ag-field-hint">{phaseMeta.subtitle}</div>
+                                </div>
+                                <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    ariaLabel={`在 ${phaseMeta.title} 新增规则`}
+                                    icon={<IconPlus size={13} />}
+                                    onClick={() => handleAddRule(phaseMeta.id)}
+                                />
+                            </div>
+
+                            {combined.length === 0 ? (
+                                <div class="ag-field-hint" style={{ padding: '4px 2px' }}>
+                                    {listViewMode === 'events_only'
+                                        ? '该阶段暂无事件规则'
+                                        : '该阶段暂无规则'}
+                                </div>
+                            ) : (
+                                <div class="ag-stack-v" style={{ gap: '6px' }}>
+                                    {combined.map((entry) => renderMasterRuleButton(entry))}
+                                </div>
+                            )}
                         </div>
-
-                        {combined.length === 0 ? (
-                            <div class="ag-field-hint" style={{ padding: '4px 2px' }}>
-                                该阶段暂无规则
-                            </div>
-                        ) : (
-                            <div class="ag-stack-v" style={{ gap: '6px' }}>
-                                {combined.map((entry) => {
-                                    const isSelected =
-                                        (entry.kind === 'preset_rule'
-                                            && selection?.kind === 'preset_rule'
-                                            && selection.ruleId === entry.rule.id)
-                                        || (entry.kind === 'scanned_wi'
-                                            && selection?.kind === 'scanned_wi'
-                                            && selection.vfsPath === entry.key);
-                                    const r = entry.rule;
-                                    return (
-                                        <button
-                                            key={entry.key}
-                                            type="button"
-                                            class={
-                                                isSelected && !isMobile
-                                                    ? 'ag-list-item ag-list-item-active'
-                                                    : 'ag-list-item'
-                                            }
-                                            style={{
-                                                opacity: r.enabled ? 1 : 0.55,
-                                                minHeight: '48px',
-                                            }}
-                                            onClick={() => {
-                                                if (entry.kind === 'preset_rule') {
-                                                    setSelection({
-                                                        kind: 'preset_rule',
-                                                        ruleId: r.id,
-                                                    });
-                                                } else {
-                                                    setSelection({
-                                                        kind: 'scanned_wi',
-                                                        vfsPath: entry.key,
-                                                    });
-                                                }
-                                                if (isMobile) {
-                                                    setDetailOpen(true);
-                                                }
-                                            }}
-                                        >
-                                            <div
-                                                class="ag-row-wrap"
-                                                style={{ justifyContent: 'space-between', width: '100%' }}
-                                            >
-                                                <span class="ag-list-item-title">
-                                                    #{r.order} · {r.label}
-                                                </span>
-                                                <Badge tone={barrierTone(r.barrier)}>
-                                                    {r.barrier}
-                                                </Badge>
-                                            </div>
-                                            <div class="ag-list-item-meta">
-                                                <span>
-                                                    {entry.kind === 'scanned_wi'
-                                                        ? '世界书 @@ (实时扫描)'
-                                                        : r.source === 'worldinfo'
-                                                            ? '世界书 @@ (已导入)'
-                                                            : '预设规则'}
-                                                    {r.groupName ? ` · @@group ${r.groupName}` : ''}
-                                                </span>
-                                                <span>{conditionSummary(r.condition)}</span>
-                                            </div>
-                                        </button>
-                                    );
-                                })}
-                            </div>
-                        )}
-                    </div>
-                );
-            })}
+                    );
+                })
+            )}
         </div>
     );
 
@@ -855,6 +1124,95 @@ export function PipelineView(props: Partial<ConsoleViewProps> = {}) {
                                 onChange={targetPathDraft.onChange}
                             />
                         </FormField>
+                    </div>
+                </Card>
+
+                {/* Event Subscriptions */}
+                <Card
+                    title="事件触发订阅 (events)"
+                    subtitle="可选：勾选后该规则会在对应事件发生时被调度；留空则仅按上方阶段泳道触发。"
+                    actions={
+                        activePresetRule.events && activePresetRule.events.length > 0 ? (
+                            <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() =>
+                                    mutateActiveRule((rule) => {
+                                        const next = { ...rule };
+                                        delete next.events;
+                                        return next;
+                                    })
+                                }
+                            >
+                                清空事件
+                            </Button>
+                        ) : undefined
+                    }
+                >
+                    <div class="ag-stack-v" style={{ gap: '10px' }}>
+                        <div class="ag-row-wrap" style={{ gap: '6px' }}>
+                            {activePresetRule.events && activePresetRule.events.length > 0 ? (
+                                activePresetRule.events.map((ev) => (
+                                    <Badge
+                                        key={ev}
+                                        tone={getTriggerEventTone(ev)}
+                                        className="ag-mono"
+                                    >
+                                        on:{ev}
+                                    </Badge>
+                                ))
+                            ) : (
+                                <span class="ag-field-hint">
+                                    当前未订阅事件（常规阶段触发模式）
+                                </span>
+                            )}
+                        </div>
+
+                        {TRIGGER_EVENT_GROUPS.map((group) => (
+                            <div key={group.id} class="ag-trigger-group">
+                                <div class="ag-trigger-group-title">{group.title}</div>
+                                <div class="ag-trigger-options">
+                                    {group.events.map((ev) => {
+                                        const checked = Boolean(
+                                            activePresetRule.events?.includes(ev.id),
+                                        );
+                                        return (
+                                            <button
+                                                key={ev.id}
+                                                type="button"
+                                                aria-pressed={checked}
+                                                data-pipeline-event-toggle={ev.id}
+                                                title={`on:${ev.id} · ${ev.desc}`}
+                                                class={
+                                                    checked
+                                                        ? 'ag-trigger-option ag-trigger-option-active'
+                                                        : 'ag-trigger-option'
+                                                }
+                                                style={{ minHeight: '44px', minWidth: '40px' }}
+                                                onClick={() => toggleRuleEvent(ev.id)}
+                                            >
+                                                <div class="ag-trigger-option-head">
+                                                    <span class="ag-trigger-option-label">
+                                                        {ev.label}
+                                                    </span>
+                                                    {checked ? (
+                                                        <span class="ag-trigger-option-check">
+                                                            <IconCheck size={13} />
+                                                        </span>
+                                                    ) : null}
+                                                </div>
+                                                <div class="ag-trigger-option-desc ag-mono">
+                                                    on:{ev.id}
+                                                </div>
+                                                <div class="ag-trigger-option-desc">
+                                                    {ev.desc}
+                                                </div>
+                                            </button>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        ))}
                     </div>
                 </Card>
 
@@ -1090,6 +1448,15 @@ export function PipelineView(props: Partial<ConsoleViewProps> = {}) {
                                     schema: {activeScannedItem.inferred.schemaSource.kind}
                                 </Badge>
                             ) : null}
+                            {activeScannedItem.inferred.events?.map((ev) => (
+                                <Badge
+                                    key={ev}
+                                    tone={getTriggerEventTone(ev)}
+                                    className="ag-mono"
+                                >
+                                    on:{ev}
+                                </Badge>
+                            ))}
                             {activeScannedItem.lore.decorators.map((dec, idx) => (
                                 <Badge key={`${dec.name}_${idx}`} tone="warning" className="ag-mono">
                                     {dec.name}

@@ -14,6 +14,7 @@ import {
     IconDatabase,
     IconPlay,
     IconRefresh,
+    IconTrash,
 } from '@/ui/components/Icons';
 import type {
     AgentWatermarkStatus,
@@ -33,6 +34,7 @@ export function CacheStorageView({ store }: ConsoleViewProps) {
     const [watermarks, setWatermarks] = useState<AgentWatermarkStatus[]>([]);
     const [overview, setOverview] = useState<StorageOverview | null>(null);
     const [loading, setLoading] = useState(true);
+    const [clearingCaches, setClearingCaches] = useState(false);
     const [compactingAgentId, setCompactingAgentId] = useState<string | null>(null);
     const [compactionBusy, setCompactionBusy] = useState(false);
     const [lastReport, setLastReport] = useState<CompactionReport | null>(null);
@@ -110,6 +112,31 @@ export function CacheStorageView({ store }: ConsoleViewProps) {
         }
     };
 
+    const handleClearPromptCaches = async () => {
+        if (clearingCaches) {
+            return;
+        }
+        if (!store.services.clearAllPromptCaches) {
+            store.pushToast('当前运行时不支持清除提示词缓存', 'warning');
+            return;
+        }
+        setClearingCaches(true);
+        try {
+            const result = await store.services.clearAllPromptCaches();
+            await loadTelemetry();
+            store.pushToast(
+                `已清除所有提示词缓存（未删除聊天历史）：前缀缓存 ${result.clearedPrefixes} 条 · VFS 缓存 ${result.clearedVfsCache} 条 · 世界书缓存 ${result.clearedLorebooks} 条`,
+                'success',
+                4000,
+            );
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            store.pushToast(`清除提示词缓存失败：${msg}`, 'error');
+        } finally {
+            setClearingCaches(false);
+        }
+    };
+
     const handleCompactAgent = async (item: AgentWatermarkStatus) => {
         if (compactingAgentId) {
             return;
@@ -184,15 +211,29 @@ export function CacheStorageView({ store }: ConsoleViewProps) {
                     title="持久智能体上下文水位与分块归档 (KV Cache 保护)"
                     subtitle="未跨过高水位 H 前严禁修改历史或折叠旧工具输出，到达 H 后在维护阶段原子归档回落至低水位 L。"
                     actions={
-                        <Button
-                            size="sm"
-                            variant="secondary"
-                            icon={<IconRefresh size={14} />}
-                            loading={loading}
-                            onClick={() => void loadTelemetry()}
-                        >
-                            刷新遥测
-                        </Button>
+                        <div class="ag-row-wrap">
+                            <Button
+                                size="sm"
+                                variant="secondary"
+                                icon={<IconTrash size={14} />}
+                                loading={clearingCaches}
+                                disabled={clearingCaches}
+                                className="ag-cache-clear-prompts-btn"
+                                title="仅清除前缀缓存、VFS 缓存与世界书缓存，不会删除聊天历史"
+                                onClick={() => void handleClearPromptCaches()}
+                            >
+                                清除所有提示词缓存
+                            </Button>
+                            <Button
+                                size="sm"
+                                variant="secondary"
+                                icon={<IconRefresh size={14} />}
+                                loading={loading}
+                                onClick={() => void loadTelemetry()}
+                            >
+                                刷新遥测
+                            </Button>
+                        </div>
                     }
                 >
                     {loading && watermarks.length === 0 ? (
