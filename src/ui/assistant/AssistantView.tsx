@@ -23,7 +23,7 @@ import {
     IconStop,
     ShadowModal,
 } from '@/ui/components';
-import type { ConsoleViewProps } from '@/ui/store';
+import type { AssistantStreamingHooks, ConsoleViewProps } from '@/ui/store';
 import { MessageBubble } from './MessageBubble';
 import {
     type AssistantSessionConfig,
@@ -117,6 +117,8 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     const pendingApprovals = useAssistantStoreSlice(store, (s) => s.assistantPendingApprovals);
     const undoStack = useAssistantStoreSlice(store, (s) => s.assistantUndoStack);
     const streamingSessionId = useAssistantStoreSlice(store, (s) => s.assistantStreamingSessionId);
+    const streamingSessionIds = useAssistantStoreSlice(store, (s) => s.assistantStreamingSessionIds);
+    const streamingDeltas = useAssistantStoreSlice(store, (s) => s.assistantStreamingDeltas);
     const settings = useAssistantStoreSlice(store, (s) => s.settings);
 
     const [openPopover, setOpenPopover] = useState<ActivePopover>(null);
@@ -124,10 +126,6 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     const [stAdminConfirmOpen, setStAdminConfirmOpen] = useState<boolean>(false);
     const [previewFile, setPreviewFile] = useState<FilePreviewState | null>(null);
     const [draft, setDraft] = useState<string>('');
-    const [streamingDelta, setStreamingDelta] = useState<{
-        sessionId: string;
-        text: string;
-    } | null>(null);
     const [busyApprovalId, setBusyApprovalId] = useState<string | null>(null);
     const [busyUndoId, setBusyUndoId] = useState<string | null>(null);
     const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
@@ -148,7 +146,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
         DEFAULT_DRAFT_SESSION_CONFIG,
     );
 
-    const abortControllerRef = useRef<AbortController | null>(null);
+    const mountedRef = useRef<boolean>(true);
     const tokenFetchSeqRef = useRef<number>(0);
     const threadRef = useRef<HTMLDivElement | null>(null);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -180,11 +178,11 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
         });
     }, [store]);
 
-    // Cleanup any active AbortController on unmount.
+    // Track mount state without aborting active background streams on tab switch.
     useEffect(() => {
+        mountedRef.current = true;
         return () => {
-            abortControllerRef.current?.abort();
-            abortControllerRef.current = null;
+            mountedRef.current = false;
         };
     }, []);
 
@@ -245,7 +243,9 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     ]);
 
     const isStreamingCurrent = Boolean(
-        activeSession && streamingSessionId === activeSession.id,
+        activeSession
+        && (streamingSessionIds.includes(activeSession.id)
+            || streamingSessionId === activeSession.id),
     );
 
     useEffect(() => {
@@ -264,17 +264,19 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             const sid = targetSessionId ?? activeSession?.id ?? null;
             const runtime = store.assistantRuntime;
             if (!sid || !runtime?.getSessionTokenStatus) {
-                setTokenStatus(null);
+                if (mountedRef.current) {
+                    setTokenStatus(null);
+                }
                 return;
             }
             const seq = ++tokenFetchSeqRef.current;
             try {
                 const nextStatus = await runtime.getSessionTokenStatus(sid);
-                if (tokenFetchSeqRef.current === seq) {
+                if (mountedRef.current && tokenFetchSeqRef.current === seq) {
                     setTokenStatus(nextStatus ?? null);
                 }
             } catch {
-                if (tokenFetchSeqRef.current === seq) {
+                if (mountedRef.current && tokenFetchSeqRef.current === seq) {
                     setTokenStatus(null);
                 }
             }
@@ -323,6 +325,19 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
             setActiveActionsMessageId(null);
         }
     }, [isStreamingCurrent]);
+
+    const streamingDelta = useMemo(() => {
+        if (
+            !activeSession
+            || !Object.prototype.hasOwnProperty.call(streamingDeltas, activeSession.id)
+        ) {
+            return null;
+        }
+        return {
+            sessionId: activeSession.id,
+            text: streamingDeltas[activeSession.id] ?? '',
+        };
+    }, [activeSession, streamingDeltas]);
 
     // Auto-scroll thread when messages or live streaming delta update.
     const messageCount = activeSession?.messages.length ?? 0;
@@ -377,15 +392,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
 
     const upsertSessionInStore = useCallback(
         (updated: AssistantSession) => {
-            const current = store.getSnapshot().assistantSessions;
-            const idx = current.findIndex((item) => item.id === updated.id);
-            if (idx >= 0) {
-                const next = [...current];
-                next[idx] = updated;
-                store.setAssistantSessions(next);
-            } else {
-                store.setAssistantSessions([updated, ...current]);
-            }
+            store.upsertAssistantSession(updated);
         },
         [store],
     );
@@ -478,11 +485,8 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
 
     const handleDeleteSession = useCallback(
         async (sessionId: string) => {
-            if (store.getSnapshot().assistantStreamingSessionId === sessionId) {
-                abortControllerRef.current?.abort();
-                store.assistantRuntime?.abort?.(sessionId);
-                store.setAssistantStreamingSessionId(null);
-                setStreamingDelta(null);
+            if (store.isAssistantSessionStreaming(sessionId)) {
+                store.abortAssistantStream(sessionId, { silentToast: true });
             }
 
             const runtime = store.assistantRuntime;
@@ -756,119 +760,25 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
     );
 
     const handleAbortStream = useCallback(() => {
-        const targetId = store.getSnapshot().assistantStreamingSessionId ?? activeSession?.id;
-        abortControllerRef.current?.abort();
-        abortControllerRef.current = null;
-        if (targetId) {
-            store.assistantRuntime?.abort?.(targetId);
-        }
-        store.setAssistantStreamingSessionId(null);
-        setStreamingDelta(null);
-        store.pushToast('已停止当前助手生成', 'warning');
-    }, [activeSession?.id, store]);
+        const targetId =
+            activeSession && store.isAssistantSessionStreaming(activeSession.id)
+                ? activeSession.id
+                : (store.getSnapshot().assistantStreamingSessionId ?? activeSession?.id);
+        store.abortAssistantStream(targetId);
+    }, [activeSession, store]);
 
     const runStreamingOperation = useCallback(
         async (
             sessionId: string,
-            executor: (hooks: {
-                signal: AbortSignal;
-                onDelta: (delta: string) => void;
-                onRetry: () => void;
-                onUpdate: (updatedSession: AssistantSession) => void;
-            }) => Promise<AssistantMessage | AssistantSession | void>,
+            executor: (hooks: AssistantStreamingHooks) => Promise<AssistantMessage | AssistantSession | void>,
             errorPrefix: string,
         ) => {
-            const controller = new AbortController();
-            abortControllerRef.current = controller;
-            store.setAssistantStreamingSessionId(sessionId);
-            setStreamingDelta({ sessionId, text: '' });
-
-            let receivedOnUpdate = false;
-            let liveBubbleOwned = false;
-
-            try {
-                const result = await executor({
-                    signal: controller.signal,
-                    onDelta: (delta: string) => {
-                        if (controller.signal.aborted || liveBubbleOwned) {
-                            return;
-                        }
-                        setStreamingDelta((prev) => ({
-                            sessionId,
-                            text: prev && prev.sessionId === sessionId ? prev.text + delta : delta,
-                        }));
-                    },
-                    onRetry: () => {
-                        setStreamingDelta({ sessionId, text: '' });
-                    },
-                    onUpdate: (updatedSession: AssistantSession) => {
-                        receivedOnUpdate = true;
-                        const last = updatedSession.messages[updatedSession.messages.length - 1];
-                        if (last?.role === 'assistant') {
-                            liveBubbleOwned = true;
-                            setStreamingDelta({ sessionId, text: '' });
-                        } else {
-                            liveBubbleOwned = false;
-                        }
-                        upsertSessionInStore(updatedSession);
-                    },
-                });
-
-                if (result && 'messages' in result && Array.isArray(result.messages)) {
-                    upsertSessionInStore(result);
-                } else if (!receivedOnUpdate && result && 'role' in result) {
-                    const cur = store
-                        .getSnapshot()
-                        .assistantSessions.find((item) => item.id === sessionId);
-                    if (cur && !cur.messages.some((m) => m.id === result.id)) {
-                        upsertSessionInStore({
-                            ...cur,
-                            updatedAt: Date.now(),
-                            messages: [...cur.messages, result],
-                        });
-                    }
-                }
-
-                const finalAssistantMsg =
-                    result && 'role' in result
-                        ? result
-                        : result && 'messages' in result && Array.isArray(result.messages)
-                            ? result.messages[result.messages.length - 1]
-                            : undefined;
-                if (finalAssistantMsg?.interrupted) {
-                    if (finalAssistantMsg.errorCode === 'max_tool_rounds') {
-                        store.pushToast(
-                            '已达到单轮工具调用上限，可点击「继续执行」接着运行',
-                            'warning',
-                        );
-                    } else if (finalAssistantMsg.errorCode === 'length') {
-                        store.pushToast(
-                            '输出达到长度上限已截断，可点击「继续生成」接着输出',
-                            'warning',
-                        );
-                    }
-                }
-            } catch (err) {
-                if (!controller.signal.aborted) {
-                    store.pushToast(`${errorPrefix}：${formatErrorMessage(err)}`, 'error');
-                }
-            } finally {
-                if (abortControllerRef.current === controller) {
-                    abortControllerRef.current = null;
-                }
-                if (store.getSnapshot().assistantStreamingSessionId === sessionId) {
-                    store.setAssistantStreamingSessionId(null);
-                }
-                setStreamingDelta(null);
-                try {
-                    await store.refreshAssistantState();
-                } catch {
-                    // Keep UI responsive even if refresh fails after abort.
-                }
+            await store.runAssistantStreamingOperation(sessionId, executor, errorPrefix);
+            if (mountedRef.current && activeSession?.id === sessionId) {
                 await refreshTokenStatus(sessionId);
             }
         },
-        [refreshTokenStatus, store, upsertSessionInStore],
+        [activeSession?.id, refreshTokenStatus, store],
     );
 
     const handleAddFiles = useCallback(
@@ -1363,7 +1273,7 @@ export function AssistantView({ store, isMobile }: ConsoleViewProps) {
                             === target.messageId
                         && updatedSession.interruptedCheckpoint?.messageId === target.messageId
                         && !hasOtherPendingOnMessage
-                        && snap.assistantStreamingSessionId !== target.sessionId
+                        && !store.isAssistantSessionStreaming(target.sessionId)
                     ) {
                         shouldAutoContinue = true;
                     }

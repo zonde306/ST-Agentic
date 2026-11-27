@@ -45,6 +45,17 @@ import {
     createMockUIServices,
 } from './mock-services';
 
+export interface AssistantStreamingHooks {
+    signal: AbortSignal;
+    onDelta: (delta: string) => void;
+    onRetry: (status?: AssistantRetryStatus) => void;
+    onUpdate: (updatedSession: AssistantSession) => void;
+}
+
+function formatStoreErrorMessage(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
+}
+
 export type ResolvedTheme = 'dark' | 'light';
 export type ToastTone = 'primary' | 'success' | 'warning' | 'error';
 export type MobileViewStack = 'list' | 'detail';
@@ -419,6 +430,8 @@ export interface AppStoreState {
     assistantPendingApprovals: PendingApproval[];
     assistantUndoStack: UndoRecord[];
     assistantStreamingSessionId: string | null;
+    assistantStreamingSessionIds: string[];
+    assistantStreamingDeltas: Record<string, string>;
     sideClues: SideClueDoc[];
     sideSessions: SideSessionInfo[];
 }
@@ -593,6 +606,8 @@ export class AppStore {
     private unsubscribeAssistantRuntime?: () => void;
     private _assistantRuntime: AssistantRuntimeBridge | null = null;
     private _sideGenRuntime: SideGenRuntimeBridge | null = null;
+    private readonly assistantStreamControllers = new Map<string, AbortController>();
+    private disposed = false;
     private toastCounter = 0;
     private resumedEventCount = 0;
 
@@ -642,6 +657,8 @@ export class AppStore {
                 ? [...options.initialAssistantUndoStack]
                 : [],
             assistantStreamingSessionId: null,
+            assistantStreamingSessionIds: [],
+            assistantStreamingDeltas: {},
             sideClues: options.initialSideClues ? [...options.initialSideClues] : [],
             sideSessions: options.initialSideSessions ? [...options.initialSideSessions] : [],
         };
@@ -929,10 +946,270 @@ export class AppStore {
     }
 
     setAssistantStreamingSessionId(sessionId: string | null): void {
-        if (this.state.assistantStreamingSessionId === sessionId) {
+        if (sessionId === null) {
+            if (
+                this.state.assistantStreamingSessionId === null
+                && this.state.assistantStreamingSessionIds.length === 0
+                && Object.keys(this.state.assistantStreamingDeltas).length === 0
+            ) {
+                return;
+            }
+            this.setState({
+                assistantStreamingSessionId: null,
+                assistantStreamingSessionIds: [],
+                assistantStreamingDeltas: {},
+            });
             return;
         }
-        this.setState({ assistantStreamingSessionId: sessionId });
+
+        const nextIds = this.state.assistantStreamingSessionIds.includes(sessionId)
+            ? this.state.assistantStreamingSessionIds
+            : [...this.state.assistantStreamingSessionIds, sessionId];
+        if (
+            this.state.assistantStreamingSessionId === sessionId
+            && nextIds === this.state.assistantStreamingSessionIds
+        ) {
+            return;
+        }
+        this.setState({
+            assistantStreamingSessionId: sessionId,
+            assistantStreamingSessionIds: nextIds,
+        });
+    }
+
+    isAssistantSessionStreaming(sessionId: string): boolean {
+        return (
+            this.state.assistantStreamingSessionIds.includes(sessionId)
+            || this.state.assistantStreamingSessionId === sessionId
+            || this.assistantStreamControllers.has(sessionId)
+        );
+    }
+
+    upsertAssistantSession(updated: AssistantSession): void {
+        const current = this.state.assistantSessions;
+        const idx = current.findIndex((item) => item.id === updated.id);
+        if (idx >= 0) {
+            const next = [...current];
+            next[idx] = updated;
+            this.setAssistantSessions(next);
+        } else {
+            this.setAssistantSessions([updated, ...current]);
+        }
+    }
+
+    private clearAssistantStreamingState(sessionId: string): void {
+        const nextIds = this.state.assistantStreamingSessionIds.filter((id) => id !== sessionId);
+        const hasDelta = Object.prototype.hasOwnProperty.call(
+            this.state.assistantStreamingDeltas,
+            sessionId,
+        );
+        const nextDeltas = hasDelta
+            ? Object.fromEntries(
+                Object.entries(this.state.assistantStreamingDeltas).filter(
+                    ([id]) => id !== sessionId,
+                ),
+            )
+            : this.state.assistantStreamingDeltas;
+        const nextPrimaryId =
+            this.state.assistantStreamingSessionId === sessionId
+                ? (nextIds[nextIds.length - 1] ?? null)
+                : this.state.assistantStreamingSessionId;
+
+        if (
+            nextIds.length === this.state.assistantStreamingSessionIds.length
+            && !hasDelta
+            && nextPrimaryId === this.state.assistantStreamingSessionId
+        ) {
+            return;
+        }
+
+        this.setState({
+            assistantStreamingSessionId: nextPrimaryId,
+            assistantStreamingSessionIds: nextIds,
+            assistantStreamingDeltas: nextDeltas,
+        });
+    }
+
+    /**
+     * Run an assistant streaming operation under AppStore ownership so tab switches
+     * or view unmounts inside the console do not abort in-flight generation.
+     */
+    async runAssistantStreamingOperation(
+        sessionId: string,
+        executor: (
+            hooks: AssistantStreamingHooks,
+        ) => Promise<AssistantMessage | AssistantSession | void>,
+        errorPrefix: string,
+    ): Promise<void> {
+        if (this.disposed) {
+            return;
+        }
+
+        const existingController = this.assistantStreamControllers.get(sessionId);
+        if (existingController) {
+            existingController.abort();
+            this.assistantStreamControllers.delete(sessionId);
+        }
+
+        const controller = new AbortController();
+        this.assistantStreamControllers.set(sessionId, controller);
+
+        const nextIds = this.state.assistantStreamingSessionIds.includes(sessionId)
+            ? this.state.assistantStreamingSessionIds
+            : [...this.state.assistantStreamingSessionIds, sessionId];
+        this.setState({
+            assistantStreamingSessionId: sessionId,
+            assistantStreamingSessionIds: nextIds,
+            assistantStreamingDeltas: {
+                ...this.state.assistantStreamingDeltas,
+                [sessionId]: '',
+            },
+        });
+
+        let receivedOnUpdate = false;
+        let liveBubbleOwned = false;
+        const isCurrentRun = () =>
+            !this.disposed && this.assistantStreamControllers.get(sessionId) === controller;
+
+        try {
+            const result = await executor({
+                signal: controller.signal,
+                onDelta: (delta: string) => {
+                    if (controller.signal.aborted || liveBubbleOwned || !isCurrentRun()) {
+                        return;
+                    }
+                    const prevText = this.state.assistantStreamingDeltas[sessionId] ?? '';
+                    this.setState({
+                        assistantStreamingDeltas: {
+                            ...this.state.assistantStreamingDeltas,
+                            [sessionId]: prevText + delta,
+                        },
+                    });
+                },
+                onRetry: () => {
+                    if (controller.signal.aborted || !isCurrentRun()) {
+                        return;
+                    }
+                    this.setState({
+                        assistantStreamingDeltas: {
+                            ...this.state.assistantStreamingDeltas,
+                            [sessionId]: '',
+                        },
+                    });
+                },
+                onUpdate: (updatedSession: AssistantSession) => {
+                    if (this.disposed) {
+                        return;
+                    }
+                    receivedOnUpdate = true;
+                    const last = updatedSession.messages[updatedSession.messages.length - 1];
+                    if (last?.role === 'assistant') {
+                        liveBubbleOwned = true;
+                        if (!controller.signal.aborted && isCurrentRun()) {
+                            this.setState({
+                                assistantStreamingDeltas: {
+                                    ...this.state.assistantStreamingDeltas,
+                                    [sessionId]: '',
+                                },
+                            });
+                        }
+                    } else {
+                        liveBubbleOwned = false;
+                    }
+                    this.upsertAssistantSession(updatedSession);
+                },
+            });
+
+            if (this.disposed) {
+                return;
+            }
+
+            if (result && 'messages' in result && Array.isArray(result.messages)) {
+                this.upsertAssistantSession(result);
+            } else if (!receivedOnUpdate && result && 'role' in result) {
+                const cur = this.state.assistantSessions.find((item) => item.id === sessionId);
+                if (cur && !cur.messages.some((m) => m.id === result.id)) {
+                    this.upsertAssistantSession({
+                        ...cur,
+                        updatedAt: Date.now(),
+                        messages: [...cur.messages, result],
+                    });
+                }
+            }
+
+            const finalAssistantMsg =
+                result && 'role' in result
+                    ? result
+                    : result && 'messages' in result && Array.isArray(result.messages)
+                        ? result.messages[result.messages.length - 1]
+                        : undefined;
+            if (finalAssistantMsg?.interrupted) {
+                if (finalAssistantMsg.errorCode === 'max_tool_rounds') {
+                    this.pushToast(
+                        '已达到单轮工具调用上限，可点击「继续执行」接着运行',
+                        'warning',
+                    );
+                } else if (finalAssistantMsg.errorCode === 'length') {
+                    this.pushToast(
+                        '输出达到长度上限已截断，可点击「继续生成」接着输出',
+                        'warning',
+                    );
+                }
+            }
+        } catch (err) {
+            if (!this.disposed && !controller.signal.aborted) {
+                this.pushToast(`${errorPrefix}：${formatStoreErrorMessage(err)}`, 'error');
+            }
+        } finally {
+            if (this.assistantStreamControllers.get(sessionId) === controller) {
+                this.assistantStreamControllers.delete(sessionId);
+                this.clearAssistantStreamingState(sessionId);
+            }
+            if (!this.disposed) {
+                try {
+                    await this.refreshAssistantState();
+                } catch {
+                    // Keep UI responsive even if refresh fails after abort.
+                }
+            }
+        }
+    }
+
+    abortAssistantStream(
+        sessionId?: string,
+        options?: { silentToast?: boolean },
+    ): void {
+        if (sessionId) {
+            const controller = this.assistantStreamControllers.get(sessionId);
+            if (controller) {
+                this.assistantStreamControllers.delete(sessionId);
+                controller.abort();
+            }
+            this._assistantRuntime?.abort?.(sessionId);
+            this.clearAssistantStreamingState(sessionId);
+        } else {
+            const controllers = Array.from(this.assistantStreamControllers.values());
+            this.assistantStreamControllers.clear();
+            for (const controller of controllers) {
+                controller.abort();
+            }
+            this._assistantRuntime?.abort?.();
+            if (
+                this.state.assistantStreamingSessionId !== null
+                || this.state.assistantStreamingSessionIds.length > 0
+                || Object.keys(this.state.assistantStreamingDeltas).length > 0
+            ) {
+                this.setState({
+                    assistantStreamingSessionId: null,
+                    assistantStreamingSessionIds: [],
+                    assistantStreamingDeltas: {},
+                });
+            }
+        }
+
+        if (!options?.silentToast && !this.disposed) {
+            this.pushToast('已停止当前助手生成', 'warning');
+        }
     }
 
     setSideClues(clues: SideClueDoc[]): void {
@@ -1414,6 +1691,12 @@ export class AppStore {
     }
 
     dispose(): void {
+        this.disposed = true;
+        const controllers = Array.from(this.assistantStreamControllers.values());
+        this.assistantStreamControllers.clear();
+        for (const controller of controllers) {
+            controller.abort();
+        }
         this.unsubscribeEvents?.();
         this.unsubscribeEvents = undefined;
         this.unsubscribeAssistantRuntime?.();

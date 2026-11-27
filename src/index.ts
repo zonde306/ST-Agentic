@@ -1648,11 +1648,15 @@ export function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServic
                     || (trace.agentProfileId.startsWith('assistant:')
                         ? trace.agentProfileId.slice('assistant:'.length)
                         : undefined);
-                const streamingSessionId = getAppStore()?.getSnapshot().assistantStreamingSessionId;
+                const store = getAppStore();
+                const streamingSessionId = store?.getSnapshot().assistantStreamingSessionId;
                 const isActive =
                     trace.status === 'running'
-                    || (sessionId ? streamingSessionId === sessionId : Boolean(streamingSessionId));
+                    || (sessionId
+                        ? Boolean(store?.isAssistantSessionStreaming(sessionId))
+                        : Boolean(streamingSessionId));
                 if (assistantRunner && isActive) {
+                    store?.abortAssistantStream(sessionId, { silentToast: true });
                     assistantRunner.abort(sessionId);
                     return true;
                 }

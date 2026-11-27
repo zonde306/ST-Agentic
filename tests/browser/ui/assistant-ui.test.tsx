@@ -342,7 +342,12 @@ function createMockAssistantRuntime(options: {
             if (controller.nextSendDeferred) {
                 const deferred = controller.nextSendDeferred;
                 controller.nextSendDeferred = null;
-                return deferred.promise;
+                const resolved = await deferred.promise;
+                if (resolved && target && !target.messages.some((m) => m.id === resolved.id)) {
+                    target.messages.push(resolved);
+                    target.updatedAt = Date.now();
+                }
+                return resolved;
             }
 
             const reply: AssistantMessage = {
@@ -2909,5 +2914,137 @@ describe('Assistant Workbench Dual-Viewport UI Contract (TS4.2)', () => {
         expect(
             shadowRoot.querySelector('[data-assistant-message-content="a_ac_2"]')?.textContent,
         ).toContain('继续完成后的最终答复。');
+    });
+
+    it('keeps generation running in the background when switching away from the assistant tab and reattaches on return', async () => {
+        await page.viewport(1280, 800);
+        activeHarness = mountAssistantHarness();
+        await settleLayout(5);
+
+        const { shadowRoot } = getShellElements();
+        const draftInput = shadowRoot.querySelector(
+            'textarea[data-assistant-draft-input="true"]',
+        ) as HTMLTextAreaElement;
+        const sendBtn = shadowRoot.querySelector(
+            '[data-assistant-send-btn="true"]',
+        ) as HTMLButtonElement;
+
+        const deferred = createDeferred<AssistantMessage | void>();
+        activeHarness.runtime.nextSendDeferred = deferred;
+
+        setInputValue(draftInput, '请在后台持续生成这段设定分析');
+        await settleLayout(2);
+        sendBtn.click();
+        await settleLayout(4);
+
+        const abortSignal = activeHarness.runtime.lastSendOptions?.signal;
+        expect(abortSignal).toBeTruthy();
+        expect(abortSignal?.aborted).toBe(false);
+        expect(shadowRoot.querySelector('[data-assistant-stop-btn="true"]')).toBeTruthy();
+
+        activeHarness.runtime.lastSendOptions?.onDelta?.('第一段分析...');
+        await settleLayout(3);
+        expect(shadowRoot.textContent).toContain('第一段分析...');
+
+        // Switch to another Agentic console tab ('logs') while streaming is in progress.
+        const logsTabBtn = shadowRoot.querySelector(
+            'aside#ag-sidebar button[data-tab-id="logs"]',
+        ) as HTMLButtonElement;
+        expect(logsTabBtn).toBeTruthy();
+        logsTabBtn.click();
+        await settleLayout(4);
+
+        expect(shadowRoot.querySelector('[data-view-id="assistant"]')).toBeNull();
+        expect(abortSignal?.aborted).toBe(false);
+        expect(activeHarness.runtime.abortSpy).not.toHaveBeenCalled();
+
+        // Continue receiving deltas in the background while on another tab.
+        activeHarness.runtime.lastSendOptions?.onDelta?.('第二段后台续写...');
+        await settleLayout(2);
+        expect(activeHarness.store.getSnapshot().assistantStreamingSessionId).toBe('ast_session_1');
+        expect(activeHarness.store.getSnapshot().assistantStreamingDeltas['ast_session_1']).toBe(
+            '第一段分析...第二段后台续写...',
+        );
+
+        // Switch back to the assistant tab and verify live stream state & stop control reattach cleanly.
+        const assistantTabBtn = shadowRoot.querySelector(
+            'aside#ag-sidebar button[data-tab-id="assistant"]',
+        ) as HTMLButtonElement;
+        expect(assistantTabBtn).toBeTruthy();
+        assistantTabBtn.click();
+        await settleLayout(4);
+
+        const stopBtnAfterReturn = shadowRoot.querySelector(
+            '[data-assistant-stop-btn="true"]',
+        ) as HTMLButtonElement;
+        expect(stopBtnAfterReturn).toBeTruthy();
+        expect(shadowRoot.querySelector('.ag-ast-streaming-cursor')).toBeTruthy();
+        expect(shadowRoot.textContent).toContain('第一段分析...第二段后台续写...');
+
+        // Clicking Stop after returning must abort the original AbortSignal and runtime session.
+        stopBtnAfterReturn.click();
+        deferred.resolve(undefined);
+        await settleLayout(4);
+
+        expect(abortSignal?.aborted).toBe(true);
+        expect(activeHarness.runtime.abortSpy).toHaveBeenCalledWith('ast_session_1');
+        expect(shadowRoot.querySelector('[data-assistant-stop-btn="true"]')).toBeNull();
+        expect(shadowRoot.querySelector('[data-assistant-send-btn="true"]')).toBeTruthy();
+    });
+
+    it('completes background assistant generation while on another tab and renders final reply on return', async () => {
+        await page.viewport(1280, 800);
+        activeHarness = mountAssistantHarness();
+        await settleLayout(5);
+
+        const { shadowRoot } = getShellElements();
+        const draftInput = shadowRoot.querySelector(
+            'textarea[data-assistant-draft-input="true"]',
+        ) as HTMLTextAreaElement;
+        const sendBtn = shadowRoot.querySelector(
+            '[data-assistant-send-btn="true"]',
+        ) as HTMLButtonElement;
+
+        const deferred = createDeferred<AssistantMessage | void>();
+        activeHarness.runtime.nextSendDeferred = deferred;
+
+        setInputValue(draftInput, '切走标签页后完成回复');
+        await settleLayout(2);
+        sendBtn.click();
+        await settleLayout(4);
+
+        const abortSignal = activeHarness.runtime.lastSendOptions?.signal;
+        expect(abortSignal?.aborted).toBe(false);
+
+        const logsTabBtn = shadowRoot.querySelector(
+            'aside#ag-sidebar button[data-tab-id="logs"]',
+        ) as HTMLButtonElement;
+        logsTabBtn.click();
+        await settleLayout(4);
+
+        expect(shadowRoot.querySelector('[data-view-id="assistant"]')).toBeNull();
+        expect(abortSignal?.aborted).toBe(false);
+
+        // Complete the stream while viewing the Logs tab.
+        deferred.resolve({
+            id: 'ast_bg_done',
+            role: 'assistant',
+            content: '后台生成已完成。',
+            timestamp: Date.now(),
+        });
+        await settleLayout(6);
+
+        expect(activeHarness.store.getSnapshot().assistantStreamingSessionId).toBeNull();
+        expect(activeHarness.store.getSnapshot().assistantStreamingSessionIds).toEqual([]);
+
+        const assistantTabBtn = shadowRoot.querySelector(
+            'aside#ag-sidebar button[data-tab-id="assistant"]',
+        ) as HTMLButtonElement;
+        assistantTabBtn.click();
+        await settleLayout(4);
+
+        expect(shadowRoot.textContent).toContain('后台生成已完成。');
+        expect(shadowRoot.querySelector('[data-assistant-stop-btn="true"]')).toBeNull();
+        expect(shadowRoot.querySelector('[data-assistant-send-btn="true"]')).toBeTruthy();
     });
 });
