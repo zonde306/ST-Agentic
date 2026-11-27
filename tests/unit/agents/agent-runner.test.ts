@@ -725,7 +725,21 @@ describe('AgentRunner & TraceLogger', () => {
         expect(textDeltas).toEqual([]);
         expect(previews[previews.length - 1]).toBe('林晚在三号泊位点亮了错误的煤油灯。');
         expect(reasonings.join('')).toContain('自检发现用词有误');
-        expect(res.trace.outputPreview).toBe('林晚在三号泊位点亮了铜制防风灯。');
+        expect(res.trace.assistantSummary).toBe('Review passed. No remaining errors.');
+        expect(res.trace.outputPreview).toBe('Review passed. No remaining errors.');
+        expect(res.trace.assistantRounds).toHaveLength(3);
+        expect(res.trace.assistantRounds?.[0]).toMatchObject({
+            roundIndex: 0,
+            beforeStepIndex: 0,
+            reasoning: '先写初稿到 /output.md。',
+            content: 'Internal draft note: writing scene now.',
+        });
+        expect(res.trace.assistantRounds?.[1]).toMatchObject({
+            roundIndex: 1,
+            beforeStepIndex: 1,
+            reasoning: '自检发现用词有误，改为铜制风灯。',
+            content: 'Internal review: fixing lamp type.',
+        });
 
         // Internal review summary is recorded in TrajectoryStore, NOT the user-visible message
         const traj = runner.trajectoryStore.getMessages('main');

@@ -10,7 +10,11 @@ import type {
     OutputProcessResult,
     PromptInjectionSession,
     ToolEditOperation,
+    ToolEventPayload,
     ToolExecutionContext,
+    ToolPostprocessAction,
+    ToolPostprocessControl,
+    ToolPostprocessOutput,
     ToolSideGenApi,
 } from '@/core/bridge';
 import {
@@ -46,12 +50,14 @@ import {
     transformToolResultBeforeSend,
     TransientToolSpillStore,
     WatermarkCompactor,
+    type InterruptedPreviousRoundSnapshot,
     type InterruptedTurnCheckpoint,
     type RegexSource,
     type TrajectoryMessageTransformState,
 } from '@/core/context';
 import {
     computeRoundRetryDelayMs,
+    createEphemeralMessagesController,
     delayWithAbort,
     isLengthFinishReason,
     isRetryableRoundError,
@@ -59,7 +65,9 @@ import {
     LLMTransportError,
     parseContextOverflowError,
     ROUND_RETRY_ERROR_CODES,
+    sanitizeToolCallPairs,
     type ContextOverflowInfo,
+    type EphemeralMessagesController,
 } from '@/core/llm';
 import { TraceLogger } from '@/core/logger';
 import {
@@ -87,6 +95,7 @@ import type {
     AgentProfile,
     AgentRunTrace,
     ApiConnection,
+    AssistantRoundLog,
     CanonicalContentPart,
     CanonicalMessage,
     CanonicalToolCall,
@@ -161,6 +170,11 @@ const EMPTY_OUTPUT_CHECK_PROMPT =
 const EMPTY_OUTPUT_FINISH_ERROR =
     '/output.md is still empty. Call write_file("/output.md", ...) first.';
 
+const DEFAULT_EMPTY_INPUT_CONTINUATION_PROMPT =
+    '[System Notice] The user sent an empty message to advance the scene. Continue the story naturally in a new response and write it to /output.md.';
+
+export const DEFAULT_MAX_ERROR_RECOVERY_ATTEMPTS = 2;
+
 const PREFLIGHT_FOLDED_TOOL_PREFIX = '[已折叠本轮早期工具输出:';
 const OVERFLOW_CROPPED_TOOL_PREFIX = '[输出因触发模型上下文上限';
 
@@ -168,6 +182,114 @@ const LIKELY_REFUSAL_RE =
     /^(?:(?:i(?:'m|\s+am)\s+sorry|sorry|apologies)[,.\s!]*)?(?:i\s+(?:can(?:'t|not)|am\s+unable\s+to|won't|will\s+not|must\s+decline)|as\s+an\s+ai|抱歉|对不起|很抱歉|作为(?:一个)?(?:ai|人工智能)|我(?:无法|不能|不便)(?:满足|协助|完成|生成|继续|回答|提供|执行))/i;
 
 type FinishTurnMode = 'main_output' | 'side_effect' | 'return_value';
+
+export interface EphemeralMessageLayerIndices {
+    layer0End: number;
+    layer1End: number;
+    turnStart: number;
+    floatingTailStart: number;
+}
+
+export interface AgentPreprocessMessagesContext {
+    target: MessageTarget;
+    phase: PipelinePhase;
+    runId: string;
+    agentId: string;
+    agentName: string;
+    triggerId?: string;
+    round: number;
+    attempt: number;
+    maxRetries: number;
+    promptTriggerContext: PromptTriggerContext;
+    messages: EphemeralMessagesController;
+    body: Record<string, unknown>;
+    layers: EphemeralMessageLayerIndices;
+    request: LLMRequest;
+    connection: ApiConnection;
+    vars: Record<string, unknown>;
+    signal: AbortSignal;
+    toolContext: ToolExecutionContext;
+}
+
+export interface AgentPostprocessOutput extends ToolPostprocessOutput {
+    text: string;
+    content: string;
+    reasoningContent?: string;
+    toolCalls: CanonicalToolCall[];
+    readonly originalText: string;
+    readonly round: number;
+    readonly fixAttempt: number;
+    readonly maxFixAttempts: number;
+}
+
+export interface AgentPostprocessResponseContext {
+    target: MessageTarget;
+    phase: PipelinePhase;
+    runId: string;
+    agentId: string;
+    agentName: string;
+    triggerId?: string;
+    round: number;
+    attempt: number;
+    maxRetries: number;
+    fixAttempt: number;
+    maxFixAttempts: number;
+    promptTriggerContext: PromptTriggerContext;
+    output: AgentPostprocessOutput;
+    control: ToolPostprocessControl;
+    connection: ApiConnection;
+    vars: Record<string, unknown>;
+    signal: AbortSignal;
+    toolContext: ToolExecutionContext;
+}
+
+export interface AgentGenerationErrorInfo {
+    readonly name: string;
+    readonly message: string;
+    readonly status?: number;
+    readonly code?: string;
+    readonly rawBody?: string;
+}
+
+export interface AgentGenerationErrorHookContext {
+    readonly target: MessageTarget;
+    readonly phase: PipelinePhase;
+    readonly runId: string;
+    readonly agentId: string;
+    readonly agentName: string;
+    readonly triggerId?: string;
+    readonly round: number;
+    readonly attempt: number;
+    readonly maxAttempts: number;
+    readonly error: AgentGenerationErrorInfo;
+    readonly rawError: unknown;
+    readonly ephemeralMessages: EphemeralMessagesController;
+    readonly layers: EphemeralMessageLayerIndices;
+    readonly connection: Readonly<ApiConnection>;
+    readonly signal: AbortSignal;
+    readonly toolContext: ToolExecutionContext;
+}
+
+export type AgentGenerationErrorDecision =
+    | {
+          action: 'retry';
+          reason?: string;
+          delayMs?: number;
+          messages?: CanonicalMessage[];
+          rollbackToolRounds?: number;
+          dropHistoryTurns?: number;
+          connectionId?: string;
+          temperature?: number;
+          maxTokens?: number;
+      }
+    | {
+          action: 'abort';
+          reason?: string;
+      }
+    | {
+          action: 'pass';
+          reason?: string;
+      };
 
 /**
  * Resolve effective strict tool loop enablement from agent override and connection default.
@@ -197,19 +319,37 @@ export interface SubAgentDescriptor {
 
 export class AgentExecutionError extends Error {
     public readonly trace: AgentRunTrace;
+    public readonly checkpoint?: InterruptedTurnCheckpoint;
 
-    constructor(message: string, trace: AgentRunTrace, causeError?: unknown) {
+    constructor(
+        message: string,
+        trace: AgentRunTrace,
+        causeError?: unknown,
+        checkpoint?: InterruptedTurnCheckpoint,
+    ) {
         super(message, causeError !== undefined ? { cause: causeError } : undefined);
         this.name = 'AgentExecutionError';
         this.trace = trace;
+        if (checkpoint !== undefined) {
+            this.checkpoint = checkpoint;
+        }
     }
 }
 
 export class MaxToolRoundsError extends AgentExecutionError {
     public readonly maxToolRounds: number;
 
-    constructor(maxToolRounds: number, trace: AgentRunTrace) {
-        super(`Agent "${trace.agentName}" exceeded maxToolRounds (${maxToolRounds}).`, trace);
+    constructor(
+        maxToolRounds: number,
+        trace: AgentRunTrace,
+        checkpoint?: InterruptedTurnCheckpoint,
+    ) {
+        super(
+            `Agent "${trace.agentName}" exceeded maxToolRounds (${maxToolRounds}).`,
+            trace,
+            undefined,
+            checkpoint,
+        );
         this.name = 'MaxToolRoundsError';
         this.maxToolRounds = maxToolRounds;
     }
@@ -261,6 +401,8 @@ export interface AgentRunnerDependencies {
     maxDelegationDepth?: number;
     roundRetryInitialDelayMs?: number;
     roundRetryMaxDelayMs?: number;
+    onPreprocessMessages?: (ctx: AgentPreprocessMessagesContext) => Promise<void> | void;
+    onPostprocessResponse?: (ctx: AgentPostprocessResponseContext) => Promise<void> | void;
 }
 
 export interface AgentRunInput {
@@ -291,6 +433,24 @@ export interface AgentRunInput {
     triggerLabel?: string;
     triggerSource?: 'preset' | 'worldinfo';
     lorebookNames?: readonly string[];
+    /** Optional background task identifier propagated onto recorded `AgentRunTrace.taskId`. */
+    taskId?: string;
+    /** Recursion guard preventing nested error-recovery hooks when running a recovery agent. */
+    isErrorRecovery?: boolean;
+    /** Explicit composite checkpoint scope (`phase`, `triggerId`) for interrupted turn persistence. */
+    checkpointScope?: { phase: PipelinePhase; triggerId?: string };
+    /** Optional per-run `ScriptSandbox` override (falls back to `AgentRunnerDependencies.sandbox`). */
+    sandbox?: ScriptSandbox;
+    /** Optional external pre-send messages hook (e.g. `@@script on=prompt_preprocess`). */
+    onPreprocessMessages?: (ctx: AgentPreprocessMessagesContext) => Promise<void> | void;
+    /** Optional external post-response hook (e.g. `@@script on=output_postprocess`). */
+    onPostprocessResponse?: (ctx: AgentPostprocessResponseContext) => Promise<void> | void;
+    /** Optional generation-error recovery hook invoked when retries are exhausted or non-retryable. */
+    onGenerationError?: (
+        ctx: AgentGenerationErrorHookContext,
+    ) => Promise<AgentGenerationErrorDecision | void> | AgentGenerationErrorDecision | void;
+    /** Max recovery attempts via `onGenerationError` per run (default 2, 0 disables). */
+    maxErrorRecoveryAttempts?: number;
     staged?: boolean;
     stream?: boolean;
     signal?: AbortSignal;
@@ -1013,6 +1173,453 @@ function cropInFlightToolMessagesForOverflow(params: {
     return { croppedCount, freedTokens };
 }
 
+function summarizeToolBatch(toolCalls: readonly CanonicalToolCall[]): string {
+    const parts = toolCalls.map((tc) => {
+        const parsed = parseArgsForLog(tc.arguments);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            const hintKey = (['path', 'query', 'command', 'key', 'agent'] as const).find(
+                (k) => typeof parsed[k] === 'string' && String(parsed[k]).trim().length > 0,
+            );
+            if (hintKey) {
+                const rawVal = String(parsed[hintKey]).trim();
+                const shortVal = rawVal.length > 48 ? `${rawVal.slice(0, 45)}...` : rawVal;
+                return `${tc.name}(${shortVal})`;
+            }
+        }
+        return tc.name;
+    });
+    return parts.join(', ');
+}
+
+function buildMainOutputFinishSummary(
+    stepBrief: string,
+    roundContent: string,
+): string | undefined {
+    const cleanBrief = stepBrief.trim();
+    const cleanContent = roundContent.trim();
+    if (cleanBrief && cleanContent) {
+        return cleanBrief === cleanContent ? cleanBrief : `${cleanBrief}\n\n${cleanContent}`;
+    }
+    return cleanBrief || cleanContent || undefined;
+}
+
+function buildSideEffectFinishSummary(
+    statusText: string,
+    stepBrief: string,
+): string | undefined {
+    const cleanStatus = statusText.trim();
+    const cleanBrief = stepBrief.trim();
+    if (cleanStatus && cleanBrief) {
+        return cleanStatus === cleanBrief ? cleanStatus : `${cleanStatus}\n${cleanBrief}`;
+    }
+    return cleanStatus || cleanBrief || undefined;
+}
+
+function extractGenerationErrorInfo(error: unknown): AgentGenerationErrorInfo {
+    if (error instanceof LLMTransportError) {
+        return Object.freeze({
+            name: error.name || 'LLMTransportError',
+            message: error.message || 'LLM transport error',
+            ...(error.status !== undefined ? { status: error.status } : {}),
+            ...(error.code !== undefined ? { code: error.code } : {}),
+            ...(error.responseBody !== undefined ? { rawBody: error.responseBody } : {}),
+        });
+    }
+    if (error instanceof Error) {
+        const rec = error as unknown as Record<string, unknown>;
+        const status =
+            typeof rec.status === 'number' && Number.isFinite(rec.status)
+                ? rec.status
+                : typeof rec.statusCode === 'number' && Number.isFinite(rec.statusCode)
+                    ? rec.statusCode
+                    : undefined;
+        const code =
+            typeof rec.code === 'string' && rec.code.trim().length > 0
+                ? rec.code.trim()
+                : undefined;
+        const rawBody =
+            typeof rec.responseBody === 'string'
+                ? rec.responseBody
+                : typeof rec.rawBody === 'string'
+                    ? rec.rawBody
+                    : undefined;
+        return Object.freeze({
+            name: error.name || 'Error',
+            message: error.message || String(error),
+            ...(status !== undefined ? { status } : {}),
+            ...(code !== undefined ? { code } : {}),
+            ...(rawBody !== undefined ? { rawBody } : {}),
+        });
+    }
+    return Object.freeze({
+        name: 'Error',
+        message: String(error),
+    });
+}
+
+function createPostprocessControl(): ToolPostprocessControl {
+    const state: {
+        action: ToolPostprocessAction;
+        retryReason?: string;
+        fixMessage?: string;
+        rejectWrite: boolean;
+        abortReason?: string;
+    } = {
+        action: 'accept',
+        rejectWrite: false,
+    };
+
+    const normalizeMsg = (val: unknown): string | undefined => {
+        if (typeof val !== 'string') {
+            return undefined;
+        }
+        const trimmed = val.trim();
+        return trimmed.length > 0 ? trimmed : undefined;
+    };
+
+    return {
+        retry(reason?: string): void {
+            if (state.action === 'abort') {
+                return;
+            }
+            state.action = 'retry';
+            state.retryReason = normalizeMsg(reason) ?? state.retryReason;
+        },
+        requestFix(message: string, options?: { rejectWrite?: boolean }): void {
+            if (state.action === 'abort' || state.action === 'retry') {
+                return;
+            }
+            state.action = 'fix';
+            state.fixMessage =
+                normalizeMsg(message) ?? 'Response postprocess requested a revision.';
+            if (options?.rejectWrite === true) {
+                state.rejectWrite = true;
+            }
+        },
+        accept(): void {
+            // Monotonic: cannot downgrade an already escalated fix/retry/abort action.
+        },
+        abort(reason?: string): void {
+            state.action = 'abort';
+            state.abortReason =
+                normalizeMsg(reason) ?? 'Response postprocess aborted generation.';
+        },
+        get action(): ToolPostprocessAction {
+            return state.action;
+        },
+        get retryReason(): string | undefined {
+            return state.retryReason;
+        },
+        get fixMessage(): string | undefined {
+            return state.fixMessage;
+        },
+        get rejectWrite(): boolean {
+            return state.rejectWrite;
+        },
+        get abortReason(): string | undefined {
+            return state.abortReason;
+        },
+    };
+}
+
+function normalizePostprocessToolCalls(raw: unknown): CanonicalToolCall[] {
+    if (!Array.isArray(raw)) {
+        return [];
+    }
+    const result: CanonicalToolCall[] = [];
+    for (let idx = 0; idx < raw.length; idx += 1) {
+        const item = raw[idx];
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+            continue;
+        }
+        const rec = item as Record<string, unknown>;
+        const name = typeof rec.name === 'string' ? rec.name.trim() : '';
+        if (!name) {
+            continue;
+        }
+        const rawId = typeof rec.id === 'string' ? rec.id.trim() : '';
+        const id = rawId || `call_${idx}`;
+        const argsStr =
+            typeof rec.arguments === 'string'
+                ? rec.arguments
+                : JSON.stringify(rec.arguments ?? {});
+        result.push({
+            id,
+            name,
+            arguments: argsStr,
+            ...(typeof rec.thoughtSignature === 'string'
+                ? { thoughtSignature: rec.thoughtSignature }
+                : {}),
+            ...(rec.extraFields && typeof rec.extraFields === 'object' && !Array.isArray(rec.extraFields)
+                ? { extraFields: canonicalClone(rec.extraFields as Record<string, unknown>) }
+                : {}),
+        });
+    }
+    return result;
+}
+
+const PREPROCESS_STANDARD_BODY_KEYS = new Set<string>([
+    'model',
+    'temperature',
+    'max_tokens',
+    'maxTokens',
+    'top_p',
+    'topP',
+    'top_k',
+    'topK',
+    'frequency_penalty',
+    'frequencyPenalty',
+    'presence_penalty',
+    'presencePenalty',
+    'stream',
+]);
+
+function buildPreprocessWorkingBody(
+    connection: ApiConnection,
+    stream: boolean,
+): {
+    workingBody: Record<string, unknown>;
+    baselineBody: Record<string, unknown>;
+    baseIncludeKeys: Set<string>;
+} {
+    const baseIncludeBody =
+        connection.includeBody
+        && typeof connection.includeBody === 'object'
+        && !Array.isArray(connection.includeBody)
+            ? canonicalClone(connection.includeBody)
+            : {};
+    const baseIncludeKeys = new Set(Object.keys(baseIncludeBody));
+    const workingBody: Record<string, unknown> = {
+        ...baseIncludeBody,
+        model: connection.model,
+        temperature: connection.temperature,
+        max_tokens: connection.maxTokens,
+        top_p: connection.topP,
+        top_k: connection.topK,
+        frequency_penalty: connection.frequencyPenalty,
+        presence_penalty: connection.presencePenalty,
+        stream,
+    };
+    return {
+        workingBody,
+        baselineBody: canonicalClone(workingBody),
+        baseIncludeKeys,
+    };
+}
+
+function applyPreprocessBodyOverrides(
+    connection: ApiConnection,
+    stream: boolean,
+    workingBody: Record<string, unknown>,
+    baselineBody: Record<string, unknown>,
+    baseIncludeKeys: ReadonlySet<string>,
+): { connection: ApiConnection; stream: boolean; changed: boolean } {
+    if (canonicalStringify(workingBody) === canonicalStringify(baselineBody)) {
+        return { connection, stream, changed: false };
+    }
+
+    const nextConnection = canonicalClone(connection);
+    let nextStream = stream;
+
+    if (typeof workingBody.model === 'string' && workingBody.model.trim().length > 0 && workingBody.model !== baselineBody.model) {
+        nextConnection.model = workingBody.model.trim();
+    }
+    if (typeof workingBody.temperature === 'number' && Number.isFinite(workingBody.temperature) && workingBody.temperature !== baselineBody.temperature) {
+        nextConnection.temperature = workingBody.temperature;
+    }
+    const nextMaxTokens =
+        typeof workingBody.maxTokens === 'number' && Number.isFinite(workingBody.maxTokens) && workingBody.maxTokens > 0
+            ? workingBody.maxTokens
+            : typeof workingBody.max_tokens === 'number' && Number.isFinite(workingBody.max_tokens) && workingBody.max_tokens > 0 && workingBody.max_tokens !== baselineBody.max_tokens
+                ? workingBody.max_tokens
+                : undefined;
+    if (nextMaxTokens !== undefined) {
+        nextConnection.maxTokens = Math.floor(nextMaxTokens);
+    }
+    const nextTopP =
+        typeof workingBody.topP === 'number' && Number.isFinite(workingBody.topP)
+            ? workingBody.topP
+            : typeof workingBody.top_p === 'number' && Number.isFinite(workingBody.top_p) && workingBody.top_p !== baselineBody.top_p
+                ? workingBody.top_p
+                : undefined;
+    if (nextTopP !== undefined) {
+        nextConnection.topP = nextTopP;
+    }
+    const nextTopK =
+        typeof workingBody.topK === 'number' && Number.isFinite(workingBody.topK)
+            ? workingBody.topK
+            : typeof workingBody.top_k === 'number' && Number.isFinite(workingBody.top_k) && workingBody.top_k !== baselineBody.top_k
+                ? workingBody.top_k
+                : undefined;
+    if (nextTopK !== undefined) {
+        nextConnection.topK = nextTopK;
+    }
+    const nextFreqPenalty =
+        typeof workingBody.frequencyPenalty === 'number' && Number.isFinite(workingBody.frequencyPenalty)
+            ? workingBody.frequencyPenalty
+            : typeof workingBody.frequency_penalty === 'number' && Number.isFinite(workingBody.frequency_penalty) && workingBody.frequency_penalty !== baselineBody.frequency_penalty
+                ? workingBody.frequency_penalty
+                : undefined;
+    if (nextFreqPenalty !== undefined) {
+        nextConnection.frequencyPenalty = nextFreqPenalty;
+    }
+    const nextPresPenalty =
+        typeof workingBody.presencePenalty === 'number' && Number.isFinite(workingBody.presencePenalty)
+            ? workingBody.presencePenalty
+            : typeof workingBody.presence_penalty === 'number' && Number.isFinite(workingBody.presence_penalty) && workingBody.presence_penalty !== baselineBody.presence_penalty
+                ? workingBody.presence_penalty
+                : undefined;
+    if (nextPresPenalty !== undefined) {
+        nextConnection.presencePenalty = nextPresPenalty;
+    }
+    if (typeof workingBody.stream === 'boolean' && workingBody.stream !== baselineBody.stream) {
+        nextStream = workingBody.stream;
+        nextConnection.stream = workingBody.stream;
+    }
+
+    const nextIncludeBody: Record<string, unknown> =
+        nextConnection.includeBody
+        && typeof nextConnection.includeBody === 'object'
+        && !Array.isArray(nextConnection.includeBody)
+            ? canonicalClone(nextConnection.includeBody)
+            : {};
+
+    for (const key of baseIncludeKeys) {
+        if (!PREPROCESS_STANDARD_BODY_KEYS.has(key) && !(key in workingBody)) {
+            delete nextIncludeBody[key];
+        }
+    }
+    for (const [key, val] of Object.entries(workingBody)) {
+        if (PREPROCESS_STANDARD_BODY_KEYS.has(key) || val === undefined) {
+            continue;
+        }
+        nextIncludeBody[key] = canonicalClone(val);
+    }
+    nextConnection.includeBody = nextIncludeBody;
+
+    return { connection: nextConnection, stream: nextStream, changed: true };
+}
+
+function rollbackTrailingToolRoundsInArray(
+    messages: CanonicalMessage[],
+    count: number,
+    transformStates?: Array<TrajectoryMessageTransformState | undefined>,
+): number {
+    const target = Math.max(0, Math.floor(count));
+    let removed = 0;
+    for (let step = 0; step < target; step += 1) {
+        let assistantIdx = -1;
+        for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+            const msg = messages[idx];
+            if (msg.role === 'assistant' && Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0) {
+                assistantIdx = idx;
+                break;
+            }
+        }
+        if (assistantIdx < 0) {
+            break;
+        }
+        let endIdx = assistantIdx + 1;
+        while (endIdx < messages.length && messages[endIdx].role === 'tool') {
+            endIdx += 1;
+        }
+        const removeCount = endIdx - assistantIdx;
+        messages.splice(assistantIdx, removeCount);
+        if (transformStates) {
+            transformStates.splice(assistantIdx, removeCount);
+        }
+        removed += 1;
+    }
+    return removed;
+}
+
+function isEmptyUserInputValue(
+    userInput: string | CanonicalContentPart[] | undefined,
+): boolean {
+    if (userInput === undefined) {
+        return true;
+    }
+    if (typeof userInput === 'string') {
+        return userInput.trim().length === 0;
+    }
+    if (Array.isArray(userInput)) {
+        if (userInput.length === 0) {
+            return true;
+        }
+        return userInput.every(
+            (part) => part.type === 'text' && part.text.trim().length === 0,
+        );
+    }
+    return false;
+}
+
+function resolveEmptyInputTrailingAssistantFallback(params: {
+    input: AgentRunInput;
+    target: MessageTarget;
+    agent: AgentProfile;
+    bridge: HostBridge;
+    trajectoryStore: TrajectoryStore;
+}): string | CanonicalContentPart[] | undefined {
+    const { input, target, agent, bridge, trajectoryStore } = params;
+    const action = input.generationAction ?? 'normal';
+    if (
+        input.phase !== 'main_turn'
+        || action !== 'normal'
+        || input.resumeMessages !== undefined
+        || !isEmptyUserInputValue(input.userInput)
+    ) {
+        return input.userInput;
+    }
+
+    const chat = bridge.getChat();
+    let prevNonSystemMsg: ChatMessageSnapshot | undefined;
+    if (Array.isArray(chat) && chat.length > 0) {
+        const startIdx = Math.min(chat.length - 1, target.messageId - 1);
+        for (let i = startIdx; i >= 0; i -= 1) {
+            const candidate = chat[i];
+            if (candidate && !candidate.isSystem) {
+                prevNonSystemMsg = candidate;
+                break;
+            }
+        }
+        if (
+            !prevNonSystemMsg
+            && target.messageId === 0
+            && chat[0]
+            && !chat[0].isSystem
+            && !chat[0].isUser
+            && chat[0].mes.trim().length > 0
+        ) {
+            prevNonSystemMsg = chat[0];
+        }
+    }
+
+    let trailingIsNonUser = false;
+    if (prevNonSystemMsg) {
+        trailingIsNonUser = !prevNonSystemMsg.isUser;
+    } else if (agent.sessionMode === 'persistent') {
+        const layer1 = trajectoryStore.getMessages(agent.id);
+        const lastLayer1 = layer1[layer1.length - 1];
+        if (lastLayer1 && lastLayer1.role === 'assistant') {
+            trailingIsNonUser = true;
+        }
+    }
+
+    if (!trailingIsNonUser) {
+        return input.userInput;
+    }
+
+    const hostSendIfEmpty = bridge.getSendIfEmpty?.()?.trim() ?? '';
+    return hostSendIfEmpty || DEFAULT_EMPTY_INPUT_CONTINUATION_PROMPT;
+}
+
+function clampLayerIndex(value: number, min: number, max: number): number {
+    if (!Number.isFinite(value)) {
+        return min;
+    }
+    return Math.min(max, Math.max(min, Math.trunc(value)));
+}
+
 /**
  * Multi-round Agent runtime executing `LLMTransport` <-> `ToolRegistry` loops
  * over `ContextAssembler` + `TrajectoryStore`, emitting live events and recording
@@ -1039,6 +1646,12 @@ export class AgentRunner {
     private readonly maxDelegationDepth: number;
     private readonly roundRetryInitialDelayMs: number;
     private readonly roundRetryMaxDelayMs: number;
+    private readonly onPreprocessMessages?: (
+        ctx: AgentPreprocessMessagesContext,
+    ) => Promise<void> | void;
+    private readonly onPostprocessResponse?: (
+        ctx: AgentPostprocessResponseContext,
+    ) => Promise<void> | void;
     private runSequence = 0;
 
     constructor(deps: AgentRunnerDependencies) {
@@ -1059,6 +1672,8 @@ export class AgentRunner {
             this.roundRetryInitialDelayMs,
             deps.roundRetryMaxDelayMs ?? 10_000,
         );
+        this.onPreprocessMessages = deps.onPreprocessMessages;
+        this.onPostprocessResponse = deps.onPostprocessResponse;
 
         this.store = deps.store ?? deps.vfs?.store ?? new ChatDataStore(deps.bridge);
         this.traceLogger = deps.traceLogger ?? new TraceLogger();
@@ -1125,12 +1740,13 @@ export class AgentRunner {
     /** Execute a full single-agent or multi-round tool-calling turn. */
     async run(input: AgentRunInput): Promise<AgentRunResult> {
         const runSandboxIds: string[] = [];
+        const effectiveSandbox = input.sandbox ?? this.sandbox;
         try {
-            return await this.runInternal(input, runSandboxIds);
+            return await this.runInternal(input, runSandboxIds, effectiveSandbox);
         } finally {
-            if (this.sandbox?.dispose) {
+            if (effectiveSandbox?.dispose) {
                 for (const sbId of runSandboxIds) {
-                    this.sandbox.dispose(sbId);
+                    effectiveSandbox.dispose(sbId);
                 }
             }
         }
@@ -1139,6 +1755,7 @@ export class AgentRunner {
     private async runInternal(
         input: AgentRunInput,
         runSandboxIds: string[],
+        effectiveSandbox?: ScriptSandbox,
     ): Promise<AgentRunResult> {
         const target = assertValidTarget(input.target);
         const signal = input.signal ?? new AbortController().signal;
@@ -1258,6 +1875,7 @@ export class AgentRunner {
             target,
             connection,
             presetFiles: preset.files,
+            sandbox: effectiveSandbox,
             sandboxScope: runSandboxScope,
             createdSandboxIds: runSandboxIds,
             signal,
@@ -1316,13 +1934,73 @@ export class AgentRunner {
                 : undefined);
 
         const maxRoundRetries = Math.max(0, Math.floor(connection.roundMaxRetries ?? 2));
+        const maxErrorRecoveryAttempts = Math.max(
+            0,
+            Math.floor(input.maxErrorRecoveryAttempts ?? DEFAULT_MAX_ERROR_RECOVERY_ATTEMPTS),
+        );
+        const effectiveOnPreprocess = input.onPreprocessMessages ?? this.onPreprocessMessages;
+        const effectiveOnPostprocess = input.onPostprocessResponse ?? this.onPostprocessResponse;
+        const resolvedCheckpointPhase: PipelinePhase = input.checkpointScope?.phase ?? input.phase;
+        const resolvedCheckpointTriggerId: string | undefined =
+            input.checkpointScope?.triggerId ?? input.triggerId;
+        const effectiveUserInput = resolveEmptyInputTrailingAssistantFallback({
+            input,
+            target,
+            agent: effectiveAgent,
+            bridge: this.bridge,
+            trajectoryStore: this.trajectoryStore,
+        });
+
         const toolSteps: ToolStepLog[] = [];
+        const assistantRounds: AssistantRoundLog[] = [];
+        let activeAssistantRound: AssistantRoundLog | null = null;
+        let previousRoundSnapshot: InterruptedPreviousRoundSnapshot | undefined;
         const retryEvents: RoundRetryLog[] = [];
         const buildTraceRetryFields = () => ({
             retryCount: retryEvents.length,
             roundMaxRetries: maxRoundRetries,
             ...(retryEvents.length > 0 ? { retryEvents: canonicalClone(retryEvents) } : {}),
         });
+        const getSnapshotAssistantRounds = (): AssistantRoundLog[] => {
+            const list = assistantRounds.map((r) => canonicalClone(r));
+            if (
+                activeAssistantRound
+                && ((activeAssistantRound.reasoning && activeAssistantRound.reasoning.length > 0)
+                    || (activeAssistantRound.content && activeAssistantRound.content.length > 0)
+                    || activeAssistantRound.isFinishTurn)
+            ) {
+                list.push(canonicalClone(activeAssistantRound));
+            }
+            return list;
+        };
+        const lockAssistantRound = (params: {
+            roundIndex: number;
+            beforeStepIndex: number;
+            timestamp: number;
+            reasoning?: string;
+            content?: string;
+            isFinishTurn?: boolean;
+            finishTurnSummary?: string;
+        }): void => {
+            const cleanReasoning = params.reasoning && params.reasoning.length > 0 ? params.reasoning : undefined;
+            const cleanContent = params.content && params.content.length > 0 ? params.content : undefined;
+            const cleanSummary =
+                params.finishTurnSummary && params.finishTurnSummary.trim().length > 0
+                    ? params.finishTurnSummary
+                    : undefined;
+            if (cleanReasoning || cleanContent || params.isFinishTurn) {
+                assistantRounds.push({
+                    roundIndex: params.roundIndex,
+                    beforeStepIndex: params.beforeStepIndex,
+                    ...(cleanReasoning ? { reasoning: cleanReasoning } : {}),
+                    ...(cleanContent ? { content: cleanContent } : {}),
+                    ...(params.isFinishTurn !== undefined ? { isFinishTurn: params.isFinishTurn } : {}),
+                    ...(cleanSummary ? { finishTurnSummary: cleanSummary } : {}),
+                    timestamp: params.timestamp,
+                });
+            }
+            activeAssistantRound = null;
+        };
         let cumulativeUsage: TokenUsage = {
             inputTokens: 0,
             cachedTokens: 0,
@@ -1342,7 +2020,10 @@ export class AgentRunner {
             ...(input.triggerLabel ? { triggerLabel: input.triggerLabel } : {}),
             ...(input.triggerSource ? { triggerSource: input.triggerSource } : {}),
             ...(normalizedLorebookNames.length > 0 ? { lorebookNames: normalizedLorebookNames } : {}),
+            ...(input.taskId ? { taskId: input.taskId } : {}),
         };
+        const hasRollbackableRoundNow = (): boolean =>
+            Boolean(previousRoundSnapshot && toolSteps.length > 0);
 
         const publishRunningTrace = (now = Date.now()): void => {
             const liveSteps = activeToolStep ? [...toolSteps, activeToolStep] : toolSteps;
@@ -1362,6 +2043,8 @@ export class AgentRunner {
                     durationMs: Math.max(0, now - startedAt),
                     usage: { ...cumulativeUsage },
                     toolSteps: canonicalClone(liveSteps),
+                    assistantRounds: getSnapshotAssistantRounds(),
+                    hasRollbackableRound: hasRollbackableRoundNow(),
                     ...buildTraceRetryFields(),
                     ...(previewSource ? { outputPreview: previewSource.slice(0, 240) } : {}),
                     ...(lastRequestSnapshot ? { requestSnapshot: lastRequestSnapshot } : {}),
@@ -1449,12 +2132,56 @@ export class AgentRunner {
             : [];
         let bestSalvageableOutput: string | null = null;
 
+        const buildInterruptedCheckpoint = (
+            reason: InterruptedReason,
+            errorMessage: string,
+            createdAt: number,
+        ): InterruptedTurnCheckpoint => {
+            const snapshotCompleted = canonicalClone(completedTurnMessages);
+            if (snapshotCompleted.length === 0 && effectiveUserInput !== undefined) {
+                snapshotCompleted.push({
+                    role: 'user',
+                    content: canonicalClone(effectiveUserInput),
+                    ...(input.userName ? { name: input.userName } : {}),
+                });
+            }
+            return {
+                agentId: agent.id,
+                target: { messageId: target.messageId, swipeId: target.swipeId },
+                reason,
+                errorMessage,
+                phase: resolvedCheckpointPhase,
+                ...(resolvedCheckpointTriggerId ? { triggerId: resolvedCheckpointTriggerId } : {}),
+                runId,
+                completedTurnMessages: snapshotCompleted,
+                readSetSnapshot: Object.fromEntries(effectiveReadSet.entries()),
+                stagedSnapshot: this.store.snapshotStagedData(target),
+                ...(previousRoundSnapshot && toolSteps.length > 0
+                    ? { previousRoundSnapshot: canonicalClone(previousRoundSnapshot) }
+                    : {}),
+                createdAt,
+            };
+        };
+
         const recordFailureAndThrow = (
             aborted: boolean,
             message: string,
             originalError?: unknown,
         ): never => {
             const endedAt = Date.now();
+            const hasPhaseProgress =
+                !isMainOutputMode
+                && (toolSteps.length > 0 || input.resumeMessages !== undefined);
+            let savedCheckpoint: InterruptedTurnCheckpoint | undefined;
+            if (hasPhaseProgress) {
+                savedCheckpoint = buildInterruptedCheckpoint(
+                    aborted ? 'user_stop' : 'error',
+                    message,
+                    endedAt,
+                );
+                this.trajectoryStore.saveInterruptedCheckpoint(savedCheckpoint);
+            }
+
             const failTrace = this.traceLogger.recordTrace(
                 {
                     runId,
@@ -1471,6 +2198,8 @@ export class AgentRunner {
                     durationMs: Math.max(0, endedAt - startedAt),
                     usage: cumulativeUsage,
                     toolSteps: canonicalClone(toolSteps),
+                    assistantRounds: getSnapshotAssistantRounds(),
+                    hasRollbackableRound: hasRollbackableRoundNow(),
                     ...buildTraceRetryFields(),
                     ...(lastContent ? { outputPreview: lastContent.slice(0, 240) } : {}),
                     ...(lastReasoning && !lastContent
@@ -1490,7 +2219,7 @@ export class AgentRunner {
             if (originalError instanceof AgentExecutionError) {
                 throw originalError;
             }
-            throw new AgentExecutionError(message, failTrace, originalError);
+            throw new AgentExecutionError(message, failTrace, originalError, savedCheckpoint);
         };
 
         const salvageAndInterrupt = async (
@@ -1504,7 +2233,7 @@ export class AgentRunner {
                     target,
                     staged,
                     source: 'salvage',
-                    emitRenderEvent: false,
+                    emitRenderEvent: true,
                 });
                 this.traceLogger.emit({
                     kind: 'output_preview',
@@ -1570,6 +2299,8 @@ export class AgentRunner {
                     durationMs: Math.max(0, endedAt - startedAt),
                     usage: cumulativeUsage,
                     toolSteps: canonicalClone(toolSteps),
+                    assistantRounds: getSnapshotAssistantRounds(),
+                    hasRollbackableRound: hasRollbackableRoundNow(),
                     ...buildTraceRetryFields(),
                     ...(currentOutput
                         ? { outputPreview: currentOutput.slice(0, 240) }
@@ -1582,24 +2313,8 @@ export class AgentRunner {
                 true,
             );
 
-            if (completedTurnMessages.length === 0 && input.userInput !== undefined) {
-                completedTurnMessages.push({
-                    role: 'user',
-                    content: canonicalClone(input.userInput),
-                    ...(input.userName ? { name: input.userName } : {}),
-                });
-            }
-
-            const checkpoint: InterruptedTurnCheckpoint = {
-                agentId: agent.id,
-                target: { messageId: target.messageId, swipeId: target.swipeId },
-                reason,
-                errorMessage: resolvedErrorMessage,
-                completedTurnMessages: canonicalClone(completedTurnMessages),
-                readSetSnapshot: Object.fromEntries(effectiveReadSet.entries()),
-                stagedSnapshot: this.store.snapshotStagedData(target),
-                createdAt: endedAt,
-            };
+            const checkpoint = buildInterruptedCheckpoint(reason, resolvedErrorMessage, endedAt);
+            this.trajectoryStore.saveInterruptedCheckpoint(checkpoint);
 
             throw new TurnInterruptedError({
                 reason,
@@ -1630,7 +2345,7 @@ export class AgentRunner {
                     : undefined;
             const effectiveMacroOverrides = buildMainSurfaceMacroOverrides({
                 bridge: this.bridge,
-                userInput: input.userInput,
+                userInput: effectiveUserInput,
                 connection,
                 budget: contextBudget,
                 callerOverrides:
@@ -1869,7 +2584,7 @@ export class AgentRunner {
                 : await this.contextAssembler.assembleWithHost({
                     ...baseAssembleInput,
                     forceRecompilePrefix: input.forceRecompilePrefix,
-                    userInput: input.userInput,
+                    userInput: effectiveUserInput,
                     userName: input.userName,
                     turnBrief: input.turnBrief,
                     dynamicReminders: input.dynamicReminders,
@@ -2182,7 +2897,10 @@ export class AgentRunner {
             let emptyOutputRetried = false;
             let overflowRecoveryAttempted = false;
             let outputFixAttempts = 0;
+            let postprocessFixAttempts = 0;
+            let errorRecoveryAttemptsUsed = 0;
             const maxOutputFixAttempts = DEFAULT_MAX_OUTPUT_FIX_ATTEMPTS;
+            const maxPostprocessFixAttempts = DEFAULT_MAX_OUTPUT_FIX_ATTEMPTS;
             const outputSessionBag: Record<string, unknown> = {};
             const outputSessionId = runId;
 
@@ -2267,7 +2985,9 @@ export class AgentRunner {
                 finalContent: string;
                 persistedAssistantContent: string;
                 reasoningContent?: string;
+                assistantSummary?: string;
             }): Promise<AgentRunResult> => {
+                activeAssistantRound = null;
                 if (consumedSideBriefPaths.length > 0) {
                     await this.vfs.markSideCluesConsumed(
                         consumedSideBriefPaths,
@@ -2313,6 +3033,17 @@ export class AgentRunner {
                     });
                 }
 
+                if (input.resumeMessages !== undefined) {
+                    this.trajectoryStore.clearInterruptedCheckpoint(target, {
+                        phase: resolvedCheckpointPhase,
+                        triggerId: resolvedCheckpointTriggerId,
+                    });
+                }
+
+                const cleanSummary =
+                    params.assistantSummary && params.assistantSummary.trim().length > 0
+                        ? params.assistantSummary
+                        : undefined;
                 const endedAt = Date.now();
                 const finalTrace = this.traceLogger.recordTrace(
                     {
@@ -2330,8 +3061,12 @@ export class AgentRunner {
                         durationMs: Math.max(0, endedAt - startedAt),
                         usage: cumulativeUsage,
                         toolSteps: canonicalClone(toolSteps),
+                        assistantRounds: getSnapshotAssistantRounds(),
+                        ...(cleanSummary
+                            ? { assistantSummary: cleanSummary, outputPreview: cleanSummary }
+                            : {}),
+                        hasRollbackableRound: hasRollbackableRoundNow(),
                         ...buildTraceRetryFields(),
-                        outputPreview: params.finalContent.slice(0, 240),
                         requestSnapshot: lastRequestSnapshot,
                     },
                     true,
@@ -2366,6 +3101,15 @@ export class AgentRunner {
             const throwMaxToolRounds = (): never => {
                 const endedAt = Date.now();
                 const errorMessage = `Agent "${agent.name}" exceeded maxToolRounds (${maxToolRounds}).`;
+                const hasAnyProgress =
+                    toolSteps.length > 0
+                    || input.resumeMessages !== undefined
+                    || this.store.hasPending(target);
+                let savedCheckpoint: InterruptedTurnCheckpoint | undefined;
+                if (hasAnyProgress) {
+                    savedCheckpoint = buildInterruptedCheckpoint('error', errorMessage, endedAt);
+                    this.trajectoryStore.saveInterruptedCheckpoint(savedCheckpoint);
+                }
                 const errorTrace = this.traceLogger.recordTrace(
                     {
                         runId,
@@ -2382,6 +3126,8 @@ export class AgentRunner {
                         durationMs: Math.max(0, endedAt - startedAt),
                         usage: cumulativeUsage,
                         toolSteps: canonicalClone(toolSteps),
+                        assistantRounds: getSnapshotAssistantRounds(),
+                        hasRollbackableRound: hasRollbackableRoundNow(),
                         ...buildTraceRetryFields(),
                         ...(lastContent ? { outputPreview: lastContent.slice(0, 240) } : {}),
                         ...(lastReasoning && !lastContent
@@ -2392,7 +3138,7 @@ export class AgentRunner {
                     },
                     true,
                 );
-                throw new MaxToolRoundsError(maxToolRounds, errorTrace);
+                throw new MaxToolRoundsError(maxToolRounds, errorTrace, savedCheckpoint);
             };
 
             // eslint-disable-next-line no-constant-condition
@@ -2401,8 +3147,18 @@ export class AgentRunner {
 
                 await runPreflightBudgetGuard();
 
+                const roundIndexForTurn = roundsCompleted;
+                const beforeStepIndexForTurn = toolSteps.length;
+                const roundStartedAt = Date.now();
                 const roundToolChoice = await computeRoundToolChoice();
                 let roundRetriesUsed = 0;
+                let pendingPostprocessFixFeedback: string | undefined;
+                let pendingRecoveryOverride:
+                    | {
+                          messages?: CanonicalMessage[];
+                          connection?: ApiConnection;
+                      }
+                    | undefined;
 
                 interface OutputMutationDirective {
                     toolCallId: string;
@@ -2437,14 +3193,152 @@ export class AgentRunner {
                 while (true) {
                     throwIfAborted(signal);
 
-                    const llmRequest: LLMRequest = {
+                    const recoveryOverride = pendingRecoveryOverride;
+                    pendingRecoveryOverride = undefined;
+                    let attemptConnection = recoveryOverride?.connection ?? connection;
+                    let attemptMessages = recoveryOverride?.messages
+                        ? canonicalClone(recoveryOverride.messages)
+                        : canonicalClone(currentAssembled.request.messages);
+                    let attemptStream = input.stream ?? attemptConnection.stream ?? true;
+
+                    const rawLayer0End = currentAssembled.layer0Messages.length;
+                    const rawLayer1End = rawLayer0End + currentAssembled.layer1Messages.length;
+                    const rawFloatingStart = rawLayer1End + currentAssembled.layer2Messages.length;
+                    const computeLayersForLength = (len: number): EphemeralMessageLayerIndices => {
+                        const layer0End = clampLayerIndex(rawLayer0End, 0, len);
+                        const layer1End = clampLayerIndex(rawLayer1End, layer0End, len);
+                        const turnStart = layer1End;
+                        const floatingTailStart = clampLayerIndex(rawFloatingStart, turnStart, len);
+                        return { layer0End, layer1End, turnStart, floatingTailStart };
+                    };
+                    let attemptLayers = computeLayersForLength(attemptMessages.length);
+
+                    let llmRequest: LLMRequest = {
                         ...currentAssembled.request,
-                        connectionId: connection.id,
-                        connection,
+                        messages: attemptMessages,
+                        connectionId: attemptConnection.id,
+                        connection: attemptConnection,
                         ...(roundToolChoice ? { toolChoice: roundToolChoice } : {}),
-                        stream: input.stream ?? connection.stream ?? true,
+                        stream: attemptStream,
                         signal,
                     };
+
+                    const presetPreprocess = preset.preprocessScript;
+                    const shouldRunPresetPreprocess = Boolean(
+                        effectiveSandbox
+                        && presetPreprocess?.enabled
+                        && presetPreprocess.code.trim().length > 0
+                        && matchesPromptTriggers(presetPreprocess.triggers, promptTriggerContext),
+                    );
+                    const shouldRunCallbackPreprocess = typeof effectiveOnPreprocess === 'function';
+
+                    if (shouldRunPresetPreprocess || shouldRunCallbackPreprocess) {
+                        const preprocessController = createEphemeralMessagesController(
+                            attemptMessages,
+                            attemptLayers,
+                        );
+                        const { workingBody, baselineBody, baseIncludeKeys } =
+                            buildPreprocessWorkingBody(attemptConnection, attemptStream);
+                        const preprocessEvent: ToolEventPayload = {
+                            type: 'prompt_preprocess',
+                            timestamp: Date.now(),
+                            target: { ...target },
+                            phase: input.phase,
+                            runId,
+                            agentId: agent.id,
+                            ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                            round: roundIndexForTurn + 1,
+                            attempt: roundRetriesUsed,
+                            maxAttempts: maxRoundRetries,
+                            messageId: target.messageId,
+                            swipeId: target.swipeId,
+                            data: {
+                                layers: { ...attemptLayers },
+                                model: attemptConnection.model,
+                                connectionId: attemptConnection.id,
+                            },
+                        };
+                        const preprocessToolCtx: ToolExecutionContext = {
+                            ...toolCtx,
+                            messages: preprocessController,
+                            body: workingBody,
+                            event: preprocessEvent,
+                        };
+
+                        if (shouldRunPresetPreprocess && effectiveSandbox && presetPreprocess) {
+                            await effectiveSandbox.evaluateScript(
+                                presetPreprocess.code,
+                                preprocessToolCtx,
+                                {
+                                    id: `${runSandboxScope}:preprocess:r${roundIndexForTurn + 1}:a${roundRetriesUsed}`,
+                                    signal,
+                                },
+                            );
+                            throwIfAborted(signal);
+                        }
+
+                        if (shouldRunCallbackPreprocess && effectiveOnPreprocess) {
+                            await effectiveOnPreprocess({
+                                target: { ...target },
+                                phase: input.phase,
+                                runId,
+                                agentId: agent.id,
+                                agentName: agent.name,
+                                ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                                round: roundIndexForTurn + 1,
+                                attempt: roundRetriesUsed,
+                                maxRetries: maxRoundRetries,
+                                promptTriggerContext,
+                                messages: preprocessController,
+                                body: workingBody,
+                                layers: { ...attemptLayers },
+                                request: llmRequest,
+                                connection: attemptConnection,
+                                vars: workingVars,
+                                signal,
+                                toolContext: preprocessToolCtx,
+                            });
+                            throwIfAborted(signal);
+                        }
+
+                        attemptMessages = preprocessController.toMessages();
+                        attemptLayers = computeLayersForLength(attemptMessages.length);
+                        const bodyApplied = applyPreprocessBodyOverrides(
+                            attemptConnection,
+                            attemptStream,
+                            workingBody,
+                            baselineBody,
+                            baseIncludeKeys,
+                        );
+                        attemptConnection = bodyApplied.connection;
+                        attemptStream = bodyApplied.stream;
+                        const clampedBreakpoints = llmRequest.cacheBreakpoints?.filter(
+                            (bp) => bp >= 0 && bp < attemptMessages.length,
+                        );
+                        llmRequest = {
+                            ...llmRequest,
+                            messages: attemptMessages,
+                            connectionId: attemptConnection.id,
+                            connection: attemptConnection,
+                            stream: attemptStream,
+                            ...(clampedBreakpoints && clampedBreakpoints.length > 0
+                                ? { cacheBreakpoints: clampedBreakpoints }
+                                : { cacheBreakpoints: undefined }),
+                        };
+                    } else if (recoveryOverride?.messages && llmRequest.cacheBreakpoints) {
+                        const clampedBreakpoints = llmRequest.cacheBreakpoints.filter(
+                            (bp) => bp >= 0 && bp < attemptMessages.length,
+                        );
+                        llmRequest = {
+                            ...llmRequest,
+                            ...(clampedBreakpoints.length > 0
+                                ? { cacheBreakpoints: clampedBreakpoints }
+                                : { cacheBreakpoints: undefined }),
+                        };
+                    }
+
+                    const lastSentMessages = canonicalClone(llmRequest.messages);
+                    const lastSentLayers = { ...attemptLayers };
 
                     lastRequestSnapshot = {
                         messages: canonicalClone(llmRequest.messages),
@@ -2452,6 +3346,11 @@ export class AgentRunner {
                         ...(llmRequest.cacheBreakpoints
                             ? { cacheBreakpoints: [...llmRequest.cacheBreakpoints] }
                             : {}),
+                    };
+                    activeAssistantRound = {
+                        roundIndex: roundIndexForTurn,
+                        beforeStepIndex: beforeStepIndexForTurn,
+                        timestamp: Date.now(),
                     };
                     publishRunningTrace();
 
@@ -2470,6 +3369,7 @@ export class AgentRunner {
                               hasReasoning?: boolean;
                           }
                         | undefined;
+                    pendingPostprocessFixFeedback = undefined;
 
                     try {
                         turnOutput = await this.invokeLLM({
@@ -2483,8 +3383,241 @@ export class AgentRunner {
                             onTextDelta:
                                 isMainOutputMode || strictToolLoop ? undefined : input.onTextDelta,
                             onReasoningDelta: input.onReasoningDelta,
+                            onInternalTextDelta: (delta) => {
+                                if (activeAssistantRound) {
+                                    activeAssistantRound.content = `${activeAssistantRound.content ?? ''}${delta}`;
+                                    publishRunningTrace();
+                                }
+                            },
+                            onInternalReasoningDelta: (delta) => {
+                                if (activeAssistantRound) {
+                                    activeAssistantRound.reasoning = `${activeAssistantRound.reasoning ?? ''}${delta}`;
+                                    publishRunningTrace();
+                                }
+                            },
                             onToolCallDelta,
                         });
+
+                        if (activeAssistantRound) {
+                            if (turnOutput.reasoningContent) {
+                                activeAssistantRound.reasoning = turnOutput.reasoningContent;
+                            }
+                            if (turnOutput.content) {
+                                activeAssistantRound.content = turnOutput.content;
+                            }
+                        }
+
+                        const presetPostprocess = preset.postprocessScript;
+                        const shouldRunPresetPostprocess = Boolean(
+                            effectiveSandbox
+                            && presetPostprocess?.enabled
+                            && presetPostprocess.code.trim().length > 0
+                            && matchesPromptTriggers(presetPostprocess.triggers, promptTriggerContext),
+                        );
+                        const shouldRunCallbackPostprocess =
+                            typeof effectiveOnPostprocess === 'function';
+
+                        if (
+                            (shouldRunPresetPostprocess || shouldRunCallbackPostprocess)
+                            && !(isMainOutputMode && isLengthFinishReason(turnOutput.finishReason))
+                        ) {
+                            const origContent = turnOutput.content ?? '';
+                            const postOutput: AgentPostprocessOutput = {
+                                text: origContent,
+                                content: origContent,
+                                ...(turnOutput.reasoningContent !== undefined
+                                    ? { reasoningContent: turnOutput.reasoningContent }
+                                    : {}),
+                                toolCalls: canonicalClone(turnOutput.toolCalls),
+                                originalText: origContent,
+                                round: roundIndexForTurn + 1,
+                                fixAttempt: postprocessFixAttempts,
+                                maxFixAttempts: maxPostprocessFixAttempts,
+                            };
+                            const postControl = createPostprocessControl();
+                            const postEvent: ToolEventPayload = {
+                                type: 'output_postprocess',
+                                timestamp: Date.now(),
+                                target: { ...target },
+                                phase: input.phase,
+                                runId,
+                                agentId: agent.id,
+                                ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                                round: roundIndexForTurn + 1,
+                                attempt: roundRetriesUsed,
+                                maxAttempts: maxRoundRetries,
+                                output: origContent,
+                                messageId: target.messageId,
+                                swipeId: target.swipeId,
+                                data: {
+                                    content: origContent,
+                                    ...(turnOutput.reasoningContent !== undefined
+                                        ? { reasoningContent: turnOutput.reasoningContent }
+                                        : {}),
+                                    toolCalls: canonicalClone(turnOutput.toolCalls),
+                                    ...(turnOutput.finishReason
+                                        ? { finishReason: turnOutput.finishReason }
+                                        : {}),
+                                },
+                            };
+                            const postToolCtx: ToolExecutionContext = {
+                                ...toolCtx,
+                                output: postOutput,
+                                control: postControl,
+                                event: postEvent,
+                            };
+
+                            const reconcileInPlaceOutput = (
+                                prevText: string,
+                                prevContent: string,
+                            ): void => {
+                                if (
+                                    typeof postOutput.content === 'string'
+                                    && postOutput.content !== prevContent
+                                ) {
+                                    postOutput.text = postOutput.content;
+                                } else if (
+                                    typeof postOutput.text === 'string'
+                                    && postOutput.text !== prevText
+                                ) {
+                                    postOutput.content = postOutput.text;
+                                }
+                            };
+
+                            if (shouldRunPresetPostprocess && effectiveSandbox && presetPostprocess) {
+                                const prevText = postOutput.text;
+                                const prevContent = postOutput.content;
+                                const prevReasoning = postOutput.reasoningContent;
+                                const rawReturn = await effectiveSandbox.evaluateScript(
+                                    presetPostprocess.code,
+                                    postToolCtx,
+                                    {
+                                        id: `${runSandboxScope}:postprocess:r${roundIndexForTurn + 1}:a${roundRetriesUsed}`,
+                                        signal,
+                                    },
+                                );
+                                throwIfAborted(signal);
+                                reconcileInPlaceOutput(prevText, prevContent);
+
+                                if (typeof rawReturn === 'string') {
+                                    const wasReasoningAssignment =
+                                        postOutput.reasoningContent !== prevReasoning
+                                        && rawReturn === postOutput.reasoningContent;
+                                    if (!wasReasoningAssignment) {
+                                        postOutput.content = rawReturn;
+                                        postOutput.text = rawReturn;
+                                    }
+                                } else if (
+                                    rawReturn
+                                    && typeof rawReturn === 'object'
+                                    && !Array.isArray(rawReturn)
+                                ) {
+                                    const rec = rawReturn as Record<string, unknown>;
+                                    if (typeof rec.content === 'string') {
+                                        postOutput.content = rec.content;
+                                        postOutput.text = rec.content;
+                                    } else if (typeof rec.text === 'string') {
+                                        postOutput.content = rec.text;
+                                        postOutput.text = rec.text;
+                                    }
+                                    if ('reasoningContent' in rec) {
+                                        postOutput.reasoningContent =
+                                            typeof rec.reasoningContent === 'string'
+                                                ? rec.reasoningContent
+                                                : undefined;
+                                    }
+                                    if (Array.isArray(rec.toolCalls)) {
+                                        postOutput.toolCalls = normalizePostprocessToolCalls(
+                                            rec.toolCalls,
+                                        );
+                                    }
+                                }
+                            }
+
+                            if (shouldRunCallbackPostprocess && effectiveOnPostprocess) {
+                                const prevText = postOutput.text;
+                                const prevContent = postOutput.content;
+                                await effectiveOnPostprocess({
+                                    target: { ...target },
+                                    phase: input.phase,
+                                    runId,
+                                    agentId: agent.id,
+                                    agentName: agent.name,
+                                    ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                                    round: roundIndexForTurn + 1,
+                                    attempt: roundRetriesUsed,
+                                    maxRetries: maxRoundRetries,
+                                    fixAttempt: postprocessFixAttempts,
+                                    maxFixAttempts: maxPostprocessFixAttempts,
+                                    promptTriggerContext,
+                                    output: postOutput,
+                                    control: postControl,
+                                    connection: attemptConnection,
+                                    vars: workingVars,
+                                    signal,
+                                    toolContext: postToolCtx,
+                                });
+                                throwIfAborted(signal);
+                                reconcileInPlaceOutput(prevText, prevContent);
+                            }
+
+                            const nextContent =
+                                typeof postOutput.content === 'string'
+                                    ? postOutput.content
+                                    : typeof postOutput.text === 'string'
+                                        ? postOutput.text
+                                        : origContent;
+                            const nextReasoning =
+                                typeof postOutput.reasoningContent === 'string'
+                                && postOutput.reasoningContent.length > 0
+                                    ? postOutput.reasoningContent
+                                    : undefined;
+                            const nextToolCalls = Array.isArray(postOutput.toolCalls)
+                                ? normalizePostprocessToolCalls(postOutput.toolCalls)
+                                : turnOutput.toolCalls;
+
+                            turnOutput = {
+                                ...turnOutput,
+                                content: nextContent,
+                                toolCalls: nextToolCalls,
+                                ...(nextReasoning !== undefined
+                                    ? { reasoningContent: nextReasoning }
+                                    : {}),
+                            };
+                            if (nextReasoning === undefined) {
+                                delete turnOutput.reasoningContent;
+                            }
+
+                            if (activeAssistantRound) {
+                                activeAssistantRound.content = nextContent || undefined;
+                                activeAssistantRound.reasoning = nextReasoning;
+                            }
+
+                            if (postControl.action === 'abort') {
+                                throw createAbortError(
+                                    postControl.abortReason
+                                        ?? 'Response postprocess aborted generation.',
+                                );
+                            }
+                            if (
+                                postControl.action === 'retry'
+                                && roundRetriesUsed < maxRoundRetries
+                            ) {
+                                throw new LLMTransportError(
+                                    postControl.retryReason
+                                        ?? 'Postprocess script requested retry.',
+                                    {
+                                        code: ROUND_RETRY_ERROR_CODES.OUTPUT_VALIDATION_RETRY,
+                                        retryable: true,
+                                    },
+                                );
+                            }
+                            if (postControl.action === 'fix') {
+                                pendingPostprocessFixFeedback =
+                                    postControl.fixMessage
+                                    ?? 'Response postprocess requested a revision.';
+                            }
+                        }
 
                         lastAttemptDiag = {
                             ...(turnOutput.finishReason
@@ -2498,7 +3631,7 @@ export class AgentRunner {
                                 : {}),
                         };
 
-                        if (!isLengthFinishReason(turnOutput.finishReason)) {
+                        if (!pendingPostprocessFixFeedback && !isLengthFinishReason(turnOutput.finishReason)) {
                             if (turnOutput.toolCalls.length === 0 && !turnOutput.content.trim()) {
                                 const allowSilentSideEffectFinish =
                                     !strictToolLoop
@@ -2569,7 +3702,11 @@ export class AgentRunner {
                         pendingMutationDirectives = new Map();
                         pendingTurnFinishOutcome = undefined;
 
-                        if (this.bridge.processOutputText && !isLengthFinishReason(turnOutput.finishReason)) {
+                        if (
+                            !pendingPostprocessFixFeedback
+                            && this.bridge.processOutputText
+                            && !isLengthFinishReason(turnOutput.finishReason)
+                        ) {
                             const prefillPrefix = peekPrefillPrefix();
                             const hasPrefill = prefillPrefix.length > 0;
                             const buildBaseMeta = (
@@ -2850,6 +3987,265 @@ export class AgentRunner {
                             continue;
                         }
 
+                        if (
+                            !input.isErrorRecovery
+                            && input.onGenerationError
+                            && errorRecoveryAttemptsUsed < maxErrorRecoveryAttempts
+                        ) {
+                            errorRecoveryAttemptsUsed += 1;
+                            const baseEphemeral = createEphemeralMessagesController(
+                                lastSentMessages,
+                                lastSentLayers,
+                            );
+                            let rolledBackRoundsViaController = 0;
+                            let droppedHistoryViaController = 0;
+                            let messagesMutatedViaController = false;
+                            const trackedEphemeral: EphemeralMessagesController = {
+                                list: () => baseEphemeral.list(),
+                                set: (next) => {
+                                    messagesMutatedViaController = true;
+                                    baseEphemeral.set(next);
+                                },
+                                rollbackToolRounds: (count) => {
+                                    const rolled = baseEphemeral.rollbackToolRounds(count);
+                                    if (rolled > 0) {
+                                        rolledBackRoundsViaController += rolled;
+                                        messagesMutatedViaController = true;
+                                    }
+                                    return rolled;
+                                },
+                                dropHistoryTurns: (count, opts) => {
+                                    const dropped = baseEphemeral.dropHistoryTurns(count, opts);
+                                    if (dropped > 0) {
+                                        droppedHistoryViaController += dropped;
+                                        messagesMutatedViaController = true;
+                                    }
+                                    return dropped;
+                                },
+                                replaceContent: (selector, replacer) => {
+                                    const replaced = baseEphemeral.replaceContent(selector, replacer);
+                                    if (replaced > 0) {
+                                        messagesMutatedViaController = true;
+                                    }
+                                    return replaced;
+                                },
+                                appendHint: (content, role) => {
+                                    messagesMutatedViaController = true;
+                                    baseEphemeral.appendHint(content, role);
+                                },
+                                toMessages: () => baseEphemeral.toMessages(),
+                            };
+
+                            const errorInfo = extractGenerationErrorInfo(error);
+                            const recoveryEvent: ToolEventPayload = {
+                                type: 'generation_error',
+                                timestamp: Date.now(),
+                                target: { ...target },
+                                phase: input.phase,
+                                runId,
+                                agentId: agent.id,
+                                ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                                round: roundIndexForTurn + 1,
+                                attempt: errorRecoveryAttemptsUsed,
+                                maxAttempts: maxErrorRecoveryAttempts,
+                                error: errorInfo.message,
+                                ...(errorInfo.code ? { errorCode: errorInfo.code } : {}),
+                                ...(errorInfo.status !== undefined
+                                    ? { statusCode: errorInfo.status }
+                                    : {}),
+                                messageId: target.messageId,
+                                swipeId: target.swipeId,
+                                data: {
+                                    layers: { ...lastSentLayers },
+                                    ...(errorInfo.rawBody !== undefined
+                                        ? { rawBody: errorInfo.rawBody }
+                                        : {}),
+                                },
+                            };
+                            const recoveryToolCtx: ToolExecutionContext = {
+                                ...toolCtx,
+                                messages: trackedEphemeral,
+                                event: recoveryEvent,
+                            };
+
+                            let decision: AgentGenerationErrorDecision | void;
+                            try {
+                                decision = await input.onGenerationError({
+                                    target: { ...target },
+                                    phase: input.phase,
+                                    runId,
+                                    agentId: agent.id,
+                                    agentName: agent.name,
+                                    ...(input.triggerId ? { triggerId: input.triggerId } : {}),
+                                    round: roundIndexForTurn + 1,
+                                    attempt: errorRecoveryAttemptsUsed,
+                                    maxAttempts: maxErrorRecoveryAttempts,
+                                    error: errorInfo,
+                                    rawError: error,
+                                    ephemeralMessages: trackedEphemeral,
+                                    layers: { ...lastSentLayers },
+                                    connection: Object.freeze(canonicalClone(attemptConnection)),
+                                    signal,
+                                    toolContext: recoveryToolCtx,
+                                });
+                            } catch (hookError) {
+                                if (isAbortError(hookError) || signal.aborted) {
+                                    throw hookError;
+                                }
+                                console.warn(
+                                    '[ST-Agentic] onGenerationError hook threw an error; continuing with original failure:',
+                                    hookError,
+                                );
+                                decision = undefined;
+                            }
+                            throwIfAborted(signal);
+
+                            if (decision?.action === 'abort') {
+                                throw createAbortError(
+                                    decision.reason?.trim()
+                                        || 'Error recovery hook aborted generation.',
+                                );
+                            }
+
+                            if (decision?.action === 'retry') {
+                                if (
+                                    rolledBackRoundsViaController === 0
+                                    && typeof decision.rollbackToolRounds === 'number'
+                                    && decision.rollbackToolRounds > 0
+                                ) {
+                                    trackedEphemeral.rollbackToolRounds(
+                                        decision.rollbackToolRounds,
+                                    );
+                                }
+                                if (
+                                    droppedHistoryViaController === 0
+                                    && typeof decision.dropHistoryTurns === 'number'
+                                    && decision.dropHistoryTurns > 0
+                                ) {
+                                    trackedEphemeral.dropHistoryTurns(decision.dropHistoryTurns);
+                                }
+
+                                if (rolledBackRoundsViaController > 0) {
+                                    rollbackTrailingToolRoundsInArray(
+                                        turnMessages,
+                                        rolledBackRoundsViaController,
+                                        turnTransformStates,
+                                    );
+                                    rollbackTrailingToolRoundsInArray(
+                                        completedTurnMessages,
+                                        rolledBackRoundsViaController,
+                                    );
+                                }
+
+                                const nextRecoveryMessages = decision.messages
+                                    ? sanitizeToolCallPairs(decision.messages)
+                                    : messagesMutatedViaController
+                                        ? trackedEphemeral.toMessages()
+                                        : undefined;
+
+                                let nextRecoveryConn: ApiConnection | undefined;
+                                const hasConnOverride = Boolean(
+                                    (typeof decision.connectionId === 'string'
+                                        && decision.connectionId.trim().length > 0)
+                                    || (typeof decision.temperature === 'number'
+                                        && Number.isFinite(decision.temperature))
+                                    || (typeof decision.maxTokens === 'number'
+                                        && Number.isFinite(decision.maxTokens)
+                                        && decision.maxTokens > 0),
+                                );
+                                if (hasConnOverride) {
+                                    const baseConn =
+                                        typeof decision.connectionId === 'string'
+                                        && decision.connectionId.trim().length > 0
+                                            ? resolveConnection(
+                                                this.settingsProvider(),
+                                                decision.connectionId.trim(),
+                                            )
+                                            : attemptConnection;
+                                    nextRecoveryConn = canonicalClone(baseConn);
+                                    if (
+                                        typeof decision.temperature === 'number'
+                                        && Number.isFinite(decision.temperature)
+                                    ) {
+                                        nextRecoveryConn.temperature = decision.temperature;
+                                    }
+                                    if (
+                                        typeof decision.maxTokens === 'number'
+                                        && Number.isFinite(decision.maxTokens)
+                                        && decision.maxTokens > 0
+                                    ) {
+                                        nextRecoveryConn.maxTokens = Math.floor(
+                                            decision.maxTokens,
+                                        );
+                                    }
+                                }
+
+                                pendingRecoveryOverride = {
+                                    ...(nextRecoveryMessages
+                                        ? { messages: nextRecoveryMessages }
+                                        : {}),
+                                    ...(nextRecoveryConn ? { connection: nextRecoveryConn } : {}),
+                                };
+
+                                const recoveryDelayMs =
+                                    typeof decision.delayMs === 'number'
+                                    && Number.isFinite(decision.delayMs)
+                                    && decision.delayMs > 0
+                                        ? Math.floor(decision.delayMs)
+                                        : 0;
+                                const recoveryReason =
+                                    decision.reason?.trim()
+                                    || `error_recovery: ${formatRoundRetryReason(error)}`;
+                                const recoveryTs = Date.now();
+                                const recoveryRetryEntry: RoundRetryLog = {
+                                    round: roundIndexForTurn + 1,
+                                    attempt: errorRecoveryAttemptsUsed,
+                                    maxAttempts: maxErrorRecoveryAttempts,
+                                    reason: recoveryReason,
+                                    delayMs: recoveryDelayMs,
+                                    timestamp: recoveryTs,
+                                    ...(lastAttemptDiag?.finishReason
+                                        ? { finishReason: lastAttemptDiag.finishReason }
+                                        : {}),
+                                    ...(lastAttemptDiag?.outputTokens !== undefined
+                                        ? { outputTokens: lastAttemptDiag.outputTokens }
+                                        : {}),
+                                    ...(lastAttemptDiag?.hasReasoning
+                                        ? { hasReasoning: true }
+                                        : {}),
+                                };
+                                retryEvents.push(recoveryRetryEntry);
+
+                                if (extractor) {
+                                    const committedOutput = await readCurrentOutputSafe();
+                                    lastOutputPreview = committedOutput;
+                                    extractor.resetRound(committedOutput);
+                                }
+                                finishExtractor?.resetRound();
+                                activeAssistantRound = null;
+                                publishRunningTrace(recoveryTs);
+
+                                this.traceLogger.emit({
+                                    kind: 'turn_retrying',
+                                    target: { ...target },
+                                    timestamp: recoveryTs,
+                                    phase: input.phase,
+                                    runId,
+                                    agentProfileId: agent.id,
+                                    retryAttempt: errorRecoveryAttemptsUsed,
+                                    retryMaxAttempts: maxErrorRecoveryAttempts,
+                                    retryDelayMs: recoveryDelayMs,
+                                    retryReason: recoveryReason,
+                                });
+                                input.onRetrying?.(canonicalClone(recoveryRetryEntry));
+
+                                if (recoveryDelayMs > 0) {
+                                    await delayWithAbort(recoveryDelayMs, signal);
+                                }
+                                continue;
+                            }
+                        }
+
                         throw error;
                     }
                 }
@@ -2901,6 +4297,54 @@ export class AgentRunner {
                     }
                 }
 
+                if (
+                    pendingPostprocessFixFeedback
+                    && postprocessFixAttempts < maxPostprocessFixAttempts
+                    && (!hasToolRoundLimit || toolRoundsExecuted < maxToolRounds)
+                ) {
+                    lockAssistantRound({
+                        roundIndex: roundIndexForTurn,
+                        beforeStepIndex: beforeStepIndexForTurn,
+                        timestamp: roundStartedAt,
+                        reasoning: turnOutput.reasoningContent,
+                        content: turnOutput.content,
+                        isFinishTurn: false,
+                    });
+                    postprocessFixAttempts += 1;
+                    toolRoundsExecuted += 1;
+
+                    const rejectedContent =
+                        turnOutput.content.trim().length > 0
+                            ? turnOutput.content
+                            : turnOutput.toolCalls.length > 0
+                                ? `[Proposed tool calls rejected by postprocess validation: ${summarizeToolBatch(turnOutput.toolCalls)}]`
+                                : '';
+                    const rejectedAssistantMsg: CanonicalMessage = {
+                        role: 'assistant',
+                        content: rejectedContent,
+                        ...(turnOutput.reasoningContent
+                            ? { reasoningContent: turnOutput.reasoningContent }
+                            : {}),
+                    };
+                    const feedbackUserMsg: CanonicalMessage = {
+                        role: 'user',
+                        content: pendingPostprocessFixFeedback,
+                    };
+                    turnMessages.push(rejectedAssistantMsg, feedbackUserMsg);
+                    turnTransformStates.push({ cached: true }, { cached: true });
+                    completedTurnMessages.push(
+                        canonicalClone(rejectedAssistantMsg),
+                        canonicalClone(feedbackUserMsg),
+                    );
+                    if (extractor) {
+                        const currentOut = await readCurrentOutputSafe();
+                        extractor.resetRound(currentOut);
+                    }
+                    finishExtractor?.resetRound();
+                    currentAssembled = await refreshFloatingAndReassembleInFlight();
+                    continue;
+                }
+
                 if (turnOutput.toolCalls.length === 0) {
                     let finalContent = turnOutput.content;
                     let persistedContent = turnOutput.content;
@@ -2912,6 +4356,14 @@ export class AgentRunner {
                                 !emptyOutputRetried
                                 && (!hasToolRoundLimit || toolRoundsExecuted < maxToolRounds)
                             ) {
+                                lockAssistantRound({
+                                    roundIndex: roundIndexForTurn,
+                                    beforeStepIndex: beforeStepIndexForTurn,
+                                    timestamp: roundStartedAt,
+                                    reasoning: turnOutput.reasoningContent,
+                                    content: turnOutput.content,
+                                    isFinishTurn: false,
+                                });
                                 emptyOutputRetried = true;
                                 toolRoundsExecuted += 1;
 
@@ -2956,6 +4408,14 @@ export class AgentRunner {
                             && outputFixAttempts < maxOutputFixAttempts
                             && (!hasToolRoundLimit || toolRoundsExecuted < maxToolRounds)
                         ) {
+                            lockAssistantRound({
+                                roundIndex: roundIndexForTurn,
+                                beforeStepIndex: beforeStepIndexForTurn,
+                                timestamp: roundStartedAt,
+                                reasoning: turnOutput.reasoningContent,
+                                content: turnOutput.content,
+                                isFinishTurn: false,
+                            });
                             outputFixAttempts += 1;
                             toolRoundsExecuted += 1;
                             const feedbackMsg = formatOutputFixFeedback(
@@ -2995,10 +4455,7 @@ export class AgentRunner {
                                     target,
                                     staged,
                                     source: 'agentic_output_process',
-                                    emitRenderEvent:
-                                        input.phase === 'before_turn' || input.phase === 'main_turn'
-                                            ? false
-                                            : true,
+                                    emitRenderEvent: true,
                                 });
                                 extractor?.markToolExecuted(finishOutcome.result.text);
                             } else {
@@ -3007,10 +4464,22 @@ export class AgentRunner {
                         }
                     }
 
+                    const plainAssistantSummary =
+                        persistedContent.trim().length > 0 ? persistedContent : undefined;
+                    lockAssistantRound({
+                        roundIndex: roundIndexForTurn,
+                        beforeStepIndex: beforeStepIndexForTurn,
+                        timestamp: roundStartedAt,
+                        reasoning: turnOutput.reasoningContent,
+                        content: persistedContent,
+                        isFinishTurn: false,
+                    });
+
                     return await finalizeSuccessfulTurn({
                         finalContent,
                         persistedAssistantContent: persistedContent,
                         reasoningContent: turnOutput.reasoningContent,
+                        assistantSummary: plainAssistantSummary,
                     });
                 }
 
@@ -3065,11 +4534,7 @@ export class AgentRunner {
                                                 target,
                                                 staged,
                                                 source: 'agentic_output_process',
-                                                emitRenderEvent:
-                                                    input.phase === 'before_turn'
-                                                    || input.phase === 'main_turn'
-                                                        ? false
-                                                        : true,
+                                                emitRenderEvent: true,
                                             },
                                         );
                                         extractor?.markToolExecuted(resolvedFinalContent);
@@ -3077,11 +4542,25 @@ export class AgentRunner {
                                     const stepBrief = String(
                                         parsedFinish.data.step_brief ?? '',
                                     ).trim();
+                                    const finishSummary = buildMainOutputFinishSummary(
+                                        stepBrief,
+                                        turnOutput.content ?? '',
+                                    );
+                                    lockAssistantRound({
+                                        roundIndex: roundIndexForTurn,
+                                        beforeStepIndex: beforeStepIndexForTurn,
+                                        timestamp: roundStartedAt,
+                                        reasoning: turnOutput.reasoningContent,
+                                        content: turnOutput.content,
+                                        isFinishTurn: true,
+                                        finishTurnSummary: finishSummary,
+                                    });
                                     return await finalizeSuccessfulTurn({
                                         finalContent: resolvedFinalContent,
                                         persistedAssistantContent:
                                             turnOutput.content.trim() || stepBrief,
                                         reasoningContent: turnOutput.reasoningContent,
+                                        assistantSummary: finishSummary,
                                     });
                                 }
                             }
@@ -3103,18 +4582,37 @@ export class AgentRunner {
                                         },
                                     );
                                 } else {
-                                    const rawStatusText =
+                                    const rawStatus =
                                         typeof parsedFinish.data.status === 'string'
-                                        && parsedFinish.data.status.trim().length > 0
                                             ? parsedFinish.data.status.trim()
-                                            : String(parsedFinish.data.step_brief ?? '').trim();
+                                            : '';
+                                    const stepBrief = String(
+                                        parsedFinish.data.step_brief ?? '',
+                                    ).trim();
+                                    const rawStatusText = rawStatus || stepBrief;
                                     const statusText = finishOutcome?.result.changed
                                         ? finishOutcome.result.text
                                         : rawStatusText;
+                                    const finishSummary = buildSideEffectFinishSummary(
+                                        finishOutcome?.result.changed
+                                            ? finishOutcome.result.text
+                                            : rawStatus,
+                                        stepBrief,
+                                    );
+                                    lockAssistantRound({
+                                        roundIndex: roundIndexForTurn,
+                                        beforeStepIndex: beforeStepIndexForTurn,
+                                        timestamp: roundStartedAt,
+                                        reasoning: turnOutput.reasoningContent,
+                                        content: turnOutput.content,
+                                        isFinishTurn: true,
+                                        finishTurnSummary: finishSummary,
+                                    });
                                     return await finalizeSuccessfulTurn({
                                         finalContent: statusText,
                                         persistedAssistantContent: statusText,
                                         reasoningContent: turnOutput.reasoningContent,
+                                        assistantSummary: finishSummary,
                                     });
                                 }
                             }
@@ -3139,20 +4637,52 @@ export class AgentRunner {
                                 const responseText = finishOutcome?.result.changed
                                     ? finishOutcome.result.text
                                     : rawResponseText;
+                                const finishSummary =
+                                    responseText.trim().length > 0 ? responseText : undefined;
+                                lockAssistantRound({
+                                    roundIndex: roundIndexForTurn,
+                                    beforeStepIndex: beforeStepIndexForTurn,
+                                    timestamp: roundStartedAt,
+                                    reasoning: turnOutput.reasoningContent,
+                                    content: turnOutput.content,
+                                    isFinishTurn: true,
+                                    finishTurnSummary: finishSummary,
+                                });
                                 return await finalizeSuccessfulTurn({
                                     finalContent: responseText,
                                     persistedAssistantContent: responseText,
                                     reasoningContent: turnOutput.reasoningContent,
+                                    assistantSummary: finishSummary,
                                 });
                             }
                         }
                     }
                 }
 
+                // Lock this intermediate assistant round before guardrail / tool execution.
+                lockAssistantRound({
+                    roundIndex: roundIndexForTurn,
+                    beforeStepIndex: beforeStepIndexForTurn,
+                    timestamp: roundStartedAt,
+                    reasoning: turnOutput.reasoningContent,
+                    content: turnOutput.content,
+                    isFinishTurn: false,
+                });
+
                 // Enforce maxToolRounds guardrail before executing another round of tool calls.
                 if (hasToolRoundLimit && toolRoundsExecuted >= maxToolRounds) {
                     throwMaxToolRounds();
                 }
+
+                // Snapshot rollback state BEFORE mutating turn messages or executing this tool batch.
+                const preBatchOutputText = await readCurrentOutputSafe();
+                previousRoundSnapshot = {
+                    completedTurnMessages: canonicalClone(completedTurnMessages),
+                    readSetSnapshot: Object.fromEntries(effectiveReadSet.entries()),
+                    stagedSnapshot: this.store.snapshotStagedData(target),
+                    outputText: preBatchOutputText,
+                    rolledBackToolSummary: summarizeToolBatch(turnOutput.toolCalls),
+                };
 
                 toolRoundsExecuted += 1;
 
@@ -3354,11 +4884,7 @@ export class AgentRunner {
                                             target,
                                             staged,
                                             source: 'agentic_output_process',
-                                            emitRenderEvent:
-                                                input.phase === 'before_turn'
-                                                || input.phase === 'main_turn'
-                                                    ? false
-                                                    : true,
+                                            emitRenderEvent: true,
                                         },
                                     );
                                 }
@@ -3562,6 +5088,8 @@ export class AgentRunner {
         signal: AbortSignal;
         onTextDelta?: (delta: string) => void;
         onReasoningDelta?: (delta: string) => void;
+        onInternalTextDelta?: (delta: string) => void;
+        onInternalReasoningDelta?: (delta: string) => void;
         onToolCallDelta?: (index: number, delta: ToolCallDeltaInput) => void;
     }): Promise<{
         content: string;
@@ -3630,6 +5158,7 @@ export class AgentRunner {
                             agentProfileId: params.agentId,
                             textDelta: delta,
                         });
+                        params.onInternalTextDelta?.(delta);
                         params.onTextDelta?.(delta);
                     },
                     onReasoning: (delta) => {
@@ -3643,6 +5172,7 @@ export class AgentRunner {
                             agentProfileId: params.agentId,
                             reasoningDelta: delta,
                         });
+                        params.onInternalReasoningDelta?.(delta);
                         params.onReasoningDelta?.(delta);
                     },
                     toolCallMap,
@@ -3845,12 +5375,14 @@ export class AgentRunner {
         target: MessageTarget;
         connection: ApiConnection;
         presetFiles: Record<string, string>;
+        sandbox?: ScriptSandbox;
         sandboxScope: string;
         createdSandboxIds: string[];
         signal: AbortSignal;
     }): Promise<{ registry: ToolRegistry; autoAttachedToolNames: string[] }> {
         const registry = this.baseToolRegistry.clone();
         const autoAttachedToolNames: string[] = [];
+        const sandbox = params.sandbox ?? this.sandbox;
 
         // 1. Register preset customTools allowed for this agent
         let customIdx = 0;
@@ -3864,7 +5396,7 @@ export class AgentRunner {
             ) {
                 continue;
             }
-            if (custom.kind === 'js' && !this.sandbox) {
+            if (custom.kind === 'js' && !sandbox) {
                 continue;
             }
             try {
@@ -3873,7 +5405,7 @@ export class AgentRunner {
                     sandboxId = `${params.sandboxScope}:custom:${customIdx++}:${custom.id?.trim() || custom.name?.trim() || 'tool'}`;
                     params.createdSandboxIds.push(sandboxId);
                 }
-                const compiled = await compileCustomToolConfig(custom, this.sandbox, {
+                const compiled = await compileCustomToolConfig(custom, sandbox, {
                     ...(sandboxId ? { sandboxId } : {}),
                     signal: params.signal,
                 });
@@ -3890,7 +5422,7 @@ export class AgentRunner {
 
         // 2. Register @@tool World Info entries when ScriptSandbox is available
         const rawLore = unwrapRawLoreEntries(params.loreEntries);
-        if (this.sandbox) {
+        if (sandbox) {
             const triggerWorldSet = new Set(
                 (params.lorebookNames ?? []).map((n) => n.trim()).filter(Boolean),
             );
@@ -3906,7 +5438,7 @@ export class AgentRunner {
                 try {
                     const sandboxId = `${params.sandboxScope}:lore:${loreIdx++}:${entry.world}:${entry.uid}`;
                     params.createdSandboxIds.push(sandboxId);
-                    const compiled = await compileLoreToolEntry(entry, this.sandbox, {
+                    const compiled = await compileLoreToolEntry(entry, sandbox, {
                         sandboxId,
                         signal: params.signal,
                     });
