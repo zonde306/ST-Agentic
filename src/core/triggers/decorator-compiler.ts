@@ -10,6 +10,7 @@ import type {
     RawLoreEntry,
     ScopedPermissions,
     TriggerCondition,
+    TriggerEventType,
     TriggerRule,
 } from '@/core/types';
 import { canonicalClone } from '@/core/utils';
@@ -203,6 +204,81 @@ function parseToolListParam(raw: string | undefined): string[] {
             .map((t) => t.trim())
             .filter(Boolean),
     );
+}
+
+const VALID_TRIGGER_EVENTS: ReadonlySet<TriggerEventType> = new Set<TriggerEventType>([
+    'generation_error',
+    'turn_interrupted',
+    'turn_aborted',
+    'turn_started',
+    'turn_completed',
+    'output_updated',
+    'prompt_preprocess',
+    'output_postprocess',
+    'chat_changed',
+    'message_sent',
+    'message_received',
+    'message_edited',
+    'message_deleted',
+    'message_swiped',
+]);
+
+const TRIGGER_EVENT_ALIASES: Readonly<Record<string, TriggerEventType>> = {
+    error: 'generation_error',
+    interrupted: 'turn_interrupted',
+    aborted: 'turn_aborted',
+};
+
+/**
+ * Normalize an event token from `@@script on=...` / `@@trigger on=...` into a canonical `TriggerEventType`.
+ */
+export function normalizeTriggerEventType(raw: string): TriggerEventType | undefined {
+    const normalized = raw.trim().toLowerCase().replace(/[\s-]+/g, '_');
+    if (!normalized) {
+        return undefined;
+    }
+    if (Object.prototype.hasOwnProperty.call(TRIGGER_EVENT_ALIASES, normalized)) {
+        return TRIGGER_EVENT_ALIASES[normalized];
+    }
+    if (VALID_TRIGGER_EVENTS.has(normalized as TriggerEventType)) {
+        return normalized as TriggerEventType;
+    }
+    return undefined;
+}
+
+/**
+ * Parse comma/semicolon-separated `on=` / `events=` decorator parameters into deduplicated `TriggerEventType[]`.
+ */
+export function parseTriggerEventsParam(
+    rawOn?: string,
+    rawEvents?: string,
+): { events: TriggerEventType[]; invalid: string[] } {
+    const combined = [rawOn, rawEvents]
+        .filter((value): value is string => Boolean(value && value.trim().length > 0))
+        .join(',');
+    if (!combined) {
+        return { events: [], invalid: [] };
+    }
+
+    const seen = new Set<TriggerEventType>();
+    const events: TriggerEventType[] = [];
+    const invalid: string[] = [];
+    for (const token of combined.split(/[,;|]+/)) {
+        const trimmed = token.trim();
+        if (!trimmed) {
+            continue;
+        }
+        const resolved = normalizeTriggerEventType(trimmed);
+        if (!resolved) {
+            invalid.push(trimmed);
+            continue;
+        }
+        if (!seen.has(resolved)) {
+            seen.add(resolved);
+            events.push(resolved);
+        }
+    }
+    return { events, invalid };
 }
 
 export function mergeDerivedAgentProfiles(
@@ -600,6 +676,13 @@ export class DecoratorCompiler {
                     : rawTargetPath;
             const condition = extractCondition(entry, params);
             const tag = params.tag?.trim() || triggerDec?.args[0]?.trim() || undefined;
+            const parsedEvents = parseTriggerEventsParam(params.on, params.events);
+            if (parsedEvents.invalid.length > 0) {
+                warnings.push(
+                    `Unknown event name(s) in ${triggerDec ? '@@trigger' : '@@script'} (${label}): ${parsedEvents.invalid.join(', ')}`,
+                );
+            }
+            const eventsField = parsedEvents.events.length > 0 ? { events: parsedEvents.events } : {};
 
             if (isScript) {
                 const scriptCode = stripCodeFenceOnly(parsed.cleanContent);
@@ -620,6 +703,7 @@ export class DecoratorCompiler {
                     ...(targetPath ? { targetPath } : {}),
                     decorator: triggerDec ? '@@trigger' : '@@script',
                     ...ifField,
+                    ...eventsField,
                     scriptCode,
                     enabled: true,
                 };
@@ -694,6 +778,7 @@ export class DecoratorCompiler {
                 ...(schemaSource ? { schemaSource } : {}),
                 decorator: '@@trigger',
                 ...ifField,
+                ...eventsField,
                 enabled: true,
             };
 

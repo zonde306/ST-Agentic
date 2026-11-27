@@ -689,4 +689,60 @@ describe('DecoratorCompiler & Trigger Grouping', () => {
             expect.arrayContaining(['comfyui_generate', 'external_lookup']),
         );
     });
+
+    it('compiles @@script and @@trigger event hooks with on=/events= and aliases while keeping legacy phase= compatible', () => {
+        const compiler = new DecoratorCompiler();
+        const compiled = compiler.compile([
+            makeEntry({
+                uid: 401,
+                comment: '错误恢复脚本',
+                content: '@@script on=error,interrupted,aborted order=2\nctx.control?.retry("recovered");',
+            }),
+            makeEntry({
+                uid: 402,
+                comment: '预处理与后处理脚本',
+                content: '@@script events="prompt_preprocess, output_postprocess" order=5\nreturn null;',
+            }),
+            makeEntry({
+                uid: 403,
+                comment: '事件触发器 Agent',
+                content: '@@trigger on=turn_completed,chat_changed order=3\n记录回合完成状态。',
+            }),
+            makeEntry({
+                uid: 404,
+                comment: '未知事件告警',
+                content: '@@script on=error,not_a_real_event order=1\nreturn 1;',
+            }),
+            makeEntry({
+                uid: 405,
+                comment: '传统阶段脚本',
+                content: '@@script phase=before order=4 barrier=turn\nreturn "legacy-brief";',
+            }),
+        ]);
+
+        expect(compiled.triggers).toHaveLength(5);
+        const [errScript, prePostScript, eventTrigger, unknownEvtScript, legacyScript] =
+            compiled.triggers;
+
+        expect(errScript.kind).toBe('script');
+        expect(errScript.order).toBe(2);
+        expect(errScript.events).toEqual([
+            'generation_error',
+            'turn_interrupted',
+            'turn_aborted',
+        ]);
+
+        expect(prePostScript.kind).toBe('script');
+        expect(prePostScript.events).toEqual(['prompt_preprocess', 'output_postprocess']);
+
+        expect(eventTrigger.kind).toBe('agent');
+        expect(eventTrigger.events).toEqual(['turn_completed', 'chat_changed']);
+
+        expect(unknownEvtScript.events).toEqual(['generation_error']);
+        expect(compiled.warnings.some((w) => w.includes('not_a_real_event'))).toBe(true);
+
+        expect(legacyScript.phase).toBe('before_turn');
+        expect(legacyScript.barrier).toBe('turn');
+        expect(legacyScript.events).toBeUndefined();
+    });
 });

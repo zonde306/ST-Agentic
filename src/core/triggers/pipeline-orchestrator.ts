@@ -1,16 +1,34 @@
 import { z } from 'zod';
 import {
+    AgentExecutionError,
     AgentRunner,
+    DEFAULT_SUBAGENT_TOOLS,
+    MaxToolRoundsError,
+    TurnInterruptedError,
+    type AgentGenerationErrorDecision,
+    type AgentGenerationErrorHookContext,
+    type AgentPostprocessResponseContext,
+    type AgentPreprocessMessagesContext,
     type AgentRunResult,
     type SubAgentDescriptor,
-    TurnInterruptedError,
 } from '@/core/agents';
 import {
     type HostBridge,
     type LLMTransport,
     type PromptInjectionSession,
     type SerializedPromptInjected,
+    type ToolAgentApi,
+    type ToolAgentRunOptions,
+    type ToolAgentRunResult,
+    type ToolAgentRunTriggerOptions,
+    type ToolEphemeralMessagesApi,
+    type ToolErrorRecoveryAction,
+    type ToolErrorRecoveryControl,
+    type ToolErrorRecoveryRetryOptions,
+    type ToolEventPayload,
     type ToolExecutionContext,
+    type ToolPostprocessControl,
+    type ToolPostprocessOutput,
     type ToolSideGenApi,
     runPromptTransform,
 } from '@/core/bridge';
@@ -29,6 +47,7 @@ import {
     type CompactionOptions,
     type WatermarkCompactionResult,
 } from '@/core/context';
+import { LLMTransportError } from '@/core/llm';
 import { TraceLogger } from '@/core/logger';
 import {
     LoreReadEvaluator,
@@ -61,6 +80,7 @@ import type {
     BarrierPolicy,
     CanonicalContentPart,
     CanonicalMessage,
+    CanonicalToolCall,
     MessageTarget,
     PipelinePhase,
     Preset,
@@ -70,8 +90,10 @@ import type {
     ScopedPermissions,
     Settings,
     ToolStepLog,
+    TriggerEventType,
     TriggerRule,
 } from '@/core/types';
+import { canonicalClone } from '@/core/utils';
 import { OUTPUT_FILE_PATH, VirtualFileSystem } from '@/core/vfs';
 import {
     BarrierCoordinator,
@@ -161,6 +183,8 @@ export interface RunTurnInput {
 
 export interface ResumeTurnInput {
     target: MessageTarget;
+    /** When true and `previousRoundSnapshot` exists, roll back the last tool round and `/output.md` before retrying. */
+    rollbackLastToolRound?: boolean;
     signal?: AbortSignal;
     stream?: boolean;
     onTextDelta?: (delta: string) => void;
@@ -170,7 +194,49 @@ export interface ResumeTurnInput {
     onToolComplete?: (step: ToolStepLog) => void;
 }
 
-export { TurnInterruptedError };
+export interface ResumeTriggerTaskOptions {
+    rollbackLastToolRound?: boolean;
+    signal?: AbortSignal;
+}
+
+export interface CompiledTurnEnvironment {
+    loreEntries: RawLoreEntry[];
+    effectiveAgents: Record<string, AgentProfile>;
+    derivedAgentsByRuleId: Record<string, AgentProfile>;
+    allTriggers: TriggerRule[];
+    subAgents: SubAgentDescriptor[];
+    globalVarSchema: z.ZodTypeAny | undefined;
+}
+
+export interface EventHookRuleResult {
+    ruleId: string;
+    label: string;
+    kind: 'agent' | 'script';
+    eventType: TriggerEventType;
+    target: MessageTarget;
+    rawResult?: unknown;
+    output: string;
+    skipped?: boolean;
+    error?: string;
+}
+
+export interface EventHookDispatchOptions {
+    target?: MessageTarget;
+    phase?: PipelinePhase;
+    staged?: boolean;
+    signal?: AbortSignal;
+    preset?: Preset;
+    env?: CompiledTurnEnvironment;
+    injectionSession?: PromptInjectionSession;
+    messages?: ToolEphemeralMessagesApi;
+    body?: Record<string, unknown>;
+    output?: ToolPostprocessOutput;
+    control?: ToolErrorRecoveryControl | ToolPostprocessControl;
+    isErrorRecovery?: boolean;
+    shouldStop?: (result: EventHookRuleResult) => boolean;
+}
+
+export { AgentExecutionError, MaxToolRoundsError, TurnInterruptedError };
 
 export interface TriggerExecutionResult {
     unitId: string;
@@ -279,6 +345,7 @@ export class PipelineOrchestrator {
     private readonly sideGen?: ToolSideGenApi;
     private readonly summarizeChunk?: ChunkSummarizer;
     private readonly compactionOptions: Partial<CompactionOptions>;
+    private readonly activeHostEventTypes = new Set<TriggerEventType>();
 
     constructor(deps: PipelineOrchestratorDependencies) {
         this.bridge = deps.bridge;
@@ -369,6 +436,12 @@ export class PipelineOrchestrator {
                 traceLogger: this.traceLogger,
                 sandbox: this.sandbox,
                 ...(this.sideGen ? { sideGen: this.sideGen } : {}),
+                onPreprocessMessages: async (prepCtx) => {
+                    await this.handlePreprocessMessagesHook(prepCtx);
+                },
+                onPostprocessResponse: async (postCtx) => {
+                    await this.handlePostprocessResponseHook(postCtx);
+                },
             });
     }
 
@@ -443,11 +516,35 @@ export class PipelineOrchestrator {
                 this.bridge.createPromptInjectionSession?.(parentStickySnapshot)?.session
                 ?? new LocalPromptInjectionSession(parentStickySnapshot);
 
+            // Notify event-driven `turn_started` hooks before entering before_turn
+            await this.dispatchEventHooks(
+                'turn_started',
+                {
+                    type: 'turn_started',
+                    timestamp: Date.now(),
+                    target: { ...target },
+                    messageId: target.messageId,
+                    swipeId: target.swipeId,
+                    phase: 'before_turn',
+                    data: { action: input.action },
+                },
+                {
+                    target,
+                    phase: 'before_turn',
+                    staged: true,
+                    signal: turnSignal,
+                    preset,
+                    env,
+                    injectionSession,
+                },
+            );
+            throwIfAborted(turnSignal);
+
             // 4. [Phase 1: before_turn] (skipped on `'continue'`)
             const beforeTurnResults: TriggerExecutionResult[] = [];
             if (input.action !== 'continue') {
                 const beforeRules = env.allTriggers.filter(
-                    (t) => t.phase === 'before_turn' && t.enabled,
+                    (t) => t.phase === 'before_turn' && t.enabled && !isEventDrivenTriggerRule(t),
                 );
                 await this.executeOrderedSyncUnits(beforeRules, {
                     target,
@@ -503,6 +600,12 @@ export class PipelineOrchestrator {
                 getVariableSchema: env.globalVarSchema ? () => env.globalVarSchema : undefined,
                 staged: true,
                 injectionSession,
+                checkpointScope: { phase: 'main_turn' },
+                ...this.buildAgentRunnerHooks({
+                    preset,
+                    env,
+                    injectionSession,
+                }),
                 stream: input.stream,
                 signal: turnSignal,
                 onTextDelta: input.onTextDelta,
@@ -539,7 +642,7 @@ export class PipelineOrchestrator {
             });
         } catch (error) {
             if (error instanceof TurnInterruptedError) {
-                return this.handleTurnInterrupted(target, error);
+                return await this.handleTurnInterrupted(target, error);
             }
 
             // Roll back uncommitted staged data if before_turn / main_turn failed or aborted
@@ -547,22 +650,34 @@ export class PipelineOrchestrator {
 
             const aborted = isAbortError(error) || turnSignal.aborted;
             if (aborted) {
+                const abortMessage = error instanceof Error ? error.message : 'Turn aborted';
                 this.traceLogger.emit({
                     kind: 'turn_aborted',
                     target: { ...target },
                     timestamp: Date.now(),
-                    error: error instanceof Error ? error.message : 'Turn aborted',
+                    error: abortMessage,
+                });
+                await this.emitAbortedHostEvent({
+                    target,
+                    phase: 'main_turn',
+                    reason: abortMessage,
                 });
                 throw error instanceof Error && isAbortError(error)
                     ? error
                     : createAbortError('Turn aborted');
             }
 
+            const errMessage = error instanceof Error ? error.message : String(error);
             this.traceLogger.emit({
                 kind: 'turn_error',
                 target: { ...target },
                 timestamp: Date.now(),
-                error: error instanceof Error ? error.message : String(error),
+                error: errMessage,
+            });
+            this.emitUnrecoveredErrorHostEvent({
+                target,
+                phase: 'main_turn',
+                error,
             });
             throw error;
         }
@@ -571,6 +686,8 @@ export class PipelineOrchestrator {
     /**
      * Resume an interrupted `main_turn` from its persisted `InterruptedTurnCheckpoint`
      * while preserving 100% byte-for-byte Prefix KV Cache invariance over completed rounds.
+     * When `input.rollbackLastToolRound` is true and `previousRoundSnapshot` exists, rolls back
+     * the last tool round's staged state and `/output.md` content before prompting a fresh retry.
      */
     async resumeTurn(input: ResumeTurnInput): Promise<RunTurnResult> {
         const target = freezeTarget(input.target);
@@ -603,18 +720,45 @@ export class PipelineOrchestrator {
 
             const env = await this.compileTurnEnvironment(preset, turnSignal);
 
+            const useRollback = Boolean(input.rollbackLastToolRound && cp.previousRoundSnapshot);
+            const prevRound = useRollback ? cp.previousRoundSnapshot : undefined;
+            const effectiveCompletedMessages = prevRound
+                ? prevRound.completedTurnMessages
+                : cp.completedTurnMessages;
+            const effectiveReadSet = prevRound ? prevRound.readSetSnapshot : cp.readSetSnapshot;
+            const effectiveStagedSnapshot = prevRound
+                ? prevRound.stagedSnapshot
+                : cp.stagedSnapshot;
+
             this.restoreTrajectoriesBeforeMessage(target.messageId);
-            this.store.restoreStagedData(target, cp.stagedSnapshot);
+            this.store.restoreStagedData(target, effectiveStagedSnapshot);
 
-            const currentOutput = await this.vfs
-                .readFile(OUTPUT_FILE_PATH, { target, staged: true })
-                .catch(() => '');
-
-            const recoveryPrompt = [
-                `[System Recovery] Previous generation was interrupted (reason: ${cp.reason}).`,
-                `Current /output.md already has ${currentOutput.length} chars saved (ending with: ${JSON.stringify(currentOutput.slice(-200))}).`,
-                'Inspect /output.md if needed, seamlessly continue writing the remaining content using append_file or edit_file on /output.md WITHOUT repeating already-written text, and review /output.md for completeness and errors before finishing.',
-            ].join('\n');
+            let currentOutput: string;
+            let recoveryPrompt: string;
+            if (prevRound) {
+                await this.vfs.writeFile(OUTPUT_FILE_PATH, prevRound.outputText, {
+                    target,
+                    staged: true,
+                    source: 'resume_rollback',
+                });
+                currentOutput = prevRound.outputText;
+                const rolledBackDesc =
+                    prevRound.rolledBackToolSummary?.trim() || 'the previous tool round';
+                recoveryPrompt = [
+                    `[System Recovery - Tool Round Rolled Back] Previous generation was interrupted (reason: ${cp.reason}) and the last tool round (${rolledBackDesc}) has been rolled back along with its staged changes and /output.md state.`,
+                    `Current /output.md now has ${currentOutput.length} chars saved (ending with: ${JSON.stringify(currentOutput.slice(-200))}).`,
+                    'Do NOT repeat the failed tool step verbatim; choose an alternative approach or corrected arguments, inspect /output.md if needed, and complete the remaining content cleanly before finishing.',
+                ].join('\n');
+            } else {
+                currentOutput = await this.vfs
+                    .readFile(OUTPUT_FILE_PATH, { target, staged: true })
+                    .catch(() => '');
+                recoveryPrompt = [
+                    `[System Recovery] Previous generation was interrupted (reason: ${cp.reason}).`,
+                    `Current /output.md already has ${currentOutput.length} chars saved (ending with: ${JSON.stringify(currentOutput.slice(-200))}).`,
+                    'Inspect /output.md if needed, seamlessly continue writing the remaining content using append_file or edit_file on /output.md WITHOUT repeating already-written text, and review /output.md for completeness and errors before finishing.',
+                ].join('\n');
+            }
 
             const mainAgent =
                 env.effectiveAgents[cp.agentId]
@@ -629,14 +773,19 @@ export class PipelineOrchestrator {
                 generationAction: 'continue',
                 promptTriggerContext: { kind: 'main', action: 'continue' },
                 resumeMessages: [
-                    ...cp.completedTurnMessages,
+                    ...effectiveCompletedMessages,
                     { role: 'user', content: recoveryPrompt },
                 ],
-                initialReadSet: cp.readSetSnapshot,
+                initialReadSet: effectiveReadSet,
                 loreEntries: env.loreEntries,
                 subAgents: env.subAgents,
                 getVariableSchema: env.globalVarSchema ? () => env.globalVarSchema : undefined,
                 staged: true,
+                checkpointScope: { phase: 'main_turn' },
+                ...this.buildAgentRunnerHooks({
+                    preset,
+                    env,
+                }),
                 stream: input.stream,
                 signal: turnSignal,
                 onTextDelta: input.onTextDelta,
@@ -670,16 +819,23 @@ export class PipelineOrchestrator {
             });
         } catch (error) {
             if (error instanceof TurnInterruptedError) {
-                return this.handleTurnInterrupted(target, error);
+                return await this.handleTurnInterrupted(target, error);
             }
 
             const aborted = isAbortError(error) || turnSignal.aborted;
             if (aborted) {
+                const abortMessage = error instanceof Error ? error.message : 'Turn resume aborted';
                 this.traceLogger.emit({
                     kind: 'turn_aborted',
                     target: { ...target },
                     timestamp: Date.now(),
-                    error: error instanceof Error ? error.message : 'Turn resume aborted',
+                    error: abortMessage,
+                });
+                await this.emitAbortedHostEvent({
+                    target,
+                    phase: 'main_turn',
+                    agentId: cp.agentId,
+                    reason: abortMessage,
                 });
                 throw error instanceof Error && isAbortError(error)
                     ? error
@@ -691,6 +847,12 @@ export class PipelineOrchestrator {
                 target: { ...target },
                 timestamp: Date.now(),
                 error: error instanceof Error ? error.message : String(error),
+            });
+            this.emitUnrecoveredErrorHostEvent({
+                target,
+                phase: 'main_turn',
+                agentId: cp.agentId,
+                error,
             });
             throw error;
         }
@@ -724,18 +886,15 @@ export class PipelineOrchestrator {
     private async compileTurnEnvironment(
         preset: Preset,
         signal: AbortSignal,
-    ): Promise<{
-        loreEntries: RawLoreEntry[];
-        effectiveAgents: Record<string, AgentProfile>;
-        derivedAgentsByRuleId: Record<string, AgentProfile>;
-        allTriggers: TriggerRule[];
-        subAgents: SubAgentDescriptor[];
-        globalVarSchema: z.ZodTypeAny | undefined;
-    }> {
+        options?: { includeDisabled?: boolean },
+    ): Promise<CompiledTurnEnvironment> {
         const loreEntries = await this.loadRawLoreEntries();
         throwIfAborted(signal);
 
-        const compiled = this.decoratorCompiler.compile(loreEntries, { preset });
+        const compiled = this.decoratorCompiler.compile(loreEntries, {
+            preset,
+            ...(options?.includeDisabled ? { includeDisabled: true } : {}),
+        });
         const effectiveAgents: Record<string, AgentProfile> = {
             ...compiled.derivedAgents,
             ...preset.agents,
@@ -754,18 +913,58 @@ export class PipelineOrchestrator {
         };
     }
 
-    private handleTurnInterrupted(target: MessageTarget, error: TurnInterruptedError): never {
+    private async handleTurnInterrupted(
+        target: MessageTarget,
+        error: TurnInterruptedError,
+    ): Promise<never> {
         this.trajectoryStore.saveInterruptedCheckpoint(error.checkpoint);
         this.trajectoryStore.saveToHost(this.bridge);
+        const now = Date.now();
         this.traceLogger.emit({
             kind: 'turn_interrupted',
             target: { ...target },
-            timestamp: Date.now(),
+            timestamp: now,
             agentProfileId: error.checkpoint.agentId,
             interruptedReason: error.reason,
             outputPreview: error.salvagedOutput,
             ...(error.causeError ? { error: error.causeError } : {}),
         });
+
+        const phase = error.checkpoint.phase ?? 'main_turn';
+        const interruptedPayload: ToolEventPayload = {
+            type: 'turn_interrupted',
+            timestamp: now,
+            target: { ...target },
+            messageId: target.messageId,
+            swipeId: target.swipeId,
+            phase,
+            runId: error.trace.runId,
+            agentId: error.checkpoint.agentId,
+            ...(error.checkpoint.triggerId ? { triggerId: error.checkpoint.triggerId } : {}),
+            reason: error.reason,
+            output: error.salvagedOutput,
+            ...(error.causeError ? { error: error.causeError } : {}),
+        };
+        this.bridge.emitHostEvent?.('agentic_turn_interrupted', interruptedPayload);
+
+        if (error.reason === 'error') {
+            const errorPayload: ToolEventPayload = {
+                ...interruptedPayload,
+                type: 'generation_error',
+                error: error.causeError ?? error.message,
+            };
+            this.bridge.emitHostEvent?.('agentic_generation_error', errorPayload);
+        }
+
+        await this.dispatchEventHooks('turn_interrupted', interruptedPayload, {
+            target,
+            phase,
+            staged: true,
+            isErrorRecovery: true,
+        }).catch((hookErr) => {
+            console.warn('[ST-Agentic] turn_interrupted event hook error:', hookErr);
+        });
+
         throw error;
     }
 
@@ -842,6 +1041,36 @@ export class PipelineOrchestrator {
             timestamp: Date.now(),
         });
 
+        await this.dispatchEventHooks(
+            'turn_completed',
+            {
+                type: 'turn_completed',
+                timestamp: Date.now(),
+                target: { ...params.target },
+                messageId: params.target.messageId,
+                swipeId: params.target.swipeId,
+                phase: 'main_turn',
+                runId: params.mainRun.runId,
+                agentId: params.mainRun.agentProfileId,
+                output: params.combinedContent,
+                data: { action: params.action },
+            },
+            {
+                target: params.target,
+                phase: 'main_turn',
+                staged: false,
+                signal: params.signal,
+                preset: params.preset,
+                env: params.env,
+                injectionSession: params.injectionSession,
+            },
+        ).catch((hookErr) => {
+            if (isAbortError(hookErr) || params.signal.aborted) {
+                return;
+            }
+            console.warn('[ST-Agentic] turn_completed event hook error:', hookErr);
+        });
+
         return {
             target: params.target,
             action: params.action,
@@ -879,7 +1108,7 @@ export class PipelineOrchestrator {
         const turnNumber = this.resolveTurnNumber(target.messageId, input.turnNumber);
         const env = await this.compileTurnEnvironment(preset, turnSignal);
         const beforeRules = env.allTriggers.filter(
-            (t) => t.phase === 'before_turn' && t.enabled,
+            (t) => t.phase === 'before_turn' && t.enabled && !isEventDrivenTriggerRule(t),
         );
         const parentSticky = this.loadParentStickyInjections(target);
         const injectionSession =
@@ -991,6 +1220,1315 @@ export class PipelineOrchestrator {
             this.store.rollbackStagedData(task.target);
         }
         return cancelled;
+    }
+
+    /**
+     * Resume an interrupted `after_turn` trigger task from its composite `(target, phase, triggerId)`
+     * checkpoint (optionally rolling back the last tool round if `rollbackLastToolRound` is true).
+     * Gracefully falls back to `rerunAfterTurn` when no persisted checkpoint exists.
+     */
+    async resumeTriggerTask(
+        targetInput: MessageTarget,
+        triggerId: string,
+        options: ResumeTriggerTaskOptions = {},
+    ): Promise<DispatchedTaskHandle<TriggerExecutionResult>[]> {
+        const target = freezeTarget(targetInput);
+        if (options.signal) {
+            throwIfAborted(options.signal);
+        }
+
+        const trimmedTriggerId = triggerId.trim();
+        const requestedTriggerIds = trimmedTriggerId
+            .split(',')
+            .map((id) => id.trim())
+            .filter(Boolean);
+
+        let cp = this.trajectoryStore.getInterruptedCheckpoint(target, {
+            phase: 'after_turn',
+            triggerId: trimmedTriggerId,
+        });
+        if (!cp && requestedTriggerIds.length === 1) {
+            const allAfterCps = this.trajectoryStore.listInterruptedCheckpoints({
+                target,
+                phase: 'after_turn',
+            });
+            for (const candidate of allAfterCps.values()) {
+                const candidateParts = (candidate.triggerId ?? '')
+                    .split(',')
+                    .map((id) => id.trim())
+                    .filter(Boolean);
+                if (candidateParts.includes(requestedTriggerIds[0])) {
+                    cp = candidate;
+                    break;
+                }
+            }
+        }
+
+        if (!cp) {
+            return await this.rerunAfterTurn(target, {
+                ...(requestedTriggerIds.length > 0 ? { triggerIds: requestedTriggerIds } : {}),
+                force: true,
+                signal: options.signal,
+            });
+        }
+
+        const settings = this.settingsProvider();
+        const preset = resolveActivePreset(settings);
+        const compileSignal = options.signal ?? new AbortController().signal;
+        const env = await this.compileTurnEnvironment(preset, compileSignal, {
+            includeDisabled: true,
+        });
+
+        const cpScopeTriggerId = cp.triggerId?.trim() || trimmedTriggerId;
+        const cpTriggerIds = cpScopeTriggerId
+            .split(',')
+            .map((id) => id.trim())
+            .filter(Boolean);
+        const cpTriggerIdSet = new Set(cpTriggerIds);
+        const matchedRules = env.allTriggers.filter((rule) => cpTriggerIdSet.has(rule.id));
+
+        const groupedUnits =
+            matchedRules.length > 0
+                ? groupTriggersForExecution(matchedRules, { includeDisabled: true })
+                : [];
+        const unit: TriggerExecutionUnit =
+            groupedUnits.length === 1
+                ? groupedUnits[0]
+                : matchedRules.length > 0
+                    ? {
+                        unitId: `resume:${cpScopeTriggerId}`,
+                        phase: cp.phase ?? 'after_turn',
+                        order: matchedRules[0].order,
+                        barrier: resolveStrictestBarrier(matchedRules),
+                        agentProfileId: cp.agentId || matchedRules[0].agentProfileId,
+                        kind: 'agent',
+                        isGrouped: matchedRules.length > 1,
+                        triggers: matchedRules,
+                        label:
+                            matchedRules.length === 1
+                                ? matchedRules[0].label
+                                : `${cpScopeTriggerId} (${matchedRules.length})`,
+                        ...(matchedRules[0].targetPath
+                            ? { targetPath: matchedRules[0].targetPath }
+                            : {}),
+                    }
+                    : {
+                        unitId: `resume:${cpScopeTriggerId}`,
+                        phase: cp.phase ?? 'after_turn',
+                        order: 1,
+                        barrier: 'self',
+                        agentProfileId: cp.agentId,
+                        kind: 'agent',
+                        isGrouped: false,
+                        triggers: [],
+                        label: cpScopeTriggerId || cp.agentId,
+                    };
+
+        const useRollback = Boolean(options.rollbackLastToolRound && cp.previousRoundSnapshot);
+        const prevRound = useRollback ? cp.previousRoundSnapshot : undefined;
+        const effectiveCompletedMessages = prevRound
+            ? prevRound.completedTurnMessages
+            : cp.completedTurnMessages;
+        const effectiveReadSet = prevRound ? prevRound.readSetSnapshot : cp.readSetSnapshot;
+        const effectiveStagedSnapshot = prevRound
+            ? prevRound.stagedSnapshot
+            : cp.stagedSnapshot;
+        const recoveryPrompt = prevRound
+            ? [
+                `[System Recovery - Tool Round Rolled Back] Previous trigger execution (${cpScopeTriggerId}) was interrupted (reason: ${cp.reason}) and the last tool round (${prevRound.rolledBackToolSummary?.trim() || 'the previous tool round'}) has been rolled back along with its staged changes.`,
+                'Do NOT repeat the failed tool call verbatim; inspect the current state if needed and retry with a different approach or corrected arguments before finishing.',
+            ].join('\n')
+            : [
+                `[System Recovery] Previous trigger execution (${cpScopeTriggerId}) was interrupted (reason: ${cp.reason}).`,
+                'Inspect the current files/variables if needed and complete the remaining trigger work cleanly without duplicating already-finished edits.',
+            ].join('\n');
+
+        const { userText, assistantText } = this.readTurnExchangeText(target);
+        const checkpointPhase: PipelinePhase = cp.phase ?? 'after_turn';
+        const checkpointAgentId = cp.agentId;
+
+        this.traceLogger.emit({
+            kind: 'turn_resumed',
+            target: { ...target },
+            timestamp: Date.now(),
+            phase: checkpointPhase,
+            agentProfileId: checkpointAgentId,
+            interruptedReason: cp.reason,
+        });
+
+        const handle = this.barrierCoordinator.dispatch<TriggerExecutionResult>(
+            {
+                target,
+                phase: checkpointPhase,
+                barrier: unit.barrier,
+                agentProfileId: checkpointAgentId || unit.agentProfileId,
+                label: unit.label,
+                ...(unit.targetPath ? { targetPath: unit.targetPath } : {}),
+                ...(options.signal ? { signal: options.signal } : {}),
+            },
+            async (taskCtx) => {
+                taskCtx.setCurrentStep(`Resuming ${unit.label}`);
+                this.store.restoreStagedData(taskCtx.target, effectiveStagedSnapshot);
+
+                if (prevRound) {
+                    const currentOutput = await this.vfs
+                        .readFile(OUTPUT_FILE_PATH, { target: taskCtx.target, staged: true })
+                        .catch(() => '');
+                    if (currentOutput !== prevRound.outputText) {
+                        await this.vfs.writeFile(OUTPUT_FILE_PATH, prevRound.outputText, {
+                            target: taskCtx.target,
+                            staged: true,
+                            source: 'resume_rollback',
+                        });
+                    }
+                }
+
+                try {
+                    const result = await this.executePreparedUnit(unit, {
+                        target: taskCtx.target,
+                        userText,
+                        assistantText,
+                        preset,
+                        effectiveAgents: env.effectiveAgents,
+                        derivedAgentsByRuleId: env.derivedAgentsByRuleId,
+                        loreEntries: env.loreEntries,
+                        subAgents: env.subAgents,
+                        globalVarSchema: env.globalVarSchema,
+                        staged: true,
+                        taskId: taskCtx.taskId,
+                        checkpointScope: {
+                            phase: checkpointPhase,
+                            triggerId: cpScopeTriggerId,
+                        },
+                        resumeMessages: [
+                            ...effectiveCompletedMessages,
+                            { role: 'user', content: recoveryPrompt },
+                        ],
+                        initialReadSet: effectiveReadSet,
+                        overrideAgentProfileId: checkpointAgentId,
+                        overrideTriggerId: cpScopeTriggerId,
+                        onToolStart: (step) => {
+                            taskCtx.setCurrentStep(`${unit.label} · ${step.toolName}`);
+                        },
+                        onRetrying: (info) => {
+                            taskCtx.setCurrentStep(
+                                `${unit.label} · 自动重试 (${info.attempt}/${info.maxAttempts}): ${info.reason}`,
+                            );
+                        },
+                        signal: taskCtx.signal,
+                    });
+
+                    throwIfAborted(taskCtx.signal);
+                    this.trajectoryStore.clearInterruptedCheckpoint(taskCtx.target, {
+                        phase: checkpointPhase,
+                        triggerId: cpScopeTriggerId,
+                    });
+                    this.store.commitStagedData(taskCtx.target);
+                    this.trajectoryStore.saveToHost(this.bridge);
+                    return result;
+                } catch (error) {
+                    this.handleBackgroundTriggerFailure(error, {
+                        target: taskCtx.target,
+                        phase: checkpointPhase,
+                        agentId: checkpointAgentId || unit.agentProfileId,
+                        triggerId: cpScopeTriggerId,
+                        signal: taskCtx.signal,
+                    });
+                    throw error;
+                }
+            },
+        );
+
+        return [handle];
+    }
+
+    /**
+     * Dispatch enabled preset & World Info event-driven rules (`rule.events?.includes(eventType)`)
+     * in ascending `order`, supporting both `kind === 'script'` (sandbox with `ctx.agent`, `ctx.event`,
+     * and optional `ctx.messages`/`ctx.control`/`ctx.body`/`ctx.output`) and `kind === 'agent'`.
+     */
+    async dispatchEventHooks(
+        eventType: TriggerEventType,
+        payload: ToolEventPayload,
+        options: EventHookDispatchOptions = {},
+    ): Promise<EventHookRuleResult[]> {
+        const signal = options.signal ?? new AbortController().signal;
+        throwIfAborted(signal);
+
+        const target = freezeTarget(
+            options.target
+            ?? payload.target
+            ?? this.resolveFallbackTarget(payload.messageId, payload.swipeId),
+        );
+        const settings = this.settingsProvider();
+        const preset = options.preset ?? resolveActivePreset(settings);
+        const env = options.env ?? await this.compileTurnEnvironment(preset, signal);
+
+        const matchedRules = env.allTriggers
+            .filter(
+                (rule) =>
+                    rule.enabled
+                    && Array.isArray(rule.events)
+                    && rule.events.includes(eventType),
+            )
+            .map((rule, idx) => ({ rule, idx }))
+            .sort((a, b) => a.rule.order - b.rule.order || a.idx - b.idx)
+            .map((item) => item.rule);
+
+        if (matchedRules.length === 0) {
+            return [];
+        }
+
+        const { userText, assistantText } = this.readTurnExchangeText(target);
+        const scanText =
+            (typeof payload.output === 'string' && payload.output.length > 0
+                ? payload.output
+                : typeof payload.error === 'string' && payload.error.length > 0
+                    ? payload.error
+                    : assistantText || userText);
+        const turnNumber = this.resolveTurnNumber(target.messageId);
+        const staged = options.staged ?? false;
+        const effectivePhase: PipelinePhase = options.phase ?? payload.phase ?? 'after_turn';
+        const isErrorRecovery = Boolean(
+            options.isErrorRecovery || eventType === 'generation_error',
+        );
+
+        const normalizedPayload: ToolEventPayload = {
+            ...payload,
+            type: eventType,
+            timestamp: payload.timestamp || Date.now(),
+            target: { ...target },
+            messageId: payload.messageId ?? target.messageId,
+            swipeId: payload.swipeId ?? target.swipeId,
+            ...(payload.phase ? {} : { phase: effectivePhase }),
+        };
+
+        const results: EventHookRuleResult[] = [];
+
+        for (const rule of matchedRules) {
+            throwIfAborted(signal);
+
+            let evalRes: { matched: boolean; matchOverrides?: Record<string, string> };
+            try {
+                evalRes = await this.evaluateCondition(rule, {
+                    target,
+                    turnNumber,
+                    scanText,
+                    signal,
+                    staged,
+                    injectionSession: options.injectionSession,
+                });
+            } catch (error) {
+                if (isAbortError(error) || signal.aborted) {
+                    throw error;
+                }
+                const errMsg = error instanceof Error ? error.message : String(error);
+                console.warn(
+                    `[ST-Agentic] Event hook condition failed for "${rule.label}" (${eventType}):`,
+                    error,
+                );
+                results.push({
+                    ruleId: rule.id,
+                    label: rule.label,
+                    kind: rule.kind,
+                    eventType,
+                    target,
+                    output: '',
+                    error: errMsg,
+                });
+                continue;
+            }
+
+            if (!evalRes.matched) {
+                continue;
+            }
+
+            if (rule.kind === 'script') {
+                const runId = `event_script_${eventType}_${rule.id}_${target.messageId}_${target.swipeId}_${Date.now()}`;
+                const code = rule.scriptCode ?? rule.instructionTemplate ?? '';
+                const isEjs = Boolean(rule.decorator && rule.decorator.includes('_ejs'));
+                const permissions: ScopedPermissions = {
+                    read: ['/**'],
+                    write: rule.targetPath
+                        ? [rule.targetPath]
+                        : ['/memory/**', '/scratch/**', '/lorebooks/**', '/state/variables.json'],
+                };
+                const agentApi = this.createToolAgentApi({
+                    defaultTarget: target,
+                    defaultPhase: effectivePhase,
+                    defaultStaged: staged,
+                    parentSignal: signal,
+                    isErrorRecovery,
+                    preset,
+                    env,
+                    injectionSession: options.injectionSession,
+                });
+                const baseToolCtx = createToolExecutionContext({
+                    bridge: this.bridge,
+                    vfs: this.vfs,
+                    store: this.store,
+                    ...(this.sideGen ? { sideGen: this.sideGen } : {}),
+                    target,
+                    signal,
+                    permissions,
+                    phase: effectivePhase,
+                    staged,
+                    source: `event:${eventType}:${rule.id}`,
+                    getVariableSchema: env.globalVarSchema ? () => env.globalVarSchema : undefined,
+                });
+                const toolCtx: ToolExecutionContext = {
+                    ...baseToolCtx,
+                    agent: agentApi,
+                    event: normalizedPayload,
+                    ...(options.messages ? { messages: options.messages } : {}),
+                    ...(options.body ? { body: options.body } : {}),
+                    ...(options.output ? { output: options.output } : {}),
+                    ...(options.control ? { control: options.control } : {}),
+                };
+
+                try {
+                    let rawResult: unknown;
+                    let output = '';
+                    let skipped = false;
+
+                    if (isEjs) {
+                        if (!this.bridge.evaluateOptionalEjs) {
+                            skipped = true;
+                        } else {
+                            const vars = await this.vfs
+                                .readVariables({ target, staged })
+                                .catch(() => ({}));
+                            const ejsVars: Record<string, unknown> = {
+                                ...vars,
+                                ...(evalRes.matchOverrides ?? {}),
+                                event: normalizedPayload,
+                                input: userText,
+                                output: assistantText,
+                                target,
+                            };
+                            const evaluated = await this.bridge.evaluateOptionalEjs(
+                                code,
+                                ejsVars,
+                                options.injectionSession
+                                    ? { injectionSession: options.injectionSession }
+                                    : undefined,
+                            );
+                            throwIfAborted(signal);
+                            rawResult = evaluated;
+                            output = evaluated;
+                        }
+                    } else {
+                        if (!this.sandbox) {
+                            throw new Error(
+                                `Event script "${rule.label}" (${eventType}) requires a ScriptSandbox instance.`,
+                            );
+                        }
+                        const prevOutText = options.output?.text;
+                        const prevOutContent = options.output?.content;
+                        const prevOutReasoning = options.output?.reasoningContent;
+
+                        rawResult = await this.sandbox.evaluateScript(code, toolCtx, {
+                            id: runId,
+                            allowNetwork: true,
+                            signal,
+                        });
+                        throwIfAborted(signal);
+
+                        if (eventType === 'output_postprocess' && options.output) {
+                            reconcilePostprocessOutputReturn(
+                                options.output,
+                                rawResult,
+                                prevOutText ?? '',
+                                prevOutContent,
+                                prevOutReasoning,
+                            );
+                        }
+
+                        if (typeof rawResult === 'string') {
+                            output = rawResult;
+                        } else if (rawResult !== undefined && rawResult !== null) {
+                            try {
+                                output = JSON.stringify(rawResult);
+                            } catch {
+                                output = String(rawResult);
+                            }
+                        }
+                    }
+
+                    const ruleResult: EventHookRuleResult = {
+                        ruleId: rule.id,
+                        label: rule.label,
+                        kind: 'script',
+                        eventType,
+                        target,
+                        rawResult,
+                        output,
+                        ...(skipped ? { skipped: true } : {}),
+                    };
+                    results.push(ruleResult);
+                    if (options.shouldStop?.(ruleResult)) {
+                        break;
+                    }
+                } catch (error) {
+                    if (isAbortError(error) || signal.aborted) {
+                        throw error;
+                    }
+                    const errMsg = error instanceof Error ? error.message : String(error);
+                    console.warn(
+                        `[ST-Agentic] Event script "${rule.label}" (${eventType}) failed:`,
+                        error,
+                    );
+                    results.push({
+                        ruleId: rule.id,
+                        label: rule.label,
+                        kind: 'script',
+                        eventType,
+                        target,
+                        output: '',
+                        error: errMsg,
+                    });
+                }
+                continue;
+            }
+
+            // Event-driven agent rule (`kind === 'agent'`)
+            const unit: TriggerExecutionUnit = {
+                unitId: `event:${eventType}:${rule.id}`,
+                phase: effectivePhase,
+                order: rule.order,
+                barrier: rule.barrier,
+                agentProfileId: rule.agentProfileId,
+                kind: 'agent',
+                isGrouped: false,
+                triggers: [rule],
+                label: rule.label,
+                ...(rule.targetPath ? { targetPath: rule.targetPath } : {}),
+            };
+            try {
+                const execRes = await this.executePreparedUnit(unit, {
+                    target,
+                    userText,
+                    assistantText,
+                    preset,
+                    effectiveAgents: env.effectiveAgents,
+                    derivedAgentsByRuleId: env.derivedAgentsByRuleId,
+                    loreEntries: env.loreEntries,
+                    subAgents: env.subAgents,
+                    globalVarSchema: env.globalVarSchema,
+                    staged,
+                    injectionSession: options.injectionSession,
+                    matchOverrides: {
+                        ...(evalRes.matchOverrides ?? {}),
+                        eventType,
+                        ...(normalizedPayload.error ? { eventError: normalizedPayload.error } : {}),
+                    },
+                    isErrorRecovery,
+                    forceDisableOutputFile: true,
+                    signal,
+                });
+                const ruleResult: EventHookRuleResult = {
+                    ruleId: rule.id,
+                    label: rule.label,
+                    kind: 'agent',
+                    eventType,
+                    target,
+                    rawResult: execRes.output,
+                    output: execRes.output,
+                    ...(execRes.skipped ? { skipped: true } : {}),
+                };
+                results.push(ruleResult);
+                if (options.shouldStop?.(ruleResult)) {
+                    break;
+                }
+            } catch (error) {
+                if (isAbortError(error) || signal.aborted) {
+                    throw error;
+                }
+                const errMsg = error instanceof Error ? error.message : String(error);
+                console.warn(
+                    `[ST-Agentic] Event agent trigger "${rule.label}" (${eventType}) failed:`,
+                    error,
+                );
+                results.push({
+                    ruleId: rule.id,
+                    label: rule.label,
+                    kind: 'agent',
+                    eventType,
+                    target,
+                    output: '',
+                    error: errMsg,
+                });
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Route a SillyTavern host event (`chat_changed`, `message_sent`, `message_received`,
+     * `message_edited`, `message_deleted`, `message_swiped`, `output_updated`, etc.) to
+     * matching `@@script on=<event>` / `@@trigger on=<event>` rules with re-entrancy protection.
+     */
+    async dispatchHostEvent(
+        eventType: TriggerEventType,
+        payload: Partial<ToolEventPayload> = {},
+        options: Omit<EventHookDispatchOptions, 'messages' | 'body' | 'output' | 'control'> = {},
+    ): Promise<EventHookRuleResult[]> {
+        if (this.activeHostEventTypes.has(eventType)) {
+            return [];
+        }
+        this.activeHostEventTypes.add(eventType);
+        try {
+            const target = freezeTarget(
+                options.target
+                ?? payload.target
+                ?? this.resolveFallbackTarget(payload.messageId, payload.swipeId),
+            );
+            const fullPayload: ToolEventPayload = {
+                ...payload,
+                type: eventType,
+                timestamp: payload.timestamp ?? Date.now(),
+                target: { ...target },
+                messageId: payload.messageId ?? target.messageId,
+                swipeId: payload.swipeId ?? target.swipeId,
+            };
+            return await this.dispatchEventHooks(eventType, fullPayload, {
+                ...options,
+                target,
+                staged: options.staged ?? false,
+            });
+        } finally {
+            this.activeHostEventTypes.delete(eventType);
+        }
+    }
+
+    private resolveFallbackTarget(messageId?: number, swipeId?: number): MessageTarget {
+        const chat = this.bridge.getChat();
+        if (
+            typeof messageId === 'number'
+            && Number.isInteger(messageId)
+            && messageId >= 0
+        ) {
+            const msg = chat[messageId];
+            const resolvedSwipe =
+                typeof swipeId === 'number' && Number.isInteger(swipeId) && swipeId >= 0
+                    ? swipeId
+                    : typeof msg?.swipeId === 'number' && Number.isInteger(msg.swipeId) && msg.swipeId >= 0
+                        ? msg.swipeId
+                        : 0;
+            return { messageId, swipeId: resolvedSwipe };
+        }
+        if (chat.length > 0) {
+            const lastIndex = chat.length - 1;
+            const lastMsg = chat[lastIndex];
+            const resolvedSwipe =
+                typeof lastMsg?.swipeId === 'number'
+                && Number.isInteger(lastMsg.swipeId)
+                && lastMsg.swipeId >= 0
+                    ? lastMsg.swipeId
+                    : 0;
+            return { messageId: lastIndex, swipeId: resolvedSwipe };
+        }
+        return { messageId: 0, swipeId: 0 };
+    }
+
+    private createToolAgentApi(baseCtx: {
+        defaultTarget: MessageTarget;
+        defaultPhase: PipelinePhase;
+        defaultStaged: boolean;
+        parentSignal: AbortSignal;
+        isErrorRecovery: boolean;
+        preset?: Preset;
+        env?: CompiledTurnEnvironment;
+        injectionSession?: PromptInjectionSession;
+    }): ToolAgentApi {
+        const run = async (rawOpts: ToolAgentRunOptions): Promise<ToolAgentRunResult> => {
+            const optsRecord = (rawOpts ?? {}) as ToolAgentRunOptions & {
+                profile?: string;
+                tools?: string[];
+            };
+            const { signal, cleanup } = linkAbortSignals(baseCtx.parentSignal, optsRecord.signal);
+            try {
+                throwIfAborted(signal);
+                const settings = this.settingsProvider();
+                const preset = baseCtx.preset ?? resolveActivePreset(settings);
+                const env = baseCtx.env ?? await this.compileTurnEnvironment(preset, signal);
+                const target = freezeTarget(optsRecord.target ?? baseCtx.defaultTarget);
+                const phase: PipelinePhase = optsRecord.phase ?? baseCtx.defaultPhase;
+                const staged = optsRecord.staged ?? baseCtx.defaultStaged;
+                const requestedAgentId = (optsRecord.agentId ?? optsRecord.profile)?.trim();
+                const requestedEnabledTools = optsRecord.enabledTools ?? optsRecord.tools;
+
+                let profile: AgentProfile | undefined;
+                let subAgentPromptPrefix = '';
+
+                if (requestedAgentId) {
+                    if (preset.agents[requestedAgentId]) {
+                        profile = canonicalClone(preset.agents[requestedAgentId]);
+                    } else {
+                        const lowered = requestedAgentId.toLowerCase();
+                        const matchedSub = env.subAgents.find(
+                            (sa) =>
+                                sa.name === requestedAgentId
+                                || sa.name.toLowerCase() === lowered
+                                || sa.toolName === requestedAgentId,
+                        );
+                        if (matchedSub) {
+                            const refProfile = matchedSub.presetName
+                                ? preset.agents[matchedSub.presetName]
+                                : preset.agents[matchedSub.name];
+                            if (refProfile) {
+                                profile = canonicalClone(refProfile);
+                            } else {
+                                profile = {
+                                    id: `subagent_${sanitizeSegmentLocal(matchedSub.name)}`,
+                                    name: matchedSub.name,
+                                    connectionId: 'inherit',
+                                    sessionMode: 'ephemeral',
+                                    ephemeralWindowSize: 0,
+                                    promptBlocks: [
+                                        {
+                                            id: 'system_base',
+                                            name: `${matchedSub.name} Instructions`,
+                                            role: 'system',
+                                            placement: 'prefix',
+                                            content:
+                                                matchedSub.instructions.trim()
+                                                || 'You are a focused specialist sub-agent. Complete the requested task concisely and accurately.',
+                                            enabled: true,
+                                        },
+                                    ],
+                                    enabledTools: [...DEFAULT_SUBAGENT_TOOLS],
+                                    permissions: { read: ['/**'], write: [] },
+                                    maxToolRounds: 0,
+                                    description: matchedSub.description,
+                                };
+                            }
+                            if (matchedSub.instructions.trim() && refProfile) {
+                                subAgentPromptPrefix = matchedSub.instructions.trim();
+                            }
+                        } else if (env.effectiveAgents[requestedAgentId]) {
+                            profile = canonicalClone(env.effectiveAgents[requestedAgentId]);
+                        } else {
+                            return {
+                                agentId: requestedAgentId,
+                                content: '',
+                                ok: false,
+                                error: `Agent "${requestedAgentId}" not found in active preset or World Info @@agent entries.`,
+                            };
+                        }
+                    }
+                } else {
+                    profile = {
+                        id: 'script_agent',
+                        name: 'Script Agent',
+                        connectionId: 'inherit',
+                        sessionMode: 'ephemeral',
+                        ephemeralWindowSize: 4,
+                        promptBlocks: [
+                            {
+                                id: 'system_base',
+                                name: 'Script Agent System',
+                                role: 'system',
+                                placement: 'prefix',
+                                content:
+                                    'You are a concise helper agent invoked by a script. Complete the requested task accurately.',
+                                enabled: true,
+                            },
+                        ],
+                        enabledTools: ['read_file', 'read_variables'],
+                        permissions: { read: ['/**'], write: [] },
+                        maxToolRounds: 0,
+                    };
+                }
+
+                // Isolate script-invoked runs from mainline persistent Layer 1 trajectories.
+                profile.sessionMode = 'ephemeral';
+                if (typeof optsRecord.connectionId === 'string' && optsRecord.connectionId.trim()) {
+                    profile.connectionId = optsRecord.connectionId.trim();
+                }
+                if (
+                    typeof optsRecord.maxToolRounds === 'number'
+                    && Number.isFinite(optsRecord.maxToolRounds)
+                    && optsRecord.maxToolRounds >= 0
+                ) {
+                    profile.maxToolRounds = Math.floor(optsRecord.maxToolRounds);
+                }
+                if (optsRecord.permissions) {
+                    profile.permissions = {
+                        read: [...optsRecord.permissions.read],
+                        write: [...optsRecord.permissions.write],
+                    };
+                }
+                const baseTools = Array.isArray(requestedEnabledTools)
+                    ? requestedEnabledTools.map((t) => t.trim()).filter(Boolean)
+                    : [...profile.enabledTools];
+                const extraToolNames = Array.isArray(optsRecord.extraTools)
+                    ? optsRecord.extraTools.map((t) => t.trim()).filter(Boolean)
+                    : [];
+                profile.enabledTools = Array.from(new Set([...baseTools, ...extraToolNames]));
+
+                const userPrompt = subAgentPromptPrefix
+                    ? optsRecord.prompt?.trim()
+                        ? `${subAgentPromptPrefix}\n\nTask:\n${optsRecord.prompt.trim()}`
+                        : subAgentPromptPrefix
+                    : (optsRecord.prompt ?? '');
+
+                const systemBasePrompt =
+                    typeof optsRecord.systemPrompt === 'string' && optsRecord.systemPrompt.trim()
+                        ? optsRecord.systemPrompt.trim()
+                        : undefined;
+
+                try {
+                    const runResult = await this.agentRunner.run({
+                        agent: profile,
+                        preset,
+                        target,
+                        phase,
+                        promptTriggerContext: { kind: 'subagent', phase },
+                        userInput: userPrompt,
+                        ...(systemBasePrompt !== undefined ? { systemBasePrompt } : {}),
+                        loreEntries: env.loreEntries,
+                        subAgents: env.subAgents,
+                        includeCategory4DynamicEntries: false,
+                        runTailRadar: false,
+                        getVariableSchema: env.globalVarSchema
+                            ? () => env.globalVarSchema
+                            : undefined,
+                        staged,
+                        stream: optsRecord.stream ?? false,
+                        requireOutputFile: false,
+                        ...(optsRecord.vars ? { vars: optsRecord.vars } : {}),
+                        ...(optsRecord.macroOverrides
+                            ? { macroOverrides: optsRecord.macroOverrides }
+                            : {}),
+                        ...(baseCtx.injectionSession
+                            ? { injectionSession: baseCtx.injectionSession }
+                            : {}),
+                        ...this.buildAgentRunnerHooks({
+                            preset,
+                            env,
+                            injectionSession: baseCtx.injectionSession,
+                            isErrorRecovery: baseCtx.isErrorRecovery,
+                        }),
+                        signal,
+                    });
+
+                    return {
+                        runId: runResult.runId,
+                        agentId: runResult.agentProfileId,
+                        content: runResult.content,
+                        ...(runResult.reasoningContent
+                            ? { reasoningContent: runResult.reasoningContent }
+                            : {}),
+                        ok: true,
+                        rounds: runResult.rounds,
+                        usage: runResult.usage,
+                        toolSteps: runResult.toolSteps,
+                    };
+                } catch (error) {
+                    if (isAbortError(error) || signal.aborted) {
+                        throw error;
+                    }
+                    const errMsg = error instanceof Error ? error.message : String(error);
+                    return {
+                        ...(error instanceof AgentExecutionError
+                            ? {
+                                runId: error.trace.runId,
+                                usage: error.trace.usage,
+                                toolSteps: error.trace.toolSteps,
+                            }
+                            : {}),
+                        agentId: profile.id,
+                        content: '',
+                        ok: false,
+                        error: errMsg,
+                    };
+                }
+            } finally {
+                cleanup();
+            }
+        };
+
+        const runTrigger = async (
+            ruleId: string,
+            rawOpts?: ToolAgentRunTriggerOptions,
+        ): Promise<ToolAgentRunResult> => {
+            const trimmedId = ruleId.trim();
+            if (!trimmedId) {
+                return {
+                    agentId: '',
+                    content: '',
+                    ok: false,
+                    skipped: true,
+                    error: 'Trigger ruleId must not be empty.',
+                };
+            }
+            const { signal, cleanup } = linkAbortSignals(baseCtx.parentSignal, rawOpts?.signal);
+            try {
+                throwIfAborted(signal);
+                const settings = this.settingsProvider();
+                const preset = baseCtx.preset ?? resolveActivePreset(settings);
+                const env = baseCtx.env ?? await this.compileTurnEnvironment(preset, signal);
+                const rule = env.allTriggers.find((item) => item.id === trimmedId);
+                if (!rule) {
+                    return {
+                        agentId: trimmedId,
+                        content: '',
+                        ok: false,
+                        skipped: true,
+                        error: `Trigger rule "${trimmedId}" not found.`,
+                    };
+                }
+
+                const target = freezeTarget(rawOpts?.target ?? baseCtx.defaultTarget);
+                const { userText, assistantText } = this.readTurnExchangeText(target);
+                const unit: TriggerExecutionUnit = {
+                    unitId: `script_trigger:${rule.id}`,
+                    phase: rule.phase,
+                    order: rule.order,
+                    barrier: rule.barrier,
+                    agentProfileId: rule.agentProfileId,
+                    kind: rule.kind,
+                    isGrouped: false,
+                    triggers: [rule],
+                    label: rule.label,
+                    ...(rule.targetPath ? { targetPath: rule.targetPath } : {}),
+                };
+
+                try {
+                    const execResult = await this.executePreparedUnit(unit, {
+                        target,
+                        userText,
+                        assistantText,
+                        preset,
+                        effectiveAgents: env.effectiveAgents,
+                        derivedAgentsByRuleId: env.derivedAgentsByRuleId,
+                        loreEntries: env.loreEntries,
+                        subAgents: env.subAgents,
+                        globalVarSchema: env.globalVarSchema,
+                        staged: baseCtx.defaultStaged,
+                        injectionSession: baseCtx.injectionSession,
+                        eventPayload: rawOpts?.event,
+                        isErrorRecovery: baseCtx.isErrorRecovery,
+                        forceDisableOutputFile: true,
+                        signal,
+                    });
+
+                    return {
+                        ...(execResult.agentResult?.runId
+                            ? { runId: execResult.agentResult.runId }
+                            : {}),
+                        agentId: execResult.agentProfileId,
+                        content: execResult.output,
+                        ...(execResult.agentResult?.reasoningContent
+                            ? { reasoningContent: execResult.agentResult.reasoningContent }
+                            : {}),
+                        ok: true,
+                        ...(execResult.skipped ? { skipped: true } : {}),
+                        ...(execResult.agentResult?.rounds !== undefined
+                            ? { rounds: execResult.agentResult.rounds }
+                            : {}),
+                        ...(execResult.agentResult?.usage
+                            ? { usage: execResult.agentResult.usage }
+                            : {}),
+                        ...(execResult.agentResult?.toolSteps
+                            ? { toolSteps: execResult.agentResult.toolSteps }
+                            : {}),
+                    };
+                } catch (error) {
+                    if (isAbortError(error) || signal.aborted) {
+                        throw error;
+                    }
+                    const errMsg = error instanceof Error ? error.message : String(error);
+                    return {
+                        ...(error instanceof AgentExecutionError
+                            ? {
+                                runId: error.trace.runId,
+                                usage: error.trace.usage,
+                                toolSteps: error.trace.toolSteps,
+                            }
+                            : {}),
+                        agentId: rule.agentProfileId,
+                        content: '',
+                        ok: false,
+                        error: errMsg,
+                    };
+                }
+            } finally {
+                cleanup();
+            }
+        };
+
+        return Object.freeze({ run, runTrigger });
+    }
+
+    private buildAgentRunnerHooks(hookCtx: {
+        preset: Preset;
+        env: CompiledTurnEnvironment;
+        injectionSession?: PromptInjectionSession;
+        isErrorRecovery?: boolean;
+    }): {
+        sandbox?: ScriptSandbox;
+        isErrorRecovery?: boolean;
+        onPreprocessMessages: (ctx: AgentPreprocessMessagesContext) => Promise<void>;
+        onPostprocessResponse: (ctx: AgentPostprocessResponseContext) => Promise<void>;
+        onGenerationError?: (
+            ctx: AgentGenerationErrorHookContext,
+        ) => Promise<AgentGenerationErrorDecision>;
+    } {
+        return {
+            ...(this.sandbox ? { sandbox: this.sandbox } : {}),
+            ...(hookCtx.isErrorRecovery ? { isErrorRecovery: true } : {}),
+            onPreprocessMessages: async (prepCtx) => {
+                await this.handlePreprocessMessagesHook(prepCtx, hookCtx);
+            },
+            onPostprocessResponse: async (postCtx) => {
+                await this.handlePostprocessResponseHook(postCtx, hookCtx);
+            },
+            ...(hookCtx.isErrorRecovery
+                ? {}
+                : {
+                    onGenerationError: async (errCtx) =>
+                        await this.handleGenerationErrorHook(errCtx, hookCtx),
+                }),
+        };
+    }
+
+    private async handlePreprocessMessagesHook(
+        prepCtx: AgentPreprocessMessagesContext,
+        hookCtx?: {
+            preset: Preset;
+            env: CompiledTurnEnvironment;
+            injectionSession?: PromptInjectionSession;
+            isErrorRecovery?: boolean;
+        },
+    ): Promise<void> {
+        const eventPayload: ToolEventPayload = {
+            type: 'prompt_preprocess',
+            timestamp: Date.now(),
+            target: { ...prepCtx.target },
+            messageId: prepCtx.target.messageId,
+            swipeId: prepCtx.target.swipeId,
+            phase: prepCtx.phase,
+            runId: prepCtx.runId,
+            agentId: prepCtx.agentId,
+            ...(prepCtx.triggerId ? { triggerId: prepCtx.triggerId } : {}),
+            round: prepCtx.round,
+            attempt: prepCtx.attempt,
+            maxAttempts: prepCtx.maxRetries,
+            data: {
+                layers: { ...prepCtx.layers },
+                model: prepCtx.connection.model,
+                connectionId: prepCtx.connection.id,
+            },
+        };
+        await this.dispatchEventHooks('prompt_preprocess', eventPayload, {
+            target: prepCtx.target,
+            phase: prepCtx.phase,
+            staged: true,
+            signal: prepCtx.signal,
+            ...(hookCtx?.preset ? { preset: hookCtx.preset } : {}),
+            ...(hookCtx?.env ? { env: hookCtx.env } : {}),
+            ...(hookCtx?.injectionSession ? { injectionSession: hookCtx.injectionSession } : {}),
+            messages: prepCtx.messages,
+            body: prepCtx.body,
+            isErrorRecovery: hookCtx?.isErrorRecovery,
+        });
+    }
+
+    private async handlePostprocessResponseHook(
+        postCtx: AgentPostprocessResponseContext,
+        hookCtx?: {
+            preset: Preset;
+            env: CompiledTurnEnvironment;
+            injectionSession?: PromptInjectionSession;
+            isErrorRecovery?: boolean;
+        },
+    ): Promise<void> {
+        const eventPayload: ToolEventPayload = {
+            type: 'output_postprocess',
+            timestamp: Date.now(),
+            target: { ...postCtx.target },
+            messageId: postCtx.target.messageId,
+            swipeId: postCtx.target.swipeId,
+            phase: postCtx.phase,
+            runId: postCtx.runId,
+            agentId: postCtx.agentId,
+            ...(postCtx.triggerId ? { triggerId: postCtx.triggerId } : {}),
+            round: postCtx.round,
+            attempt: postCtx.attempt,
+            maxAttempts: postCtx.maxRetries,
+            output: postCtx.output.text,
+            data: {
+                content: postCtx.output.content,
+                ...(postCtx.output.reasoningContent !== undefined
+                    ? { reasoningContent: postCtx.output.reasoningContent }
+                    : {}),
+                toolCalls: canonicalClone(postCtx.output.toolCalls),
+                fixAttempt: postCtx.fixAttempt,
+                maxFixAttempts: postCtx.maxFixAttempts,
+            },
+        };
+        await this.dispatchEventHooks('output_postprocess', eventPayload, {
+            target: postCtx.target,
+            phase: postCtx.phase,
+            staged: true,
+            signal: postCtx.signal,
+            ...(hookCtx?.preset ? { preset: hookCtx.preset } : {}),
+            ...(hookCtx?.env ? { env: hookCtx.env } : {}),
+            ...(hookCtx?.injectionSession ? { injectionSession: hookCtx.injectionSession } : {}),
+            output: postCtx.output,
+            control: postCtx.control,
+            isErrorRecovery: hookCtx?.isErrorRecovery,
+            shouldStop: () =>
+                postCtx.control.action === 'abort' || postCtx.control.action === 'retry',
+        });
+    }
+
+    private async handleGenerationErrorHook(
+        errCtx: AgentGenerationErrorHookContext,
+        hookCtx: {
+            preset: Preset;
+            env: CompiledTurnEnvironment;
+            injectionSession?: PromptInjectionSession;
+        },
+    ): Promise<AgentGenerationErrorDecision> {
+        const errorControl = createErrorRecoveryControl();
+        let hookRolledBackDirectly = false;
+        let hookDroppedHistoryDirectly = false;
+
+        const trackedMessagesApi: ToolEphemeralMessagesApi = {
+            list: () => errCtx.ephemeralMessages.list(),
+            set: (nextMessages) => errCtx.ephemeralMessages.set(nextMessages),
+            rollbackToolRounds: (count?: number) => {
+                hookRolledBackDirectly = true;
+                return errCtx.ephemeralMessages.rollbackToolRounds(count);
+            },
+            dropHistoryTurns: (count?: number, opts?: { from?: 'newest' | 'oldest' }) => {
+                hookDroppedHistoryDirectly = true;
+                return errCtx.ephemeralMessages.dropHistoryTurns(count, opts);
+            },
+            replaceContent: (selector, replacer) =>
+                errCtx.ephemeralMessages.replaceContent(selector, replacer),
+            appendHint: (content, role) => errCtx.ephemeralMessages.appendHint(content, role),
+            toMessages: () => errCtx.ephemeralMessages.toMessages(),
+        };
+
+        const eventPayload: ToolEventPayload = {
+            type: 'generation_error',
+            timestamp: Date.now(),
+            target: { ...errCtx.target },
+            messageId: errCtx.target.messageId,
+            swipeId: errCtx.target.swipeId,
+            phase: errCtx.phase,
+            runId: errCtx.runId,
+            agentId: errCtx.agentId,
+            ...(errCtx.triggerId ? { triggerId: errCtx.triggerId } : {}),
+            round: errCtx.round,
+            attempt: errCtx.attempt,
+            maxAttempts: errCtx.maxAttempts,
+            error: errCtx.error.message,
+            ...(errCtx.error.code ? { errorCode: errCtx.error.code } : {}),
+            ...(errCtx.error.status !== undefined ? { statusCode: errCtx.error.status } : {}),
+            data: {
+                layers: { ...errCtx.layers },
+                ...(errCtx.error.rawBody !== undefined ? { rawBody: errCtx.error.rawBody } : {}),
+            },
+        };
+
+        let resolvedDecision: AgentGenerationErrorDecision | undefined;
+
+        const buildRetryDecision = (params: {
+            reason?: string;
+            delayMs?: number;
+            messages?: CanonicalMessage[];
+            rollbackToolRounds?: number;
+            dropHistoryTurns?: number;
+            connectionId?: string;
+            temperature?: number;
+            maxTokens?: number;
+        }): AgentGenerationErrorDecision => {
+            if (
+                !hookRolledBackDirectly
+                && typeof params.rollbackToolRounds === 'number'
+                && params.rollbackToolRounds > 0
+            ) {
+                errCtx.ephemeralMessages.rollbackToolRounds(params.rollbackToolRounds);
+            }
+            if (
+                !hookDroppedHistoryDirectly
+                && typeof params.dropHistoryTurns === 'number'
+                && params.dropHistoryTurns > 0
+            ) {
+                errCtx.ephemeralMessages.dropHistoryTurns(params.dropHistoryTurns);
+            }
+            const nextMessages = params.messages ?? errCtx.ephemeralMessages.toMessages();
+            return {
+                action: 'retry',
+                ...(params.reason !== undefined ? { reason: params.reason } : {}),
+                ...(params.delayMs !== undefined ? { delayMs: params.delayMs } : {}),
+                messages: nextMessages,
+                ...(params.rollbackToolRounds !== undefined
+                    ? { rollbackToolRounds: params.rollbackToolRounds }
+                    : {}),
+                ...(params.dropHistoryTurns !== undefined
+                    ? { dropHistoryTurns: params.dropHistoryTurns }
+                    : {}),
+                ...(params.connectionId !== undefined ? { connectionId: params.connectionId } : {}),
+                ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
+                ...(params.maxTokens !== undefined ? { maxTokens: params.maxTokens } : {}),
+            };
+        };
+
+        await this.dispatchEventHooks('generation_error', eventPayload, {
+            target: errCtx.target,
+            phase: errCtx.phase,
+            staged: true,
+            signal: errCtx.signal,
+            preset: hookCtx.preset,
+            env: hookCtx.env,
+            injectionSession: hookCtx.injectionSession,
+            messages: trackedMessagesApi,
+            control: errorControl,
+            isErrorRecovery: true,
+            shouldStop: (ruleResult) => {
+                if (errorControl.action === 'abort') {
+                    resolvedDecision = {
+                        action: 'abort',
+                        ...(errorControl.reason !== undefined
+                            ? { reason: errorControl.reason }
+                            : {}),
+                    };
+                    return true;
+                }
+                if (errorControl.action === 'retry') {
+                    resolvedDecision = buildRetryDecision({
+                        reason: errorControl.reason,
+                        delayMs: errorControl.delayMs,
+                        rollbackToolRounds: errorControl.rollbackToolRounds,
+                        dropHistoryTurns: errorControl.dropHistoryTurns,
+                        connectionId: errorControl.connectionId,
+                        temperature: errorControl.temperature,
+                        maxTokens: errorControl.maxTokens,
+                    });
+                    return true;
+                }
+
+                const parsedRet = parseErrorRecoveryReturnDecision(ruleResult.rawResult);
+                if (parsedRet?.action === 'abort') {
+                    resolvedDecision = parsedRet;
+                    return true;
+                }
+                if (parsedRet?.action === 'retry') {
+                    resolvedDecision = buildRetryDecision(parsedRet);
+                    return true;
+                }
+                return false;
+            },
+        });
+
+        return resolvedDecision ?? { action: 'pass' };
+    }
+
+    private handleBackgroundTriggerFailure(
+        error: unknown,
+        ctx: {
+            target: MessageTarget;
+            phase: PipelinePhase;
+            agentId?: string;
+            triggerId?: string;
+            signal: AbortSignal;
+        },
+    ): void {
+        if (
+            (error instanceof AgentExecutionError || error instanceof MaxToolRoundsError)
+            && error.checkpoint
+        ) {
+            this.trajectoryStore.saveInterruptedCheckpoint(error.checkpoint);
+            this.trajectoryStore.saveToHost(this.bridge);
+        }
+
+        const aborted = isAbortError(error) || ctx.signal.aborted;
+        if (aborted) {
+            const abortMessage = error instanceof Error ? error.message : 'Background trigger aborted';
+            void this.emitAbortedHostEvent({
+                target: ctx.target,
+                phase: ctx.phase,
+                agentId: ctx.agentId,
+                triggerId: ctx.triggerId,
+                reason: abortMessage,
+            }).catch(() => {});
+            return;
+        }
+
+        this.emitUnrecoveredErrorHostEvent({
+            target: ctx.target,
+            phase: ctx.phase,
+            agentId: ctx.agentId,
+            triggerId: ctx.triggerId,
+            error,
+        });
+    }
+
+    private emitUnrecoveredErrorHostEvent(params: {
+        target: MessageTarget;
+        phase: PipelinePhase;
+        agentId?: string;
+        triggerId?: string;
+        error: unknown;
+    }): void {
+        const diag = extractErrorDiagnostics(params.error);
+        const trace = params.error instanceof AgentExecutionError ? params.error.trace : undefined;
+        const payload: ToolEventPayload = {
+            type: 'generation_error',
+            timestamp: Date.now(),
+            target: { ...params.target },
+            messageId: params.target.messageId,
+            swipeId: params.target.swipeId,
+            phase: params.phase,
+            ...(trace?.runId ? { runId: trace.runId } : {}),
+            ...(params.agentId ?? trace?.agentProfileId
+                ? { agentId: params.agentId ?? trace?.agentProfileId }
+                : {}),
+            ...(params.triggerId ?? trace?.triggerId
+                ? { triggerId: params.triggerId ?? trace?.triggerId }
+                : {}),
+            error: diag.message,
+            ...(diag.code ? { errorCode: diag.code } : {}),
+            ...(diag.status !== undefined ? { statusCode: diag.status } : {}),
+        };
+        this.bridge.emitHostEvent?.('agentic_generation_error', payload);
+    }
+
+    private async emitAbortedHostEvent(params: {
+        target: MessageTarget;
+        phase: PipelinePhase;
+        agentId?: string;
+        triggerId?: string;
+        reason: string;
+    }): Promise<void> {
+        const payload: ToolEventPayload = {
+            type: 'turn_aborted',
+            timestamp: Date.now(),
+            target: { ...params.target },
+            messageId: params.target.messageId,
+            swipeId: params.target.swipeId,
+            phase: params.phase,
+            ...(params.agentId ? { agentId: params.agentId } : {}),
+            ...(params.triggerId ? { triggerId: params.triggerId } : {}),
+            reason: params.reason,
+            error: params.reason,
+        };
+        this.bridge.emitHostEvent?.('agentic_turn_aborted', payload);
+        await this.dispatchEventHooks('turn_aborted', payload, {
+            target: params.target,
+            phase: params.phase,
+            staged: false,
+            isErrorRecovery: true,
+        }).catch((hookErr) => {
+            console.warn('[ST-Agentic] turn_aborted event hook error:', hookErr);
+        });
     }
 
     /** Evaluate whether a `TriggerRule`'s `condition` (and optional `findRegex`) matches. */
@@ -1258,7 +2796,9 @@ export class PipelineOrchestrator {
             (t) =>
                 t.phase === 'after_turn'
                 && (t.enabled || allowDisabled)
-                && (!params.onlyTriggerIds || params.onlyTriggerIds.has(t.id)),
+                && (!params.onlyTriggerIds
+                    ? !isEventDrivenTriggerRule(t)
+                    : params.onlyTriggerIds.has(t.id)),
         );
         if (afterRules.length === 0) {
             return [];
@@ -1303,6 +2843,7 @@ export class PipelineOrchestrator {
                         unit.triggers,
                         matchOverridesByRuleId,
                     );
+                    const unitTriggerIds = unit.triggers.map((t) => t.id).join(',');
                     const handle = this.barrierCoordinator.dispatch<TriggerExecutionResult>(
                         {
                             target: params.target,
@@ -1319,33 +2860,49 @@ export class PipelineOrchestrator {
                                     : `Running ${unit.agentProfileId}`,
                             );
 
-                            const result = await this.executePreparedUnit(unit, {
-                                target: taskCtx.target,
-                                userText: params.userText,
-                                assistantText: params.assistantText,
-                                preset: params.preset,
-                                effectiveAgents: params.effectiveAgents,
-                                derivedAgentsByRuleId: params.derivedAgentsByRuleId,
-                                loreEntries: params.loreEntries,
-                                subAgents: params.subAgents,
-                                globalVarSchema: params.globalVarSchema,
-                                staged: true,
-                                injectionSession: params.injectionSession,
-                                matchOverrides: unitOverrides,
-                                onToolStart: (step) => {
-                                    taskCtx.setCurrentStep(`${unit.label} · ${step.toolName}`);
-                                },
-                                onRetrying: (info) => {
-                                    taskCtx.setCurrentStep(
-                                        `${unit.label} · 自动重试 (${info.attempt}/${info.maxAttempts}): ${info.reason}`,
-                                    );
-                                },
-                                signal: taskCtx.signal,
-                            });
+                            try {
+                                const result = await this.executePreparedUnit(unit, {
+                                    target: taskCtx.target,
+                                    userText: params.userText,
+                                    assistantText: params.assistantText,
+                                    preset: params.preset,
+                                    effectiveAgents: params.effectiveAgents,
+                                    derivedAgentsByRuleId: params.derivedAgentsByRuleId,
+                                    loreEntries: params.loreEntries,
+                                    subAgents: params.subAgents,
+                                    globalVarSchema: params.globalVarSchema,
+                                    staged: true,
+                                    injectionSession: params.injectionSession,
+                                    matchOverrides: unitOverrides,
+                                    taskId: taskCtx.taskId,
+                                    checkpointScope: {
+                                        phase: 'after_turn',
+                                        triggerId: unitTriggerIds,
+                                    },
+                                    onToolStart: (step) => {
+                                        taskCtx.setCurrentStep(`${unit.label} · ${step.toolName}`);
+                                    },
+                                    onRetrying: (info) => {
+                                        taskCtx.setCurrentStep(
+                                            `${unit.label} · 自动重试 (${info.attempt}/${info.maxAttempts}): ${info.reason}`,
+                                        );
+                                    },
+                                    signal: taskCtx.signal,
+                                });
 
-                            throwIfAborted(taskCtx.signal);
-                            this.store.commitStagedData(taskCtx.target);
-                            return result;
+                                throwIfAborted(taskCtx.signal);
+                                this.store.commitStagedData(taskCtx.target);
+                                return result;
+                            } catch (error) {
+                                this.handleBackgroundTriggerFailure(error, {
+                                    target: taskCtx.target,
+                                    phase: 'after_turn',
+                                    agentId: unit.agentProfileId,
+                                    triggerId: unitTriggerIds,
+                                    signal: taskCtx.signal,
+                                });
+                                throw error;
+                            }
                         },
                     );
                     batchAllPromises.push(handle.promise);
@@ -1414,34 +2971,51 @@ export class PipelineOrchestrator {
                     );
 
                     const unitResults = await Promise.all(
-                        units.map((unit) =>
-                            this.executePreparedUnit(unit, {
-                                target: taskCtx.target,
-                                userText: params.userText,
-                                assistantText: params.assistantText,
-                                preset: params.preset,
-                                effectiveAgents: params.effectiveAgents,
-                                derivedAgentsByRuleId: params.derivedAgentsByRuleId,
-                                loreEntries: params.loreEntries,
-                                subAgents: params.subAgents,
-                                globalVarSchema: params.globalVarSchema,
-                                staged: true,
-                                injectionSession: params.injectionSession,
-                                matchOverrides: mergeUnitMatchOverrides(
-                                    unit.triggers,
-                                    matchOverridesByRuleId,
-                                ),
-                                onToolStart: (step) => {
-                                    taskCtx.setCurrentStep(`${unit.label} · ${step.toolName}`);
-                                },
-                                onRetrying: (info) => {
-                                    taskCtx.setCurrentStep(
-                                        `${unit.label} · 自动重试 (${info.attempt}/${info.maxAttempts}): ${info.reason}`,
-                                    );
-                                },
-                                signal: taskCtx.signal,
-                            }),
-                        ),
+                        units.map(async (unit) => {
+                            const unitTriggerIds = unit.triggers.map((t) => t.id).join(',');
+                            try {
+                                return await this.executePreparedUnit(unit, {
+                                    target: taskCtx.target,
+                                    userText: params.userText,
+                                    assistantText: params.assistantText,
+                                    preset: params.preset,
+                                    effectiveAgents: params.effectiveAgents,
+                                    derivedAgentsByRuleId: params.derivedAgentsByRuleId,
+                                    loreEntries: params.loreEntries,
+                                    subAgents: params.subAgents,
+                                    globalVarSchema: params.globalVarSchema,
+                                    staged: true,
+                                    injectionSession: params.injectionSession,
+                                    matchOverrides: mergeUnitMatchOverrides(
+                                        unit.triggers,
+                                        matchOverridesByRuleId,
+                                    ),
+                                    taskId: taskCtx.taskId,
+                                    checkpointScope: {
+                                        phase: 'after_turn',
+                                        triggerId: unitTriggerIds,
+                                    },
+                                    onToolStart: (step) => {
+                                        taskCtx.setCurrentStep(`${unit.label} · ${step.toolName}`);
+                                    },
+                                    onRetrying: (info) => {
+                                        taskCtx.setCurrentStep(
+                                            `${unit.label} · 自动重试 (${info.attempt}/${info.maxAttempts}): ${info.reason}`,
+                                        );
+                                    },
+                                    signal: taskCtx.signal,
+                                });
+                            } catch (error) {
+                                this.handleBackgroundTriggerFailure(error, {
+                                    target: taskCtx.target,
+                                    phase: 'after_turn',
+                                    agentId: unit.agentProfileId,
+                                    triggerId: unitTriggerIds,
+                                    signal: taskCtx.signal,
+                                });
+                                throw error;
+                            }
+                        }),
                     );
 
                     throwIfAborted(taskCtx.signal);
@@ -1522,7 +3096,7 @@ export class PipelineOrchestrator {
                     return await this.watermarkCompactor.compact(this.trajectoryStore, {
                         agentId: agent.id,
                         watermark: agent.watermark,
-                        triggers: params.allTriggers,
+                        triggers: params.allTriggers.filter((t) => !isEventDrivenTriggerRule(t)),
                         loreEntries: params.loreEntries,
                         summarizeChunk: this.summarizeChunk,
                         ...this.compactionOptions,
@@ -1551,6 +3125,15 @@ export class PipelineOrchestrator {
             staged: boolean;
             injectionSession?: PromptInjectionSession;
             matchOverrides?: Record<string, string>;
+            taskId?: string;
+            checkpointScope?: { phase: PipelinePhase; triggerId?: string };
+            resumeMessages?: readonly CanonicalMessage[];
+            initialReadSet?: Record<string, string>;
+            overrideAgentProfileId?: string;
+            overrideTriggerId?: string;
+            eventPayload?: ToolEventPayload;
+            isErrorRecovery?: boolean;
+            forceDisableOutputFile?: boolean;
             onToolStart?: (step: ToolStepLog) => void;
             onRetrying?: (info: RoundRetryLog) => void;
             signal: AbortSignal;
@@ -1563,13 +3146,24 @@ export class PipelineOrchestrator {
         }
 
         const startedAt = Date.now();
-        const profile = resolveEffectiveUnitAgentProfile(
-            unit,
-            ctx.preset,
-            ctx.derivedAgentsByRuleId,
-            ctx.effectiveAgents,
-        );
-        const triggerIds = unit.triggers.map((t) => t.id);
+        const profile =
+            (ctx.overrideAgentProfileId
+                ? ctx.preset.agents[ctx.overrideAgentProfileId]
+                  ?? ctx.effectiveAgents[ctx.overrideAgentProfileId]
+                : undefined)
+            ?? resolveEffectiveUnitAgentProfile(
+                unit,
+                ctx.preset,
+                ctx.derivedAgentsByRuleId,
+                ctx.effectiveAgents,
+            );
+        const triggerIds =
+            unit.triggers.length > 0
+                ? unit.triggers.map((t) => t.id)
+                : ctx.overrideTriggerId
+                    ? ctx.overrideTriggerId.split(',').map((s) => s.trim()).filter(Boolean)
+                    : [];
+        const triggerIdString = ctx.overrideTriggerId ?? triggerIds.join(',');
         const lorebookNames = collectUnitLorebookNames(unit.triggers);
         const triggerSource = resolveUnitTriggerSource(unit.triggers, lorebookNames);
 
@@ -1578,7 +3172,10 @@ export class PipelineOrchestrator {
         let triggerPrompt: string;
         try {
             unitSchema = await this.compileUnitVariableSchema(unit, ctx.globalVarSchema);
-            const built = await this.buildTriggerAgentPrompt(unit, ctx);
+            const built =
+                unit.triggers.length > 0
+                    ? await this.buildTriggerAgentPrompt(unit, ctx)
+                    : { promptInput: '', triggerPrompt: '' };
             promptInput = built.promptInput;
             triggerPrompt = built.triggerPrompt;
         } catch (error) {
@@ -1593,7 +3190,7 @@ export class PipelineOrchestrator {
                         phase: unit.phase,
                         agentProfileId: profile.id,
                         agentName: profile.name || unit.label,
-                        triggerId: triggerIds.join(','),
+                        triggerId: triggerIdString,
                         triggerLabel: unit.label,
                         ...(triggerSource ? { triggerSource } : {}),
                         ...(lorebookNames.length > 0 ? { lorebookNames } : {}),
@@ -1632,10 +3229,32 @@ export class PipelineOrchestrator {
             ...(ctx.matchOverrides ?? {}),
             triggerPrompt,
             triggerLabel: unit.label,
-            triggerId: triggerIds.join(','),
+            triggerId: triggerIdString,
             triggerPhase: unit.phase,
             triggerTargetPath: unit.targetPath ?? targetPaths.join(','),
         };
+
+        const envForHooks: CompiledTurnEnvironment = {
+            loreEntries: [...ctx.loreEntries],
+            effectiveAgents: ctx.effectiveAgents,
+            derivedAgentsByRuleId: ctx.derivedAgentsByRuleId ?? {},
+            allTriggers: [],
+            subAgents: [...ctx.subAgents],
+            globalVarSchema: ctx.globalVarSchema,
+        };
+        // Re-derive triggers cheaply only when hooks fire; use compileTurnEnvironment lazily if empty.
+        const runnerHooks = this.buildAgentRunnerHooks({
+            preset: ctx.preset,
+            env: {
+                ...envForHooks,
+                allTriggers: mergePresetAndCompiledTriggers(
+                    ctx.preset.triggers,
+                    this.decoratorCompiler.compile(ctx.loreEntries, { preset: ctx.preset }).triggers,
+                ),
+            },
+            injectionSession: ctx.injectionSession,
+            isErrorRecovery: ctx.isErrorRecovery,
+        });
 
         const agentResult = await this.agentRunner.run({
             agent: {
@@ -1653,18 +3272,27 @@ export class PipelineOrchestrator {
                 decorators,
                 targetPaths,
             },
-            userInput: promptInput,
+            ...(ctx.resumeMessages
+                ? {
+                    resumeMessages: ctx.resumeMessages,
+                    ...(ctx.initialReadSet ? { initialReadSet: ctx.initialReadSet } : {}),
+                }
+                : { userInput: promptInput }),
             loreEntries: ctx.loreEntries,
             subAgents: ctx.subAgents,
             includeCategory4DynamicEntries: false,
             runTailRadar: false,
             getVariableSchema: unitSchema ? () => unitSchema : undefined,
-            triggerId: triggerIds.join(','),
+            triggerId: triggerIdString,
             triggerLabel: unit.label,
             ...(triggerSource ? { triggerSource } : {}),
             ...(lorebookNames.length > 0 ? { lorebookNames } : {}),
+            ...(ctx.taskId ? { taskId: ctx.taskId } : {}),
+            ...(ctx.checkpointScope ? { checkpointScope: ctx.checkpointScope } : {}),
+            ...(ctx.forceDisableOutputFile ? { requireOutputFile: false } : {}),
             staged: ctx.staged,
             ...(ctx.injectionSession ? { injectionSession: ctx.injectionSession } : {}),
+            ...runnerHooks,
             ...(ctx.onToolStart ? { onToolStart: ctx.onToolStart } : {}),
             ...(ctx.onRetrying ? { onRetrying: ctx.onRetrying } : {}),
             signal: ctx.signal,
@@ -1676,7 +3304,7 @@ export class PipelineOrchestrator {
             phase: unit.phase,
             target: ctx.target,
             kind: 'agent',
-            triggerIds: unit.triggers.map((t) => t.id),
+            triggerIds,
             agentProfileId: profile.id,
             output: agentResult.content,
             agentResult,
@@ -1690,10 +3318,16 @@ export class PipelineOrchestrator {
             userText: string;
             assistantText: string;
             preset: Preset;
+            effectiveAgents?: Record<string, AgentProfile>;
+            derivedAgentsByRuleId?: Record<string, AgentProfile>;
+            loreEntries?: readonly RawLoreEntry[];
+            subAgents?: readonly SubAgentDescriptor[];
             globalVarSchema?: z.ZodTypeAny;
             staged: boolean;
             injectionSession?: PromptInjectionSession;
             matchOverrides?: Record<string, string>;
+            eventPayload?: ToolEventPayload;
+            isErrorRecovery?: boolean;
             onToolStart?: (step: ToolStepLog) => void;
             onRetrying?: (info: RoundRetryLog) => void;
             signal: AbortSignal;
@@ -1712,7 +3346,17 @@ export class PipelineOrchestrator {
                 : ['/memory/**', '/scratch/**', '/lorebooks/**', '/state/variables.json'],
         };
 
-        const toolCtx: ToolExecutionContext = createToolExecutionContext({
+        const agentApi = this.createToolAgentApi({
+            defaultTarget: ctx.target,
+            defaultPhase: unit.phase,
+            defaultStaged: ctx.staged,
+            parentSignal: ctx.signal,
+            isErrorRecovery: Boolean(ctx.isErrorRecovery),
+            preset: ctx.preset,
+            injectionSession: ctx.injectionSession,
+        });
+
+        const baseToolCtx = createToolExecutionContext({
             bridge: this.bridge,
             vfs: this.vfs,
             store: this.store,
@@ -1725,6 +3369,11 @@ export class PipelineOrchestrator {
             source: `script:${rule.id}`,
             getVariableSchema: ctx.globalVarSchema ? () => ctx.globalVarSchema : undefined,
         });
+        const toolCtx: ToolExecutionContext = {
+            ...baseToolCtx,
+            agent: agentApi,
+            ...(ctx.eventPayload ? { event: ctx.eventPayload } : {}),
+        };
 
         let output = '';
         let skipped = false;
@@ -2292,6 +3941,271 @@ function resolveUnitTriggerSource(
         return 'preset';
     }
     return undefined;
+}
+
+function isEventDrivenTriggerRule(rule: TriggerRule): boolean {
+    return Array.isArray(rule.events) && rule.events.length > 0;
+}
+
+function sanitizeSegmentLocal(raw: string): string {
+    return raw
+        .trim()
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}_-]+/gu, '_')
+        .replace(/^_+|_+$/g, '') || 'agent';
+}
+
+function linkAbortSignals(
+    parent: AbortSignal,
+    child?: AbortSignal,
+): { signal: AbortSignal; cleanup: () => void } {
+    if (!child || child === parent) {
+        return { signal: parent, cleanup: () => {} };
+    }
+    const controller = new AbortController();
+    const abortFrom = (src: AbortSignal) => {
+        if (!controller.signal.aborted) {
+            controller.abort(src.reason ?? createAbortError('Operation aborted'));
+        }
+    };
+    if (parent.aborted) {
+        abortFrom(parent);
+        return { signal: controller.signal, cleanup: () => {} };
+    }
+    if (child.aborted) {
+        abortFrom(child);
+        return { signal: controller.signal, cleanup: () => {} };
+    }
+    const onParentAbort = () => abortFrom(parent);
+    const onChildAbort = () => abortFrom(child);
+    parent.addEventListener('abort', onParentAbort, { once: true });
+    child.addEventListener('abort', onChildAbort, { once: true });
+    return {
+        signal: controller.signal,
+        cleanup: () => {
+            parent.removeEventListener('abort', onParentAbort);
+            child.removeEventListener('abort', onChildAbort);
+        },
+    };
+}
+
+function createErrorRecoveryControl(): ToolErrorRecoveryControl {
+    const state: {
+        action: ToolErrorRecoveryAction;
+        reason?: string;
+        delayMs?: number;
+        rollbackToolRounds?: number;
+        dropHistoryTurns?: number;
+        connectionId?: string;
+        temperature?: number;
+        maxTokens?: number;
+        mode?: 'round' | 'turn';
+        retryOptions?: ToolErrorRecoveryRetryOptions;
+        fallbackContent?: string;
+    } = {
+        action: 'none',
+    };
+
+    const control: ToolErrorRecoveryControl = {
+        retry(reason?: string, opts?: ToolErrorRecoveryRetryOptions) {
+            state.action = 'retry';
+            state.reason = reason;
+            state.delayMs = opts?.delayMs;
+            state.rollbackToolRounds = opts?.rollbackToolRounds;
+            state.dropHistoryTurns = opts?.dropHistoryTurns;
+            state.connectionId = opts?.connectionId;
+            state.temperature = opts?.temperature;
+            state.maxTokens = opts?.maxTokens;
+            state.mode = opts?.mode;
+            state.retryOptions = opts ? { ...opts } : undefined;
+        },
+        abort(reason?: string) {
+            state.action = 'abort';
+            state.reason = reason;
+        },
+        fallback(content: string, reason?: string) {
+            state.action = 'fallback';
+            state.fallbackContent = content;
+            state.reason = reason;
+        },
+        get action() {
+            return state.action;
+        },
+        get reason() {
+            return state.reason;
+        },
+        get delayMs() {
+            return state.delayMs;
+        },
+        get rollbackToolRounds() {
+            return state.rollbackToolRounds;
+        },
+        get dropHistoryTurns() {
+            return state.dropHistoryTurns;
+        },
+        get connectionId() {
+            return state.connectionId;
+        },
+        get temperature() {
+            return state.temperature;
+        },
+        get maxTokens() {
+            return state.maxTokens;
+        },
+        get mode() {
+            return state.mode;
+        },
+        get retryOptions() {
+            return state.retryOptions;
+        },
+        get fallbackContent() {
+            return state.fallbackContent;
+        },
+    };
+    return control;
+}
+
+function normalizePostprocessToolCalls(rawCalls: readonly unknown[]): CanonicalToolCall[] {
+    const result: CanonicalToolCall[] = [];
+    for (const item of rawCalls) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+            continue;
+        }
+        const rec = item as Record<string, unknown>;
+        const id = typeof rec.id === 'string' ? rec.id.trim() : '';
+        const name = typeof rec.name === 'string' ? rec.name.trim() : '';
+        if (!id || !name) {
+            continue;
+        }
+        const args =
+            typeof rec.arguments === 'string'
+                ? rec.arguments
+                : JSON.stringify(rec.arguments ?? {});
+        result.push({
+            id,
+            name,
+            arguments: args,
+            ...(typeof rec.thoughtSignature === 'string'
+                ? { thoughtSignature: rec.thoughtSignature }
+                : {}),
+        });
+    }
+    return result;
+}
+
+function reconcilePostprocessOutputReturn(
+    postOutput: ToolPostprocessOutput,
+    rawReturn: unknown,
+    prevText: string,
+    prevContent: string | undefined,
+    prevReasoning: string | undefined,
+): void {
+    if (typeof postOutput.content === 'string' && postOutput.content !== prevContent) {
+        postOutput.text = postOutput.content;
+    } else if (typeof postOutput.text === 'string' && postOutput.text !== prevText) {
+        postOutput.content = postOutput.text;
+    }
+
+    if (typeof rawReturn === 'string') {
+        const wasReasoningAssignment =
+            postOutput.reasoningContent !== prevReasoning
+            && rawReturn === postOutput.reasoningContent;
+        if (!wasReasoningAssignment) {
+            postOutput.content = rawReturn;
+            postOutput.text = rawReturn;
+        }
+        return;
+    }
+
+    if (rawReturn && typeof rawReturn === 'object' && !Array.isArray(rawReturn)) {
+        const rec = rawReturn as Record<string, unknown>;
+        if (typeof rec.content === 'string') {
+            postOutput.content = rec.content;
+            postOutput.text = rec.content;
+        } else if (typeof rec.text === 'string') {
+            postOutput.content = rec.text;
+            postOutput.text = rec.text;
+        }
+        if ('reasoningContent' in rec) {
+            postOutput.reasoningContent =
+                typeof rec.reasoningContent === 'string' ? rec.reasoningContent : undefined;
+        }
+        if (Array.isArray(rec.toolCalls)) {
+            postOutput.toolCalls = normalizePostprocessToolCalls(rec.toolCalls);
+        }
+    }
+}
+
+function parseErrorRecoveryReturnDecision(
+    rawReturn: unknown,
+): AgentGenerationErrorDecision | undefined {
+    if (!rawReturn || typeof rawReturn !== 'object' || Array.isArray(rawReturn)) {
+        return undefined;
+    }
+    const rec = rawReturn as Record<string, unknown>;
+    if (rec.action === 'abort') {
+        return {
+            action: 'abort',
+            ...(typeof rec.reason === 'string' ? { reason: rec.reason } : {}),
+        };
+    }
+    if (rec.action === 'retry') {
+        return {
+            action: 'retry',
+            ...(typeof rec.reason === 'string' ? { reason: rec.reason } : {}),
+            ...(typeof rec.delayMs === 'number' && Number.isFinite(rec.delayMs)
+                ? { delayMs: rec.delayMs }
+                : {}),
+            ...(Array.isArray(rec.messages) ? { messages: rec.messages as CanonicalMessage[] } : {}),
+            ...(typeof rec.rollbackToolRounds === 'number' && Number.isFinite(rec.rollbackToolRounds)
+                ? { rollbackToolRounds: rec.rollbackToolRounds }
+                : {}),
+            ...(typeof rec.dropHistoryTurns === 'number' && Number.isFinite(rec.dropHistoryTurns)
+                ? { dropHistoryTurns: rec.dropHistoryTurns }
+                : {}),
+            ...(typeof rec.connectionId === 'string' ? { connectionId: rec.connectionId } : {}),
+            ...(typeof rec.temperature === 'number' && Number.isFinite(rec.temperature)
+                ? { temperature: rec.temperature }
+                : {}),
+            ...(typeof rec.maxTokens === 'number' && Number.isFinite(rec.maxTokens)
+                ? { maxTokens: rec.maxTokens }
+                : {}),
+        };
+    }
+    return undefined;
+}
+
+function extractErrorDiagnostics(error: unknown): {
+    message: string;
+    code?: string;
+    status?: number;
+} {
+    const cause = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
+    const primary =
+        error instanceof LLMTransportError
+            ? error
+            : cause instanceof LLMTransportError
+                ? cause
+                : error;
+    const message = error instanceof Error ? error.message : String(error);
+    const rec =
+        primary && typeof primary === 'object'
+            ? (primary as { code?: unknown; status?: unknown; statusCode?: unknown })
+            : undefined;
+    const code = typeof rec?.code === 'string' && rec.code.trim() ? rec.code.trim() : undefined;
+    const rawStatus =
+        typeof rec?.status === 'number'
+            ? rec.status
+            : typeof rec?.statusCode === 'number'
+                ? rec.statusCode
+                : undefined;
+    const status =
+        rawStatus !== undefined && Number.isFinite(rawStatus) ? Math.trunc(rawStatus) : undefined;
+    return {
+        message,
+        ...(code ? { code } : {}),
+        ...(status !== undefined ? { status } : {}),
+    };
 }
 
 export type { CanonicalMessage };

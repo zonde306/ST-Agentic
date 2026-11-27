@@ -5,7 +5,7 @@ import {
     UndoStore,
     createChatMetadataUndoAdapter,
 } from '@/core/assistant';
-import { PROMPT_TRANSFORM_EVENTS, type ToolSideGenApi } from '@/core/bridge';
+import { PROMPT_TRANSFORM_EVENTS, type ToolEventPayload, type ToolSideGenApi } from '@/core/bridge';
 import {
     buildPresetFromPromptsImport,
     createDefaultSettings,
@@ -34,7 +34,7 @@ import {
     type ExternalDocItem,
     type ExternalDocRegistration,
 } from '@/core/docs';
-import { FetchLLMTransport } from '@/core/llm';
+import { FetchLLMTransport, LLMTransportError } from '@/core/llm';
 import { TraceLogger } from '@/core/logger';
 import {
     buildLoreVfsPath,
@@ -89,6 +89,7 @@ import type {
     Preset,
     RawLoreEntry,
     Settings,
+    TriggerEventType,
     WICategory,
 } from '@/core/types';
 import { canonicalClone, canonicalStringify, initXxHash, normalizeVfsPath } from '@/core/utils';
@@ -148,6 +149,8 @@ import {
     AppStore,
     type AgenticUIServices,
     type AgentWatermarkStatus,
+    type AssistantRuntimeBridge,
+    type ClearPromptCachesResult,
     type ConnectionModelsResult,
     type ConnectionTestResult,
     type EmbeddedCardStatus,
@@ -418,13 +421,15 @@ function createEjsVfsHelpers(
     };
 }
 
-interface RuntimeServicesDeps {
+export interface RuntimeServicesDeps {
     bridge: STHostBridge;
     store: ChatDataStore;
     dataCompactor: DataCompactor;
     vfs: VirtualFileSystem;
     sideGen: ToolSideGenApi;
+    abortSideGen?: (reason?: string) => void;
     assistantRunner?: AssistantRunner;
+    assistantRuntime?: AssistantRuntimeBridge;
     traceLogger: TraceLogger;
     sandbox: IframeJsSandbox;
     toolRegistry: ToolRegistry;
@@ -442,14 +447,75 @@ interface RuntimeServicesDeps {
     isSuppressingSave: () => boolean;
 }
 
-function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
+export function emitOffMainlineGenerationError(
+    bridge: Pick<STHostBridge, 'emitHostEvent'>,
+    params: {
+        target: MessageTarget;
+        offMainlineKind: 'assistant' | 'sidegen_once' | 'sidegen_session';
+        sessionId?: string;
+        agentId: string;
+        error: unknown;
+    },
+): void {
+    if (isAbortError(params.error)) {
+        return;
+    }
+    const cause =
+        params.error instanceof Error
+            ? (params.error as { cause?: unknown }).cause
+            : undefined;
+    const primary =
+        params.error instanceof LLMTransportError
+            ? params.error
+            : cause instanceof LLMTransportError
+                ? cause
+                : params.error;
+    const rec =
+        primary && typeof primary === 'object'
+            ? (primary as { code?: unknown; status?: unknown; statusCode?: unknown })
+            : undefined;
+    const errorCode =
+        typeof rec?.code === 'string' && rec.code.trim() ? rec.code.trim() : undefined;
+    const rawStatus =
+        typeof rec?.status === 'number'
+            ? rec.status
+            : typeof rec?.statusCode === 'number'
+                ? rec.statusCode
+                : undefined;
+    const statusCode =
+        rawStatus !== undefined && Number.isFinite(rawStatus) ? Math.trunc(rawStatus) : undefined;
+    const message =
+        params.error instanceof Error ? params.error.message : String(params.error);
+
+    const payload: ToolEventPayload = {
+        type: 'generation_error',
+        timestamp: Date.now(),
+        target: { ...params.target },
+        messageId: params.target.messageId,
+        swipeId: params.target.swipeId,
+        phase: 'maintenance',
+        agentId: params.agentId,
+        error: message,
+        ...(errorCode ? { errorCode } : {}),
+        ...(statusCode !== undefined ? { statusCode } : {}),
+        data: {
+            offMainlineKind: params.offMainlineKind,
+            ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+        },
+    };
+    bridge.emitHostEvent?.('agentic_generation_error', payload);
+}
+
+export function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
     const {
         bridge,
         store,
         dataCompactor,
         vfs,
         sideGen,
+        abortSideGen,
         assistantRunner,
+        assistantRuntime,
         traceLogger,
         sandbox,
         toolRegistry,
@@ -874,6 +940,62 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             || input.path.trim() === OUTPUT_FILE_PATH
             || cleanKey === 'output.md'
         );
+    };
+
+    const settleAfterTurnHandles = async (
+        target: MessageTarget,
+        handles: Awaited<ReturnType<PipelineOrchestrator['rerunAfterTurn']>>,
+        prevRunIds: ReadonlySet<string>,
+    ): Promise<void> => {
+        const storeUi = getAppStore();
+        storeUi?.setBackgroundTasks(barrierCoordinator.listTasks());
+        const settled = await Promise.allSettled(handles.map((handle) => handle.promise));
+        trajectoryStore.saveToHost(bridge);
+        storeUi?.setBackgroundTasks(barrierCoordinator.listTasks());
+        if (storeUi) {
+            await storeUi.refreshTraces();
+        }
+        const firstNonAbortRejection = settled.find(
+            (res): res is PromiseRejectedResult =>
+                res.status === 'rejected' && !isAbortError(res.reason),
+        );
+        if (firstNonAbortRejection) {
+            const hasNewErrorTrace = traceLogger
+                .listTraces({
+                    messageId: target.messageId,
+                    swipeId: target.swipeId,
+                    phase: 'after_turn',
+                    status: 'error',
+                })
+                .some((t) => !prevRunIds.has(t.runId));
+            if (!hasNewErrorTrace) {
+                throw firstNonAbortRejection.reason instanceof Error
+                    ? firstNonAbortRejection.reason
+                    : new Error(String(firstNonAbortRejection.reason));
+            }
+        }
+    };
+
+    const rerunAfterTurnImpl = async (
+        targetInput?: MessageTarget,
+        options?: { triggerIds?: string[]; force?: boolean },
+    ): Promise<void> => {
+        const target = resolveTarget(targetInput);
+        const prevRunIds = new Set(
+            traceLogger
+                .listTraces({ messageId: target.messageId, swipeId: target.swipeId })
+                .map((t) => t.runId),
+        );
+        const handles = await orchestrator.rerunAfterTurn(target, {
+            ...(options?.triggerIds?.length ? { triggerIds: options.triggerIds } : {}),
+            ...(options?.force ? { force: true } : {}),
+        });
+        if (options?.triggerIds?.length && handles.length === 0) {
+            throw new Error(
+                '未找到可运行的后置触发器规则（请确认规则处于 after_turn 阶段且所在世界书已激活）',
+            );
+        }
+        await settleAfterTurnHandles(target, handles, prevRunIds);
     };
 
     return {
@@ -1416,6 +1538,18 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             };
         },
 
+        async clearAllPromptCaches(): Promise<ClearPromptCachesResult> {
+            const clearedPrefixes = trajectoryStore.clearAllFrozenPrefixes();
+            trajectoryStore.saveToHost(bridge);
+            const clearedVfsCache = vfs.clearReadTransformCache();
+            const clearedLorebooks = bridge.clearLorebookCache?.() ?? 0;
+            return {
+                clearedPrefixes,
+                clearedVfsCache,
+                clearedLorebooks,
+            };
+        },
+
         async getStorageOverview(): Promise<StorageOverview> {
             const settings = getSettings();
             return {
@@ -1494,53 +1628,183 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             getAppStore()?.setTraces([]);
         },
 
-        async rerunAfterTurn(
-            targetInput?: MessageTarget,
-            options?: { triggerIds?: string[]; force?: boolean },
-        ): Promise<void> {
-            const target = resolveTarget(targetInput);
-            const prevRunIds = new Set(
-                traceLogger
-                    .listTraces({ messageId: target.messageId, swipeId: target.swipeId })
-                    .map((t) => t.runId),
-            );
-            const handles = await orchestrator.rerunAfterTurn(target, {
-                ...(options?.triggerIds?.length ? { triggerIds: options.triggerIds } : {}),
-                ...(options?.force ? { force: true } : {}),
-            });
-            if (options?.triggerIds?.length && handles.length === 0) {
-                throw new Error(
-                    '未找到可运行的后置触发器规则（请确认规则处于 after_turn 阶段且所在世界书已激活）',
-                );
-            }
-            const storeUi = getAppStore();
-            storeUi?.setBackgroundTasks(barrierCoordinator.listTasks());
-            const settled = await Promise.allSettled(handles.map((handle) => handle.promise));
-            trajectoryStore.saveToHost(bridge);
-            storeUi?.setBackgroundTasks(barrierCoordinator.listTasks());
-            if (storeUi) {
-                await storeUi.refreshTraces();
-            }
-            const firstNonAbortRejection = settled.find(
-                (res): res is PromiseRejectedResult =>
-                    res.status === 'rejected' && !isAbortError(res.reason),
-            );
-            if (firstNonAbortRejection) {
-                const hasNewErrorTrace = traceLogger
-                    .listTraces({
-                        messageId: target.messageId,
-                        swipeId: target.swipeId,
-                        phase: 'after_turn',
-                        status: 'error',
-                    })
-                    .some((t) => !prevRunIds.has(t.runId));
-                if (!hasNewErrorTrace) {
-                    throw firstNonAbortRejection.reason instanceof Error
-                        ? firstNonAbortRejection.reason
-                        : new Error(String(firstNonAbortRejection.reason));
+        stopTrace(trace: AgentRunTrace): boolean {
+            if (
+                trace.offMainlineKind === 'assistant'
+                || trace.agentProfileId.startsWith('assistant:')
+            ) {
+                const sessionId =
+                    trace.offMainlineSessionId
+                    || (trace.agentProfileId.startsWith('assistant:')
+                        ? trace.agentProfileId.slice('assistant:'.length)
+                        : undefined);
+                const streamingSessionId = getAppStore()?.getSnapshot().assistantStreamingSessionId;
+                const isActive =
+                    trace.status === 'running'
+                    || (sessionId ? streamingSessionId === sessionId : Boolean(streamingSessionId));
+                if (assistantRunner && isActive) {
+                    assistantRunner.abort(sessionId);
+                    return true;
                 }
+                return false;
+            }
+
+            if (
+                trace.offMainlineKind === 'sidegen_once'
+                || trace.offMainlineKind === 'sidegen_session'
+                || trace.agentProfileId.startsWith('side:')
+                || trace.agentProfileId === 'sidegen:once'
+            ) {
+                if (trace.status === 'running' && abortSideGen) {
+                    abortSideGen('Stopped from logs');
+                    return true;
+                }
+                return false;
+            }
+
+            if (trace.phase === 'main_turn' || trace.phase === 'before_turn') {
+                return Boolean(getInterceptorHandle()?.abortActiveTakeover('Stopped from logs'));
+            }
+
+            if (trace.phase === 'after_turn' || trace.phase === 'maintenance') {
+                if (trace.taskId?.trim()) {
+                    const cancelled = orchestrator.cancelBackgroundTask(
+                        trace.taskId.trim(),
+                        'Stopped from logs',
+                    );
+                    if (cancelled) {
+                        getAppStore()?.setBackgroundTasks(barrierCoordinator.listTasks());
+                        return true;
+                    }
+                }
+
+                const matchingTasks = barrierCoordinator.listTasks({
+                    target: trace.target,
+                    agentProfileId: trace.agentProfileId,
+                    state: ['queued', 'running'],
+                });
+                const candidates =
+                    matchingTasks.length > 0
+                        ? matchingTasks
+                        : trace.phase === 'after_turn'
+                            ? barrierCoordinator.listTasks({
+                                target: trace.target,
+                                phase: 'after_turn',
+                                agentProfileId: 'after_turn_batch',
+                                state: ['queued', 'running'],
+                            })
+                            : [];
+                let cancelledAny = false;
+                for (const task of candidates) {
+                    if (orchestrator.cancelBackgroundTask(task.taskId, 'Stopped from logs')) {
+                        cancelledAny = true;
+                    }
+                }
+                if (cancelledAny) {
+                    getAppStore()?.setBackgroundTasks(barrierCoordinator.listTasks());
+                }
+                return cancelledAny;
+            }
+
+            return false;
+        },
+
+        async continueTrace(
+            trace: AgentRunTrace,
+            options?: { rollbackLastToolRound?: boolean },
+        ): Promise<void> {
+            const target = resolveValidTarget(trace.target);
+            if (trace.phase === 'main_turn') {
+                const handle = getInterceptorHandle();
+                if (!handle) {
+                    throw new Error('Agentic interceptor is not initialized.');
+                }
+                const hasCheckpoint = Boolean(trajectoryStore.getInterruptedCheckpoint(target));
+                if (hasCheckpoint) {
+                    await handle.resumeTakeoverTurn(target, options);
+                } else {
+                    await handle.retryTakeoverTurn(target);
+                }
+                await getAppStore()?.refreshTraces().catch(() => {});
+                return;
+            }
+
+            if (trace.phase === 'after_turn') {
+                const triggerId = trace.triggerId?.trim();
+                if (triggerId) {
+                    const prevRunIds = new Set(
+                        traceLogger
+                            .listTraces({ messageId: target.messageId, swipeId: target.swipeId })
+                            .map((t) => t.runId),
+                    );
+                    const handles = await orchestrator.resumeTriggerTask(target, triggerId, options);
+                    await settleAfterTurnHandles(target, handles, prevRunIds);
+                    return;
+                }
+                await rerunAfterTurnImpl(target);
+                return;
+            }
+
+            if (trace.phase === 'before_turn') {
+                const handle = getInterceptorHandle();
+                if (!handle) {
+                    throw new Error('Agentic interceptor is not initialized.');
+                }
+                await handle.retryTakeoverTurn(target);
+                await getAppStore()?.refreshTraces().catch(() => {});
             }
         },
+
+        async retryTrace(trace: AgentRunTrace): Promise<void> {
+            const target = resolveValidTarget(trace.target);
+            if (trace.phase === 'main_turn' || trace.phase === 'before_turn') {
+                const handle = getInterceptorHandle();
+                if (!handle) {
+                    throw new Error('Agentic interceptor is not initialized.');
+                }
+                await handle.retryTakeoverTurn(target);
+                await getAppStore()?.refreshTraces().catch(() => {});
+                return;
+            }
+
+            if (trace.phase === 'after_turn') {
+                const rawTriggerId = trace.triggerId?.trim();
+                if (rawTriggerId) {
+                    trajectoryStore.clearInterruptedCheckpoint(target, {
+                        phase: 'after_turn',
+                        triggerId: rawTriggerId,
+                    });
+                    const splitIds = rawTriggerId
+                        .split(',')
+                        .map((id) => id.trim())
+                        .filter(Boolean);
+                    for (const id of splitIds) {
+                        trajectoryStore.clearInterruptedCheckpoint(target, {
+                            phase: 'after_turn',
+                            triggerId: id,
+                        });
+                    }
+                    trajectoryStore.saveToHost(bridge);
+                    await rerunAfterTurnImpl(target, { triggerIds: splitIds, force: true });
+                    return;
+                }
+
+                const existingCps = trajectoryStore.listInterruptedCheckpoints({
+                    target,
+                    phase: 'after_turn',
+                });
+                for (const cp of existingCps.values()) {
+                    trajectoryStore.clearInterruptedCheckpoint(target, {
+                        phase: 'after_turn',
+                        triggerId: cp.triggerId,
+                    });
+                }
+                trajectoryStore.saveToHost(bridge);
+                await rerunAfterTurnImpl(target);
+            }
+        },
+
+        rerunAfterTurn: rerunAfterTurnImpl,
 
         async resumeTurn(targetInput: MessageTarget): Promise<void> {
             const target = resolveValidTarget(targetInput);
@@ -1953,7 +2217,11 @@ function createLiveUiServices(deps: RuntimeServicesDeps): AgenticUIServices {
             return traceLogger.subscribe(listener);
         },
 
-        ...(assistantRunner ? { assistantRuntime: assistantRunner } : {}),
+        ...(assistantRuntime
+            ? { assistantRuntime }
+            : assistantRunner
+                ? { assistantRuntime: assistantRunner }
+                : {}),
     };
 }
 
@@ -2066,6 +2334,7 @@ function setupHostUiContainers(appStore: AppStore): HostMountController {
     };
 }
 
+if (typeof jQuery === 'function') {
 jQuery(async () => {
     try {
         await initXxHash();
@@ -2269,11 +2538,21 @@ jQuery(async () => {
 
         const sideGenApi: ToolSideGenApi = {
             async runOnce(opts) {
-                const result = await sideGenService.runOnce(opts);
-                if (result.bridgedPath) {
-                    scheduleSideGenUiRefresh();
+                try {
+                    const result = await sideGenService.runOnce(opts);
+                    if (result.bridgedPath) {
+                        scheduleSideGenUiRefresh();
+                    }
+                    return result;
+                } catch (error) {
+                    emitOffMainlineGenerationError(bridge, {
+                        target: resolveValidTarget(runtimeRefs.appStore?.getSnapshot().activeTarget),
+                        offMainlineKind: 'sidegen_once',
+                        agentId: 'sidegen:once',
+                        error,
+                    });
+                    throw error;
                 }
-                return result;
             },
             async createSession(opts) {
                 const info = await sideGenService.createSession(opts);
@@ -2281,17 +2560,39 @@ jQuery(async () => {
                 return info;
             },
             async send(sessionId, prompt, opts) {
-                const result = await sideGenService.send(sessionId, prompt, opts);
-                scheduleSideGenUiRefresh();
-                return result;
+                try {
+                    const result = await sideGenService.send(sessionId, prompt, opts);
+                    scheduleSideGenUiRefresh();
+                    return result;
+                } catch (error) {
+                    emitOffMainlineGenerationError(bridge, {
+                        target: resolveValidTarget(runtimeRefs.appStore?.getSnapshot().activeTarget),
+                        offMainlineKind: 'sidegen_session',
+                        sessionId,
+                        agentId: `side:${sessionId}`,
+                        error,
+                    });
+                    throw error;
+                }
             },
             getSession: (sessionId) => sideGenService.getSession(sessionId),
             listSessions: (filter) => sideGenService.listSessions(filter),
             getTranscript: (sessionId) => sideGenService.getTranscript(sessionId),
             async compactSession(sessionId) {
-                const result = await sideGenService.compactSession(sessionId);
-                scheduleSideGenUiRefresh();
-                return result;
+                try {
+                    const result = await sideGenService.compactSession(sessionId);
+                    scheduleSideGenUiRefresh();
+                    return result;
+                } catch (error) {
+                    emitOffMainlineGenerationError(bridge, {
+                        target: resolveValidTarget(runtimeRefs.appStore?.getSnapshot().activeTarget),
+                        offMainlineKind: 'sidegen_session',
+                        sessionId,
+                        agentId: `side:${sessionId}`,
+                        error,
+                    });
+                    throw error;
+                }
             },
             async deleteSession(sessionId) {
                 const deleted = await sideGenService.deleteSession(sessionId);
@@ -2447,13 +2748,93 @@ jQuery(async () => {
 
         let suppressNextSave = false;
 
+        let sideGenLifecycleController = new AbortController();
+        const rotateSideGenLifecycleAbort = (reason: string): void => {
+            const prev = sideGenLifecycleController;
+            sideGenLifecycleController = new AbortController();
+            if (!prev.signal.aborted) {
+                prev.abort(reason);
+            }
+        };
+
+        const runAssistantWithErrorEmit = async <T>(
+            sessionId: string | undefined,
+            executor: () => Promise<T>,
+        ): Promise<T> => {
+            try {
+                return await executor();
+            } catch (error) {
+                emitOffMainlineGenerationError(bridge, {
+                    target: resolveValidTarget(runtimeRefs.appStore?.getSnapshot().activeTarget),
+                    offMainlineKind: 'assistant',
+                    ...(sessionId ? { sessionId } : {}),
+                    agentId: sessionId ? `assistant:${sessionId}` : 'assistant',
+                    error,
+                });
+                throw error;
+            }
+        };
+
+        const wrappedAssistantRuntime: AssistantRuntimeBridge = {
+            listSessions: () => assistantRunner.listSessions(),
+            getSession: (sessionId) => assistantRunner.getSession(sessionId),
+            createSession: (opts) => assistantRunner.createSession(opts),
+            deleteSession: (sessionId) => assistantRunner.deleteSession(sessionId),
+            updateSessionConfig: (sessionId, patch) =>
+                assistantRunner.updateSessionConfig(sessionId, patch),
+            sendPrompt: (sessionId, prompt, opts) =>
+                runAssistantWithErrorEmit(sessionId, () =>
+                    assistantRunner.sendPrompt(sessionId, prompt, opts),
+                ),
+            editMessage: (sessionId, messageId, newContent) =>
+                assistantRunner.editMessage(sessionId, messageId, newContent),
+            editAndResendMessage: (sessionId, messageId, newContent, opts) =>
+                runAssistantWithErrorEmit(sessionId, () =>
+                    assistantRunner.editAndResendMessage(sessionId, messageId, newContent, opts),
+                ),
+            retractMessage: (sessionId, messageId) =>
+                assistantRunner.retractMessage(sessionId, messageId),
+            regenerateLastMessage: (sessionId, opts) =>
+                runAssistantWithErrorEmit(sessionId, () =>
+                    assistantRunner.regenerateLastMessage(sessionId, opts),
+                ),
+            continueLastMessage: (sessionId, opts) =>
+                runAssistantWithErrorEmit(sessionId, () =>
+                    assistantRunner.continueLastMessage(sessionId, opts),
+                ),
+            abort: (sessionId) => assistantRunner.abort(sessionId),
+            listApprovals: (sessionId) => assistantRunner.listApprovals(sessionId),
+            decideApproval: (approvalId, decision, feedback) =>
+                runAssistantWithErrorEmit(undefined, () =>
+                    assistantRunner.decideApproval(approvalId, decision, feedback),
+                ),
+            retryApproval: (approvalId, feedback) =>
+                runAssistantWithErrorEmit(undefined, () =>
+                    assistantRunner.retryApproval(approvalId, feedback),
+                ),
+            listUndoRecords: (sessionId) => assistantRunner.listUndoRecords(sessionId),
+            applyUndo: (undoId) => assistantRunner.applyUndo(undoId),
+            readPreviewFile: (path) => assistantRunner.readPreviewFile(path),
+            getSessionTokenStatus: (sessionId) => assistantRunner.getSessionTokenStatus(sessionId),
+            compactSession: (sessionId, opts) =>
+                runAssistantWithErrorEmit(sessionId, () =>
+                    assistantRunner.compactSession(sessionId, opts),
+                ),
+            subscribe: (listener) => assistantRunner.subscribe(listener),
+        };
+
         const uiServices = createLiveUiServices({
             bridge,
             store,
             dataCompactor,
             vfs,
             sideGen: sideGenApi,
+            abortSideGen: (reason = 'Stopped from logs') => {
+                rotateSideGenLifecycleAbort(reason);
+                sideGenService.abortAll(reason);
+            },
             assistantRunner,
+            assistantRuntime: wrappedAssistantRuntime,
             traceLogger,
             sandbox,
             toolRegistry,
@@ -2479,12 +2860,12 @@ jQuery(async () => {
             initialBackgroundTasks: barrierCoordinator.listTasks(),
             initialTarget: resolveValidTarget(),
             services: uiServices,
-            assistantRuntime: assistantRunner,
+            assistantRuntime: wrappedAssistantRuntime,
             sideGenRuntime: sideGenApi,
             getHostLuminance: () => bridge.getHostLuminance(),
         });
         runtimeRefs.appStore = appStore;
-        appStore.setAssistantRuntime(assistantRunner);
+        appStore.setAssistantRuntime(wrappedAssistantRuntime);
         appStore.setSideGenRuntime(sideGenApi);
         setDefaultAppStore(appStore);
 
@@ -2528,15 +2909,6 @@ jQuery(async () => {
             isTakeoverActive: () => interceptorHandle.isTakeoverActive(),
         });
         runtimeRefs.companionHooksHandle = companionHooksHandle;
-
-        let sideGenLifecycleController = new AbortController();
-        const rotateSideGenLifecycleAbort = (reason: string): void => {
-            const prev = sideGenLifecycleController;
-            sideGenLifecycleController = new AbortController();
-            if (!prev.signal.aborted) {
-                prev.abort(reason);
-            }
-        };
 
         const sideGenSlashHandle = registerSideGenSlashCommands({
             getSideGen: () => sideGenApi,
@@ -2766,6 +3138,13 @@ jQuery(async () => {
             rehydrateMessageCapsules();
             await syncCustomAndLoreTools();
             await runAutoStorageCompactionIfNeeded();
+            void orchestrator
+                .dispatchHostEvent('chat_changed', {
+                    target: resolveValidTarget(appStore?.getSnapshot().activeTarget),
+                })
+                .catch((err) => {
+                    console.warn('[ST-Agentic] chat_changed event hook error:', err);
+                });
         };
 
         const handleSettingsReloaded = async (): Promise<void> => {
@@ -2793,22 +3172,105 @@ jQuery(async () => {
 
         bridge.setAgenticSettingsReloadHook(handleSettingsReloaded);
 
-        eventSource.on(event_types.CHAT_CHANGED, () => {
+        const buildHostMessageEventPayload = (
+            rawMessageId: unknown,
+        ): Partial<ToolEventPayload> => {
+            const resolvedMsgId =
+                typeof rawMessageId === 'number'
+                && Number.isInteger(rawMessageId)
+                && rawMessageId >= 0
+                    ? rawMessageId
+                    : undefined;
+            const target =
+                resolvedMsgId !== undefined && chat[resolvedMsgId]
+                    ? (() => {
+                        const msg = chat[resolvedMsgId] as { swipe_id?: unknown };
+                        const swipeId =
+                            typeof msg?.swipe_id === 'number'
+                            && Number.isInteger(msg.swipe_id)
+                            && msg.swipe_id >= 0
+                                ? msg.swipe_id
+                                : 0;
+                        return { messageId: resolvedMsgId, swipeId };
+                    })()
+                    : resolveValidTarget(appStore?.getSnapshot().activeTarget);
+            const rawMes =
+                chat[target.messageId] && typeof (chat[target.messageId] as { mes?: unknown }).mes === 'string'
+                    ? ((chat[target.messageId] as { mes: string }).mes)
+                    : undefined;
+            return {
+                target,
+                messageId: target.messageId,
+                swipeId: target.swipeId,
+                ...(rawMes !== undefined ? { output: rawMes } : {}),
+            };
+        };
+
+        let outputUpdatedDispatching = false;
+        const dispatchHostTriggerEvent = (
+            eventType: TriggerEventType,
+            rawMessageId?: unknown,
+        ): void => {
+            if (eventType === 'output_updated') {
+                if (outputUpdatedDispatching) {
+                    return;
+                }
+                outputUpdatedDispatching = true;
+                void orchestrator
+                    .dispatchHostEvent(eventType, buildHostMessageEventPayload(rawMessageId))
+                    .catch((err) => {
+                        console.warn(`[ST-Agentic] ${eventType} event hook error:`, err);
+                    })
+                    .finally(() => {
+                        outputUpdatedDispatching = false;
+                    });
+                return;
+            }
+            void orchestrator
+                .dispatchHostEvent(eventType, buildHostMessageEventPayload(rawMessageId))
+                .catch((err) => {
+                    console.warn(`[ST-Agentic] ${eventType} event hook error:`, err);
+                });
+        };
+
+        const hostEventUnbinders: Array<() => void> = [];
+        const bindHostEvent = (
+            eventName: string | undefined,
+            listener: (...args: unknown[]) => void,
+        ): void => {
+            if (!eventName || typeof eventSource?.on !== 'function') {
+                return;
+            }
+            eventSource.on(eventName, listener);
+            hostEventUnbinders.push(() => {
+                const emitter = eventSource as unknown as {
+                    removeListener?: (evt: string, fn: (...args: unknown[]) => void) => void;
+                    off?: (evt: string, fn: (...args: unknown[]) => void) => void;
+                };
+                if (typeof emitter.removeListener === 'function') {
+                    emitter.removeListener(eventName, listener);
+                } else if (typeof emitter.off === 'function') {
+                    emitter.off(eventName, listener);
+                }
+            });
+        };
+
+        bindHostEvent(event_types.CHAT_CHANGED, () => {
             void handleChatChanged();
         });
-        eventSource.on(event_types.SETTINGS_LOADED, () => {
+        bindHostEvent(event_types.SETTINGS_LOADED, () => {
             void handleSettingsReloaded();
         });
-        eventSource.on(event_types.EXTENSION_SETTINGS_LOADED, () => {
+        bindHostEvent(event_types.EXTENSION_SETTINGS_LOADED, () => {
             void handleSettingsReloaded();
         });
-        eventSource.on(event_types.WORLDINFO_UPDATED, () => {
+        bindHostEvent(event_types.WORLDINFO_UPDATED, () => {
             void syncCustomAndLoreTools();
         });
-        eventSource.on(event_types.WORLDINFO_SETTINGS_UPDATED, () => {
+        bindHostEvent(event_types.WORLDINFO_SETTINGS_UPDATED, () => {
             void syncCustomAndLoreTools();
         });
-        eventSource.on(event_types.MESSAGE_DELETED, (messageId: unknown) => {
+        bindHostEvent(event_types.MESSAGE_DELETED, (messageId: unknown) => {
             const resolvedMsgId =
                 typeof messageId === 'number' && Number.isInteger(messageId) && messageId >= 0
                     ? messageId
@@ -2822,8 +3284,9 @@ jQuery(async () => {
             syncActiveTargetFromChat();
             appStore?.setTraces(traceLogger.listTraces());
             scheduleSideGenUiRefresh();
+            dispatchHostTriggerEvent('message_deleted', resolvedMsgId);
         });
-        eventSource.on(event_types.MESSAGE_SWIPED, (messageId: unknown) => {
+        bindHostEvent(event_types.MESSAGE_SWIPED, (messageId: unknown) => {
             const resolvedMsgId = typeof messageId === 'number' ? messageId : undefined;
             syncActiveTargetFromChat(resolvedMsgId);
             const nextAnchor = appStore.getSnapshot().activeTarget;
@@ -2832,53 +3295,50 @@ jQuery(async () => {
             appStore?.setTraces(traceLogger.listTraces());
             rehydrateMessageCapsules(resolvedMsgId);
             scheduleSideGenUiRefresh(nextAnchor);
+            dispatchHostTriggerEvent('message_swiped', resolvedMsgId);
         });
-        if (event_types.MESSAGE_SWIPE_DELETED) {
-            eventSource.on(event_types.MESSAGE_SWIPE_DELETED, () => {
-                syncActiveTargetFromChat();
-                const nextAnchor = appStore.getSnapshot().activeTarget;
-                rotateSideGenLifecycleAbort('branch_changed');
-                sideGenService.onBranchChanged(nextAnchor, { pruneSiblings: false });
-                scheduleSideGenUiRefresh(nextAnchor);
-            });
-        }
-        eventSource.on(event_types.MESSAGE_RECEIVED, (messageId: unknown) => {
+        bindHostEvent(event_types.MESSAGE_SWIPE_DELETED, () => {
+            syncActiveTargetFromChat();
+            const nextAnchor = appStore.getSnapshot().activeTarget;
+            rotateSideGenLifecycleAbort('branch_changed');
+            sideGenService.onBranchChanged(nextAnchor, { pruneSiblings: false });
+            scheduleSideGenUiRefresh(nextAnchor);
+        });
+        bindHostEvent(event_types.MESSAGE_RECEIVED, (messageId: unknown) => {
             syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
             scheduleSideGenUiRefresh();
             void runAutoStorageCompactionIfNeeded().catch(() => {
                 // Best-effort message-received background compaction.
             });
+            dispatchHostTriggerEvent('message_received', messageId);
         });
-        if (event_types.MESSAGE_SENT) {
-            eventSource.on(event_types.MESSAGE_SENT, (messageId: unknown) => {
-                syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
-                scheduleSideGenUiRefresh();
-            });
-        }
-        eventSource.on(event_types.MESSAGE_UPDATED, (messageId: unknown) => {
+        bindHostEvent(event_types.MESSAGE_SENT, (messageId: unknown) => {
             syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
             scheduleSideGenUiRefresh();
+            dispatchHostTriggerEvent('message_sent', messageId);
         });
-        if (event_types.MESSAGE_EDITED) {
-            eventSource.on(event_types.MESSAGE_EDITED, (messageId: unknown) => {
-                syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
-                scheduleSideGenUiRefresh();
-            });
-        }
-        if (event_types.GENERATION_STOPPED) {
-            eventSource.on(event_types.GENERATION_STOPPED, () => {
-                rotateSideGenLifecycleAbort('generation_stopped');
-                sideGenService.abortAll('generation_stopped');
-                assistantRunner.abort();
-            });
-        }
-        eventSource.on(event_types.APP_READY, () => {
+        bindHostEvent(event_types.MESSAGE_UPDATED, (messageId: unknown) => {
+            syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
+            scheduleSideGenUiRefresh();
+            dispatchHostTriggerEvent('output_updated', messageId);
+        });
+        bindHostEvent(event_types.MESSAGE_EDITED, (messageId: unknown) => {
+            syncActiveTargetFromChat(typeof messageId === 'number' ? messageId : undefined);
+            scheduleSideGenUiRefresh();
+            dispatchHostTriggerEvent('message_edited', messageId);
+        });
+        bindHostEvent(event_types.GENERATION_STOPPED, () => {
+            rotateSideGenLifecycleAbort('generation_stopped');
+            sideGenService.abortAll('generation_stopped');
+            assistantRunner.abort();
+        });
+        bindHostEvent(event_types.APP_READY, () => {
             hostMounts.sync();
             syncActiveTargetFromChat();
             rehydrateMessageCapsules();
             scheduleSideGenUiRefresh();
         });
-        eventSource.on(event_types.EXTENSIONS_FIRST_LOAD, () => {
+        bindHostEvent(event_types.EXTENSIONS_FIRST_LOAD, () => {
             hostMounts.sync();
         });
 
@@ -2888,6 +3348,13 @@ jQuery(async () => {
                 return;
             }
             runtimeDisposed = true;
+            for (const unbind of hostEventUnbinders.splice(0, hostEventUnbinders.length)) {
+                try {
+                    unbind();
+                } catch {
+                    // Ignore listener teardown errors on unload.
+                }
+            }
             assistantRunner.abort();
             assistantRunner.clearSpillStore();
             toolRegistry.clearSpillStore();
@@ -2921,21 +3388,34 @@ jQuery(async () => {
             createSession: (opts) => assistantRunner.createSession(opts),
             updateSession: (sessionId, patch) => assistantRunner.updateSessionConfig(sessionId, patch),
             deleteSession: (sessionId) => assistantRunner.deleteSession(sessionId),
-            send: (sessionId, prompt, opts) => assistantRunner.sendPrompt(sessionId, prompt, opts),
+            send: (sessionId, prompt, opts) =>
+                runAssistantWithErrorEmit(sessionId, () =>
+                    assistantRunner.sendPrompt(sessionId, prompt, opts),
+                ),
             editMessage: (sessionId, messageId, newContent) =>
                 assistantRunner.editMessage(sessionId, messageId, newContent),
             editAndResendMessage: (sessionId, messageId, newContent, opts) =>
-                assistantRunner.editAndResendMessage(sessionId, messageId, newContent, opts),
+                runAssistantWithErrorEmit(sessionId, () =>
+                    assistantRunner.editAndResendMessage(sessionId, messageId, newContent, opts),
+                ),
             retractMessage: (sessionId, messageId) =>
                 assistantRunner.retractMessage(sessionId, messageId),
             regenerateLastMessage: (sessionId, opts) =>
-                assistantRunner.regenerateLastMessage(sessionId, opts),
+                runAssistantWithErrorEmit(sessionId, () =>
+                    assistantRunner.regenerateLastMessage(sessionId, opts),
+                ),
             continueLastMessage: (sessionId, opts) =>
-                assistantRunner.continueLastMessage(sessionId, opts),
+                runAssistantWithErrorEmit(sessionId, () =>
+                    assistantRunner.continueLastMessage(sessionId, opts),
+                ),
             decideApproval: (approvalId, decision, feedback) =>
-                assistantRunner.decideApproval(approvalId, decision, feedback),
+                runAssistantWithErrorEmit(undefined, () =>
+                    assistantRunner.decideApproval(approvalId, decision, feedback),
+                ),
             retryApproval: (approvalId, feedback) =>
-                assistantRunner.retryApproval(approvalId, feedback),
+                runAssistantWithErrorEmit(undefined, () =>
+                    assistantRunner.retryApproval(approvalId, feedback),
+                ),
             undo: (undoId) => assistantRunner.undo(undoId),
             listPendingApprovals: (sessionId) => assistantRunner.listApprovals(sessionId),
             listUndoHistory: (sessionId) => assistantRunner.listUndoRecords(sessionId),
@@ -2962,7 +3442,9 @@ jQuery(async () => {
             pendingDocs.length = 0;
         }
 
-        const publicApi: AgenticPublicApi = {
+        const publicApi: AgenticPublicApi & {
+            clearPromptCaches(): Promise<ClearPromptCachesResult>;
+        } = {
             version: AGENTIC_VERSION,
             events: PROMPT_TRANSFORM_EVENTS,
             getSettings: () => canonicalClone(currentSettings),
@@ -2976,6 +3458,7 @@ jQuery(async () => {
             rerunAfterTurn: async (target, options) => {
                 await uiServices.rerunAfterTurn(target, options);
             },
+            clearPromptCaches: async () => await uiServices.clearAllPromptCaches!(),
             sideGen: sideGenApi,
             assistant: publicAssistantApi,
             docs: docsApi,
@@ -3003,6 +3486,7 @@ jQuery(async () => {
         console.error('[Agentic] Initialization failed:', error);
     }
 });
+}
 
 export type {
     AgenticAssistantPublicApi,
