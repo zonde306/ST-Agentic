@@ -1404,8 +1404,8 @@ describe('ST-Agentic E2E Golden Paths against Real SillyTavern', () => {
 
         // Open console from #extensionsMenu wand button.
         await page.locator('#extensionsMenuButton').click();
-        await page.locator('#agentic_menu_files').waitFor({ state: 'visible', timeout: 5000 });
-        await page.locator('#agentic_menu_files').click();
+        await page.locator('#agentic_menu_assistant').waitFor({ state: 'visible', timeout: 5000 });
+        await page.locator('#agentic_menu_assistant').click();
 
         const dialog = page.locator('dialog#agentic-app');
         await dialog.waitFor({ state: 'visible', timeout: 10000 });

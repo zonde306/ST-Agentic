@@ -503,6 +503,56 @@ export class STHostBridge implements HostBridge {
         return new Map(this.cachedLorebooks);
     }
 
+    /** Clear cached lorebook snapshots and return how many books were cleared. */
+    clearLorebookCache(): number {
+        const count = this.cachedLorebooks.size;
+        this.cachedLorebooks.clear();
+        return count;
+    }
+
+    /**
+     * Safely read SillyTavern's `oai_settings.send_if_empty` text if available on the host,
+     * returning `''` when unavailable or blank.
+     */
+    getSendIfEmpty(): string {
+        try {
+            const holder = globalThis as {
+                SillyTavern?: {
+                    getContext?: () =>
+                        | {
+                              chatCompletionSettings?: { send_if_empty?: unknown };
+                              oai_settings?: { send_if_empty?: unknown };
+                          }
+                        | undefined;
+                };
+                oai_settings?: { send_if_empty?: unknown };
+            };
+            const stCtx = holder.SillyTavern?.getContext?.();
+            const ctxSettings = stCtx?.chatCompletionSettings ?? stCtx?.oai_settings;
+            if (ctxSettings && typeof ctxSettings === 'object') {
+                return typeof ctxSettings.send_if_empty === 'string'
+                    ? ctxSettings.send_if_empty.trim()
+                    : '';
+            }
+            if (holder.oai_settings && typeof holder.oai_settings === 'object') {
+                return typeof holder.oai_settings.send_if_empty === 'string'
+                    ? holder.oai_settings.send_if_empty.trim()
+                    : '';
+            }
+            if (typeof document !== 'undefined' && typeof document.querySelector === 'function') {
+                const textarea = document.querySelector<HTMLTextAreaElement>(
+                    '#send_if_empty_textarea',
+                );
+                if (typeof textarea?.value === 'string') {
+                    return textarea.value.trim();
+                }
+            }
+        } catch {
+            // Ignore host inspection errors and fall back to empty string.
+        }
+        return '';
+    }
+
     getChat(): ChatMessageSnapshot[] {
         if (!Array.isArray(chat)) {
             return [];

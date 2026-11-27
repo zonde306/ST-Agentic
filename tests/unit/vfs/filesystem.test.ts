@@ -301,7 +301,28 @@ describe('VirtualFileSystem', () => {
         expect(await vfs.readFile('/output.md', { target: { messageId: 1, swipeId: 5 } })).toBe('');
 
         // Write, verbatim append (no auto-newline), edit, and delete on exact branch
+        bridge.emittedEvents.length = 0;
         await vfs.writeFile('/output.md', '第一段', { target: { messageId: 1, swipeId: 0 } });
+        expect(bridge.writtenMessages.at(-1)?.options).toEqual({
+            emitEvent: true,
+            emitRenderEvent: true,
+        });
+        expect(bridge.emittedEvents).toEqual([
+            { event: 'MESSAGE_UPDATED', payload: 1 },
+            { event: 'CHARACTER_MESSAGE_RENDERED', payload: 1 },
+        ]);
+
+        bridge.emittedEvents.length = 0;
+        await vfs.writeFile('/output.md', '第一段', {
+            target: { messageId: 1, swipeId: 0 },
+            emitRenderEvent: false,
+        });
+        expect(bridge.writtenMessages.at(-1)?.options).toEqual({
+            emitEvent: true,
+            emitRenderEvent: false,
+        });
+        expect(bridge.emittedEvents).toEqual([{ event: 'MESSAGE_UPDATED', payload: 1 }]);
+
         await vfs.appendFile('/output.md', '，紧接续写。', { target: { messageId: 1, swipeId: 0 } });
         expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe('第一段，紧接续写。');
         expect(bridge.readChatMessage({ messageId: 1, swipeId: 1 })).toBe('reply s1');
@@ -312,8 +333,17 @@ describe('VirtualFileSystem', () => {
         expect(editRes.ok).toBe(true);
         expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe('第一段，原地修正。');
 
+        bridge.emittedEvents.length = 0;
         expect(await vfs.deleteFile('/output.md', { target: { messageId: 1, swipeId: 0 } })).toBe(true);
         expect(bridge.readChatMessage({ messageId: 1, swipeId: 0 })).toBe('');
+        expect(bridge.writtenMessages.at(-1)?.options).toEqual({
+            emitEvent: true,
+            emitRenderEvent: true,
+        });
+        expect(bridge.emittedEvents).toEqual([
+            { event: 'MESSAGE_UPDATED', payload: 1 },
+            { event: 'CHARACTER_MESSAGE_RENDERED', payload: 1 },
+        ]);
 
         // Companion before_turn pre-create buffer when target message doesn't exist yet
         const preTarget = { messageId: 2, swipeId: 0 };

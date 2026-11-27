@@ -531,49 +531,25 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
         ]);
     });
 
-    it('createToolExecutionContext suppresses render events in before_turn/main_turn and emits them in after_turn/interactive', async () => {
+    it('createToolExecutionContext emits MESSAGE_UPDATED and CHARACTER_MESSAGE_RENDERED immediately across before_turn, main_turn, after_turn, and interactive phases', async () => {
         const bridge = setupWorkspaceBridge();
         const store = new ChatDataStore(bridge);
         const vfs = new VirtualFileSystem({ bridge, store });
         const target = { messageId: 1, swipeId: 0 };
         const registry = createBuiltinToolRegistry();
 
-        // 1. main_turn & before_turn suppress CHARACTER_MESSAGE_RENDERED on /output.md writes & append_reply_view
-        for (const phase of ['before_turn', 'main_turn'] as const) {
-            bridge.emittedEvents.length = 0;
-            const ctx = createToolExecutionContext({
-                bridge,
-                store,
-                vfs,
-                target,
-                phase,
-                staged: true,
-                permissions: { read: ['/**'], write: ['/output.md'] },
-            });
-            const writeRes = await registry.executeToolCall(
-                'write_file',
-                { path: '/output.md', content: `${phase} content` },
-                ctx,
-            );
-            expect(writeRes.ok).toBe(true);
-            await ctx.message.appendView('\n[view]');
-            expect(
-                bridge.emittedEvents.some((ev) => ev.event === 'CHARACTER_MESSAGE_RENDERED'),
-            ).toBe(false);
-        }
-
-        // 2. after_turn & omitted phase emit CHARACTER_MESSAGE_RENDERED on write_file & append_reply_view
-        for (const phase of ['after_turn', undefined] as const) {
-            bridge.emittedEvents.length = 0;
+        for (const phase of ['before_turn', 'main_turn', 'after_turn', undefined] as const) {
             const ctx = createToolExecutionContext({
                 bridge,
                 store,
                 vfs,
                 target,
                 ...(phase ? { phase } : {}),
-                staged: phase === 'after_turn',
+                staged: phase !== undefined,
                 permissions: { read: ['/**'], write: ['/output.md'] },
             });
+
+            bridge.emittedEvents.length = 0;
             const writeRes = await registry.executeToolCall(
                 'write_file',
                 { path: '/output.md', content: `${phase ?? 'interactive'} content` },
@@ -581,17 +557,73 @@ describe('ToolRegistry & Built-in VFS / History / Message Tools', () => {
             );
             expect(writeRes.ok).toBe(true);
             expect(bridge.emittedEvents).toContainEqual({
+                event: 'MESSAGE_UPDATED',
+                payload: 1,
+            });
+            expect(bridge.emittedEvents).toContainEqual({
                 event: 'CHARACTER_MESSAGE_RENDERED',
                 payload: 1,
             });
 
             bridge.emittedEvents.length = 0;
-            const viewRes = await registry.executeToolCall(
+            const appendRes = await registry.executeToolCall(
+                'append_file',
+                { path: '/output.md', content: ' + appended' },
+                ctx,
+            );
+            expect(appendRes.ok).toBe(true);
+            expect(bridge.emittedEvents).toContainEqual({
+                event: 'MESSAGE_UPDATED',
+                payload: 1,
+            });
+            expect(bridge.emittedEvents).toContainEqual({
+                event: 'CHARACTER_MESSAGE_RENDERED',
+                payload: 1,
+            });
+
+            bridge.emittedEvents.length = 0;
+            const editRes = await registry.executeToolCall(
+                'edit_file',
+                { path: '/output.md', search: 'appended', replace: 'edited' },
+                ctx,
+            );
+            expect(editRes.ok).toBe(true);
+            expect(bridge.emittedEvents).toContainEqual({
+                event: 'MESSAGE_UPDATED',
+                payload: 1,
+            });
+            expect(bridge.emittedEvents).toContainEqual({
+                event: 'CHARACTER_MESSAGE_RENDERED',
+                payload: 1,
+            });
+
+            bridge.emittedEvents.length = 0;
+            const viewAppendRes = await registry.executeToolCall(
                 'append_reply_view',
                 { text: '<div>status</div>' },
                 ctx,
             );
-            expect(viewRes.ok).toBe(true);
+            expect(viewAppendRes.ok).toBe(true);
+            expect(bridge.emittedEvents).toContainEqual({
+                event: 'MESSAGE_UPDATED',
+                payload: 1,
+            });
+            expect(bridge.emittedEvents).toContainEqual({
+                event: 'CHARACTER_MESSAGE_RENDERED',
+                payload: 1,
+            });
+
+            bridge.emittedEvents.length = 0;
+            const viewReplaceRes = await registry.executeToolCall(
+                'replace_reply_view',
+                { text: '<div>replaced</div>' },
+                ctx,
+            );
+            expect(viewReplaceRes.ok).toBe(true);
+            expect(bridge.emittedEvents).toContainEqual({
+                event: 'MESSAGE_UPDATED',
+                payload: 1,
+            });
             expect(bridge.emittedEvents).toContainEqual({
                 event: 'CHARACTER_MESSAGE_RENDERED',
                 payload: 1,
