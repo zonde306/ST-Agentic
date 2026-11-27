@@ -1568,6 +1568,17 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
             return updatedItem ?? { ...watermarks[0] };
         },
 
+        async clearAllPromptCaches() {
+            const loreWorlds = new Set(
+                loreEntries.map((item) => item.entry.world).filter(Boolean),
+            );
+            return {
+                clearedPrefixes: watermarks.length,
+                clearedVfsCache: files.length,
+                clearedLorebooks: Math.max(1, loreWorlds.size),
+            };
+        },
+
         async getStorageOverview() {
             return { ...storageOverview };
         },
@@ -1624,6 +1635,117 @@ export function createMockUIServices(options: MockUIServicesOptions = {}): Agent
                         && (filter.swipeId === undefined || t.target.swipeId === filter.swipeId),
                 )
                 .map((t) => ({ ...t }));
+        },
+
+        async stopTrace(trace: AgentRunTrace): Promise<boolean> {
+            const now = Date.now();
+            const idx = traces.findIndex((t) => t.runId === trace.runId);
+            const targetTrace = idx >= 0 ? traces[idx] : trace;
+            if (targetTrace.status !== 'running') {
+                return false;
+            }
+            const abortedTrace: AgentRunTrace = {
+                ...targetTrace,
+                status: 'aborted',
+                interruptedReason: 'user_stop',
+                endedAt: now,
+                durationMs: Math.max(targetTrace.durationMs, Math.max(0, now - targetTrace.startedAt)),
+            };
+            if (idx >= 0) {
+                traces[idx] = abortedTrace;
+            }
+            emitEvent({
+                kind: 'trace_recorded',
+                target: { ...abortedTrace.target },
+                timestamp: now,
+                phase: abortedTrace.phase,
+                runId: abortedTrace.runId,
+                agentProfileId: abortedTrace.agentProfileId,
+                trace: { ...abortedTrace },
+            });
+            return true;
+        },
+
+        async continueTrace(
+            trace: AgentRunTrace,
+            continueOptions?: { rollbackLastToolRound?: boolean },
+        ): Promise<void> {
+            const now = Date.now();
+            const idx = traces.findIndex((t) => t.runId === trace.runId);
+            const baseTrace = idx >= 0 ? traces[idx] : trace;
+            const nextSteps =
+                continueOptions?.rollbackLastToolRound && baseTrace.toolSteps.length > 0
+                    ? baseTrace.toolSteps.slice(0, -1)
+                    : [...baseTrace.toolSteps];
+            const resumedTrace: AgentRunTrace = {
+                ...baseTrace,
+                status: 'completed',
+                interruptedReason: undefined,
+                error: undefined,
+                hasRollbackableRound: false,
+                toolSteps: nextSteps,
+                endedAt: now,
+                durationMs: Math.max(baseTrace.durationMs, Math.max(0, now - baseTrace.startedAt)),
+            };
+            if (idx >= 0) {
+                traces[idx] = resumedTrace;
+            }
+            if (resumedTrace.phase === 'main_turn') {
+                emitEvent({
+                    kind: 'turn_resumed',
+                    target: { ...resumedTrace.target },
+                    timestamp: now,
+                    phase: 'main_turn',
+                    runId: resumedTrace.runId,
+                    trace: { ...resumedTrace },
+                });
+            }
+            emitEvent({
+                kind: 'trace_recorded',
+                target: { ...resumedTrace.target },
+                timestamp: now,
+                phase: resumedTrace.phase,
+                runId: resumedTrace.runId,
+                agentProfileId: resumedTrace.agentProfileId,
+                trace: { ...resumedTrace },
+            });
+        },
+
+        async retryTrace(trace: AgentRunTrace): Promise<void> {
+            if (trace.phase === 'after_turn') {
+                const triggerIds = trace.triggerId
+                    ?.split(',')
+                    .map((id) => id.trim())
+                    .filter(Boolean);
+                await this.rerunAfterTurn(
+                    trace.target,
+                    triggerIds && triggerIds.length > 0 ? { triggerIds } : undefined,
+                );
+                return;
+            }
+            const now = Date.now();
+            const idx = traces.findIndex((t) => t.runId === trace.runId);
+            const baseTrace = idx >= 0 ? traces[idx] : trace;
+            const retriedTrace: AgentRunTrace = {
+                ...baseTrace,
+                status: 'completed',
+                interruptedReason: undefined,
+                error: undefined,
+                endedAt: now,
+                durationMs: Math.max(baseTrace.durationMs, Math.max(0, now - baseTrace.startedAt)),
+            };
+            if (idx >= 0) {
+                traces[idx] = retriedTrace;
+            }
+            emitEvent({
+                kind: 'trace_recorded',
+                target: { ...retriedTrace.target },
+                timestamp: now,
+                phase: retriedTrace.phase,
+                runId: retriedTrace.runId,
+                agentProfileId: retriedTrace.agentProfileId,
+                trace: { ...retriedTrace },
+            });
         },
 
         async rerunAfterTurn(

@@ -15,7 +15,12 @@ import {
     importSillyTavernOpenAIPreset,
     isSillyTavernOpenAIPreset,
 } from '@/core/migration';
-import type { AgentProfile, PromptBlock, PromptTriggerType } from '@/core/types';
+import type {
+    AgentProfile,
+    PresetMessageScript,
+    PromptBlock,
+    PromptTriggerType,
+} from '@/core/types';
 import {
     Badge,
     Button,
@@ -32,6 +37,8 @@ import {
     IconArrowDown,
     IconArrowUp,
     IconCheck,
+    IconChevronRight,
+    IconCode,
     IconCopy,
     IconDownload,
     IconPlus,
@@ -388,6 +395,69 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
     const [exportOpen, setExportOpen] = useState(false);
     const [exportBlock, setExportBlock] = useState<PromptBlock | null>(null);
 
+    // Preset-level message pre/post-process script modal state
+    const [scriptModalKind, setScriptModalKind] = useState<'preprocess' | 'postprocess' | null>(
+        null,
+    );
+    const [scriptDraftEnabled, setScriptDraftEnabled] = useState(false);
+    const [scriptDraftTriggers, setScriptDraftTriggers] = useState<PromptTriggerType[]>([]);
+    const [scriptDraftCode, setScriptDraftCode] = useState('');
+
+    const preprocessScriptActive = Boolean(
+        activePreset.preprocessScript?.enabled && activePreset.preprocessScript.code.trim(),
+    );
+    const postprocessScriptActive = Boolean(
+        activePreset.postprocessScript?.enabled && activePreset.postprocessScript.code.trim(),
+    );
+
+    const openScriptModal = (kind: 'preprocess' | 'postprocess') => {
+        const existing =
+            kind === 'preprocess'
+                ? activePreset.preprocessScript
+                : activePreset.postprocessScript;
+        setScriptDraftEnabled(existing?.enabled ?? false);
+        setScriptDraftTriggers(existing?.triggers ? [...existing.triggers] : []);
+        setScriptDraftCode(existing?.code ?? '');
+        setScriptModalKind(kind);
+    };
+
+    const handleSaveScriptModal = () => {
+        if (!scriptModalKind) {
+            return;
+        }
+        const targetPresetId = activePreset.id;
+        const fieldKey =
+            scriptModalKind === 'preprocess' ? 'preprocessScript' : 'postprocessScript';
+        const nextScript: PresetMessageScript = {
+            enabled: scriptDraftEnabled,
+            code: scriptDraftCode,
+            ...(scriptDraftTriggers.length > 0 ? { triggers: [...scriptDraftTriggers] } : {}),
+        };
+        void store.updateSettings((prev) => {
+            const preset = prev.presets[targetPresetId];
+            if (!preset) {
+                return prev;
+            }
+            return {
+                ...prev,
+                presets: {
+                    ...prev.presets,
+                    [targetPresetId]: {
+                        ...preset,
+                        [fieldKey]: nextScript,
+                    },
+                },
+            };
+        });
+        store.pushToast(
+            scriptModalKind === 'preprocess'
+                ? '已保存预设消息预处理脚本'
+                : '已保存预设消息后处理脚本',
+            'success',
+        );
+        setScriptModalKind(null);
+    };
+
     const mutateActiveAgentBlocks = (
         updater: (blocks: PromptBlock[]) => PromptBlock[],
     ): void => {
@@ -721,16 +791,53 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                             </div>
                         </div>
 
-                        {agentOptions.length > 0 ? (
-                            <div style={{ minWidth: '180px', maxWidth: '100%' }}>
-                                <SelectInput
-                                    ariaLabel="选择目标智能体"
-                                    value={activeAgent?.id ?? ''}
-                                    options={agentOptions}
-                                    onChange={(id) => setSelectedAgentId(id)}
-                                />
-                            </div>
-                        ) : null}
+                        <div class="ag-row-wrap" style={{ alignItems: 'center', gap: '8px' }}>
+                            <Button
+                                size="sm"
+                                variant="secondary"
+                                active={preprocessScriptActive}
+                                icon={<IconCode size={14} />}
+                                className="ag-preset-preprocess-btn"
+                                ariaLabel="消息预处理"
+                                title="配置预设级消息预处理脚本（发给 LLM 前）"
+                                onClick={() => openScriptModal('preprocess')}
+                            >
+                                <span class="ag-row" style={{ gap: '6px' }}>
+                                    <span>消息预处理</span>
+                                    {preprocessScriptActive ? (
+                                        <Badge tone="success">已启用</Badge>
+                                    ) : null}
+                                </span>
+                            </Button>
+                            <Button
+                                size="sm"
+                                variant="secondary"
+                                active={postprocessScriptActive}
+                                icon={<IconCode size={14} />}
+                                className="ag-preset-postprocess-btn"
+                                ariaLabel="消息后处理"
+                                title="配置预设级消息后处理脚本（收到 LLM 返回时）"
+                                onClick={() => openScriptModal('postprocess')}
+                            >
+                                <span class="ag-row" style={{ gap: '6px' }}>
+                                    <span>消息后处理</span>
+                                    {postprocessScriptActive ? (
+                                        <Badge tone="success">已启用</Badge>
+                                    ) : null}
+                                </span>
+                            </Button>
+
+                            {agentOptions.length > 0 ? (
+                                <div style={{ minWidth: '180px', maxWidth: '100%' }}>
+                                    <SelectInput
+                                        ariaLabel="选择目标智能体"
+                                        value={activeAgent?.id ?? ''}
+                                        options={agentOptions}
+                                        onChange={(id) => setSelectedAgentId(id)}
+                                    />
+                                </div>
+                            ) : null}
+                        </div>
                     </div>
 
                     {/* Prompt List Card */}
@@ -1415,6 +1522,125 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                         showToolbar={false}
                         value={exportJsonText}
                         onChange={() => {}}
+                    />
+                </div>
+            </ShadowModal>
+
+            {/* Preset Message Preprocess / Postprocess Script ShadowModal */}
+            <ShadowModal
+                open={scriptModalKind !== null}
+                title={
+                    scriptModalKind === 'preprocess'
+                        ? '消息预处理脚本（发给 LLM 前）'
+                        : '消息后处理脚本（收到 LLM 返回时）'
+                }
+                maxWidth="700px"
+                onClose={() => setScriptModalKind(null)}
+                footer={
+                    <div class="ag-row-wrap" style={{ justifyContent: 'flex-end' }}>
+                        <Button variant="secondary" onClick={() => setScriptModalKind(null)}>
+                            取消
+                        </Button>
+                        <Button
+                            variant="primary"
+                            icon={<IconCheck size={14} />}
+                            onClick={handleSaveScriptModal}
+                        >
+                            保存
+                        </Button>
+                    </div>
+                }
+            >
+                <div class="ag-stack-v">
+                    <ToggleSwitch
+                        checked={scriptDraftEnabled}
+                        onChange={setScriptDraftEnabled}
+                        label={scriptDraftEnabled ? '已启用脚本' : '已停用脚本'}
+                        description={
+                            scriptModalKind === 'preprocess'
+                                ? '仅修改本次发送给模型的临时消息与请求体，不会破坏持久化历史或 KV 前缀。'
+                                : '在收到模型返回后运行，可改写响应文本/工具调用，或触发自动重试与自我修正。'
+                        }
+                    />
+
+                    <FormField
+                        label="触发场景过滤（可选）"
+                        hint="默认留空即全部场景生效；勾选后仅在匹配场景中执行此脚本。"
+                    >
+                        <PromptTriggerPicker
+                            value={scriptDraftTriggers}
+                            onChange={setScriptDraftTriggers}
+                            presetTriggers={activePreset.triggers}
+                        />
+                    </FormField>
+
+                    <details class="ag-round-reasoning">
+                        <summary>
+                            <IconChevronRight size={12} />
+                            <span>ctx 变量速查提示</span>
+                        </summary>
+                        {scriptModalKind === 'preprocess' ? (
+                            <div class="ag-stack-v" style={{ gap: '4px', paddingTop: '4px' }}>
+                                <div>
+                                    <code class="ag-mono">ctx.messages</code>：临时消息控制器（
+                                    <code class="ag-mono">list()</code> /{' '}
+                                    <code class="ag-mono">set(msgs)</code> /{' '}
+                                    <code class="ag-mono">rollbackToolRounds(n)</code> /{' '}
+                                    <code class="ag-mono">dropHistoryTurns(n)</code> /{' '}
+                                    <code class="ag-mono">replaceContent(sel, fn)</code> /{' '}
+                                    <code class="ag-mono">appendHint(text, role)</code>）
+                                </div>
+                                <div>
+                                    <code class="ag-mono">ctx.body</code>：可写请求体浅拷贝（如{' '}
+                                    <code class="ag-mono">ctx.body.temperature = 0.6</code>）
+                                </div>
+                                <div>
+                                    <code class="ag-mono">ctx.event.data.layers</code>：分层边界索引（
+                                    <code class="ag-mono">layer0End</code> /{' '}
+                                    <code class="ag-mono">layer1End</code> /{' '}
+                                    <code class="ag-mono">turnStart</code> /{' '}
+                                    <code class="ag-mono">floatingTailStart</code>）
+                                </div>
+                                <div>
+                                    <code class="ag-mono">ctx.vars</code>：读取或写入当前对话变量（
+                                    <code class="ag-mono">await ctx.vars.get(key)</code>）
+                                </div>
+                            </div>
+                        ) : (
+                            <div class="ag-stack-v" style={{ gap: '4px', paddingTop: '4px' }}>
+                                <div>
+                                    <code class="ag-mono">ctx.output</code>：可写模型返回对象（
+                                    <code class="ag-mono">ctx.output.text</code> /{' '}
+                                    <code class="ag-mono">ctx.output.content</code> /{' '}
+                                    <code class="ag-mono">ctx.output.reasoningContent</code> /{' '}
+                                    <code class="ag-mono">ctx.output.toolCalls</code>）
+                                </div>
+                                <div>
+                                    <code class="ag-mono">ctx.control.retry(reason?)</code>：按连接重试策略重新请求本轮
+                                </div>
+                                <div>
+                                    <code class="ag-mono">ctx.control.requestFix(message)</code>：附加修正要求进入下一轮自我修正
+                                </div>
+                                <div>
+                                    <code class="ag-mono">ctx.vars</code> /{' '}
+                                    <code class="ag-mono">ctx.event</code>：访问当前变量与本轮元数据
+                                </div>
+                            </div>
+                        )}
+                    </details>
+
+                    <CodeEditor
+                        label={`脚本代码 (${scriptDraftCode.length} 字符)`}
+                        languageHint="javascript"
+                        rows={10}
+                        minHeight="220px"
+                        value={scriptDraftCode}
+                        placeholder={
+                            scriptModalKind === 'preprocess'
+                                ? '// 发给 LLM 前运行（仅修改本次临时请求，不影响持久化历史）\n// ctx.messages.appendHint("请保持客观克制");\n// ctx.body.temperature = 0.7;'
+                                : '// 收到 LLM 返回时运行\n// if (!ctx.output.content?.trim() && !ctx.output.toolCalls?.length) {\n//   ctx.control.retry("empty_output");\n// }'
+                        }
+                        onChange={setScriptDraftCode}
                     />
                 </div>
             </ShadowModal>

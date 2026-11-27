@@ -304,6 +304,12 @@ export interface ImportPresetResult {
     message: string;
 }
 
+export interface ClearPromptCachesResult {
+    clearedPrefixes: number;
+    clearedVfsCache: number;
+    clearedLorebooks: number;
+}
+
 /**
  * Abstract UI Service Adapter decoupling UI components from SillyTavern host
  * and runtime storage implementations (`dev:ui` uses mock implementation).
@@ -330,6 +336,7 @@ export interface AgenticUIServices {
     // Watermark & Cold-layer Compaction (View 3)
     getWatermarkStatuses(): Promise<AgentWatermarkStatus[]>;
     compactAgentContext(agentId: string): Promise<AgentWatermarkStatus>;
+    clearAllPromptCaches?(): Promise<ClearPromptCachesResult>;
     getStorageOverview(): Promise<StorageOverview>;
     previewColdCompaction(keepDepth?: number): Promise<CompactionReport>;
     runColdCompaction(keepDepth?: number): Promise<CompactionReport>;
@@ -337,6 +344,12 @@ export interface AgenticUIServices {
     // Traces & Execution Actions (View 2 & Capsule / Magic Menu)
     listTraces(filter?: { messageId?: number; swipeId?: number }): Promise<AgentRunTrace[]>;
     clearTraces?(): Promise<void>;
+    stopTrace?(trace: AgentRunTrace): Promise<boolean> | boolean;
+    continueTrace?(
+        trace: AgentRunTrace,
+        options?: { rollbackLastToolRound?: boolean },
+    ): Promise<void>;
+    retryTrace?(trace: AgentRunTrace): Promise<void>;
     rerunAfterTurn(target?: MessageTarget, options?: { triggerIds?: string[]; force?: boolean }): Promise<void>;
     resumeTurn?(target: MessageTarget): Promise<void>;
     cancelBackgroundTask(taskId: string): Promise<void>;

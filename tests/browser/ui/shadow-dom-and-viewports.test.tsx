@@ -1757,16 +1757,26 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
             expect(retryHistoryCard!.textContent).toContain('EMPTY_RESPONSE');
             expect(retryHistoryCard!.textContent).toContain('含思考内容');
 
-            const rerunBtn = shadowRoot.querySelector(
-                'button.ag-log-rerun-btn',
+            const recoveryMainBtn = shadowRoot.querySelector(
+                '.ag-log-recovery-btn .ag-split-btn-main',
             ) as HTMLButtonElement | null;
-            expect(rerunBtn, `${vp.label}: expected manual rerun button`).toBeTruthy();
-            expect(rerunBtn!.textContent).toContain('重试此触发器');
+            const recoveryCaretBtn = shadowRoot.querySelector(
+                '.ag-log-recovery-btn .ag-split-btn-caret',
+            ) as HTMLButtonElement | null;
+            expect(recoveryMainBtn, `${vp.label}: expected recovery split main button`).toBeTruthy();
+            expect(recoveryCaretBtn, `${vp.label}: expected recovery split caret button`).toBeTruthy();
+            expect(recoveryMainBtn!.textContent).toContain('继续');
 
             assertNoHorizontalOverflow(dialog, shadowRoot, `${vp.label}:logs:retry_detail`);
             assertInteractiveTargetsAndTypography(shadowRoot, `${vp.label}:logs:retry_detail`);
 
-            rerunBtn!.click();
+            recoveryCaretBtn!.click();
+            await settleLayout(4);
+            const retryMenuItem = shadowRoot.querySelector(
+                '[data-menu-item-id="retry"]',
+            ) as HTMLButtonElement | null;
+            expect(retryMenuItem, `${vp.label}: expected retry menu item`).toBeTruthy();
+            retryMenuItem!.click();
             await vi.waitFor(() => {
                 expect(rerunCalls).toHaveLength(1);
             });
@@ -2025,17 +2035,17 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
             expect(getUnrecoveredItem()!.getAttribute('data-log-superseded')).toBeNull();
             expect(getUnrecoveredItem()!.textContent).not.toContain('已重跑');
 
-            // Select superseded old error -> shows 已重跑 in detail and secondary button
+            // Select superseded old error -> shows 已重跑 in detail and secondary SplitActionButton
             getOldItem()!.click();
             await settleLayout(5);
-            const oldRerunBtn = shadowRoot.querySelector(
-                'button.ag-log-rerun-btn',
+            const oldRecoveryBtn = shadowRoot.querySelector(
+                '.ag-log-recovery-btn .ag-split-btn-main',
             ) as HTMLButtonElement | null;
-            expect(oldRerunBtn).toBeTruthy();
-            expect(oldRerunBtn!.textContent).toContain('重试此触发器');
-            expect(oldRerunBtn!.classList.contains('ag-btn-secondary')).toBe(true);
+            expect(oldRecoveryBtn).toBeTruthy();
+            expect(oldRecoveryBtn!.textContent).toContain('继续');
+            expect(oldRecoveryBtn!.classList.contains('ag-btn-secondary')).toBe(true);
 
-            // Select newer completed trace -> button says "重跑此触发器" (secondary)
+            // Select newer completed trace -> simple button says "重跑此触发器" (secondary)
             await returnToListIfMobile();
             getNewItem()!.click();
             await settleLayout(5);
@@ -2046,15 +2056,15 @@ describe('Shadow DOM Isolation, Keyboard Guardrail & Dual-Viewport UI Contract',
             expect(newRerunBtn!.textContent).toContain('重跑此触发器');
             expect(newRerunBtn!.classList.contains('ag-btn-secondary')).toBe(true);
 
-            // Select unrecovered error trace -> button says "重试此触发器" (primary)
+            // Select unrecovered error trace -> SplitActionButton main button is primary
             await returnToListIfMobile();
             getUnrecoveredItem()!.click();
             await settleLayout(5);
             const unrecoveredBtn = shadowRoot.querySelector(
-                'button.ag-log-rerun-btn',
+                '.ag-log-recovery-btn .ag-split-btn-main',
             ) as HTMLButtonElement | null;
             expect(unrecoveredBtn).toBeTruthy();
-            expect(unrecoveredBtn!.textContent).toContain('重试此触发器');
+            expect(unrecoveredBtn!.textContent).toContain('继续');
             expect(unrecoveredBtn!.classList.contains('ag-btn-primary')).toBe(true);
         }
     });

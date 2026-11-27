@@ -1,6 +1,8 @@
+import { Fragment } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type {
     AgentRunTrace,
+    AssistantRoundLog,
     CanonicalToolCall,
     PipelinePhase,
     ToolStepLog,
@@ -13,6 +15,8 @@ import {
     MasterDetailLayout,
     SegmentedControl,
     SelectInput,
+    SplitActionButton,
+    type SplitActionMenuItem,
     TextInput,
 } from '@/ui/components';
 import {
@@ -21,9 +25,12 @@ import {
     IconCheck,
     IconChevronRight,
     IconCopy,
+    IconPlay,
     IconRefresh,
+    IconStop,
     IconTerminal,
     IconTrash,
+    IconUndo,
 } from '@/ui/components/Icons';
 import type { ConsoleViewProps } from '@/ui/store';
 import {
@@ -240,7 +247,43 @@ export function computeSupersededRunIds(
     return superseded;
 }
 
-function matchesSearch(trace: AgentRunTrace, query: string): boolean {
+export function resolveTraceAssistantSummary(trace: AgentRunTrace): string | null {
+    if (typeof trace.assistantSummary === 'string') {
+        return trace.assistantSummary.trim() ? trace.assistantSummary : null;
+    }
+    // New-format traces carry `assistantRounds`; when `assistantSummary` is absent,
+    // do not fall back to intermediate-round `outputPreview`.
+    if (trace.assistantRounds !== undefined) {
+        return null;
+    }
+    if (typeof trace.outputPreview === 'string' && trace.outputPreview.trim()) {
+        return trace.outputPreview;
+    }
+    return null;
+}
+
+export function getRenderableRoundParts(
+    round: AssistantRoundLog,
+    trace: AgentRunTrace,
+): { reasoning: string | null; content: string | null } {
+    const reasoning = round.reasoning?.trim() ? round.reasoning : null;
+    const rawContent = round.content?.trim() ? round.content : null;
+    const resolvedSummary = resolveTraceAssistantSummary(trace);
+    const isClosingContent =
+        Boolean(round.isFinishTurn)
+        || (
+            round.beforeStepIndex >= trace.toolSteps.length
+            && resolvedSummary !== null
+            && rawContent !== null
+            && rawContent.trim() === resolvedSummary.trim()
+        );
+    return {
+        reasoning,
+        content: isClosingContent ? null : rawContent,
+    };
+}
+
+export function matchesTraceSearch(trace: AgentRunTrace, query: string): boolean {
     if (!query) {
         return true;
     }
@@ -252,9 +295,16 @@ function matchesSearch(trace: AgentRunTrace, query: string): boolean {
         || trace.runId.toLowerCase().includes(q)
         || (trace.triggerLabel?.toLowerCase().includes(q) ?? false)
         || (trace.lorebookNames?.some((name) => name.toLowerCase().includes(q)) ?? false)
+        || (trace.assistantSummary?.toLowerCase().includes(q) ?? false)
         || (trace.outputPreview?.toLowerCase().includes(q) ?? false)
         || (trace.error?.toLowerCase().includes(q) ?? false)
         || (trace.retryEvents?.some((ev) => ev.reason.toLowerCase().includes(q)) ?? false)
+        || (trace.assistantRounds?.some(
+            (round) =>
+                (round.reasoning?.toLowerCase().includes(q) ?? false)
+                || (round.content?.toLowerCase().includes(q) ?? false)
+                || (round.finishTurnSummary?.toLowerCase().includes(q) ?? false),
+        ) ?? false)
         || `#${trace.target.messageId}`.includes(q)
     ) {
         return true;
@@ -285,7 +335,8 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
     const [detailTab, setDetailTab] = useState<DetailViewTab>('steps');
     const [refreshing, setRefreshing] = useState(false);
     const [rerunningRunId, setRerunningRunId] = useState<string | null>(null);
-    const [resumingRunId, setResumingRunId] = useState<string | null>(null);
+    const [continuingRunId, setContinuingRunId] = useState<string | null>(null);
+    const [stoppingRunId, setStoppingRunId] = useState<string | null>(null);
 
     const lastDeepLinkSigRef = useRef<string>('');
     const didAutoLoadRef = useRef(false);
@@ -383,7 +434,7 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             if (phaseFilter !== 'all' && trace.phase !== phaseFilter) {
                 return false;
             }
-            return matchesSearch(trace, searchQuery.trim());
+            return matchesTraceSearch(trace, searchQuery.trim());
         });
     }, [messageFilter, phaseFilter, searchQuery, traces]);
 
@@ -512,8 +563,129 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
         );
     };
 
+    const handleCopyPlainText = async (label: string, text: string) => {
+        const ok = await copyTextToClipboard(text);
+        store.pushToast(
+            ok ? `已复制 ${label} 到剪贴板` : '剪贴板不可用，复制失败',
+            ok ? 'success' : 'warning',
+        );
+    };
+
+    const handleStopTrace = async (trace: AgentRunTrace) => {
+        if (stoppingRunId === trace.runId) {
+            return;
+        }
+        setStoppingRunId(trace.runId);
+        try {
+            if (store.services.stopTrace) {
+                const stopped = await store.services.stopTrace(trace);
+                store.pushToast(
+                    stopped ? '已发送停止信号' : '当前任务已结束或无法停止',
+                    'warning',
+                );
+                await store.refreshTraces().catch(() => {});
+            } else if (trace.taskId) {
+                await store.cancelBackgroundTask(trace.taskId);
+                await store.refreshTraces().catch(() => {});
+            } else {
+                store.pushToast('当前运行时不支持停止该运行任务', 'warning');
+            }
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            store.pushToast(`停止运行失败：${msg}`, 'error');
+        } finally {
+            setStoppingRunId((prev) => (prev === trace.runId ? null : prev));
+        }
+    };
+
+    const handleContinueTrace = async (
+        trace: AgentRunTrace,
+        options?: { rollbackLastToolRound?: boolean },
+    ) => {
+        if (continuingRunId || rerunningRunId) {
+            return;
+        }
+        setContinuingRunId(trace.runId);
+        try {
+            if (store.services.continueTrace) {
+                await store.services.continueTrace(trace, options);
+                await store.refreshTraces().catch(() => {});
+            } else if (!options?.rollbackLastToolRound && store.services.resumeTurn) {
+                await store.resumeTurn(trace.target);
+                await store.refreshTraces().catch(() => {});
+            } else {
+                store.pushToast(
+                    options?.rollbackLastToolRound
+                        ? '当前运行时不支持回退工具轮并重试'
+                        : '当前运行时不支持断点继续',
+                    'warning',
+                );
+            }
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            store.pushToast(
+                options?.rollbackLastToolRound
+                    ? `回退并重试失败：${msg}`
+                    : `继续执行失败：${msg}`,
+                'error',
+            );
+        } finally {
+            setContinuingRunId((prev) => (prev === trace.runId ? null : prev));
+        }
+    };
+
+    const handleRetryTrace = async (trace: AgentRunTrace) => {
+        if (continuingRunId || rerunningRunId) {
+            return;
+        }
+        const prevRunIds = new Set(store.getSnapshot().traces.map((t) => t.runId));
+        setContinuingRunId(trace.runId);
+        try {
+            if (store.services.retryTrace) {
+                await store.services.retryTrace(trace);
+                await store.refreshTraces().catch(() => {});
+            } else if (trace.phase === 'after_turn') {
+                const triggerIds = trace.triggerId
+                    ?.split(',')
+                    .map((id) => id.trim())
+                    .filter(Boolean);
+                await store.rerunAfterTurn(
+                    trace.target,
+                    triggerIds && triggerIds.length > 0
+                        ? {
+                              triggerIds,
+                              label: trace.triggerLabel ?? trace.agentName,
+                          }
+                        : undefined,
+                );
+                await store.refreshTraces().catch(() => {});
+            } else {
+                store.pushToast('当前运行时不支持整轮重试', 'warning');
+                return;
+            }
+            const newestTrace = store
+                .getSnapshot()
+                .traces.find(
+                    (t) =>
+                        !prevRunIds.has(t.runId)
+                        && t.target.messageId === trace.target.messageId
+                        && t.target.swipeId === trace.target.swipeId
+                        && t.phase === trace.phase,
+                );
+            if (newestTrace) {
+                setSelectedRunId(newestTrace.runId);
+                setHighlightedStepKey(null);
+            }
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            store.pushToast(`重试失败：${msg}`, 'error');
+        } finally {
+            setContinuingRunId((prev) => (prev === trace.runId ? null : prev));
+        }
+    };
+
     const handleRerunTrace = async (trace: AgentRunTrace) => {
-        if (rerunningRunId) {
+        if (rerunningRunId || continuingRunId) {
             return;
         }
         const prevRunIds = new Set(store.getSnapshot().traces.map((t) => t.runId));
@@ -551,22 +723,6 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             store.pushToast(`重新运行触发器失败：${msg}`, 'error');
         } finally {
             setRerunningRunId((prev) => (prev === trace.runId ? null : prev));
-        }
-    };
-
-    const handleResumeTrace = async (trace: AgentRunTrace) => {
-        if (resumingRunId || !store.services.resumeTurn) {
-            return;
-        }
-        setResumingRunId(trace.runId);
-        try {
-            await store.resumeTurn(trace.target);
-            await store.refreshTraces().catch(() => {});
-        } catch (error) {
-            const msg = error instanceof Error ? error.message : String(error);
-            store.pushToast(`继续生成失败：${msg}`, 'error');
-        } finally {
-            setResumingRunId((prev) => (prev === trace.runId ? null : prev));
         }
     };
 
@@ -861,6 +1017,16 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             durationMs: selectedTrace.durationMs,
             usage: selectedTrace.usage,
             toolSteps: selectedTrace.toolSteps,
+            ...(selectedTrace.assistantRounds?.length
+                ? { assistantRounds: selectedTrace.assistantRounds }
+                : {}),
+            ...(selectedTrace.assistantSummary !== undefined
+                ? { assistantSummary: selectedTrace.assistantSummary }
+                : {}),
+            ...(selectedTrace.taskId ? { taskId: selectedTrace.taskId } : {}),
+            ...(selectedTrace.hasRollbackableRound !== undefined
+                ? { hasRollbackableRound: selectedTrace.hasRollbackableRound }
+                : {}),
             ...(selectedTrace.retryCount !== undefined
                 ? { retryCount: selectedTrace.retryCount }
                 : {}),
@@ -875,25 +1041,100 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
             requestSnapshot: selectedTrace.requestSnapshot,
         };
 
-        const isAfterTurnRerunnable = selectedTrace.phase === 'after_turn';
-        const isMainTurnResumable =
-            selectedTrace.phase === 'main_turn'
-            && selectedTrace.status === 'interrupted'
-            && Boolean(store.services.resumeTurn);
-        const isRerunningThis = rerunningRunId === selectedTrace.runId;
-        const isResumingThis = resumingRunId === selectedTrace.runId;
         const isSelectedSuperseded = supersededRunIds.has(selectedTrace.runId);
-        const isFailedOrAborted =
+        const isRunningOrBusy =
+            selectedTrace.status === 'running'
+            || continuingRunId === selectedTrace.runId
+            || rerunningRunId === selectedTrace.runId;
+        const isRecoverableStatus =
             selectedTrace.status === 'error'
-            || selectedTrace.status === 'aborted'
-            || selectedTrace.status === 'interrupted';
-        const rerunLabel = selectedTrace.triggerId
-            ? isFailedOrAborted
-                ? '重试此触发器'
-                : '重跑此触发器'
-            : '重跑后置触发';
-        const rerunVariant =
-            isFailedOrAborted && !isSelectedSuperseded ? 'primary' : 'secondary';
+            || selectedTrace.status === 'interrupted'
+            || selectedTrace.status === 'aborted';
+        const isCompletedAfterTurn =
+            selectedTrace.phase === 'after_turn' && selectedTrace.status === 'completed';
+        const completedRerunLabel = selectedTrace.triggerId ? '重跑此触发器' : '重跑后置触发';
+        const canRollbackLastRound = Boolean(
+            selectedTrace.hasRollbackableRound || selectedTrace.toolSteps.length > 0,
+        );
+        const recoveryMenuItems: SplitActionMenuItem[] = [
+            {
+                id: 'rollback_retry',
+                label: '回退并重试',
+                description: '回退最近 1 轮工具调用及暂存状态后继续',
+                icon: <IconUndo size={14} />,
+                disabled: !canRollbackLastRound,
+                title: canRollbackLastRound
+                    ? '回退最近 1 轮工具调用及暂存状态后继续'
+                    : '尚无已完成工具轮可回退',
+                onClick: () =>
+                    void handleContinueTrace(selectedTrace, { rollbackLastToolRound: true }),
+            },
+            {
+                id: 'retry',
+                label: '重试',
+                description: '清空断点，整轮从头重跑',
+                icon: <IconRefresh size={14} />,
+                tone: 'danger',
+                onClick: () => void handleRetryTrace(selectedTrace),
+            },
+        ];
+
+        const resolvedSummary = resolveTraceAssistantSummary(selectedTrace);
+        const roundsBeforeStep = new Map<number, AssistantRoundLog[]>();
+        const trailingRounds: AssistantRoundLog[] = [];
+        for (const round of selectedTrace.assistantRounds ?? []) {
+            if (selectedTrace.toolSteps.length === 0 || round.beforeStepIndex >= selectedTrace.toolSteps.length) {
+                trailingRounds.push(round);
+            } else {
+                const bucketIndex = Math.max(0, round.beforeStepIndex);
+                const list = roundsBeforeStep.get(bucketIndex);
+                if (list) {
+                    list.push(round);
+                } else {
+                    roundsBeforeStep.set(bucketIndex, [round]);
+                }
+            }
+        }
+
+        const renderRoundInterlude = (round: AssistantRoundLog, keySuffix: string) => {
+            const { reasoning, content } = getRenderableRoundParts(round, selectedTrace);
+            if (!reasoning && !content) {
+                return null;
+            }
+            return (
+                <div
+                    key={`${selectedTrace.runId}_round_${round.roundIndex}_${keySuffix}`}
+                    class="ag-round-interlude"
+                    data-log-round-interlude={round.roundIndex}
+                    data-before-step-index={round.beforeStepIndex}
+                >
+                    <div class="ag-round-interlude-header">
+                        <span class="ag-row" style={{ gap: '6px' }}>
+                            <Badge tone="neutral">Round #{round.roundIndex + 1}</Badge>
+                            <span>模型轮次</span>
+                        </span>
+                        {round.timestamp ? (
+                            <span class="ag-mono">{formatTimestamp(round.timestamp)}</span>
+                        ) : null}
+                    </div>
+                    {reasoning ? (
+                        <details class="ag-round-reasoning">
+                            <summary>
+                                <IconChevronRight size={12} />
+                                <span>模型思考 (reasoning · {reasoning.length} 字)</span>
+                            </summary>
+                            <div>{reasoning}</div>
+                        </details>
+                    ) : null}
+                    {content ? (
+                        <div class="ag-round-content">
+                            <div class="ag-field-label">模型中间输出 (content)</div>
+                            <div>{content}</div>
+                        </div>
+                    ) : null}
+                </div>
+            );
+        };
 
         return (
             <div
@@ -954,32 +1195,48 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                             </div>
 
                             <div class="ag-card-actions">
-                                {isAfterTurnRerunnable ? (
+                                {isRunningOrBusy ? (
                                     <Button
                                         size="sm"
-                                        variant={rerunVariant}
+                                        variant="danger"
+                                        icon={<IconStop size={14} />}
+                                        loading={stoppingRunId === selectedTrace.runId}
+                                        ariaLabel="停止运行"
+                                        title="发送中断信号以停止当前运行"
+                                        className="ag-log-stop-btn"
+                                        onClick={() => void handleStopTrace(selectedTrace)}
+                                    >
+                                        停止
+                                    </Button>
+                                ) : isRecoverableStatus ? (
+                                    <SplitActionButton
+                                        label="继续"
+                                        icon={<IconPlay size={14} />}
+                                        variant={!isSelectedSuperseded ? 'primary' : 'secondary'}
+                                        size="sm"
+                                        disabled={
+                                            continuingRunId !== null || rerunningRunId !== null
+                                        }
+                                        ariaLabel="继续"
+                                        menuAriaLabel="更多恢复操作"
+                                        title="从断点继续执行当前回合"
+                                        className="ag-log-recovery-btn"
+                                        onClick={() => void handleContinueTrace(selectedTrace)}
+                                        menuItems={recoveryMenuItems}
+                                    />
+                                ) : isCompletedAfterTurn ? (
+                                    <Button
+                                        size="sm"
+                                        variant="secondary"
                                         icon={<IconRefresh size={14} />}
-                                        loading={isRerunningThis}
-                                        disabled={rerunningRunId !== null || selectedTrace.status === 'running'}
-                                        ariaLabel={rerunLabel}
+                                        disabled={
+                                            rerunningRunId !== null || continuingRunId !== null
+                                        }
+                                        ariaLabel={completedRerunLabel}
                                         className="ag-log-rerun-btn"
                                         onClick={() => void handleRerunTrace(selectedTrace)}
                                     >
-                                        {isRerunningThis ? '重跑中...' : rerunLabel}
-                                    </Button>
-                                ) : null}
-                                {isMainTurnResumable ? (
-                                    <Button
-                                        size="sm"
-                                        variant="primary"
-                                        icon={<IconRefresh size={14} />}
-                                        loading={isResumingThis}
-                                        disabled={isResumingThis}
-                                        ariaLabel="继续生成"
-                                        className="ag-log-resume-btn"
-                                        onClick={() => void handleResumeTrace(selectedTrace)}
-                                    >
-                                        {isResumingThis ? '恢复中...' : '继续生成'}
+                                        {completedRerunLabel}
                                     </Button>
                                 ) : null}
                                 <SegmentedControl<DetailViewTab>
@@ -1096,8 +1353,8 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                             ? `/${selectedTrace.roundMaxRetries}`
                                             : ''}
                                         {' '}次后仍失败（可在「API 连接」中调整单拍自动重试次数
-                                        {isAfterTurnRerunnable
-                                            ? `，或点击上方「${rerunLabel}」手动重试`
+                                        {isRecoverableStatus
+                                            ? '，或点击上方「继续 / 重试」手动恢复'
                                             : ''}
                                         ）。
                                     </div>
@@ -1170,151 +1427,169 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                             ) : null}
 
                             {selectedTrace.toolSteps.length === 0 ? (
-                                <div class="ag-banner ag-banner-neutral">
-                                    {isScriptTrace
-                                        ? '纯脚本触发器运行（无 LLM 生成步骤）。'
-                                        : selectedTrace.status === 'running'
-                                            ? '运行中，正在等待模型响应或工具调用...'
-                                            : '本轮运行未调用工具（纯文本推理/输出）。'}
-                                </div>
+                                <>
+                                    <div class="ag-banner ag-banner-neutral">
+                                        {isScriptTrace
+                                            ? '纯脚本触发器运行（无 LLM 生成步骤）。'
+                                            : selectedTrace.status === 'running'
+                                                ? '运行中，正在等待模型响应或工具调用...'
+                                                : '本轮运行未调用工具（纯文本推理/输出）。'}
+                                    </div>
+                                    {trailingRounds.map((round, roundIdx) =>
+                                        renderRoundInterlude(round, `tail_${roundIdx}`),
+                                    )}
+                                </>
                             ) : (
-                                selectedTrace.toolSteps.map((step: ToolStepLog, arrayIndex: number) => {
-                                    const stepKey = getStepDomKey(step, arrayIndex);
-                                    const refMapKey = `${selectedTrace.runId}::${stepKey}`;
-                                    const isFocused = highlightedStepKey === stepKey;
-                                    const stepRunning = isStepRunning(step);
-                                    return (
-                                        <div
-                                            key={refMapKey}
-                                            ref={(el: HTMLDivElement | null) => {
-                                                if (el) {
-                                                    stepCardRefs.current.set(refMapKey, el);
-                                                } else {
-                                                    stepCardRefs.current.delete(refMapKey);
-                                                }
-                                            }}
-                                            class={
-                                                isFocused
-                                                    ? 'ag-card ag-log-step-card ag-log-step-card-focused'
-                                                    : 'ag-card ag-log-step-card'
-                                            }
-                                            data-log-step-card={stepKey}
-                                            data-log-step-index={step.stepIndex}
-                                            data-focused={isFocused ? 'true' : 'false'}
-                                        >
-                                            <div class="ag-card-header">
-                                                <div class="ag-row-wrap">
-                                                    <Badge tone={stepRunning ? 'primary' : step.ok ? 'success' : 'error'}>
-                                                        Step #{step.stepIndex + 1}
-                                                    </Badge>
-                                                    <span class="ag-mono" style={{ fontWeight: 700 }}>
-                                                        {step.toolName}
-                                                    </span>
-                                                    <span
-                                                        class="ag-mono"
-                                                        style={{
-                                                            fontSize: '11px',
-                                                            color: 'var(--muted-foreground)',
-                                                        }}
-                                                    >
-                                                        {step.toolCallId}
-                                                    </span>
-                                                </div>
-                                                <div class="ag-row">
-                                                    {stepRunning ? (
-                                                        <Badge tone="primary">
-                                                            <IconRefresh size={12} />
-                                                            <span>执行中</span>
-                                                        </Badge>
-                                                    ) : (
-                                                        <Badge tone={step.ok ? 'success' : 'error'}>
-                                                            {step.ok ? (
-                                                                <IconCheck size={12} />
+                                <>
+                                    {selectedTrace.toolSteps.map((step: ToolStepLog, arrayIndex: number) => {
+                                        const stepKey = getStepDomKey(step, arrayIndex);
+                                        const refMapKey = `${selectedTrace.runId}::${stepKey}`;
+                                        const isFocused = highlightedStepKey === stepKey;
+                                        const stepRunning = isStepRunning(step);
+                                        const beforeRounds = roundsBeforeStep.get(arrayIndex) ?? [];
+                                        return (
+                                            <Fragment key={refMapKey}>
+                                                {beforeRounds.map((round, roundIdx) =>
+                                                    renderRoundInterlude(
+                                                        round,
+                                                        `step_${arrayIndex}_${roundIdx}`,
+                                                    ),
+                                                )}
+                                                <div
+                                                    ref={(el: HTMLDivElement | null) => {
+                                                        if (el) {
+                                                            stepCardRefs.current.set(refMapKey, el);
+                                                        } else {
+                                                            stepCardRefs.current.delete(refMapKey);
+                                                        }
+                                                    }}
+                                                    class={
+                                                        isFocused
+                                                            ? 'ag-card ag-log-step-card ag-log-step-card-focused'
+                                                            : 'ag-card ag-log-step-card'
+                                                    }
+                                                    data-log-step-card={stepKey}
+                                                    data-log-step-index={step.stepIndex}
+                                                    data-focused={isFocused ? 'true' : 'false'}
+                                                >
+                                                    <div class="ag-card-header">
+                                                        <div class="ag-row-wrap">
+                                                            <Badge tone={stepRunning ? 'primary' : step.ok ? 'success' : 'error'}>
+                                                                Step #{step.stepIndex + 1}
+                                                            </Badge>
+                                                            <span class="ag-mono" style={{ fontWeight: 700 }}>
+                                                                {step.toolName}
+                                                            </span>
+                                                            <span
+                                                                class="ag-mono"
+                                                                style={{
+                                                                    fontSize: '11px',
+                                                                    color: 'var(--muted-foreground)',
+                                                                }}
+                                                            >
+                                                                {step.toolCallId}
+                                                            </span>
+                                                        </div>
+                                                        <div class="ag-row">
+                                                            {stepRunning ? (
+                                                                <Badge tone="primary">
+                                                                    <IconRefresh size={12} />
+                                                                    <span>执行中</span>
+                                                                </Badge>
                                                             ) : (
-                                                                <IconAlertTriangle size={12} />
+                                                                <Badge tone={step.ok ? 'success' : 'error'}>
+                                                                    {step.ok ? (
+                                                                        <IconCheck size={12} />
+                                                                    ) : (
+                                                                        <IconAlertTriangle size={12} />
+                                                                    )}
+                                                                    <span>{step.ok ? '成功' : '失败'}</span>
+                                                                </Badge>
                                                             )}
-                                                            <span>{step.ok ? '成功' : '失败'}</span>
-                                                        </Badge>
-                                                    )}
-                                                    <span
-                                                        class="ag-mono"
-                                                        style={{
-                                                            fontSize: '11px',
-                                                            color: 'var(--muted-foreground)',
-                                                        }}
-                                                    >
-                                                        {stepRunning ? '进行中...' : formatDurationMs(step.durationMs)}
-                                                    </span>
-                                                </div>
-                                            </div>
-                                            <div class="ag-card-body ag-stack-v" style={{ gap: '8px' }}>
-                                                <div>
-                                                    <div
-                                                        class="ag-row"
-                                                        style={{
-                                                            justifyContent: 'space-between',
-                                                            marginBottom: '4px',
-                                                        }}
-                                                    >
-                                                        <span class="ag-field-label">入参 (args)</span>
-                                                        <Button
-                                                            size="sm"
-                                                            variant="ghost"
-                                                            icon={<IconCopy size={13} />}
-                                                            onClick={() =>
-                                                                void handleCopyPayload(
-                                                                    `${step.toolName} 入参`,
-                                                                    step.args,
-                                                                )
-                                                            }
-                                                        >
-                                                            复制入参
-                                                        </Button>
+                                                            <span
+                                                                class="ag-mono"
+                                                                style={{
+                                                                    fontSize: '11px',
+                                                                    color: 'var(--muted-foreground)',
+                                                                }}
+                                                            >
+                                                                {stepRunning ? '进行中...' : formatDurationMs(step.durationMs)}
+                                                            </span>
+                                                        </div>
                                                     </div>
-                                                    <pre class="ag-pre">{formatJsonBlock(step.args)}</pre>
-                                                </div>
+                                                    <div class="ag-card-body ag-stack-v" style={{ gap: '8px' }}>
+                                                        <div>
+                                                            <div
+                                                                class="ag-row"
+                                                                style={{
+                                                                    justifyContent: 'space-between',
+                                                                    marginBottom: '4px',
+                                                                }}
+                                                            >
+                                                                <span class="ag-field-label">入参 (args)</span>
+                                                                <Button
+                                                                    size="sm"
+                                                                    variant="ghost"
+                                                                    icon={<IconCopy size={13} />}
+                                                                    onClick={() =>
+                                                                        void handleCopyPayload(
+                                                                            `${step.toolName} 入参`,
+                                                                            step.args,
+                                                                        )
+                                                                    }
+                                                                >
+                                                                    复制入参
+                                                                </Button>
+                                                            </div>
+                                                            <pre class="ag-pre">{formatJsonBlock(step.args)}</pre>
+                                                        </div>
 
-                                                <div>
-                                                    <div
-                                                        class="ag-row"
-                                                        style={{
-                                                            justifyContent: 'space-between',
-                                                            marginBottom: '4px',
-                                                        }}
-                                                    >
-                                                        <span class="ag-field-label">返回 (result)</span>
-                                                        <Button
-                                                            size="sm"
-                                                            variant="ghost"
-                                                            icon={<IconCopy size={13} />}
-                                                            onClick={() =>
-                                                                void handleCopyPayload(
-                                                                    `${step.toolName} 返回值`,
-                                                                    step.result,
-                                                                )
-                                                            }
-                                                        >
-                                                            复制返回
-                                                        </Button>
-                                                    </div>
-                                                    <pre class="ag-pre">
-                                                        {step.result || (stepRunning ? '工具执行中，等待返回结果...' : '(空)')}
-                                                    </pre>
-                                                </div>
+                                                        <div>
+                                                            <div
+                                                                class="ag-row"
+                                                                style={{
+                                                                    justifyContent: 'space-between',
+                                                                    marginBottom: '4px',
+                                                                }}
+                                                            >
+                                                                <span class="ag-field-label">返回 (result)</span>
+                                                                <Button
+                                                                    size="sm"
+                                                                    variant="ghost"
+                                                                    icon={<IconCopy size={13} />}
+                                                                    onClick={() =>
+                                                                        void handleCopyPayload(
+                                                                            `${step.toolName} 返回值`,
+                                                                            step.result,
+                                                                        )
+                                                                    }
+                                                                >
+                                                                    复制返回
+                                                                </Button>
+                                                            </div>
+                                                            <pre class="ag-pre">
+                                                                {step.result || (stepRunning ? '工具执行中，等待返回结果...' : '(空)')}
+                                                            </pre>
+                                                        </div>
 
-                                                {step.error ? (
-                                                    <div class="ag-banner ag-banner-error ag-mono">
-                                                        错误：{step.error}
+                                                        {step.error ? (
+                                                            <div class="ag-banner ag-banner-error ag-mono">
+                                                                错误：{step.error}
+                                                            </div>
+                                                        ) : null}
                                                     </div>
-                                                ) : null}
-                                            </div>
-                                        </div>
-                                    );
-                                })
+                                                </div>
+                                            </Fragment>
+                                        );
+                                    })}
+                                    {trailingRounds.map((round, roundIdx) =>
+                                        renderRoundInterlude(round, `after_${roundIdx}`),
+                                    )}
+                                </>
                             )}
 
-                            {selectedTrace.outputPreview ? (
-                                <div class="ag-card">
+                            {resolvedSummary ? (
+                                <div class="ag-card" data-log-assistant-summary={selectedTrace.runId}>
                                     <div class="ag-card-header">
                                         <span class="ag-card-title">Assistant 输出摘要</span>
                                         <Button
@@ -1322,9 +1597,9 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                             variant="ghost"
                                             icon={<IconCopy size={13} />}
                                             onClick={() =>
-                                                void handleCopyPayload(
+                                                void handleCopyPlainText(
                                                     'Assistant 输出摘要',
-                                                    selectedTrace.outputPreview,
+                                                    resolvedSummary,
                                                 )
                                             }
                                         >
@@ -1332,7 +1607,15 @@ export function LogsView({ store, isMobile }: ConsoleViewProps) {
                                         </Button>
                                     </div>
                                     <div class="ag-card-body">
-                                        <pre class="ag-pre">{selectedTrace.outputPreview}</pre>
+                                        <pre
+                                            class="ag-pre"
+                                            style={{
+                                                whiteSpace: 'pre-wrap',
+                                                wordBreak: 'break-word',
+                                            }}
+                                        >
+                                            {resolvedSummary}
+                                        </pre>
                                     </div>
                                 </div>
                             ) : null}
