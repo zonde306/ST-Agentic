@@ -8,6 +8,7 @@ import {
     type InterruptedReason,
     type MessageTarget,
     type NamespaceDataMap,
+    type PipelinePhase,
     parseBranchKey,
     toBranchKey,
 } from '@/core/types';
@@ -108,21 +109,100 @@ export interface SerializedAgentTrajectory {
     } | null;
 }
 
+export interface InterruptedPreviousRoundSnapshot {
+    completedTurnMessages: CanonicalMessage[];
+    readSetSnapshot: Record<string, string>;
+    stagedSnapshot: NamespaceDataMap;
+    outputText: string;
+    rolledBackToolSummary?: string;
+}
+
+export interface InterruptedCheckpointScope {
+    phase?: PipelinePhase;
+    triggerId?: string;
+}
+
+export type InterruptedCheckpointKey = BranchKey | `${BranchKey}::${string}`;
+
 export interface InterruptedTurnCheckpoint {
     agentId: string;
     target: MessageTarget;
     reason: InterruptedReason;
     errorMessage?: string;
+    phase?: PipelinePhase;
+    triggerId?: string;
+    runId?: string;
     completedTurnMessages: CanonicalMessage[];
     readSetSnapshot: Record<string, string>;
     stagedSnapshot: NamespaceDataMap;
+    previousRoundSnapshot?: InterruptedPreviousRoundSnapshot;
     createdAt: number;
 }
 
 export interface SerializedTrajectoryStore {
     version: 1;
     threads: Record<string, SerializedAgentTrajectory>;
-    interrupted?: Record<BranchKey, InterruptedTurnCheckpoint>;
+    interrupted?: Record<string, InterruptedTurnCheckpoint>;
+}
+
+const VALID_PIPELINE_PHASES = new Set<PipelinePhase>([
+    'before_turn',
+    'main_turn',
+    'after_turn',
+    'maintenance',
+]);
+
+/**
+ * Compute a deterministic composite storage key for an interrupted checkpoint.
+ * `main_turn` checkpoints without `triggerId` use the plain `BranchKey` (`${messageId}#${swipeId}`)
+ * for 100% backward compatibility; other phases or specific triggers use `${branchKey}::${phase}[::${triggerId}]`.
+ */
+export function toInterruptedCheckpointKey(
+    target: MessageTarget,
+    scope?: InterruptedCheckpointScope,
+): InterruptedCheckpointKey {
+    const base = toBranchKey(target);
+    const phase = scope?.phase && VALID_PIPELINE_PHASES.has(scope.phase) ? scope.phase : undefined;
+    const triggerId =
+        typeof scope?.triggerId === 'string' && scope.triggerId.trim().length > 0
+            ? scope.triggerId.trim()
+            : undefined;
+    const hasNonMainPhase = Boolean(phase && phase !== 'main_turn');
+    if (!hasNonMainPhase && !triggerId) {
+        return base;
+    }
+    const effectivePhase: PipelinePhase = phase ?? 'main_turn';
+    return triggerId
+        ? (`${base}::${effectivePhase}::${triggerId}` as InterruptedCheckpointKey)
+        : (`${base}::${effectivePhase}` as InterruptedCheckpointKey);
+}
+
+/** Parse a composite interrupted checkpoint key back into `{ target, phase?, triggerId? }`. */
+export function parseInterruptedCheckpointKey(
+    key: string,
+): { target: MessageTarget; phase?: PipelinePhase; triggerId?: string } | null {
+    if (typeof key !== 'string' || !key) {
+        return null;
+    }
+    const parts = key.split('::');
+    const target = parseBranchKey(parts[0]);
+    if (!target) {
+        return null;
+    }
+    if (parts.length === 1) {
+        return { target };
+    }
+    const rawPhase = parts[1];
+    const phase = VALID_PIPELINE_PHASES.has(rawPhase as PipelinePhase)
+        ? (rawPhase as PipelinePhase)
+        : undefined;
+    const rawTrigger = parts.length >= 3 ? parts.slice(2).join('::').trim() : '';
+    const triggerId = rawTrigger.length > 0 ? rawTrigger : undefined;
+    return {
+        target,
+        ...(phase ? { phase } : {}),
+        ...(triggerId ? { triggerId } : {}),
+    };
 }
 
 interface InternalTrajectoryState {
@@ -266,7 +346,7 @@ function normalizeTurnEndCounts(
  */
 export class TrajectoryStore {
     private readonly threads = new Map<string, InternalTrajectoryState>();
-    private readonly interrupted = new Map<BranchKey, InterruptedTurnCheckpoint>();
+    private readonly interrupted = new Map<InterruptedCheckpointKey, InterruptedTurnCheckpoint>();
 
     constructor(initial?: SerializedTrajectoryStore) {
         if (initial && initial.version === 1 && initial.threads) {
@@ -277,7 +357,11 @@ export class TrajectoryStore {
                 for (const [key, rawCp] of Object.entries(initial.interrupted)) {
                     const cp = deserializeInterruptedCheckpoint(key, rawCp);
                     if (cp) {
-                        this.interrupted.set(toBranchKey(cp.target), cp);
+                        const cpKey = toInterruptedCheckpointKey(cp.target, {
+                            phase: cp.phase,
+                            triggerId: cp.triggerId,
+                        });
+                        this.interrupted.set(cpKey, cp);
                     }
                 }
             }
@@ -440,6 +524,21 @@ export class TrajectoryStore {
     ): void {
         const state = this.getOrCreateThread(agentId);
         state.frozenPrefix = prefix ? freezeStaticPrefix(prefix) : null;
+    }
+
+    /**
+     * Clear cached Layer 0 `frozenPrefix` across all threads without removing Layer 1
+     * conversation history, Read-Set, or checkpoints. Returns the number of cleared threads.
+     */
+    clearAllFrozenPrefixes(): number {
+        let cleared = 0;
+        for (const state of this.threads.values()) {
+            if (state.frozenPrefix !== null) {
+                state.frozenPrefix = null;
+                cleared += 1;
+            }
+        }
+        return cleared;
     }
 
     /**
@@ -695,10 +794,8 @@ export class TrajectoryStore {
         }
 
         for (const [key, cp] of Array.from(this.interrupted.entries())) {
-            const parsed = parseBranchKey(key);
             if (
-                parsed
-                && parsed.messageId >= messageId
+                cp.target.messageId >= messageId
                 && (agentId === undefined || cp.agentId === agentId)
             ) {
                 this.interrupted.delete(key);
@@ -722,9 +819,14 @@ export class TrajectoryStore {
             }
         }
 
-        const interruptedCp = this.interrupted.get(branchKey);
-        if (interruptedCp && (agentId === undefined || interruptedCp.agentId === agentId)) {
-            this.interrupted.delete(branchKey);
+        for (const [key, interruptedCp] of Array.from(this.interrupted.entries())) {
+            if (
+                interruptedCp.target.messageId === target.messageId
+                && interruptedCp.target.swipeId === target.swipeId
+                && (agentId === undefined || interruptedCp.agentId === agentId)
+            ) {
+                this.interrupted.delete(key);
+            }
         }
 
         return removedCount;
@@ -808,10 +910,8 @@ export class TrajectoryStore {
         }
 
         for (const [key, cp] of Array.from(this.interrupted.entries())) {
-            const parsed = parseBranchKey(key);
             if (
-                parsed
-                && parsed.messageId < cutoff
+                cp.target.messageId < cutoff
                 && (agentId === undefined || cp.agentId === agentId)
             ) {
                 this.interrupted.delete(key);
@@ -831,31 +931,63 @@ export class TrajectoryStore {
         }
     }
 
-    /** Save an interrupted turn checkpoint bound to `checkpoint.target`. */
+    /** Save an interrupted turn checkpoint bound to `checkpoint.target` (+ optional `phase`/`triggerId`). */
     saveInterruptedCheckpoint(checkpoint: InterruptedTurnCheckpoint): void {
         assertValidTarget(checkpoint.target);
-        const key = toBranchKey(checkpoint.target);
-        this.interrupted.set(key, storeInterruptedCheckpoint(checkpoint));
+        const stored = storeInterruptedCheckpoint(checkpoint);
+        const key = toInterruptedCheckpointKey(stored.target, {
+            phase: stored.phase,
+            triggerId: stored.triggerId,
+        });
+        this.interrupted.set(key, stored);
     }
 
-    /** Read a defensive clone of the interrupted turn checkpoint for `target`, if any. */
-    getInterruptedCheckpoint(target: MessageTarget): InterruptedTurnCheckpoint | undefined {
-        const cp = this.interrupted.get(toBranchKey(target));
+    /** Read a defensive clone of the interrupted turn checkpoint for `target` (+ optional `phase`/`triggerId`), if any. */
+    getInterruptedCheckpoint(
+        target: MessageTarget,
+        scope?: InterruptedCheckpointScope,
+    ): InterruptedTurnCheckpoint | undefined {
+        const cp = this.interrupted.get(toInterruptedCheckpointKey(target, scope));
         return cp ? cloneInterruptedCheckpoint(cp) : undefined;
     }
 
-    /** List defensive clones of all persisted interrupted turn checkpoints. */
-    listInterruptedCheckpoints(): Map<BranchKey, InterruptedTurnCheckpoint> {
-        const result = new Map<BranchKey, InterruptedTurnCheckpoint>();
+    /** List defensive clones of persisted interrupted turn checkpoints (optionally filtered). */
+    listInterruptedCheckpoints(filter?: {
+        target?: MessageTarget;
+        phase?: PipelinePhase;
+        triggerId?: string;
+        agentId?: string;
+    }): Map<InterruptedCheckpointKey, InterruptedTurnCheckpoint> {
+        const result = new Map<InterruptedCheckpointKey, InterruptedTurnCheckpoint>();
         for (const [key, cp] of this.interrupted.entries()) {
+            if (filter?.target) {
+                if (
+                    cp.target.messageId !== filter.target.messageId
+                    || cp.target.swipeId !== filter.target.swipeId
+                ) {
+                    continue;
+                }
+            }
+            if (filter?.phase !== undefined && (cp.phase ?? 'main_turn') !== filter.phase) {
+                continue;
+            }
+            if (filter?.triggerId !== undefined && cp.triggerId !== filter.triggerId) {
+                continue;
+            }
+            if (filter?.agentId !== undefined && cp.agentId !== filter.agentId) {
+                continue;
+            }
             result.set(key, cloneInterruptedCheckpoint(cp));
         }
         return result;
     }
 
-    /** Remove the interrupted turn checkpoint bound to `target`. */
-    clearInterruptedCheckpoint(target: MessageTarget): boolean {
-        return this.interrupted.delete(toBranchKey(target));
+    /** Remove the interrupted turn checkpoint bound to `target` (+ optional `phase`/`triggerId`). */
+    clearInterruptedCheckpoint(
+        target: MessageTarget,
+        scope?: InterruptedCheckpointScope,
+    ): boolean {
+        return this.interrupted.delete(toInterruptedCheckpointKey(target, scope));
     }
 
     /**
@@ -911,7 +1043,7 @@ export class TrajectoryStore {
         };
 
         if (this.interrupted.size > 0) {
-            const interrupted: Record<BranchKey, InterruptedTurnCheckpoint> = {};
+            const interrupted: Record<string, InterruptedTurnCheckpoint> = {};
             const sortedKeys = Array.from(this.interrupted.keys()).sort((a, b) =>
                 a < b ? -1 : a > b ? 1 : 0,
             );
@@ -1022,15 +1154,92 @@ function isValidTargetObject(target: unknown): target is MessageTarget {
     );
 }
 
+function storePreviousRoundSnapshot(
+    snapshot: InterruptedPreviousRoundSnapshot,
+): InterruptedPreviousRoundSnapshot {
+    return {
+        completedTurnMessages: (snapshot.completedTurnMessages ?? []).map(freezeCanonicalMessage),
+        readSetSnapshot: canonicalClone(snapshot.readSetSnapshot ?? {}),
+        stagedSnapshot: canonicalClone(snapshot.stagedSnapshot ?? {}),
+        outputText: typeof snapshot.outputText === 'string' ? snapshot.outputText : '',
+        ...(typeof snapshot.rolledBackToolSummary === 'string'
+            ? { rolledBackToolSummary: snapshot.rolledBackToolSummary }
+            : {}),
+    };
+}
+
+function clonePreviousRoundSnapshot(
+    snapshot: InterruptedPreviousRoundSnapshot,
+): InterruptedPreviousRoundSnapshot {
+    return {
+        completedTurnMessages: snapshot.completedTurnMessages.map((msg) => canonicalClone(msg)),
+        readSetSnapshot: canonicalClone(snapshot.readSetSnapshot),
+        stagedSnapshot: canonicalClone(snapshot.stagedSnapshot),
+        outputText: snapshot.outputText,
+        ...(snapshot.rolledBackToolSummary !== undefined
+            ? { rolledBackToolSummary: snapshot.rolledBackToolSummary }
+            : {}),
+    };
+}
+
+function deserializePreviousRoundSnapshot(
+    raw: unknown,
+): InterruptedPreviousRoundSnapshot | undefined {
+    if (!isPlainObjectRecord(raw)) {
+        return undefined;
+    }
+
+    const completedTurnMessages = Array.isArray(raw.completedTurnMessages)
+        ? raw.completedTurnMessages.map(freezeCanonicalMessage)
+        : [];
+    const readSetSnapshot: Record<string, string> = {};
+    if (isPlainObjectRecord(raw.readSetSnapshot)) {
+        for (const [path, hash] of Object.entries(raw.readSetSnapshot)) {
+            if (typeof hash === 'string') {
+                readSetSnapshot[path] = hash;
+            }
+        }
+    }
+    const stagedSnapshot: NamespaceDataMap = isPlainObjectRecord(raw.stagedSnapshot)
+        ? canonicalClone(raw.stagedSnapshot as NamespaceDataMap)
+        : {};
+    const outputText = typeof raw.outputText === 'string' ? raw.outputText : '';
+
+    return {
+        completedTurnMessages,
+        readSetSnapshot: canonicalClone(readSetSnapshot),
+        stagedSnapshot,
+        outputText,
+        ...(typeof raw.rolledBackToolSummary === 'string'
+            ? { rolledBackToolSummary: raw.rolledBackToolSummary }
+            : {}),
+    };
+}
+
 function storeInterruptedCheckpoint(cp: InterruptedTurnCheckpoint): InterruptedTurnCheckpoint {
+    const phase = cp.phase && VALID_PIPELINE_PHASES.has(cp.phase) ? cp.phase : undefined;
+    const triggerId =
+        typeof cp.triggerId === 'string' && cp.triggerId.trim().length > 0
+            ? cp.triggerId.trim()
+            : undefined;
+    const runId =
+        typeof cp.runId === 'string' && cp.runId.trim().length > 0
+            ? cp.runId.trim()
+            : undefined;
     return {
         agentId: cp.agentId,
         target: { messageId: cp.target.messageId, swipeId: cp.target.swipeId },
         reason: cp.reason,
         ...(cp.errorMessage !== undefined ? { errorMessage: cp.errorMessage } : {}),
+        ...(phase !== undefined ? { phase } : {}),
+        ...(triggerId !== undefined ? { triggerId } : {}),
+        ...(runId !== undefined ? { runId } : {}),
         completedTurnMessages: cp.completedTurnMessages.map(freezeCanonicalMessage),
         readSetSnapshot: canonicalClone(cp.readSetSnapshot ?? {}),
         stagedSnapshot: canonicalClone(cp.stagedSnapshot ?? {}),
+        ...(cp.previousRoundSnapshot
+            ? { previousRoundSnapshot: storePreviousRoundSnapshot(cp.previousRoundSnapshot) }
+            : {}),
         createdAt: cp.createdAt,
     };
 }
@@ -1041,9 +1250,15 @@ function cloneInterruptedCheckpoint(cp: InterruptedTurnCheckpoint): InterruptedT
         target: { messageId: cp.target.messageId, swipeId: cp.target.swipeId },
         reason: cp.reason,
         ...(cp.errorMessage !== undefined ? { errorMessage: cp.errorMessage } : {}),
+        ...(cp.phase !== undefined ? { phase: cp.phase } : {}),
+        ...(cp.triggerId !== undefined ? { triggerId: cp.triggerId } : {}),
+        ...(cp.runId !== undefined ? { runId: cp.runId } : {}),
         completedTurnMessages: cp.completedTurnMessages.map((msg) => canonicalClone(msg)),
         readSetSnapshot: canonicalClone(cp.readSetSnapshot),
         stagedSnapshot: canonicalClone(cp.stagedSnapshot),
+        ...(cp.previousRoundSnapshot
+            ? { previousRoundSnapshot: clonePreviousRoundSnapshot(cp.previousRoundSnapshot) }
+            : {}),
         createdAt: cp.createdAt,
     };
 }
@@ -1056,10 +1271,10 @@ function deserializeInterruptedCheckpoint(
         return null;
     }
 
-    const parsedKey = parseBranchKey(key);
+    const parsedKey = parseInterruptedCheckpointKey(key);
     const target = isValidTargetObject(raw.target)
         ? { messageId: raw.target.messageId, swipeId: raw.target.swipeId }
-        : parsedKey;
+        : (parsedKey?.target ?? null);
     if (!target) {
         return null;
     }
@@ -1072,6 +1287,18 @@ function deserializeInterruptedCheckpoint(
         typeof raw.reason === 'string' && VALID_INTERRUPTED_REASONS.has(raw.reason as InterruptedReason)
             ? (raw.reason as InterruptedReason)
             : 'error';
+    const phase: PipelinePhase | undefined =
+        typeof raw.phase === 'string' && VALID_PIPELINE_PHASES.has(raw.phase as PipelinePhase)
+            ? (raw.phase as PipelinePhase)
+            : parsedKey?.phase;
+    const triggerId =
+        typeof raw.triggerId === 'string' && raw.triggerId.trim().length > 0
+            ? raw.triggerId.trim()
+            : parsedKey?.triggerId;
+    const runId =
+        typeof raw.runId === 'string' && raw.runId.trim().length > 0
+            ? raw.runId.trim()
+            : undefined;
     const completedTurnMessages = Array.isArray(raw.completedTurnMessages)
         ? raw.completedTurnMessages.map(freezeCanonicalMessage)
         : [];
@@ -1089,6 +1316,8 @@ function deserializeInterruptedCheckpoint(
         ? canonicalClone(raw.stagedSnapshot as NamespaceDataMap)
         : {};
 
+    const previousRoundSnapshot = deserializePreviousRoundSnapshot(raw.previousRoundSnapshot);
+
     const createdAt =
         typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt)
             ? raw.createdAt
@@ -1099,9 +1328,13 @@ function deserializeInterruptedCheckpoint(
         target,
         reason,
         ...(typeof raw.errorMessage === 'string' ? { errorMessage: raw.errorMessage } : {}),
+        ...(phase !== undefined ? { phase } : {}),
+        ...(triggerId !== undefined ? { triggerId } : {}),
+        ...(runId !== undefined ? { runId } : {}),
         completedTurnMessages,
         readSetSnapshot: canonicalClone(readSetSnapshot),
         stagedSnapshot,
+        ...(previousRoundSnapshot ? { previousRoundSnapshot } : {}),
         createdAt,
     };
 }

@@ -372,4 +372,119 @@ describe('src/core/config defaults, normalization, and secret-free exports', () 
         expect(parsedFromStPreset.blocks[0].placement).toBe('prefix');
         expect(parsedFromStPreset.blocks[1].placement).toBe('tail');
     });
+
+    it('normalizes and losslessly round-trips PresetMessageScript and TriggerRule.events across preset, prompts, and settings export/import', () => {
+        const allEvents = [
+            'generation_error',
+            'turn_interrupted',
+            'turn_aborted',
+            'turn_started',
+            'turn_completed',
+            'output_updated',
+            'prompt_preprocess',
+            'output_postprocess',
+            'chat_changed',
+            'message_sent',
+            'message_received',
+            'message_edited',
+            'message_deleted',
+            'message_swiped',
+        ] as const;
+
+        const normalizedPreset = normalizePreset({
+            id: 'scripted_preset',
+            name: 'Scripted Preset',
+            preprocessScript: {
+                enabled: true,
+                code: 'messages.appendHint("Stay sharp");',
+                triggers: ['main', 'main', 'invalid_trigger', 'trigger_after'],
+            },
+            postprocessScript: {
+                enabled: false,
+                code: 'output.text = output.text.trim();',
+            },
+            triggers: [
+                {
+                    id: 'ev_rule',
+                    label: 'Event Recovery Rule',
+                    source: 'preset',
+                    phase: 'after_turn',
+                    order: 1,
+                    barrier: 'turn',
+                    agentProfileId: 'main',
+                    kind: 'script',
+                    condition: { type: 'always' },
+                    instructionTemplate: '',
+                    scriptCode: 'control.retry("auto");',
+                    events: [...allEvents, 'generation_error', 'not_a_real_event'],
+                    enabled: true,
+                },
+                {
+                    id: 'bad_ev_rule',
+                    label: 'Invalid Events Only',
+                    source: 'preset',
+                    phase: 'after_turn',
+                    order: 2,
+                    barrier: 'none',
+                    agentProfileId: 'main',
+                    kind: 'script',
+                    condition: { type: 'always' },
+                    instructionTemplate: '',
+                    events: ['unknown_event', 123],
+                    enabled: true,
+                },
+            ],
+        });
+
+        expect(normalizedPreset.preprocessScript).toEqual({
+            enabled: true,
+            code: 'messages.appendHint("Stay sharp");',
+            triggers: ['main', 'trigger_after'],
+        });
+        expect(normalizedPreset.postprocessScript).toEqual({
+            enabled: false,
+            code: 'output.text = output.text.trim();',
+        });
+        expect(normalizedPreset.triggers[0]?.events).toEqual([...allEvents]);
+        expect(normalizedPreset.triggers[1]?.events).toBeUndefined();
+
+        // Preset export / import round-trip
+        const exportedPreset = exportPreset(normalizedPreset);
+        const reimportedPreset = importPreset(JSON.parse(JSON.stringify(exportedPreset))).presets[0];
+        expect(reimportedPreset.preprocessScript).toEqual(normalizedPreset.preprocessScript);
+        expect(reimportedPreset.postprocessScript).toEqual(normalizedPreset.postprocessScript);
+        expect(reimportedPreset.triggers[0]?.events).toEqual([...allEvents]);
+
+        // Full Settings export / import round-trip
+        const settings = createDefaultSettings({
+            presets: { scripted_preset: normalizedPreset },
+            currentPresetId: 'scripted_preset',
+        });
+        const reimportedSettings = importSettings(JSON.parse(JSON.stringify(exportSettings(settings))));
+        expect(reimportedSettings.presets.scripted_preset.preprocessScript).toEqual(
+            normalizedPreset.preprocessScript,
+        );
+        expect(reimportedSettings.presets.scripted_preset.postprocessScript).toEqual(
+            normalizedPreset.postprocessScript,
+        );
+        expect(reimportedSettings.presets.scripted_preset.triggers[0]?.events).toEqual([
+            ...allEvents,
+        ]);
+
+        // Prompt-pack (`st-agentic-prompts`) export / import preserves optional preprocess/postprocess scripts
+        const promptsValidation = validatePromptsImport({
+            format: EXPORT_FORMAT_PROMPTS,
+            version: 1,
+            presetName: 'With Scripts',
+            prompts: normalizedPreset.agents[normalizedPreset.mainAgentId].promptBlocks,
+            preprocessScript: normalizedPreset.preprocessScript,
+            postprocessScript: normalizedPreset.postprocessScript,
+        });
+        expect(promptsValidation.ok).toBe(true);
+        if (promptsValidation.ok) {
+            const built = buildPresetFromPromptsImport(promptsValidation.data);
+            expect(built.preprocessScript).toEqual(normalizedPreset.preprocessScript);
+            expect(built.postprocessScript).toEqual(normalizedPreset.postprocessScript);
+        }
+    });
 });

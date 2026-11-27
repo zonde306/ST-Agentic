@@ -452,4 +452,215 @@ describe('TrajectoryStore', () => {
         expect('prefixFingerprint' in (replaced.getFrozenPrefix('legacy_thread') ?? {})).toBe(false);
         expect(replaced.getFrozenPrefix('assistant:sess_1')?.prefixFingerprint).toBe('fp_preset_1');
     });
+
+    it('clears all frozenPrefix caches via clearAllFrozenPrefixes without deleting Layer 1 messages or checkpoints', () => {
+        const store = new TrajectoryStore();
+
+        expect(store.clearAllFrozenPrefixes()).toBe(0);
+
+        store.setFrozenPrefix(
+            {
+                tools: [],
+                messages: [{ role: 'system', content: 'Main L0' }],
+                layer0EndIndex: 0,
+            },
+            'main',
+        );
+        store.appendTurn(
+            [
+                { role: 'user', content: 'Turn 1' },
+                { role: 'assistant', content: 'Reply 1' },
+            ],
+            'main',
+        );
+        store.markRead('/lorebooks/a.md', 'h-a', 'main');
+        store.recordCheckpoint({ messageId: 1, swipeId: 0 }, 'main');
+
+        store.setFrozenPrefix(
+            {
+                tools: [],
+                messages: [{ role: 'system', content: 'Chronicler L0' }],
+                layer0EndIndex: 0,
+            },
+            'chronicler',
+        );
+        store.appendTurn([{ role: 'user', content: 'Log turn 1' }], 'chronicler');
+
+        // Thread with no frozen prefix should not inflate count
+        store.appendTurn([{ role: 'user', content: 'No prefix thread' }], 'ephemeral_like');
+
+        store.saveInterruptedCheckpoint({
+            agentId: 'main',
+            target: { messageId: 3, swipeId: 0 },
+            reason: 'user_stop',
+            completedTurnMessages: [{ role: 'user', content: 'In-flight' }],
+            readSetSnapshot: {},
+            stagedSnapshot: {},
+            createdAt: 500,
+        });
+
+        expect(store.clearAllFrozenPrefixes()).toBe(2);
+        expect(store.clearAllFrozenPrefixes()).toBe(0);
+
+        expect(store.getFrozenPrefix('main')).toBeNull();
+        expect(store.getFrozenPrefix('chronicler')).toBeNull();
+        // Layer 1 history, Read-Set, branch checkpoints, and interrupted checkpoints remain completely intact
+        expect(store.getMessages('main')).toHaveLength(2);
+        expect(store.getMessages('chronicler')).toHaveLength(1);
+        expect(store.getReadSet('main').get('/lorebooks/a.md')).toBe('h-a');
+        expect(store.getCheckpoint({ messageId: 1, swipeId: 0 }, 'main')).toBeDefined();
+        expect(store.getInterruptedCheckpoint({ messageId: 3, swipeId: 0 })).toBeDefined();
+    });
+
+    it('isolates interrupted checkpoints by composite (target, phase, triggerId) key and round-trips previousRoundSnapshot', () => {
+        const bridge = new MemoryHostBridge();
+        const store = new TrajectoryStore();
+        const target = { messageId: 7, swipeId: 2 };
+
+        const mainCp: InterruptedTurnCheckpoint = {
+            agentId: 'main',
+            target,
+            phase: 'main_turn',
+            runId: 'run_main_1',
+            reason: 'error',
+            errorMessage: 'tool failed',
+            completedTurnMessages: [
+                { role: 'user', content: 'Action' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [{ id: 'tc_2', name: 'write_file', arguments: '{}' }],
+                },
+                { role: 'tool', toolCallId: 'tc_2', toolName: 'write_file', content: 'err' },
+            ],
+            readSetSnapshot: { '/lorebooks/a.md': 'h1' },
+            stagedSnapshot: {
+                files: {
+                    '/memory/note.md': { source: 'main', content: 'after round 2' },
+                },
+            },
+            previousRoundSnapshot: {
+                completedTurnMessages: [{ role: 'user', content: 'Action' }],
+                readSetSnapshot: {},
+                stagedSnapshot: {
+                    files: {
+                        '/memory/note.md': { source: 'main', content: 'before round 2' },
+                    },
+                },
+                outputText: 'Partial output before round 2',
+                rolledBackToolSummary: 'write_file(/memory/note.md)',
+            },
+            createdAt: 1000,
+        };
+
+        const afterTriggerACp: InterruptedTurnCheckpoint = {
+            agentId: 'chronicler',
+            target,
+            phase: 'after_turn',
+            triggerId: 'trigger_summary',
+            runId: 'run_after_a',
+            reason: 'length',
+            completedTurnMessages: [{ role: 'user', content: 'Summarize' }],
+            readSetSnapshot: {},
+            stagedSnapshot: {},
+            createdAt: 1010,
+        };
+
+        const afterTriggerBCp: InterruptedTurnCheckpoint = {
+            agentId: 'tracker',
+            target,
+            phase: 'after_turn',
+            triggerId: 'trigger_vars',
+            runId: 'run_after_b',
+            reason: 'user_stop',
+            completedTurnMessages: [{ role: 'user', content: 'Update vars' }],
+            readSetSnapshot: {},
+            stagedSnapshot: {},
+            createdAt: 1020,
+        };
+
+        store.saveInterruptedCheckpoint(mainCp);
+        store.saveInterruptedCheckpoint(afterTriggerACp);
+        store.saveInterruptedCheckpoint(afterTriggerBCp);
+
+        // Mutating original previousRoundSnapshot must not leak into store
+        mainCp.previousRoundSnapshot!.outputText = 'tampered';
+        mainCp.previousRoundSnapshot!.stagedSnapshot.files['/memory/note.md'].content = 'tampered';
+
+        // Backward-compatible target-only lookup resolves main_turn checkpoint without overwriting or mixing with after_turn
+        const loadedMain = store.getInterruptedCheckpoint(target);
+        expect(loadedMain?.runId).toBe('run_main_1');
+        expect(loadedMain?.phase).toBe('main_turn');
+        expect(loadedMain?.previousRoundSnapshot?.outputText).toBe('Partial output before round 2');
+        expect(loadedMain?.previousRoundSnapshot?.rolledBackToolSummary).toBe('write_file(/memory/note.md)');
+        expect(loadedMain?.previousRoundSnapshot?.stagedSnapshot.files['/memory/note.md'].content).toBe(
+            'before round 2',
+        );
+        expect(store.getInterruptedCheckpoint(target, { phase: 'main_turn' })).toEqual(loadedMain);
+
+        // Distinct after_turn trigger checkpoints coexist cleanly on the exact same target
+        expect(
+            store.getInterruptedCheckpoint(target, {
+                phase: 'after_turn',
+                triggerId: 'trigger_summary',
+            })?.runId,
+        ).toBe('run_after_a');
+        expect(
+            store.getInterruptedCheckpoint(target, {
+                phase: 'after_turn',
+                triggerId: 'trigger_vars',
+            })?.runId,
+        ).toBe('run_after_b');
+        expect(store.listInterruptedCheckpoints().size).toBe(3);
+        expect(store.listInterruptedCheckpoints({ target, phase: 'after_turn' }).size).toBe(2);
+
+        // Round-trip through serialize/deserialize and HostBridge
+        store.saveToHost(bridge);
+        const reloaded = TrajectoryStore.loadFromHost(bridge);
+        expect(reloaded.listInterruptedCheckpoints().size).toBe(3);
+        expect(reloaded.getInterruptedCheckpoint(target)?.previousRoundSnapshot?.outputText).toBe(
+            'Partial output before round 2',
+        );
+        expect(
+            reloaded.getInterruptedCheckpoint(target, {
+                phase: 'after_turn',
+                triggerId: 'trigger_summary',
+            })?.agentId,
+        ).toBe('chronicler');
+        expect(
+            reloaded.getInterruptedCheckpoint(target, {
+                phase: 'after_turn',
+                triggerId: 'trigger_vars',
+            })?.agentId,
+        ).toBe('tracker');
+
+        // Clearing main_turn checkpoint leaves after_turn checkpoints untouched
+        expect(reloaded.clearInterruptedCheckpoint(target)).toBe(true);
+        expect(reloaded.getInterruptedCheckpoint(target)).toBeUndefined();
+        expect(
+            reloaded.getInterruptedCheckpoint(target, {
+                phase: 'after_turn',
+                triggerId: 'trigger_summary',
+            }),
+        ).toBeDefined();
+
+        // pruneSwipe cleans all remaining composite checkpoints on that swipe
+        reloaded.pruneSwipe(target);
+        expect(reloaded.listInterruptedCheckpoints().size).toBe(0);
+
+        // pruneFromMessage cleans composite checkpoints at or after messageId
+        reloaded.saveInterruptedCheckpoint(afterTriggerACp);
+        reloaded.saveInterruptedCheckpoint({
+            ...afterTriggerBCp,
+            target: { messageId: 2, swipeId: 0 },
+        });
+        reloaded.pruneFromMessage(5);
+        expect(reloaded.listInterruptedCheckpoints().size).toBe(1);
+        expect(
+            reloaded.getInterruptedCheckpoint(
+                { messageId: 2, swipeId: 0 },
+                { phase: 'after_turn', triggerId: 'trigger_vars' },
+            ),
+        ).toBeDefined();
+    });
 });

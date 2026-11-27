@@ -10,6 +10,7 @@ import type {
     CustomToolConfig,
     PipelinePhase,
     Preset,
+    PresetMessageScript,
     PromptBlock,
     RegexRule,
     RegexStage,
@@ -23,6 +24,7 @@ import type {
     SystemInstructionMode,
     ThemeMode,
     TriggerCondition,
+    TriggerEventType,
     TriggerRule,
     WICategory,
 } from '../types';
@@ -437,6 +439,58 @@ const VALID_PHASES = new Set<PipelinePhase>([
 ]);
 const VALID_BARRIERS = new Set<BarrierPolicy>(['turn', 'self', 'none']);
 
+export const VALID_TRIGGER_EVENT_TYPES: ReadonlySet<TriggerEventType> = new Set<TriggerEventType>([
+    'generation_error',
+    'turn_interrupted',
+    'turn_aborted',
+    'turn_started',
+    'turn_completed',
+    'output_updated',
+    'prompt_preprocess',
+    'output_postprocess',
+    'chat_changed',
+    'message_sent',
+    'message_received',
+    'message_edited',
+    'message_deleted',
+    'message_swiped',
+]);
+
+/** Normalize an untrusted array of `TriggerEventType` values, deduplicating and filtering unknown entries. */
+export function normalizeTriggerEvents(raw: unknown): TriggerEventType[] | undefined {
+    if (!Array.isArray(raw)) {
+        return undefined;
+    }
+    const seen = new Set<TriggerEventType>();
+    const result: TriggerEventType[] = [];
+    for (const item of raw) {
+        if (typeof item !== 'string') {
+            continue;
+        }
+        const trimmed = item.trim() as TriggerEventType;
+        if (VALID_TRIGGER_EVENT_TYPES.has(trimmed) && !seen.has(trimmed)) {
+            seen.add(trimmed);
+            result.push(trimmed);
+        }
+    }
+    return result.length > 0 ? result : undefined;
+}
+
+/** Normalize an untrusted `PresetMessageScript` object, returning `undefined` when absent or invalid. */
+export function normalizePresetMessageScript(raw: unknown): PresetMessageScript | undefined {
+    if (!isPlainRecord(raw)) {
+        return undefined;
+    }
+    const enabled = Boolean(raw.enabled);
+    const code = typeof raw.code === 'string' ? raw.code : String(raw.code ?? '');
+    const triggers = normalizePromptTriggers(raw.triggers);
+    return {
+        enabled,
+        code,
+        ...(triggers ? { triggers } : {}),
+    };
+}
+
 /** Normalize a `TriggerRule`. */
 export function normalizeTriggerRule(input: unknown, fallbackId = 'trigger_1'): TriggerRule {
     const raw = isPlainRecord(input) ? input : {};
@@ -500,6 +554,10 @@ export function normalizeTriggerRule(input: unknown, fallbackId = 'trigger_1'): 
         if (ifConditions.length > 0) {
             rule.ifConditions = ifConditions;
         }
+    }
+    const events = normalizeTriggerEvents(raw.events);
+    if (events) {
+        rule.events = events;
     }
     if (typeof raw.scriptCode === 'string') {
         rule.scriptCode = raw.scriptCode;
@@ -743,6 +801,8 @@ export function normalizePreset(input: unknown, fallbackId: string = DEFAULT_PRE
         : [];
 
     const builtinToolSettings = normalizeBuiltinToolSettings(raw.builtinToolSettings);
+    const preprocessScript = normalizePresetMessageScript(raw.preprocessScript);
+    const postprocessScript = normalizePresetMessageScript(raw.postprocessScript);
 
     const rawMainAgent = rawAgentsById[mainAgentId];
     if (rawMainAgent && agents[mainAgentId]) {
@@ -792,6 +852,8 @@ export function normalizePreset(input: unknown, fallbackId: string = DEFAULT_PRE
         files: normalizeFileMap(raw.files),
         wiRouterOverrides: normalizeWIRouterOverrides(raw.wiRouterOverrides),
         ...(builtinToolSettings ? { builtinToolSettings } : {}),
+        ...(preprocessScript ? { preprocessScript } : {}),
+        ...(postprocessScript ? { postprocessScript } : {}),
     };
 }
 

@@ -398,6 +398,13 @@ export class VirtualFileSystem {
         this.presetMount.setFilesProvider(provider);
     }
 
+    /** Clear cached VFS read-transform entries and return how many entries were removed. */
+    clearReadTransformCache(): number {
+        const cleared = this.readTransformCache.size;
+        this.readTransformCache.clear();
+        return cleared;
+    }
+
     /** Normalize a VFS path (rejecting `..` traversal and null bytes). */
     normalizePath(path: string): string {
         try {
