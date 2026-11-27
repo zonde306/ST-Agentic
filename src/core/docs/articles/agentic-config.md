@@ -8,19 +8,19 @@
 
 | 工具名 | 用途 | 关键参数 |
 | :--- | :--- | :--- |
-| `agentic_config_read` | 只读检查 ST-Agentic 配置 | `section`: `'summary' \| 'settings' \| 'presets' \| 'preset' \| 'prompts' \| 'agents' \| 'triggers' \| 'tools' \| 'regex' \| 'wi_router' \| 'connections'`；可选 `presetId`、`agentId`、`itemId` |
-| `agentic_settings_patch` | 修改全局设置、切换/新建/重命名/删除预设、改预设全局字段 | `runMode`、`themeMode`、`capsulePosition`、`capsulePersistMode`、`currentPresetId`、`currentConnectionId`、`storage`、`offMainline`、`createPreset`、`renamePreset`、`deletePresetId`、`presetPatch` |
-| `agentic_preset_component_upsert` | 新增或按 ID/名称合并更新预设组件 | `presetId?`、`kind`、`agentId?`、`insertAt?`、`item`、`reloadMessages?` |
-| `agentic_preset_component_delete` | 删除预设组件 | `presetId?`、`kind`、`id`、`agentId?`、`reloadMessages?` |
+| `agentic_config_read` | 只读检查 ST-Agentic 配置 | `section`: `'summary' \| 'settings' \| 'presets' \| 'preset' \| 'prompts' \| 'prompt_scripts' \| 'agents' \| 'triggers' \| 'tools' \| 'regex' \| 'wi_router' \| 'connections'`；可选 `presetId`、`agentId`、`itemId`（`prompt_scripts` 下可传 `'preprocess' \| 'postprocess'`） |
+| `agentic_settings_patch` | 修改全局设置、切换/新建/重命名/删除预设、改预设全局字段与预处理/后处理脚本 | `runMode`、`themeMode`、`capsulePosition`、`capsulePersistMode`、`currentPresetId`、`currentConnectionId`、`storage`、`offMainline`、`createPreset`、`renamePreset`、`deletePresetId`、`presetPatch`（含 `mainAgentId`、`wiRouterOverrides`、`builtinToolSettings`、`preprocessScript`、`postprocessScript`） |
+| `agentic_preset_component_upsert` | 新增或按 ID/名称合并更新预设组件（含 `prompt_script` 行级代码 Diff 审批与撤销） | `presetId?`、`kind`、`agentId?`、`insertAt?`、`item`、`reloadMessages?` |
+| `agentic_preset_component_delete` | 删除/清空预设组件（高危操作，必弹确认并保留撤销） | `presetId?`、`kind`、`id`、`agentId?`、`reloadMessages?` |
 | `agentic_connection_upsert` | 新增或更新 API 连接（不传 `apiKey` 自动保留原密钥） | `id`、`name`、`providerFormat`、`baseUrl`、`apiKey`、`clearApiKey`、`model`、`contextSize`、`maxTokens`、`cachePolicy`、`systemInstructionMode`、`strictToolLoop`、`roundMaxRetries`、`setAsCurrent` |
 
-> **最佳实践**：修改前先调 `agentic_config_read({ section: 'summary' })` 或 targeted `section + itemId` 查看现有 ID，再做局部 `upsert`（`item` 会与同 ID 现有项合并，只需传变更字段或完整新项）。
+> **最佳实践**：修改前先调 `agentic_config_read({ section: 'summary' })`（已包含每个预设的 `preprocessScript` / `postprocessScript` 启用摘要与 `triggerIds[].events`）、`agentic_config_read({ section: 'prompt_scripts' })`（读取完整消息预处理/后处理脚本源码与 `triggers`）或 targeted `section + itemId` 查看现有 ID，再做局部 `upsert`（`item` 会与同 ID 现有项合并，只需传变更字段或完整新项）。
 
 ---
 
-## 2. `agentic_preset_component_upsert` 支持的 6 种 `kind`
+## 2. `agentic_preset_component_upsert` 支持的 7 种 `kind`
 
-`kind` 取值：`'prompt_block' | 'agent' | 'trigger' | 'custom_tool' | 'regex_rule' | 'preset_file'`。
+`kind` 取值：`'prompt_block' | 'prompt_script' | 'agent' | 'trigger' | 'custom_tool' | 'regex_rule' | 'preset_file'`。
 
 ### 1) `prompt_block`（需配合 `agentId?`，默认主智能体）
 ```json
@@ -39,7 +39,25 @@
 }
 ```
 
-### 2) `agent`（智能体配置）
+### 2) `prompt_script`（预设级消息预处理 / 后处理脚本，自动行级代码 Diff 审批）
+`item.id` 或 `item.stage` 必须为 `'preprocess'`（发给 LLM 前）或 `'postprocess'`（收到 LLM 返回时）；支持局部合并 `enabled?: boolean`、`code?: string`、`triggers?: PromptTriggerType[]`（传 `triggers: []` 或 `null` 可清空触发过滤，表示全部场景生效）。脚本 API 写法详见 `/docs/scripts.md`。
+
+```json
+{
+  "kind": "prompt_script",
+  "item": {
+    "id": "preprocess",
+    "enabled": true,
+    "triggers": ["main"],
+    "code": "ctx.messages.appendHint('保持当前悬疑节奏。', 'system');\nctx.body.temperature = 0.7;"
+  }
+}
+```
+- **读取完整代码**：`agentic_config_read({ section: 'prompt_scripts' })`（返回 `{ presetId, preprocessScript, postprocessScript }`，也支持 `itemId: 'preprocess' | 'postprocess'`；`'preset'` 与 `'prompts'` 分支也会同步附带完整 `preprocessScript` / `postprocessScript`）。
+- **审批与撤销**：`upsert` 与 `delete` 均以原 `code` 与新 `code` 自动生成行级 Diff 审批卡片，并写入 `UndoRecord` 支持一键还原。
+- **清空/删除脚本**：`agentic_preset_component_delete({ kind: 'prompt_script', id: 'preprocess' })`（或 `id: 'postprocess'`）。
+
+### 3) `agent`（智能体配置）
 ```json
 {
   "kind": "agent",
@@ -59,7 +77,8 @@
 }
 ```
 
-### 3) `trigger`（管线触发器：`kind: 'agent' | 'script'`）
+### 4) `trigger`（管线与事件触发器：`kind: 'agent' | 'script'`）
+支持传统四阶段管线触发，也支持通过 **`events?: TriggerEventType[]`** 订阅错误恢复、中断、消息变更等事件（完整事件名列表见 `/docs/triggers.md`；传 `events: []` 可清空事件绑定）。
 ```json
 {
   "kind": "trigger",
@@ -79,8 +98,29 @@
   }
 }
 ```
+事件触发脚本示例（`events` 字段）：
+```json
+{
+  "kind": "trigger",
+  "item": {
+    "id": "recover_on_400",
+    "label": "400 报错自动回退重试",
+    "source": "preset",
+    "phase": "after_turn",
+    "order": 1,
+    "barrier": "turn",
+    "agentProfileId": "script",
+    "kind": "script",
+    "events": ["generation_error"],
+    "condition": { "type": "always" },
+    "instructionTemplate": "",
+    "scriptCode": "if (ctx.event?.statusCode === 400) { ctx.messages?.rollbackToolRounds(1); ctx.control?.retry('回退异常工具轮重试'); }",
+    "enabled": true
+  }
+}
+```
 
-### 4) `custom_tool`（JS 工具或 Slash 桥接工具）
+### 5) `custom_tool`（JS 工具或 Slash 桥接工具）
 ```json
 {
   "kind": "custom_tool",
@@ -96,7 +136,7 @@
 }
 ```
 
-### 5) `regex_rule`（ST-Agentic 三阶段正则）
+### 6) `regex_rule`（ST-Agentic 三阶段正则）
 ```json
 {
   "kind": "regex_rule",
@@ -115,7 +155,7 @@
 ```
 - `stage` 可选：`'display'`（展示视图清洗，默认更新后触发消息刷新）| `'ingest'`（写入规范化清洗）| `'lore_read'`（读取 `/lorebooks/*` 时清洗）。
 
-### 6) `preset_file`（挂载到 `/preset/*` 的随包只读参考文件）
+### 7) `preset_file`（挂载到 `/preset/*` 的随包只读参考文件）
 ```json
 {
   "kind": "preset_file",
@@ -129,10 +169,24 @@
 
 ---
 
-## 3. 世界书路由器覆写（`wiRouterOverrides`）
+## 3. `agentic_settings_patch` 预设级快捷补丁（`presetPatch`）
 
-通过 `agentic_settings_patch` 的 `presetPatch.wiRouterOverrides` 修正条目的四类分流归属（键为 `world/uid` 或 `/lorebooks/...` 路径，值为分类或 `null` 清除）：
-- `'system_rule'` | `'core_manifest'` | `'on_demand_archive'` | `'dynamic_or_trigger'`
+除全局配置与预设增删外，`agentic_settings_patch` 的 `presetPatch` 支持一次性更新当前（或指定 `presetId`）预设的以下字段：
+- **`wiRouterOverrides`**：修正世界书条目的四类分流归属（键为 `world/uid` 或 `/lorebooks/...` 路径，值为 `'system_rule' | 'core_manifest' | 'on_demand_archive' | 'dynamic_or_trigger'` 或 `null` 清除）。
+- **`builtinToolSettings`**：覆写内置工具开关、描述与参数说明（设为 `null` 还原默认）。
+- **`preprocessScript` / `postprocessScript`**：
+  - 传入对象 `{ enabled?, code?, triggers? }` 与现有脚本局部合并（适合**一键开关**如 `{ enabled: false }` 或**批量改写**两个阶段脚本）；
+  - 传入 `null` 直接清空对应脚本。
+
+```json
+{
+  "presetPatch": {
+    "preprocessScript": { "enabled": false },
+    "postprocessScript": null
+  }
+}
+```
+> **何时选 `prompt_script` vs `presetPatch`**：改写或评审具体 JS 代码时优先使用 `agentic_preset_component_upsert({ kind: 'prompt_script', ... })`，可向用户展示清晰的代码行级 Diff；仅做开关切换、清空或与其他设置联动修改时可用 `presetPatch`。
 
 ---
 

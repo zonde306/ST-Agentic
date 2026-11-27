@@ -6,6 +6,7 @@ import {
     normalizeAgentProfile,
     normalizeConnection,
     normalizeCustomToolConfig,
+    normalizePresetMessageScript,
     normalizePromptBlock,
     normalizeRegexRule,
     normalizeSettings,
@@ -21,7 +22,9 @@ import type {
     CustomToolConfig,
     OffMainlineSettings,
     Preset,
+    PresetMessageScript,
     PromptBlock,
+    PromptTriggerType,
     RegexRule,
     Settings,
     TriggerRule,
@@ -167,6 +170,75 @@ export function stripConnectionSecretsForUndo(connection: ApiConnection): Record
     return copy;
 }
 
+type PromptScriptStage = 'preprocess' | 'postprocess';
+
+function parsePromptScriptStageToken(raw: unknown): PromptScriptStage | null {
+    if (typeof raw !== 'string') {
+        return null;
+    }
+    const normalized = raw.trim().toLowerCase();
+    if (normalized === 'preprocess' || normalized === 'postprocess') {
+        return normalized;
+    }
+    return null;
+}
+
+function resolvePromptScriptStage(rawId?: unknown, rawStage?: unknown): PromptScriptStage {
+    const idStage = parsePromptScriptStageToken(rawId);
+    const explicitStage = parsePromptScriptStageToken(rawStage);
+    if (typeof rawId === 'string' && rawId.trim() !== '' && !idStage) {
+        throw new Error(
+            `Invalid prompt_script id "${rawId.trim()}": expected "preprocess" or "postprocess".`,
+        );
+    }
+    if (typeof rawStage === 'string' && rawStage.trim() !== '' && !explicitStage) {
+        throw new Error(
+            `Invalid prompt_script stage "${rawStage.trim()}": expected "preprocess" or "postprocess".`,
+        );
+    }
+    if (idStage && explicitStage && idStage !== explicitStage) {
+        throw new Error(
+            `Conflicting prompt_script id ("${idStage}") and stage ("${explicitStage}").`,
+        );
+    }
+    const resolved = idStage ?? explicitStage;
+    if (!resolved) {
+        throw new Error('prompt_script requires id or stage to be "preprocess" or "postprocess".');
+    }
+    return resolved;
+}
+
+function mergePresetMessageScript(
+    existing: PresetMessageScript | undefined,
+    patch: Record<string, unknown>,
+): PresetMessageScript {
+    const mergedRaw: Record<string, unknown> = {
+        enabled: existing ? existing.enabled : true,
+        code: existing?.code ?? '',
+        ...(existing?.triggers ? { triggers: [...existing.triggers] } : {}),
+        ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+        ...(patch.code !== undefined ? { code: patch.code } : {}),
+        ...(patch.triggers !== undefined ? { triggers: patch.triggers } : {}),
+    };
+    return (
+        normalizePresetMessageScript(mergedRaw) ?? {
+            enabled: false,
+            code: '',
+        }
+    );
+}
+
+function summarizePresetMessageScript(script?: PresetMessageScript) {
+    const code = script?.code ?? '';
+    return {
+        configured: Boolean(script),
+        enabled: Boolean(script?.enabled),
+        hasCode: code.trim().length > 0,
+        codeLength: code.length,
+        triggers: script?.triggers ?? ([] as PromptTriggerType[]),
+    };
+}
+
 function summarizePresetForCatalog(preset: Preset, currentPresetId: string) {
     const mainAgent = preset.agents[preset.mainAgentId];
     return {
@@ -183,9 +255,18 @@ function summarizePresetForCatalog(preset: Preset, currentPresetId: string) {
             presetFiles: Object.keys(preset.files).length,
             wiRouterOverrides: Object.keys(preset.wiRouterOverrides).length,
         },
+        preprocessScript: summarizePresetMessageScript(preset.preprocessScript),
+        postprocessScript: summarizePresetMessageScript(preset.postprocessScript),
         agentIds: Object.keys(preset.agents),
         customToolNames: preset.customTools.map((t) => ({ id: t.id, name: t.name, kind: t.kind, enabled: t.enabled })),
-        triggerIds: preset.triggers.map((t) => ({ id: t.id, label: t.label, kind: t.kind, phase: t.phase, enabled: t.enabled })),
+        triggerIds: preset.triggers.map((t) => ({
+            id: t.id,
+            label: t.label,
+            kind: t.kind,
+            phase: t.phase,
+            ...(t.events?.length ? { events: t.events } : {}),
+            enabled: t.enabled,
+        })),
         regexIds: preset.regexRules.map((r) => ({ id: r.id, name: r.name, stage: r.stage, enabled: r.enabled })),
         presetFilePaths: Object.keys(preset.files).sort(),
     };
@@ -203,6 +284,7 @@ const AGENTIC_CONFIG_READ_SCHEMA = z.object({
             'presets',
             'preset',
             'prompts',
+            'prompt_scripts',
             'agents',
             'triggers',
             'tools',
@@ -215,7 +297,18 @@ const AGENTIC_CONFIG_READ_SCHEMA = z.object({
         .describe('Config section to inspect.'),
     presetId: z.string().optional().describe('Target ST-Agentic preset ID (defaults to currentPresetId).'),
     agentId: z.string().optional().describe('Optional AgentProfile ID when reading prompts or agents.'),
-    itemId: z.string().optional().describe('Optional item ID/name/path filter for targeted drill-down.'),
+    itemId: z
+        .string()
+        .optional()
+        .describe(
+            'Optional item ID/name/path filter for targeted drill-down (e.g. "preprocess" | "postprocess" for prompt_scripts).',
+        ),
+});
+
+const PRESET_MESSAGE_SCRIPT_PATCH_SCHEMA = z.object({
+    enabled: z.boolean().optional(),
+    code: z.string().optional(),
+    triggers: z.array(z.string()).nullable().optional(),
 });
 
 const AGENTIC_SETTINGS_PATCH_SCHEMA = z.object({
@@ -281,12 +374,15 @@ const AGENTIC_SETTINGS_PATCH_SCHEMA = z.object({
                         .nullable(),
                 )
                 .optional(),
+            preprocessScript: PRESET_MESSAGE_SCRIPT_PATCH_SCHEMA.nullable().optional(),
+            postprocessScript: PRESET_MESSAGE_SCRIPT_PATCH_SCHEMA.nullable().optional(),
         })
         .optional(),
 });
 
 const PRESET_COMPONENT_KIND_SCHEMA = z.enum([
     'prompt_block',
+    'prompt_script',
     'agent',
     'trigger',
     'custom_tool',
@@ -301,7 +397,11 @@ const AGENTIC_PRESET_COMPONENT_UPSERT_SCHEMA = z.object({
     kind: PRESET_COMPONENT_KIND_SCHEMA,
     agentId: z.string().optional().describe('Agent ID for prompt_block; defaults to preset.mainAgentId.'),
     insertAt: z.number().int().min(0).optional().describe('Optional insertion index when creating ordered list items.'),
-    item: z.record(z.string(), z.unknown()).describe('Component fields (merged over existing item if id/name matches).'),
+    item: z
+        .record(z.string(), z.unknown())
+        .describe(
+            'Component fields (merged over existing item if id/name matches; for prompt_script use id/stage: "preprocess" | "postprocess", enabled?, code?, triggers?).',
+        ),
     reloadMessages: z
         .boolean()
         .optional()
@@ -312,7 +412,12 @@ const AGENTIC_PRESET_COMPONENT_UPSERT_SCHEMA = z.object({
 const AGENTIC_PRESET_COMPONENT_DELETE_SCHEMA = z.object({
     presetId: z.string().optional().describe('Target preset ID; defaults to currentPresetId.'),
     kind: PRESET_COMPONENT_KIND_SCHEMA,
-    id: z.string().min(1).describe('Component ID (or custom_tool name / preset_file relative path).'),
+    id: z
+        .string()
+        .min(1)
+        .describe(
+            'Component ID (or custom_tool name / preset_file relative path / prompt_script stage "preprocess" | "postprocess").',
+        ),
     agentId: z.string().optional().describe('Agent ID for prompt_block; defaults to preset.mainAgentId.'),
     reloadMessages: z
         .boolean()
@@ -455,6 +560,26 @@ function applyAgenticSettingsPatch(
             }
             target.builtinToolSettings = nextBuiltin;
         }
+        if (args.presetPatch.preprocessScript !== undefined) {
+            if (args.presetPatch.preprocessScript === null) {
+                delete target.preprocessScript;
+            } else {
+                target.preprocessScript = mergePresetMessageScript(
+                    target.preprocessScript,
+                    args.presetPatch.preprocessScript as Record<string, unknown>,
+                );
+            }
+        }
+        if (args.presetPatch.postprocessScript !== undefined) {
+            if (args.presetPatch.postprocessScript === null) {
+                delete target.postprocessScript;
+            } else {
+                target.postprocessScript = mergePresetMessageScript(
+                    target.postprocessScript,
+                    args.presetPatch.postprocessScript as Record<string, unknown>,
+                );
+            }
+        }
         summaryParts.push(`presetPatch(${target.id})`);
     }
 
@@ -583,6 +708,28 @@ function applyPresetComponentUpsert(
             afterText: normalized.content,
             shouldReloadMessages: false,
             savedComponent: normalized,
+        };
+    }
+
+    if (kind === 'prompt_script') {
+        const stage = resolvePromptScriptStage(rawItem.id, rawItem.stage);
+        const propKey = stage === 'preprocess' ? 'preprocessScript' : 'postprocessScript';
+        const existing = preset[propKey];
+        const normalized = mergePresetMessageScript(existing, rawItem);
+        preset[propKey] = normalized;
+        return {
+            nextSettings: normalizeSettings(nextSettings),
+            presetId: preset.id,
+            previousPreset,
+            itemLabel: stage,
+            beforeText: existing?.code ?? '',
+            afterText: normalized.code,
+            shouldReloadMessages: false,
+            savedComponent: {
+                id: stage,
+                stage,
+                ...normalized,
+            },
         };
     }
 
@@ -807,6 +954,26 @@ function applyPresetComponentDelete(
         };
     }
 
+    if (args.kind === 'prompt_script') {
+        const stage = resolvePromptScriptStage(targetId);
+        const propKey = stage === 'preprocess' ? 'preprocessScript' : 'postprocessScript';
+        const existing = preset[propKey];
+        if (!existing) {
+            throw new Error(
+                `Prompt script "${stage}" is not configured in preset "${preset.id}".`,
+            );
+        }
+        delete preset[propKey];
+        return {
+            nextSettings: normalizeSettings(nextSettings),
+            presetId: preset.id,
+            previousPreset,
+            itemLabel: stage,
+            beforeText: existing.code,
+            shouldReloadMessages: false,
+        };
+    }
+
     if (args.kind === 'agent') {
         if (targetId === preset.mainAgentId) {
             throw new Error(`Cannot delete mainAgentId "${preset.mainAgentId}".`);
@@ -911,7 +1078,7 @@ export function createFullAgenticConfigTools(): AssistantToolDefinition[] {
     const agenticConfigReadTool: AssistantToolDefinition<typeof AGENTIC_CONFIG_READ_SCHEMA> = {
         name: 'agentic_config_read',
         description:
-            'Inspect ST-Agentic own configuration: summary, global settings, presets, prompt blocks, agents, triggers/@@scripts, custom tools, regex rules, WI router overrides, or API connections (secrets are automatically redacted to ***REDACTED***). Read-only.',
+            'Inspect ST-Agentic own configuration: summary, global settings, presets, prompt blocks, prompt_scripts (preset preprocessScript / postprocessScript), agents, triggers/@@scripts, custom tools, regex rules, WI router overrides, or API connections (secrets are automatically redacted to ***REDACTED***). Read-only.',
         parameters: AGENTIC_CONFIG_READ_SCHEMA,
         tier: 'full',
         readOnly: true,
@@ -994,7 +1161,44 @@ export function createFullAgenticConfigTools(): AssistantToolDefinition[] {
             }
 
             if (section === 'preset') {
-                return finalizeReadToolResult({ ok: true, section, preset });
+                return finalizeReadToolResult({
+                    ok: true,
+                    section,
+                    preset,
+                    preprocessScript: preset.preprocessScript ?? null,
+                    postprocessScript: preset.postprocessScript ?? null,
+                });
+            }
+
+            if (section === 'prompt_scripts') {
+                const preprocessScript = preset.preprocessScript ?? null;
+                const postprocessScript = preset.postprocessScript ?? null;
+                const requestedItem = args.itemId?.trim();
+                if (requestedItem) {
+                    const stage = parsePromptScriptStageToken(requestedItem);
+                    if (!stage) {
+                        return finalizeToolError(
+                            `Invalid prompt_scripts itemId "${requestedItem}": expected "preprocess" or "postprocess".`,
+                            ctx.signal,
+                        );
+                    }
+                    return finalizeReadToolResult({
+                        ok: true,
+                        section,
+                        presetId: preset.id,
+                        stage,
+                        script: stage === 'preprocess' ? preprocessScript : postprocessScript,
+                        preprocessScript,
+                        postprocessScript,
+                    });
+                }
+                return finalizeReadToolResult({
+                    ok: true,
+                    section,
+                    presetId: preset.id,
+                    preprocessScript,
+                    postprocessScript,
+                });
             }
 
             if (section === 'prompts') {
@@ -1016,6 +1220,8 @@ export function createFullAgenticConfigTools(): AssistantToolDefinition[] {
                     agentId: targetAgentId,
                     total: blocks.length,
                     promptBlocks: blocks,
+                    preprocessScript: preset.preprocessScript ?? null,
+                    postprocessScript: preset.postprocessScript ?? null,
                 });
             }
 
@@ -1098,7 +1304,7 @@ export function createFullAgenticConfigTools(): AssistantToolDefinition[] {
     const agenticSettingsPatchTool: AssistantToolDefinition<typeof AGENTIC_SETTINGS_PATCH_SCHEMA> = {
         name: 'agentic_settings_patch',
         description:
-            'Update ST-Agentic global settings (runMode, themeMode, active preset/connection, storage, offMainline), create/rename/delete ST-Agentic presets, or update wiRouterOverrides / builtinToolSettings. Syncs live immediately.',
+            'Update ST-Agentic global settings (runMode, themeMode, active preset/connection, storage, offMainline), create/rename/delete ST-Agentic presets, or update wiRouterOverrides / builtinToolSettings / preprocessScript / postprocessScript. Syncs live immediately.',
         parameters: AGENTIC_SETTINGS_PATCH_SCHEMA,
         tier: 'full',
         readOnly: false,
@@ -1194,7 +1400,7 @@ export function createFullAgenticConfigTools(): AssistantToolDefinition[] {
     > = {
         name: 'agentic_preset_component_upsert',
         description:
-            'Create or update an ST-Agentic preset component (prompt_block, agent, trigger / @@script, custom_tool JS defineTool or slash_bridge, regex_rule for display/ingest/lore_read, or preset_file). Syncs live to UI, tool registry, and regex pipeline immediately.',
+            'Create or update an ST-Agentic preset component (prompt_block, prompt_script [preprocess/postprocess], agent, trigger / @@script with optional events, custom_tool JS defineTool or slash_bridge, regex_rule for display/ingest/lore_read, or preset_file). Syncs live to UI, tool registry, and regex pipeline immediately.',
         parameters: AGENTIC_PRESET_COMPONENT_UPSERT_SCHEMA,
         tier: 'full',
         readOnly: false,
@@ -1267,7 +1473,7 @@ export function createFullAgenticConfigTools(): AssistantToolDefinition[] {
     > = {
         name: 'agentic_preset_component_delete',
         description:
-            'Permanently delete a component (prompt_block, agent, trigger, custom_tool, regex_rule, or preset_file) from an ST-Agentic preset. High-risk mandatoryConfirm operation.',
+            'Permanently delete a component (prompt_block, prompt_script [preprocess/postprocess], agent, trigger, custom_tool, regex_rule, or preset_file) from an ST-Agentic preset. High-risk mandatoryConfirm operation.',
         parameters: AGENTIC_PRESET_COMPONENT_DELETE_SCHEMA,
         tier: 'full',
         readOnly: false,
