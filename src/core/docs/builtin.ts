@@ -4,6 +4,7 @@ import ejsReferenceDoc from './articles/ejs-reference.md';
 import eventHooksDoc from './articles/event-hooks.md';
 import jsToolsDoc from './articles/js-tools.md';
 import scriptsDoc from './articles/scripts.md';
+import sidegenDoc from './articles/sidegen.md';
 import stNativeDoc from './articles/st-native.md';
 import statusUiDoc from './articles/status-ui.md';
 import triggersDoc from './articles/triggers.md';
@@ -93,6 +94,14 @@ export const BUILTIN_DOCS: readonly BuiltinDocEntry[] = [
         title: '修改 ST-Agentic 自身配置与预设指南',
         summary: 'agentic_config_read / agentic_settings_patch / agentic_preset_component_* / agentic_connection_upsert',
         content: agenticConfigDoc,
+        source: 'builtin',
+    },
+    {
+        fileName: 'sidegen.md',
+        path: '/docs/sidegen.md',
+        title: 'SideGen 线外生成与 /side/* 线索指南',
+        summary: 'runOnce / 持久 SideSession / clues API、/side/* 4 档投递、/sidegen-* Slash 命令、triggers: ["sidegen"] 与分支回滚',
+        content: sidegenDoc,
         source: 'builtin',
     },
 ];

@@ -80,7 +80,7 @@ export default defineTool({
 | **`ctx.st`** | `slash(cmd)` | 执行 SillyTavern Slash 命令，返回 `Promise<string>` |
 | | `emit(event, data?)` | 发送宿主事件 |
 | | `getActiveInfo()` | 获取当前角色/人设/聊天 ID 等宿主上下文 (`HostIdentity`) |
-| **`ctx.sideGen`** | 可选对象 | 线外生成与 `/side/*` 线索操作 API（见 `ToolSideGenApi`） |
+| **`ctx.sideGen`** | 可选对象 | 线外生成与 `/side/*` 线索操作 API（完整 API 与线索系统见 `/docs/sidegen.md`） |
 | **`ctx.target`** | `{ messageId, swipeId }` | 当前因果分支锚点（只读） |
 | **`ctx.signal`** | `AbortSignal` | Swipe/取消信号；发起 `fetch` 务必传入 `signal: ctx.signal` |
 | **`ctx.permissions`** | `{ read: string[], write: string[] }` | 当前运行者的读写权限规则 |

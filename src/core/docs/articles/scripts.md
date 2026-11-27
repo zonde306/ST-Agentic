@@ -44,7 +44,7 @@ return { turnCount: turn };
 
 1. **顶层 `async` 函数体**：脚本被包装在异步函数中执行，可直接顶层使用 `await` 与 `return`。
 2. **注入的全局对象**：
-   - `ctx`：`ToolExecutionContext`（含 `ctx.fs`、`ctx.vars`、`ctx.message`、`ctx.st`、`ctx.sideGen`、`ctx.target`、`ctx.signal`、`ctx.permissions`，完整签名见 `/docs/js-tools.md`）。
+   - `ctx`：`ToolExecutionContext`（含 `ctx.fs`、`ctx.vars`、`ctx.message`、`ctx.st`、`ctx.sideGen`、`ctx.target`、`ctx.signal`、`ctx.permissions`，完整签名见 `/docs/js-tools.md`，SideGen 详解见 `/docs/sidegen.md`）。
    - `z`：Zod v4，可用于校验数据结构。
    - `_`：冻结的安全版 Lodash（已移除 `template`、`runInContext`、`noConflict`、`mixin`、`VERSION`）。
    - `defineTool`：工具定义辅助函数。

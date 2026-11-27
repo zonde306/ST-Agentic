@@ -666,6 +666,7 @@ function buildAssistantSystemPrompt(
     lines.push(
         `- /docs/event-hooks.md — agentic_prompt_transform & agentic_output_process eventSource hooks (${hasThScripts ? 'JS-Slash-Runner & ' : ''}extensions), cache control, messageId/swipeId/target, retry & requestFix`,
         '- /docs/agentic-config.md — agentic_config_read / agentic_settings_patch / agentic_preset_component_* / agentic_connection_upsert',
+        '- /docs/sidegen.md — SideGen off-mainline runOnce / persistent SideSession / clues API, /side/* 4-level delivery, /sidegen-* slash commands, and triggers: ["sidegen"]',
     );
     if (externalDocs.length > 0) {
         const MAX_INDEXED_EXTERNAL_DOCS = 24;

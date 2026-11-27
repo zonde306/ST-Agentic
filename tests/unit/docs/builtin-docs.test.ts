@@ -17,7 +17,11 @@ import {
     createDefaultSettings,
     DEFAULT_MAIN_AGENT_PERMISSIONS,
 } from '@/core/config';
-import { hashText } from '@/core/utils';
+import {
+    hashText,
+    SIDE_CLUE_DELIVERIES,
+    SIDE_CLUE_STATUSES,
+} from '@/core/utils';
 import {
     VfsNotFoundError,
     VfsReadOnlyError,
@@ -29,7 +33,7 @@ describe('Built-in /docs/ VFS mount & authoring docs', () => {
     afterEach(() => {
         clearExternalDocs();
     });
-    it('mounts all 9 built-in reference docs read-only at /docs/ and isolates them from default root search', async () => {
+    it('mounts all 10 built-in reference docs read-only at /docs/ and isolates them from default root search', async () => {
         const bridge = new MemoryHostBridge();
         const vfs = new VirtualFileSystem({ bridge });
 
@@ -44,7 +48,7 @@ describe('Built-in /docs/ VFS mount & authoring docs', () => {
         });
 
         const docEntries = await vfs.listDir('/docs');
-        expect(docEntries).toHaveLength(9);
+        expect(docEntries).toHaveLength(10);
         expect(docEntries.every((entry) => entry.writable === false && entry.size > 0)).toBe(true);
         expect(docEntries.map((entry) => entry.name)).toEqual(
             BUILTIN_DOCS.map((doc) => doc.fileName).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
@@ -85,9 +89,13 @@ describe('Built-in /docs/ VFS mount & authoring docs', () => {
         expect(scopedGrepHits.some((hit) => hit.path === '/docs/status-ui.md')).toBe(true);
 
         const globbed = await vfs.globFiles('/docs/*.md');
-        expect(globbed).toHaveLength(9);
+        expect(globbed).toHaveLength(10);
         expect(globbed).toContain('/docs/status-ui.md');
         expect(globbed).toContain('/docs/event-hooks.md');
+        expect(globbed).toContain('/docs/sidegen.md');
+
+        const sidegenSearchHits = await vfs.searchFiles('exportToWorldInfo', { pathPrefix: '/docs' });
+        expect(sidegenSearchHits.some((hit) => hit.path === '/docs/sidegen.md')).toBe(true);
 
         // Mainline workspace notices never emit /docs/*
         const notices = await buildWorkspaceNotices({
@@ -144,6 +152,34 @@ describe('Built-in /docs/ VFS mount & authoring docs', () => {
         ]) {
             expect(eventHooksDoc).toContain(token);
         }
+
+        const sidegenDoc = getBuiltinDoc('sidegen.md')?.content ?? '';
+        for (const delivery of SIDE_CLUE_DELIVERIES) {
+            expect(sidegenDoc).toContain(delivery);
+        }
+        for (const status of SIDE_CLUE_STATUSES) {
+            expect(sidegenDoc).toContain(status);
+        }
+        for (const token of [
+            'runOnce',
+            'createSession',
+            'compactSession',
+            'getTranscript',
+            'exportToWorldInfo',
+            'updateDelivery',
+            'updateStatus',
+            '/sidegen-once',
+            '/sidegen-send',
+            '/sidegen-clue',
+            'autoBridge',
+            'mainChatDepth',
+            'includeVars',
+            'triggers',
+            'sidegen',
+            '{{systemBase}}',
+        ]) {
+            expect(sidegenDoc).toContain(token);
+        }
     });
 
     it('accepts ST-Prompt-Template decorators in lintWorldInfoContent without spurious warnings', () => {
@@ -191,6 +227,7 @@ describe('Built-in /docs/ VFS mount & authoring docs', () => {
         expect(sysText).toContain('/docs/ejs-reference.md');
         expect(sysText).toContain('/docs/status-ui.md');
         expect(sysText).toContain('/docs/event-hooks.md');
+        expect(sysText).toContain('/docs/sidegen.md');
         expect(sysText).not.toContain('External Extension Docs');
     });
 
