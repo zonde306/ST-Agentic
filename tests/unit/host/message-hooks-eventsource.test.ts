@@ -59,10 +59,13 @@ vi.mock('@st/script.js', () => ({
     chat_metadata: stMocks.state.chat_metadata,
     deleteMessage: vi.fn(),
     getCharacterCardFields: vi.fn(() => ({})),
+    getCurrentChatId: vi.fn(() => 'chat-1'),
+    isChatSaving: false,
     messageFormatting: vi.fn((text: string) => text),
     name1: 'User',
     name2: 'Alice',
     refreshSwipeButtons: vi.fn(),
+    saveChatConditional: vi.fn(async () => undefined),
     saveChatDebounced: vi.fn(),
     saveSettingsDebounced: vi.fn(),
     substituteParams: vi.fn((text: string) => text),
@@ -101,6 +104,10 @@ vi.mock('@st/scripts/power-user.js', () => ({
 
 vi.mock('@st/scripts/reasoning.js', () => ({
     updateReasoningUI: vi.fn(),
+}));
+
+vi.mock('@st/scripts/group-chats.js', () => ({
+    selected_group: null,
 }));
 
 vi.mock('@st/scripts/utils.js', () => ({

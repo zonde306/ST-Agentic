@@ -53,7 +53,10 @@ vi.mock('@st/script.js', () => ({
     getRequestHeaders: vi.fn(() => ({ 'Content-Type': 'application/json' })),
     saveSettingsDebounced: stMocks.fns.saveSettingsDebounced,
     saveCharacterDebounced: vi.fn(),
+    saveChatConditional: vi.fn(async () => undefined),
     saveChatDebounced: vi.fn(),
+    getCurrentChatId: vi.fn(() => 'chat-1'),
+    isChatSaving: false,
     selectCharacterById: vi.fn(),
     chat: [],
     chat_metadata: {},
@@ -68,6 +71,10 @@ vi.mock('@st/scripts/extensions.js', () => ({
 
 vi.mock('@st/scripts/i18n.js', () => ({
     translate: (fallback: string) => fallback,
+}));
+
+vi.mock('@st/scripts/group-chats.js', () => ({
+    selected_group: null,
 }));
 
 vi.mock('@st/scripts/util/AccountStorage.js', () => ({

@@ -1111,11 +1111,17 @@ export class TrajectoryStore {
         return new TrajectoryStore(record as SerializedTrajectoryStore);
     }
 
-    /** Persist trajectory state to `HostBridge.getMetadata()` and trigger debounced save. */
-    saveToHost(bridge: HostBridge, metadataKey: string = AGENTIC_TRAJECTORIES_KEY): void {
+    /** Persist trajectory state to `HostBridge.getMetadata()` and optionally trigger debounced save. */
+    saveToHost(
+        bridge: HostBridge,
+        metadataKey: string = AGENTIC_TRAJECTORIES_KEY,
+        options?: { scheduleSave?: boolean },
+    ): void {
         const metadata = bridge.getMetadata();
         metadata[metadataKey] = this.serialize();
-        bridge.saveChatDebounced();
+        if (options?.scheduleSave !== false) {
+            bridge.saveChatDebounced();
+        }
     }
 
     /** Load trajectory state from `HostBridge.getMetadata()`. */

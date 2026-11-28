@@ -99,6 +99,7 @@ export interface MemoryHostBridgeInit {
     enableAuthorBridge?: boolean;
     enableAdminBridge?: boolean;
     extensionCapabilities?: Partial<HostExtensionCapabilities>;
+    onSaveChatNow?: () => Promise<void> | void;
 }
 
 const DEFAULT_MOCK_HOST_SETTINGS: Record<string, Record<string, unknown>> = {
@@ -149,6 +150,8 @@ export class MemoryHostBridge implements HostBridge {
     public hostLuminance: 'dark' | 'light';
 
     public saveChatCalls = 0;
+    public saveChatNowCalls = 0;
+    public onSaveChatNow?: () => Promise<void> | void;
     public writtenMessages: Array<{
         target: MessageTarget;
         content: string;
@@ -346,6 +349,7 @@ export class MemoryHostBridge implements HostBridge {
         if (init.enableAdminBridge !== false) {
             this.admin = this.createAdminBridge();
         }
+        this.onSaveChatNow = init.onSaveChatNow;
     }
 
     getChat(): ChatMessageSnapshot[] {
@@ -358,6 +362,11 @@ export class MemoryHostBridge implements HostBridge {
 
     saveChatDebounced(): void {
         this.saveChatCalls += 1;
+    }
+
+    async saveChatNow(): Promise<void> {
+        this.saveChatNowCalls += 1;
+        await this.onSaveChatNow?.();
     }
 
     readMessageVariables(target: MessageTarget): Record<string, unknown> | null {

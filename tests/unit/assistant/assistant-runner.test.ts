@@ -2037,4 +2037,165 @@ describe('AssistantRunner & AssistantSessionStore (TS2.1)', () => {
         expect(retryStatuses).toHaveLength(1);
         expect(reply.content).toBe('保留下来的有效回复。');
     });
+
+    it('avoids debounced-save spamming during streaming deltas and flushes metadata + trajectory via saveChatNow() on turn end and mutations', async () => {
+        const bridge = createOffMainlineTestBridge();
+        const transport = new ScriptedLLMTransport([
+            {
+                chunkSize: 3,
+                content: '第1段第2段第3段第4段第5段',
+            },
+        ]);
+        const trajectoryStore = new TrajectoryStore();
+        const sessionStore = new AssistantSessionStore({
+            bridge,
+            trajectoryStore,
+            persistenceMode: 'metadata',
+        });
+        const runner = new AssistantRunner({
+            bridge,
+            transport,
+            trajectoryStore,
+            sessionStore,
+            settings: createDefaultSettings(),
+            stream: true,
+        });
+
+        const session = await runner.createSession({ title: '流式落盘测试', mode: 'chat' });
+        expect(bridge.saveChatNowCalls).toBe(1);
+
+        const saveCallsBeforeTurn = bridge.saveChatCalls;
+        const nowCallsBeforeTurn = bridge.saveChatNowCalls;
+        const streamedSnapshots: string[] = [];
+
+        const reply = await runner.sendPrompt(session.id, '开始生成', {
+            onUpdate: (s) => {
+                const last = s.messages[s.messages.length - 1];
+                if (last?.role === 'assistant') {
+                    streamedSnapshots.push(last.content);
+                }
+            },
+        });
+
+        expect(reply.content).toBe('第1段第2段第3段第4段第5段');
+        expect(streamedSnapshots.length).toBeGreaterThanOrEqual(5);
+        // Streaming deltas must not trigger per-delta saveChatDebounced() floods;
+        // user append + final bubble sync + flush occur once per turn.
+        expect(bridge.saveChatCalls - saveCallsBeforeTurn).toBeLessThanOrEqual(3);
+        expect(bridge.saveChatNowCalls).toBe(nowCallsBeforeTurn + 1);
+
+        // Reloading from metadata preserves the latest assistant message and trajectory
+        const reloadedTrajectory = TrajectoryStore.loadFromHost(bridge);
+        expect(reloadedTrajectory.getMessages(toAssistantThreadId(session.id))).toHaveLength(2);
+        const reloadedStore = new AssistantSessionStore({
+            bridge,
+            trajectoryStore: reloadedTrajectory,
+            persistenceMode: 'metadata',
+        });
+        const reloadedSession = reloadedStore.getSession(session.id);
+        expect(reloadedSession?.messages.map((m) => m.content)).toEqual([
+            '开始生成',
+            '第1段第2段第3段第4段第5段',
+        ]);
+
+        // Discrete mutations flush immediately via saveChatNow()
+        const beforeEditNow = bridge.saveChatNowCalls;
+        await runner.editMessage(session.id, reply.id, '已改写内容');
+        expect(bridge.saveChatNowCalls).toBe(beforeEditNow + 1);
+
+        const beforeRetractNow = bridge.saveChatNowCalls;
+        await runner.retractMessage(session.id, reply.id);
+        expect(bridge.saveChatNowCalls).toBe(beforeRetractNow + 1);
+
+        const beforeDeleteNow = bridge.saveChatNowCalls;
+        await runner.deleteSession(session.id);
+        expect(bridge.saveChatNowCalls).toBe(beforeDeleteNow + 1);
+    });
+
+    it('AssistantSessionStore.load() clears prior chat sessions and anchors when switching to a chat with empty metadata', async () => {
+        const bridge = createOffMainlineTestBridge();
+        const trajectoryStore = new TrajectoryStore();
+        const store = new AssistantSessionStore({
+            bridge,
+            trajectoryStore,
+            persistenceMode: 'metadata',
+        });
+
+        const s1 = store.createSession({ title: '聊天A会话', mode: 'chat' });
+        store.appendMessage(s1.id, {
+            id: 'm1',
+            role: 'user',
+            content: '聊天A的消息',
+            timestamp: Date.now(),
+        });
+        store.recordUsageAnchor(s1.id, 1200, 1000, 2);
+        expect(store.listSessions()).toHaveLength(1);
+        expect(store.getUsageAnchor(s1.id)).not.toBeNull();
+
+        // Simulate switching to Chat B whose metadata has no agentic_assistant_sessions key
+        bridge.metadata = {};
+        const loaded = await store.load();
+        expect(loaded).toEqual([]);
+        expect(store.getSession(s1.id)).toBeNull();
+        expect(store.getUsageAnchor(s1.id)).toBeNull();
+    });
+
+    it('onChatChanged() prevents mid-stream aborted Chat A turn from writing stale messages or checkpoints into Chat B metadata', async () => {
+        const bridge = createOffMainlineTestBridge();
+        const trajectoryStore = new TrajectoryStore();
+        const sessionStore = new AssistantSessionStore({
+            bridge,
+            trajectoryStore,
+            persistenceMode: 'metadata',
+        });
+
+        let releaseAbortableStream!: () => void;
+        const slowTransport = {
+            async complete() {
+                return { content: '', toolCalls: [], usage: { inputTokens: 0, cachedTokens: 0, outputTokens: 0, totalTokens: 0, cacheHitRate: 0 } };
+            },
+            async *stream(req: { signal?: AbortSignal }) {
+                yield { type: 'text_delta' as const, delta: '聊天A中途内容' };
+                await new Promise<void>((resolve) => {
+                    releaseAbortableStream = resolve;
+                    req.signal?.addEventListener('abort', () => resolve(), { once: true });
+                });
+                throw new Error('Aborted');
+            },
+            async listModels() {
+                return [];
+            },
+        };
+
+        const runner = new AssistantRunner({
+            bridge,
+            transport: slowTransport as never,
+            trajectoryStore,
+            sessionStore,
+            settings: createDefaultSettings(),
+            stream: true,
+        });
+
+        const chatASession = await runner.createSession({ title: '聊天A', mode: 'chat' });
+        const chatATurnPromise = runner.sendPrompt(chatASession.id, '你好A');
+
+        // Wait until the first streaming delta has arrived
+        await new Promise((r) => setTimeout(r, 20));
+
+        // Simulate SillyTavern switching to Chat B (metadata replaced before onChatChanged)
+        const chatBMetadata: Record<string, unknown> = {};
+        bridge.metadata = chatBMetadata;
+        const nowCallsAtSwitch = bridge.saveChatNowCalls;
+        runner.onChatChanged();
+        await sessionStore.load();
+
+        releaseAbortableStream();
+        await chatATurnPromise;
+
+        // Chat B's metadata must remain untouched by Chat A's async abort cleanup
+        expect(chatBMetadata.agentic_assistant_sessions).toBeUndefined();
+        expect(chatBMetadata.agentic_trajectories).toBeUndefined();
+        expect(bridge.saveChatNowCalls).toBe(nowCallsAtSwitch);
+        expect(runner.listSessions()).toEqual([]);
+    });
 });

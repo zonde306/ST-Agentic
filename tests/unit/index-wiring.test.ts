@@ -54,6 +54,8 @@ vi.mock('@st/script.js', () => ({
     saveSettingsDebounced: vi.fn(),
     saveChatDebounced: vi.fn(),
     saveChatConditional: vi.fn(async () => undefined),
+    getCurrentChatId: vi.fn(() => 'chat-1'),
+    isChatSaving: false,
     substituteParams: (text: string) => text,
     activateSendButtons: vi.fn(),
     deactivateSendButtons: vi.fn(),

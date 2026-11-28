@@ -1249,6 +1249,7 @@ export class AssistantRunner {
     private readonly activeControllers = new Map<string, AbortController>();
     private readonly suspendedApprovals = new Map<string, SuspendedApprovalRound>();
     private readonly compactingSessions = new Set<string>();
+    private chatEpoch = 0;
     private seq = 0;
 
     constructor(options: AssistantRunnerOptions) {
@@ -1372,6 +1373,40 @@ export class AssistantRunner {
         this.spillStore.clearAll();
     }
 
+    /**
+     * Reset all in-flight runs, pending approvals, and spill caches when SillyTavern
+     * switches chats, bumping `chatEpoch` so aborted turns cannot write into the new chat.
+     */
+    public onChatChanged(): void {
+        this.chatEpoch += 1;
+        this.abort();
+        this.clearSpillStore();
+        this.approvalGate.clear();
+        this.suspendedApprovals.clear();
+        this.compactingSessions.clear();
+    }
+
+    private async flushDurableState(expectedEpoch?: number): Promise<void> {
+        if (expectedEpoch !== undefined && this.chatEpoch !== expectedEpoch) {
+            return;
+        }
+        if (
+            this.sessionStore.getPersistenceMode() === 'metadata'
+            && this.trajectoryStore.listAgentIds().length > 0
+        ) {
+            this.trajectoryStore.saveToHost(this.bridge, undefined, { scheduleSave: false });
+        }
+        await this.sessionStore.flush();
+    }
+
+    private async flushDurableStateSafe(expectedEpoch?: number): Promise<void> {
+        try {
+            await this.flushDurableState(expectedEpoch);
+        } catch {
+            // Preserve primary abort/error flow if host persistence fails.
+        }
+    }
+
     public getSessionTokenStatus(sessionId: string): AssistantSessionTokenStatus | null {
         const session = this.sessionStore.getSession(sessionId);
         if (!session) {
@@ -1409,6 +1444,7 @@ export class AssistantRunner {
             };
         }
 
+        const epoch = this.chatEpoch;
         this.compactingSessions.add(sessionId);
         this.notify();
 
@@ -1437,6 +1473,9 @@ export class AssistantRunner {
                 layer0,
                 tools,
             });
+            if (this.chatEpoch === epoch && report.compacted) {
+                await this.flushDurableState(epoch);
+            }
             return report;
         } finally {
             this.compactingSessions.delete(sessionId);
@@ -1461,6 +1500,7 @@ export class AssistantRunner {
     ): Promise<AssistantSession> {
         const session = this.sessionStore.createSession(options);
         this.notify();
+        await this.flushDurableState();
         return session;
     }
 
@@ -1476,6 +1516,7 @@ export class AssistantRunner {
         const deleted = this.sessionStore.deleteSession(sessionId);
         if (deleted) {
             this.notify();
+            await this.flushDurableState();
         }
         return deleted;
     }
@@ -1492,6 +1533,7 @@ export class AssistantRunner {
         const cleared = this.sessionStore.clearSession(sessionId);
         if (cleared) {
             this.notify();
+            await this.flushDurableState();
         }
         return cleared;
     }
@@ -1503,6 +1545,7 @@ export class AssistantRunner {
         const updated = this.sessionStore.updateSession(sessionId, patch);
         if (updated) {
             this.notify();
+            await this.flushDurableState();
         }
         return updated;
     }
@@ -1670,6 +1713,7 @@ export class AssistantRunner {
 
         this.sessionStore.syncTrajectoryToMessages(sessionId);
         this.notify();
+        await this.flushDurableState();
         return this.sessionStore.getSession(sessionId);
     }
 
@@ -1748,6 +1792,7 @@ export class AssistantRunner {
 
         this.cleanupApprovalsForMessages(sessionId, result.removedMessages);
         this.notify();
+        await this.flushDurableState();
         return result;
     }
 
@@ -1982,6 +2027,8 @@ export class AssistantRunner {
         this.activeControllers.set(sessionId, controller);
 
         const cleanupExternalSignal = this.linkExternalSignal(controller, options.signal);
+        const turnChatEpoch = this.chatEpoch;
+        const isStaleChat = (): boolean => this.chatEpoch !== turnChatEpoch;
 
         const resume = config.resumeState;
         if (!resume) {
@@ -2140,7 +2187,13 @@ export class AssistantRunner {
             return steps;
         };
 
-        const syncAssistantBubble = (patch?: Partial<AssistantMessage>): void => {
+        const syncAssistantBubble = (
+            patch?: Partial<AssistantMessage>,
+            syncOptions?: { streamingDelta?: boolean },
+        ): void => {
+            if (isStaleChat()) {
+                return;
+            }
             const activity = buildActivity();
             const nextMessage: AssistantMessage = {
                 ...assistantMessage,
@@ -2177,14 +2230,26 @@ export class AssistantRunner {
                 }
             }
             assistantMessage = nextMessage;
-            this.sessionStore.updateMessage(sessionId, assistantMessageId, () => assistantMessage);
-            this.emitSessionUpdate(sessionId, options.onUpdate);
+            this.sessionStore.updateMessage(
+                sessionId,
+                assistantMessageId,
+                () => assistantMessage,
+                syncOptions?.streamingDelta ? { persist: 'memory' } : undefined,
+            );
+            this.emitSessionUpdate(
+                sessionId,
+                options.onUpdate,
+                syncOptions?.streamingDelta ? { notifySubscribers: false } : undefined,
+            );
         };
 
         const saveCheckpoint = (
             reason: AssistantInterruptedCheckpoint['reason'],
             extra?: { errorMessage?: string },
         ): void => {
+            if (isStaleChat()) {
+                return;
+            }
             const bubbleBaseContent = contentBuffer.slice(0, committedContentPrefixLen);
             const partialContent = contentBuffer.slice(committedContentPrefixLen);
             this.sessionStore.setInterruptedCheckpoint(sessionId, {
@@ -2345,6 +2410,9 @@ export class AssistantRunner {
                 finalContentForTrajectory: string,
                 finalReasoningContent: string,
             ): Promise<AssistantMessage> => {
+                if (isStaleChat()) {
+                    return canonicalClone(assistantMessage);
+                }
                 const finalCanonicalAssistant: CanonicalMessage = {
                     role: 'assistant',
                     content: finalContentForTrajectory,
@@ -2388,6 +2456,9 @@ export class AssistantRunner {
                     signal: controller.signal,
                     attachNotice: false,
                 });
+                if (isStaleChat()) {
+                    return canonicalClone(assistantMessage);
+                }
                 if (autoReport.compacted) {
                     turnCompactionNotice = {
                         tokensBefore: autoReport.tokensBefore,
@@ -2415,6 +2486,7 @@ export class AssistantRunner {
                     canContinue: undefined,
                     retryStatus: undefined,
                 });
+                await this.flushDurableState(turnChatEpoch);
                 return canonicalClone(assistantMessage);
             };
 
@@ -2531,7 +2603,7 @@ export class AssistantRunner {
                               finishTurnStreamedAnyResponse = true;
                               contentBuffer += delta;
                               options.onDelta?.(delta);
-                              syncAssistantBubble();
+                              syncAssistantBubble(undefined, { streamingDelta: true });
                           },
                           onStepBriefDelta: (delta) => {
                               if (!hasNativeReasoning) {
@@ -2540,7 +2612,7 @@ export class AssistantRunner {
                                   roundStepBriefThinkBuffer += delta;
                                   thinkBuffer += delta;
                                   options.onReasoningDelta?.(delta);
-                                  syncAssistantBubble();
+                                  syncAssistantBubble(undefined, { streamingDelta: true });
                               }
                           },
                           onSuppressed: () => {
@@ -2595,7 +2667,7 @@ export class AssistantRunner {
                                       activeRetryStatus = undefined;
                                       contentBuffer += delta;
                                       options.onDelta?.(delta);
-                                      syncAssistantBubble();
+                                      syncAssistantBubble(undefined, { streamingDelta: true });
                                   },
                             onReasoningDelta: (delta) => {
                                 activeRetryStatus = undefined;
@@ -2608,7 +2680,7 @@ export class AssistantRunner {
                                 roundStreamThinkBuffer += delta;
                                 thinkBuffer += delta;
                                 options.onReasoningDelta?.(delta);
-                                syncAssistantBubble();
+                                syncAssistantBubble(undefined, { streamingDelta: true });
                             },
                             onToolCallDelta: (index, delta) => {
                                 if (activeRetryStatus) {
@@ -2976,6 +3048,7 @@ export class AssistantRunner {
                         canContinue: true,
                         retryStatus: undefined,
                     });
+                    await this.flushDurableState(turnChatEpoch);
                     return canonicalClone(assistantMessage);
                 }
 
@@ -3457,6 +3530,7 @@ export class AssistantRunner {
                 // Suspend turn cleanly so the inline bubble approval UI renders without blocking.
                 if (suspendedThisRound) {
                     syncAssistantBubble();
+                    await this.flushDurableState(turnChatEpoch);
                     return canonicalClone(assistantMessage);
                 }
             }
@@ -3472,9 +3546,13 @@ export class AssistantRunner {
                 canContinue: true,
                 retryStatus: undefined,
             });
+            await this.flushDurableState(turnChatEpoch);
             return canonicalClone(assistantMessage);
         } catch (error) {
             activeRetryStatus = undefined;
+            if (isStaleChat()) {
+                return canonicalClone(assistantMessage);
+            }
             if (
                 isAssistantAbortError(error)
                 || isAbortError(error)
@@ -3487,6 +3565,7 @@ export class AssistantRunner {
                     canContinue: true,
                     retryStatus: undefined,
                 });
+                await this.flushDurableStateSafe(turnChatEpoch);
                 return canonicalClone(assistantMessage);
             }
             const errorCode = classifyAssistantErrorCode(error);
@@ -3507,6 +3586,7 @@ export class AssistantRunner {
                 canContinue: !isOverflow,
                 retryStatus: undefined,
             });
+            await this.flushDurableStateSafe(turnChatEpoch);
             throw new Error(redactedErr);
         } finally {
             cleanupExternalSignal();
@@ -3615,6 +3695,7 @@ export class AssistantRunner {
         decision: 'approve' | 'reject',
         feedback?: string,
     ): Promise<PendingApproval | null> {
+        const epoch = this.chatEpoch;
         const existing = this.approvalGate.get(approvalId);
         if (!existing) {
             return null;
@@ -3628,6 +3709,7 @@ export class AssistantRunner {
                 this.finalizeResolvedApprovalRound(suspended, session);
             }
             this.notify();
+            await this.flushDurableState(epoch);
             return rejected;
         }
 
@@ -3673,6 +3755,9 @@ export class AssistantRunner {
         });
 
         const execResult = await executeAssistantTool(toolDef, existing.args, toolCtx);
+        if (this.chatEpoch !== epoch) {
+            return null;
+        }
         if (!execResult.ok) {
             throw new Error(execResult.error ?? `Execution of "${existing.toolName}" failed.`);
         }
@@ -3732,6 +3817,7 @@ export class AssistantRunner {
         }
 
         this.notify();
+        await this.flushDurableState(epoch);
         return approved;
     }
 
@@ -3743,6 +3829,7 @@ export class AssistantRunner {
         approvalId: string,
         feedback?: string,
     ): Promise<PendingApproval | null> {
+        const epoch = this.chatEpoch;
         const existing = this.approvalGate.get(approvalId);
         if (!existing) {
             return null;
@@ -3967,6 +4054,9 @@ export class AssistantRunner {
                     throw llmError;
                 }
             }
+            if (this.chatEpoch !== epoch) {
+                return null;
+            }
             if (turnOutput.usage.inputTokens > 0) {
                 this.sessionStore.recordUsageAnchor(
                     existing.sessionId,
@@ -4009,6 +4099,9 @@ export class AssistantRunner {
                         policy,
                         toolCtx,
                     );
+                    if (this.chatEpoch !== epoch) {
+                        return null;
+                    }
 
                     const retried = this.approvalGate.retry(approvalId, {
                         rejectionFeedback: feedbackText || undefined,
@@ -4107,6 +4200,7 @@ export class AssistantRunner {
                     }
 
                     this.notify();
+                    await this.flushDurableState(epoch);
                     return retried;
                 }
             }
@@ -4128,6 +4222,7 @@ export class AssistantRunner {
                 summary: fallbackSummary,
             });
             this.notify();
+            await this.flushDurableState(epoch);
             return retried;
         } finally {
             if (this.activeControllers.get(existing.sessionId) === controller) {
@@ -4149,6 +4244,7 @@ export class AssistantRunner {
                 }
             }
             this.notify();
+            await this.flushDurableState();
         }
         return result;
     }
@@ -4774,6 +4870,7 @@ export class AssistantRunner {
     private emitSessionUpdate(
         sessionId: string,
         onUpdate?: (session: AssistantSession) => void,
+        options?: { notifySubscribers?: boolean },
     ): void {
         if (onUpdate) {
             const latest = this.sessionStore.getSession(sessionId);
@@ -4785,7 +4882,9 @@ export class AssistantRunner {
                 }
             }
         }
-        this.notify();
+        if (options?.notifySubscribers !== false) {
+            this.notify();
+        }
     }
 
     private notify(): void {

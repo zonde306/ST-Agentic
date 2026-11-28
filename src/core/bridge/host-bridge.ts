@@ -123,6 +123,7 @@ export interface HostBridge {
     getChat(): ChatMessageSnapshot[];
     getMetadata(): Record<string, unknown>;
     saveChatDebounced(): void;
+    saveChatNow?(): Promise<void>;
     getActiveIdentity(): HostIdentity;
 
     // 1b. Native ST 3-scope variables (message / chat / global)

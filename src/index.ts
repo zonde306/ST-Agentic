@@ -3132,8 +3132,9 @@ jQuery(async () => {
         rehydrateMessageCapsules();
 
         const handleChatChanged = async (): Promise<void> => {
-            assistantRunner.abort();
-            assistantRunner.clearSpillStore();
+            bridge.notifyChatChanged();
+            appStore?.abortAssistantStream(undefined, { silentToast: true, chatChanged: true });
+            assistantRunner.onChatChanged();
             toolRegistry.clearSpillStore();
             rotateSideGenLifecycleAbort('chat_changed');
             sideGenService.abortAll('chat_changed');
@@ -3386,7 +3387,14 @@ jQuery(async () => {
         };
 
         if (typeof window !== 'undefined') {
-            window.addEventListener('beforeunload', disposeOffMainlineAndHost, { once: true });
+            window.addEventListener('beforeunload', (event) => {
+                if (bridge.hasPendingChatSave()) {
+                    event.preventDefault();
+                    event.returnValue = '';
+                    return;
+                }
+                disposeOffMainlineAndHost();
+            });
             window.addEventListener('pagehide', disposeOffMainlineAndHost, { once: true });
         }
 

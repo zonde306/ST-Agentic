@@ -935,6 +935,10 @@ export class AssistantSessionStore {
         }
     }
 
+    public getPersistenceMode(): AssistantPersistenceMode {
+        return this.persistenceMode;
+    }
+
     public getDefaultWatermark(): { high: number; low: number } {
         return { ...this.defaultWatermark };
     }
@@ -957,6 +961,9 @@ export class AssistantSessionStore {
             [],
         );
         this.sessions.clear();
+        this.usageAnchors.clear();
+        this.compactionAnchors.clear();
+        this.compactionCycleCounts.clear();
         if (Array.isArray(loaded)) {
             for (const item of loaded) {
                 if (isValidAssistantSession(item)) {
@@ -967,9 +974,18 @@ export class AssistantSessionStore {
         return this.listSessions();
     }
 
-    /** Wait for any queued async persistence operations to complete. */
+    /** Wait for any queued async persistence operations to complete and flush metadata saves. */
     public async flush(): Promise<void> {
         await this.persistChain;
+        if (this.bridge && this.persistenceMode === 'metadata') {
+            const meta = this.bridge.getMetadata();
+            meta[this.storageKey] = this.listSessions();
+            if (typeof this.bridge.saveChatNow === 'function') {
+                await this.bridge.saveChatNow();
+            } else {
+                this.bridge.saveChatDebounced();
+            }
+        }
     }
 
     public createSession(options: CreateAssistantSessionOptions = {}): AssistantSession {
@@ -1116,6 +1132,7 @@ export class AssistantSessionStore {
         sessionId: string,
         messageId: string,
         updater: (prev: AssistantMessage) => AssistantMessage,
+        options?: { persist?: 'debounced' | 'memory' },
     ): AssistantMessage | null {
         const session = this.sessions.get(sessionId);
         if (!session) {
@@ -1128,7 +1145,9 @@ export class AssistantSessionStore {
         const updated = canonicalClone(updater(canonicalClone(session.messages[idx])));
         session.messages[idx] = updated;
         session.updatedAt = this.now();
-        this.persist();
+        if (options?.persist !== 'memory') {
+            this.persist();
+        }
         return canonicalClone(updated);
     }
 
@@ -2210,12 +2229,15 @@ export class AssistantSessionStore {
         if (!this.bridge) {
             return;
         }
+        this.sessions.clear();
+        this.usageAnchors.clear();
+        this.compactionAnchors.clear();
+        this.compactionCycleCounts.clear();
         const meta = this.bridge.getMetadata();
         const raw = meta[this.storageKey];
         if (!Array.isArray(raw)) {
             return;
         }
-        this.sessions.clear();
         for (const item of raw) {
             if (isValidAssistantSession(item)) {
                 this.sessions.set(item.id, cloneSession(item));

@@ -607,6 +607,7 @@ export class AppStore {
     private _assistantRuntime: AssistantRuntimeBridge | null = null;
     private _sideGenRuntime: SideGenRuntimeBridge | null = null;
     private readonly assistantStreamControllers = new Map<string, AbortController>();
+    private assistantChatEpoch = 0;
     private disposed = false;
     private toastCounter = 0;
     private resumedEventCount = 0;
@@ -1068,8 +1069,11 @@ export class AppStore {
 
         let receivedOnUpdate = false;
         let liveBubbleOwned = false;
+        const runChatEpoch = this.assistantChatEpoch;
         const isCurrentRun = () =>
-            !this.disposed && this.assistantStreamControllers.get(sessionId) === controller;
+            !this.disposed
+            && this.assistantChatEpoch === runChatEpoch
+            && this.assistantStreamControllers.get(sessionId) === controller;
 
         try {
             const result = await executor({
@@ -1098,7 +1102,7 @@ export class AppStore {
                     });
                 },
                 onUpdate: (updatedSession: AssistantSession) => {
-                    if (this.disposed) {
+                    if (this.disposed || this.assistantChatEpoch !== runChatEpoch) {
                         return;
                     }
                     receivedOnUpdate = true;
@@ -1120,7 +1124,7 @@ export class AppStore {
                 },
             });
 
-            if (this.disposed) {
+            if (this.disposed || this.assistantChatEpoch !== runChatEpoch) {
                 return;
             }
 
@@ -1157,7 +1161,7 @@ export class AppStore {
                 }
             }
         } catch (err) {
-            if (!this.disposed && !controller.signal.aborted) {
+            if (!this.disposed && this.assistantChatEpoch === runChatEpoch && !controller.signal.aborted) {
                 this.pushToast(`${errorPrefix}：${formatStoreErrorMessage(err)}`, 'error');
             }
         } finally {
@@ -1165,7 +1169,7 @@ export class AppStore {
                 this.assistantStreamControllers.delete(sessionId);
                 this.clearAssistantStreamingState(sessionId);
             }
-            if (!this.disposed) {
+            if (!this.disposed && this.assistantChatEpoch === runChatEpoch) {
                 try {
                     await this.refreshAssistantState();
                 } catch {
@@ -1177,8 +1181,11 @@ export class AppStore {
 
     abortAssistantStream(
         sessionId?: string,
-        options?: { silentToast?: boolean },
+        options?: { silentToast?: boolean; chatChanged?: boolean },
     ): void {
+        if (options?.chatChanged) {
+            this.assistantChatEpoch += 1;
+        }
         if (sessionId) {
             const controller = this.assistantStreamControllers.get(sessionId);
             if (controller) {

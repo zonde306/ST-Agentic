@@ -7,10 +7,13 @@ import {
     chat_metadata,
     deleteMessage,
     getCharacterCardFields,
+    getCurrentChatId,
+    isChatSaving,
     messageFormatting,
     name1,
     name2,
     refreshSwipeButtons,
+    saveChatConditional,
     saveChatDebounced,
     saveSettingsDebounced,
     substituteParams,
@@ -22,6 +25,7 @@ import {
 import { MEDIA_SOURCE, MEDIA_TYPE } from '@st/scripts/constants.js';
 import { eventSource, event_types } from '@st/scripts/events.js';
 import { extension_settings, saveMetadataDebounced } from '@st/scripts/extensions.js';
+import { selected_group } from '@st/scripts/group-chats.js';
 import { user_avatar } from '@st/scripts/personas.js';
 import { power_user } from '@st/scripts/power-user.js';
 import { updateReasoningUI } from '@st/scripts/reasoning.js';
@@ -412,6 +416,14 @@ export class STHostBridge implements HostBridge {
     private outputProcessDepth = 0;
     private promptPreprocessDepth = 0;
     private outputPostprocessDepth = 0;
+    private saveChatEpoch = 0;
+    private saveChatDirty = false;
+    private saveChatScope: {
+        epoch: number;
+        chatKey: string | null;
+        metadataRef: unknown;
+    } | null = null;
+    private saveChatFlushPromise: Promise<void> | null = null;
 
     evaluateOptionalEjs?: EvaluateOptionalEjsHook;
     createPromptInjectionSession?: CreatePromptInjectionSessionHook;
@@ -573,6 +585,108 @@ export class STHostBridge implements HostBridge {
 
     saveChatDebounced(): void {
         saveChatDebounced();
+    }
+
+    private captureActiveChatKey(): string | null {
+        const currentId = typeof getCurrentChatId === 'function' ? getCurrentChatId() : undefined;
+        if (typeof currentId === 'string' && currentId) {
+            const scopePrefix = selected_group
+                ? `group:${String(selected_group)}`
+                : `char:${String(this_chid ?? '')}`;
+            return `${scopePrefix}:${currentId}`;
+        }
+        const chid = Number(this_chid);
+        if (Number.isInteger(chid) && chid >= 0 && Array.isArray(characters)) {
+            const chatFile = characters[chid]?.chat;
+            if (typeof chatFile === 'string' && chatFile) {
+                return `char:${chid}:${chatFile}`;
+            }
+        }
+        return null;
+    }
+
+    private captureSaveScope(): {
+        epoch: number;
+        chatKey: string | null;
+        metadataRef: unknown;
+    } {
+        return {
+            epoch: this.saveChatEpoch,
+            chatKey: this.captureActiveChatKey(),
+            metadataRef: chat_metadata,
+        };
+    }
+
+    private isSameSaveScope(scope: {
+        epoch: number;
+        chatKey: string | null;
+        metadataRef: unknown;
+    }): boolean {
+        return (
+            scope.epoch === this.saveChatEpoch
+            && scope.chatKey === this.captureActiveChatKey()
+            && scope.metadataRef === chat_metadata
+        );
+    }
+
+    /**
+     * Invalidate any queued `saveChatNow()` flush when SillyTavern switches chats
+     * so stale metadata cannot be written into a newly loaded chat.
+     */
+    notifyChatChanged(): void {
+        this.saveChatEpoch += 1;
+        this.saveChatDirty = false;
+        this.saveChatScope = null;
+    }
+
+    /**
+     * Report whether an immediate or SillyTavern-level chat save is currently pending/in-flight.
+     */
+    hasPendingChatSave(): boolean {
+        return this.saveChatDirty || this.saveChatFlushPromise !== null || Boolean(isChatSaving);
+    }
+
+    async saveChatNow(): Promise<void> {
+        if (typeof saveChatConditional !== 'function') {
+            saveChatDebounced();
+            return;
+        }
+
+        const scope = this.captureSaveScope();
+        this.saveChatDirty = true;
+        this.saveChatScope = scope;
+
+        if (!this.saveChatFlushPromise) {
+            const flushPromise = Promise.resolve().then(async () => {
+                try {
+                    while (this.saveChatDirty) {
+                        const activeScope = this.saveChatScope;
+                        this.saveChatDirty = false;
+                        if (!activeScope || !this.isSameSaveScope(activeScope)) {
+                            continue;
+                        }
+                        const deadline = Date.now() + 15_000;
+                        while (Boolean(isChatSaving) && Date.now() < deadline) {
+                            if (!this.isSameSaveScope(activeScope)) {
+                                break;
+                            }
+                            await new Promise<void>((resolve) => setTimeout(resolve, 50));
+                        }
+                        if (!this.isSameSaveScope(activeScope) || Boolean(isChatSaving)) {
+                            continue;
+                        }
+                        await saveChatConditional();
+                    }
+                } finally {
+                    if (this.saveChatFlushPromise === flushPromise) {
+                        this.saveChatFlushPromise = null;
+                    }
+                }
+            });
+            this.saveChatFlushPromise = flushPromise;
+        }
+
+        await this.saveChatFlushPromise;
     }
 
     readMessageVariables(target: MessageTarget): Record<string, unknown> | null {

@@ -29,6 +29,8 @@ const stMocks = vi.hoisted(() => {
         registeredSlashCommands: {} as Record<string, Record<string, unknown>>,
         registeredMacros: new Map<string, unknown>(),
         is_send_press: false,
+        isChatSaving: false,
+        currentChatId: 'chat-1' as string | undefined,
     };
 
     const fns = {
@@ -37,6 +39,8 @@ const stMocks = vi.hoisted(() => {
                 ? { 'X-CSRF-Token': 'csrf-test' }
                 : { 'Content-Type': 'application/json', 'X-CSRF-Token': 'csrf-test' },
         ),
+        getCurrentChatId: vi.fn(() => state.currentChatId),
+        saveChatConditional: vi.fn(async () => undefined),
         saveChatDebounced: vi.fn(),
         saveCharacterDebounced: vi.fn(),
         saveSettingsDebounced: vi.fn(),
@@ -200,9 +204,14 @@ vi.mock('@st/script.js', () => ({
     get is_send_press() {
         return stMocks.state.is_send_press;
     },
+    get isChatSaving() {
+        return stMocks.state.isChatSaving;
+    },
     extension_prompt_types: { NONE: -1, IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 },
     extension_prompt_roles: { SYSTEM: 0, USER: 1, ASSISTANT: 2 },
+    getCurrentChatId: stMocks.fns.getCurrentChatId,
     getRequestHeaders: stMocks.fns.getRequestHeaders,
+    saveChatConditional: stMocks.fns.saveChatConditional,
     saveChatDebounced: stMocks.fns.saveChatDebounced,
     saveCharacterDebounced: stMocks.fns.saveCharacterDebounced,
     saveSettingsDebounced: stMocks.fns.saveSettingsDebounced,
@@ -399,6 +408,8 @@ function resetStState() {
     stMocks.state.name2 = 'Alice';
     stMocks.state.user_avatar = 'tester.png';
     stMocks.state.selected_group = null;
+    stMocks.state.isChatSaving = false;
+    stMocks.state.currentChatId = 'chat-1';
     stMocks.state.characters = [
         {
             name: 'Alice',
@@ -2462,5 +2473,61 @@ describe('/sidegen-* Slash Commands', () => {
         );
 
         handle.dispose();
+    });
+
+    it('STHostBridge.saveChatNow() waits for isChatSaving, coalesces overlapping writes, and cancels on chat change', async () => {
+        const bridge = new STHostBridge();
+        let releaseFirstSave!: () => void;
+        let callCount = 0;
+
+        stMocks.fns.saveChatConditional.mockImplementation(async () => {
+            callCount += 1;
+            if (callCount === 1) {
+                stMocks.state.isChatSaving = true;
+                await new Promise<void>((resolve) => {
+                    releaseFirstSave = () => {
+                        stMocks.state.isChatSaving = false;
+                        resolve();
+                    };
+                });
+            }
+        });
+
+        const firstSave = bridge.saveChatNow();
+        await Promise.resolve();
+        expect(bridge.hasPendingChatSave()).toBe(true);
+
+        // Concurrent saves while first save is active coalesce into a single follow-up flush
+        const secondSave = bridge.saveChatNow();
+        const thirdSave = bridge.saveChatNow();
+
+        releaseFirstSave();
+        await Promise.all([firstSave, secondSave, thirdSave]);
+        expect(callCount).toBe(2);
+        expect(bridge.hasPendingChatSave()).toBe(false);
+
+        // Wait for external isChatSaving=true to clear instead of dropping
+        callCount = 0;
+        stMocks.fns.saveChatConditional.mockImplementation(async () => {
+            callCount += 1;
+        });
+        stMocks.state.isChatSaving = true;
+        const waitedSave = bridge.saveChatNow();
+        setTimeout(() => {
+            stMocks.state.isChatSaving = false;
+        }, 60);
+        await waitedSave;
+        expect(callCount).toBe(1);
+
+        // Switching chats invalidates queued saves so stale metadata never writes to the new chat
+        callCount = 0;
+        stMocks.state.isChatSaving = true;
+        const staleSave = bridge.saveChatNow();
+        stMocks.state.currentChatId = 'chat-2';
+        stMocks.state.chat_metadata = { character_name: 'Alice', chat2: true };
+        bridge.notifyChatChanged();
+        stMocks.state.isChatSaving = false;
+        await staleSave;
+        expect(callCount).toBe(0);
     });
 });
