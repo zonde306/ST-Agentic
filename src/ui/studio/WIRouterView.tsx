@@ -23,12 +23,12 @@ import {
 } from '@/ui/components';
 import {
     IconBookOpen,
-    IconDownload,
+    IconExport,
     IconFolder,
+    IconImport,
     IconPlus,
     IconRefresh,
     IconTrash,
-    IconUpload,
 } from '@/ui/components/Icons';
 import {
     type ConsoleViewProps,
@@ -329,7 +329,7 @@ export function WIRouterView(props: Partial<ConsoleViewProps> = {}) {
                 + content.length;
             if (projected > DEFAULT_FILE_MAP_SIZE_LIMIT) {
                 store.pushToast(
-                    `上传失败：预设文件总大小超出 ${Math.floor(DEFAULT_FILE_MAP_SIZE_LIMIT / 1024)} KB 上限`,
+                    `导入失败：预设文件总大小超出 ${Math.floor(DEFAULT_FILE_MAP_SIZE_LIMIT / 1024)} KB 上限`,
                     'error',
                 );
                 return;
@@ -345,7 +345,7 @@ export function WIRouterView(props: Partial<ConsoleViewProps> = {}) {
             if (isMobile) {
                 setFileDetailOpen(true);
             }
-            store.pushToast(`已上传 /preset/${safeName}`, 'success');
+            store.pushToast(`已导入 /preset/${safeName}`, 'success');
         };
         reader.readAsText(file);
         event.currentTarget.value = '';
@@ -623,10 +623,10 @@ export function WIRouterView(props: Partial<ConsoleViewProps> = {}) {
                 <Button
                     size="sm"
                     variant="secondary"
-                    icon={<IconUpload size={14} />}
+                    icon={<IconImport size={14} />}
                     onClick={() => fileUploadRef.current?.click()}
                 >
-                    上传文本文件
+                    导入文本文件
                 </Button>
             </div>
 
@@ -682,7 +682,7 @@ export function WIRouterView(props: Partial<ConsoleViewProps> = {}) {
                                 <Button
                                     size="sm"
                                     variant="secondary"
-                                    icon={<IconDownload size={14} />}
+                                    icon={<IconExport size={14} />}
                                     onClick={() => {
                                         const basename = selectedFile.split('/').pop() || selectedFile;
                                         const mime = selectedFile.toLowerCase().endsWith('.json')
@@ -691,10 +691,10 @@ export function WIRouterView(props: Partial<ConsoleViewProps> = {}) {
                                                 ? 'text/markdown;charset=utf-8'
                                                 : 'text/plain;charset=utf-8';
                                         downloadTextFile(basename, fileDraft.value, mime);
-                                        store.pushToast(`已下载 ${basename}`, 'success');
+                                        store.pushToast(`已导出 ${basename}`, 'success');
                                     }}
                                 >
-                                    下载文件
+                                    导出文件
                                 </Button>
                                 <Button
                                     size="sm"

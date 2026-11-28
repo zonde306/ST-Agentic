@@ -14,7 +14,7 @@ import {
     TextInput,
     ToggleSwitch,
 } from '@/ui/components';
-import { IconCheck, IconUpload } from '@/ui/components/Icons';
+import { IconCheck, IconExport } from '@/ui/components/Icons';
 import type { AppStore } from '@/ui/store';
 import {
     formatErrorMessage,
@@ -207,7 +207,7 @@ export function ExportWorldInfoModal({
                             variant="primary"
                             size="sm"
                             loading={submitting}
-                            icon={<IconUpload size={14} />}
+                            icon={<IconExport size={14} />}
                             onClick={() => {
                                 void handleSubmit();
                             }}

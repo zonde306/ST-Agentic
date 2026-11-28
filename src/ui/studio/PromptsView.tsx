@@ -40,10 +40,10 @@ import {
     IconChevronRight,
     IconCode,
     IconCopy,
-    IconDownload,
+    IconExport,
+    IconImport,
     IconPlus,
     IconTrash,
-    IconUpload,
 } from '@/ui/components/Icons';
 import {
     type ConsoleViewProps,
@@ -858,7 +858,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                                 <Button
                                     size="sm"
                                     variant="secondary"
-                                    icon={<IconUpload size={14} />}
+                                    icon={<IconImport size={14} />}
                                     disabled={!activeAgent}
                                     onClick={() => {
                                         setImportError(null);
@@ -870,7 +870,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                                 <Button
                                     size="sm"
                                     variant="secondary"
-                                    icon={<IconDownload size={14} />}
+                                    icon={<IconExport size={14} />}
                                     disabled={!activeAgent || promptBlocks.length === 0}
                                     onClick={() => {
                                         setExportBlock(null);
@@ -1142,7 +1142,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                                                     variant="ghost"
                                                     ariaLabel={`导出提示词 ${block.name}`}
                                                     title="导出单条提示词"
-                                                    icon={<IconDownload size={15} />}
+                                                    icon={<IconExport size={15} />}
                                                     onClick={() => {
                                                         setExportBlock(block);
                                                         setExportOpen(true);
@@ -1435,7 +1435,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                         <Button
                             variant="secondary"
                             size="sm"
-                            icon={<IconUpload size={14} />}
+                            icon={<IconImport size={14} />}
                             onClick={() => importFileRef.current?.click()}
                         >
                             选择 JSON 文件
@@ -1483,7 +1483,7 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                         <Button
                             variant="primary"
                             size="sm"
-                            icon={<IconDownload size={14} />}
+                            icon={<IconExport size={14} />}
                             onClick={() => {
                                 const slug = exportBlock
                                     ? exportBlock.name
@@ -1491,10 +1491,10 @@ export function PromptsView({ store: propStore }: ConsoleViewProps) {
                                 const safeSlug =
                                     slug.replace(/[^a-zA-Z0-9\u4e00-\u9fff_-]+/g, '_') || 'prompts';
                                 downloadTextFile(`agentic-prompts-${safeSlug}.json`, exportJsonText);
-                                store.pushToast('已下载提示词 JSON 文件', 'success');
+                                store.pushToast('已导出提示词 JSON 文件', 'success');
                             }}
                         >
-                            下载 JSON 文件
+                            导出 JSON 文件
                         </Button>
                         <Button
                             variant="secondary"

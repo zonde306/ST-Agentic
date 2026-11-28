@@ -34,11 +34,11 @@ import {
     IconArrowDown,
     IconArrowUp,
     IconCopy,
-    IconDownload,
+    IconExport,
     IconFilter,
+    IconImport,
     IconPlus,
     IconTrash,
-    IconUpload,
 } from '@/ui/components/Icons';
 import {
     type ConsoleViewProps,
@@ -496,7 +496,7 @@ export function RegexView(props: Partial<ConsoleViewProps> = {}) {
                 <Button
                     size="sm"
                     variant="secondary"
-                    icon={<IconUpload size={14} />}
+                    icon={<IconImport size={14} />}
                     onClick={() => {
                         setImportError(null);
                         setImportModalOpen(true);
@@ -507,7 +507,7 @@ export function RegexView(props: Partial<ConsoleViewProps> = {}) {
                 <Button
                     size="sm"
                     variant="secondary"
-                    icon={<IconDownload size={14} />}
+                    icon={<IconExport size={14} />}
                     disabled={activePreset.regexRules.length === 0}
                     onClick={() => void handleExportJson(false)}
                 >
@@ -851,7 +851,7 @@ export function RegexView(props: Partial<ConsoleViewProps> = {}) {
                         <Button
                             size="sm"
                             variant="secondary"
-                            icon={<IconUpload size={14} />}
+                            icon={<IconImport size={14} />}
                             onClick={() => fileInputRef.current?.click()}
                         >
                             选择 JSON 文件

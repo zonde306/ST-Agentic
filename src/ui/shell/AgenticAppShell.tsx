@@ -19,6 +19,7 @@ import {
     IconFilter,
     IconFolder,
     IconGitBranch,
+    IconImport,
     IconLayers,
     IconMaximize,
     IconMinimize,
@@ -29,7 +30,6 @@ import {
     IconPlug,
     IconSun,
     IconTerminal,
-    IconUpload,
     IconWrench,
 } from '../components/Icons';
 import {
@@ -279,7 +279,7 @@ function FallbackConsoleView({
                             <Button
                                 variant="secondary"
                                 size="sm"
-                                icon={<IconUpload size={14} />}
+                                icon={<IconImport size={14} />}
                                 onClick={() => store.openModal({ kind: 'import_manager' })}
                             >
                                 测试导入 / 迁移与角色卡嵌入面板
@@ -438,7 +438,7 @@ function AgenticShellContent() {
                                     className="ag-header-import-btn"
                                     ariaLabel="导入、导出与角色卡嵌入"
                                     title="导入、导出与角色卡嵌入"
-                                    icon={<IconUpload size={16} />}
+                                    icon={<IconImport size={16} />}
                                     onClick={() => store.openModal({ kind: 'import_manager' })}
                                 >
                                     导入

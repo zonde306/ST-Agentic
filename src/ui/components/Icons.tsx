@@ -180,6 +180,16 @@ export function IconDownload(props: IconProps) {
     );
 }
 
+/** Semantic import icon: arrow pointing down into tray (↓). */
+export function IconImport(props: IconProps) {
+    return <IconDownload {...props} />;
+}
+
+/** Semantic export icon: arrow pointing up out of tray (↑). */
+export function IconExport(props: IconProps) {
+    return <IconUpload {...props} />;
+}
+
 export function IconClose(props: IconProps) {
     return (
         <SvgIcon {...props}>

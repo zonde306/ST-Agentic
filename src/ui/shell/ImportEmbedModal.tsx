@@ -11,8 +11,8 @@ import {
 import {
     IconCheck,
     IconCopy,
-    IconDownload,
-    IconUpload,
+    IconExport,
+    IconImport,
 } from '../components/Icons';
 import {
     type ActiveModalState,
@@ -211,10 +211,10 @@ function ImportManagerBody() {
                             variant="primary"
                             size="sm"
                             disabled={busy}
-                            icon={<IconDownload size={14} />}
+                            icon={<IconExport size={14} />}
                             onClick={() => void handleExportPreset(false)}
                         >
-                            下载预设 JSON
+                            导出预设 JSON
                         </Button>
                         <Button
                             variant="secondary"
@@ -249,7 +249,7 @@ function ImportManagerBody() {
                             variant="secondary"
                             size="sm"
                             disabled={busy}
-                            icon={<IconUpload size={14} />}
+                            icon={<IconImport size={14} />}
                             onClick={() => fileInputRef.current?.click()}
                         >
                             选择 JSON 文件导入

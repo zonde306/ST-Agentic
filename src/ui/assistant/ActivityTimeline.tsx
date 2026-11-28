@@ -11,11 +11,11 @@ import {
     IconChevronRight,
     IconCode,
     IconDatabase,
-    IconDownload,
     IconEdit,
     IconFileText,
     IconFilter,
     IconFolder,
+    IconImport,
     IconLayers,
     IconMessage,
     IconPlug,
@@ -63,7 +63,7 @@ function ToolIcon({ kind, size = 14 }: { kind: ToolIconKind; size?: number }) {
         case 'terminal':
             return <IconTerminal size={size} />;
         case 'import':
-            return <IconDownload size={size} />;
+            return <IconImport size={size} />;
         case 'plug':
             return <IconPlug size={size} />;
         case 'agentic':

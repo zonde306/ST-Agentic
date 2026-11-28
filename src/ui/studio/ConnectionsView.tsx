@@ -31,13 +31,13 @@ import {
     IconChevronDown,
     IconChevronRight,
     IconCopy,
-    IconDownload,
+    IconExport,
+    IconImport,
     IconPlay,
     IconPlug,
     IconPlus,
     IconRefresh,
     IconTrash,
-    IconUpload,
 } from '@/ui/components/Icons';
 import {
     type ConnectionModelsResult,
@@ -625,7 +625,7 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                 <Button
                     size="sm"
                     variant="secondary"
-                    icon={<IconUpload size={14} />}
+                    icon={<IconImport size={14} />}
                     onClick={() => {
                         setImportError(null);
                         setImportOpen(true);
@@ -636,7 +636,7 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                 <Button
                     size="sm"
                     variant="secondary"
-                    icon={<IconDownload size={14} />}
+                    icon={<IconExport size={14} />}
                     onClick={() => void handleExportConnections(false)}
                 >
                     导出脱敏
@@ -1334,7 +1334,7 @@ export function ConnectionsView(props: Partial<ConsoleViewProps> = {}) {
                         <Button
                             size="sm"
                             variant="secondary"
-                            icon={<IconUpload size={14} />}
+                            icon={<IconImport size={14} />}
                             onClick={() => fileInputRef.current?.click()}
                         >
                             选择 JSON 文件

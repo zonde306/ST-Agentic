@@ -18,10 +18,10 @@ import {
 } from '@/ui/components';
 import {
     IconCheck,
+    IconExport,
     IconFolder,
     IconPlus,
     IconTrash,
-    IconUpload,
 } from '@/ui/components/Icons';
 import type { AppStore } from '@/ui/store';
 import { ExportWorldInfoModal } from './ExportWorldInfoModal';
@@ -603,7 +603,7 @@ export function CluesManagerPane({ store, isMobile }: CluesManagerPaneProps) {
                 <Button
                     variant="secondary"
                     size="sm"
-                    icon={<IconUpload size={14} />}
+                    icon={<IconExport size={14} />}
                     onClick={() => setExportModalOpen(true)}
                 >
                     📤 导出到世界书

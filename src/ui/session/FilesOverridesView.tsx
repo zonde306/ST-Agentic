@@ -21,12 +21,12 @@ import {
 import {
     IconCheck,
     IconCopy,
-    IconDownload,
+    IconExport,
     IconFolder,
+    IconImport,
     IconPlus,
     IconRefresh,
     IconTrash,
-    IconUpload,
 } from '@/ui/components/Icons';
 import type {
     ConsoleViewProps,
@@ -537,7 +537,7 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
         const filename = resolveBasename(selectedItem.path);
         const ok = downloadTextFile(filename, draftContent, resolveMimeType(selectedItem.path));
         store.pushToast(
-            ok ? `已下载 ${filename}` : '当前环境不支持文件下载',
+            ok ? `已导出 ${filename}` : '当前环境不支持文件导出',
             ok ? 'success' : 'warning',
         );
     };
@@ -564,7 +564,7 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
             'application/json;charset=utf-8',
         );
         store.pushToast(
-            ok ? `已导出 ${filteredItems.length} 个文件打包 JSON` : '当前环境不支持文件下载',
+            ok ? `已导出 ${filteredItems.length} 个文件打包 JSON` : '当前环境不支持文件导出',
             ok ? 'success' : 'warning',
         );
     };
@@ -719,13 +719,13 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                 if (successCount > 0) {
                     store.pushToast(
                         successCount === 1 && lastSaved
-                            ? `已上传 ${lastSaved.path}`
-                            : `已成功上传 ${successCount} 个文件`,
+                            ? `已导入 ${lastSaved.path}`
+                            : `已成功导入 ${successCount} 个文件`,
                         'success',
                     );
                 }
                 if (failures.length > 0) {
-                    store.pushToast(`部分文件上传失败：${failures[0]}`, 'error');
+                    store.pushToast(`部分文件导入失败：${failures[0]}`, 'error');
                 }
             } finally {
                 setSaving(false);
@@ -949,17 +949,17 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                 <Button
                     size="sm"
                     variant="secondary"
-                    icon={<IconUpload size={14} />}
+                    icon={<IconImport size={14} />}
                     loading={saving}
-                    title="上传本地 .md / .txt / .json 文件（或直接拖拽到列表）"
+                    title="导入本地 .md / .txt / .json 文件（或直接拖拽到列表）"
                     onClick={() => handleTriggerUpload()}
                 >
-                    上传
+                    导入
                 </Button>
                 <Button
                     size="sm"
                     variant="secondary"
-                    icon={<IconDownload size={14} />}
+                    icon={<IconExport size={14} />}
                     disabled={filteredItems.length === 0}
                     title="将当前筛选结果导出为 JSON 打包文件"
                     onClick={handleExportBundle}
@@ -982,7 +982,7 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
 
             {dragActive ? (
                 <div class="ag-banner ag-banner-primary">
-                    松开鼠标即可上传文件到 {resolveDefaultScopeFromFilter() === 'workspace_shared' ? '/workspace/shared/' : '/workspace/docs/ (AGENTS.md 自动入根规范)'}
+                    松开鼠标即可导入文件到 {resolveDefaultScopeFromFilter() === 'workspace_shared' ? '/workspace/shared/' : '/workspace/docs/ (AGENTS.md 自动入根规范)'}
                 </div>
             ) : null}
 
@@ -1168,10 +1168,10 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                         <Button
                             variant="secondary"
                             size="sm"
-                            icon={<IconDownload size={14} />}
+                            icon={<IconExport size={14} />}
                             onClick={handleDownloadSelected}
                         >
-                            下载
+                            导出
                         </Button>
                         <Button
                             variant="danger"
@@ -1259,14 +1259,14 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                 onDetailOpenChange={setDetailOpen}
                 detailTitle={selectedItem?.path ?? '文件详情'}
                 emptyDetailTitle="选择左侧文件或覆写条目"
-                emptyDetailDescription="支持工作区与协作文件、AGENTS.md 规范树、/state/variables.json、世界书覆写及 /output.md 消息输出的上传、下载、编辑与 Diff 对比。"
+                emptyDetailDescription="支持工作区与协作文件、AGENTS.md 规范树、/state/variables.json、世界书覆写及 /output.md 消息输出的导入、导出、编辑与 Diff 对比。"
                 master={masterPane}
                 detail={detailPane}
             />
 
             <ShadowModal
                 open={createModalOpen}
-                title="新建或上传规范与工作区文件"
+                title="新建或导入规范与工作区文件"
                 maxWidth="480px"
                 onClose={() => setCreateModalOpen(false)}
                 footer={
@@ -1276,14 +1276,14 @@ export function FilesOverridesView({ store, isMobile }: ConsoleViewProps) {
                         </Button>
                         <Button
                             variant="secondary"
-                            icon={<IconUpload size={14} />}
+                            icon={<IconImport size={14} />}
                             loading={saving}
                             onClick={() => {
                                 setCreateModalOpen(false);
                                 handleTriggerUpload(createScope);
                             }}
                         >
-                            上传本地文件至此域
+                            导入本地文件至此域
                         </Button>
                         <Button
                             variant="primary"

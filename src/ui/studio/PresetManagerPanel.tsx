@@ -21,11 +21,11 @@ import {
     IconCheck,
     IconCopy,
     IconCreditCard,
-    IconDownload,
     IconEdit,
+    IconExport,
+    IconImport,
     IconPlus,
     IconTrash,
-    IconUpload,
 } from '@/ui/components/Icons';
 import {
     type AppStore,
@@ -314,7 +314,7 @@ export function PresetManagerPanel({
         }
         const safeFile = (activePreset.name || 'agentic-preset').replace(/[^\w.-]+/g, '_');
         downloadTextFile(`${safeFile}.json`, sanitizedExportJson);
-        store.pushToast('已下载脱敏预设 JSON（apiKey 已强制剥离）', 'success');
+        store.pushToast('已导出脱敏预设 JSON（apiKey 已强制剥离）', 'success');
     };
 
     const handleCopyExport = async () => {
@@ -500,7 +500,7 @@ export function PresetManagerPanel({
                 <Button
                     size="sm"
                     variant="ghost"
-                    icon={<IconUpload size={16} />}
+                    icon={<IconImport size={16} />}
                     title="导入预设 / 旧版自动迁移"
                     onClick={() => {
                         setErrorText(null);
@@ -513,7 +513,7 @@ export function PresetManagerPanel({
                 <Button
                     size="sm"
                     variant="ghost"
-                    icon={<IconDownload size={16} />}
+                    icon={<IconExport size={16} />}
                     title="导出脱敏预设"
                     onClick={() => setDialogKind('export')}
                 >
@@ -627,7 +627,7 @@ export function PresetManagerPanel({
                             variant="secondary"
                             size="sm"
                             disabled={busy}
-                            icon={<IconUpload size={14} />}
+                            icon={<IconImport size={14} />}
                             onClick={() => fileInputRef.current?.click()}
                         >
                             选择 JSON 文件
@@ -696,10 +696,10 @@ export function PresetManagerPanel({
                         <Button
                             variant="primary"
                             size="sm"
-                            icon={<IconDownload size={14} />}
+                            icon={<IconExport size={14} />}
                             onClick={handleDownloadExport}
                         >
-                            下载 JSON 文件
+                            导出 JSON 文件
                         </Button>
                         <Button
                             variant="secondary"
