@@ -136,6 +136,33 @@ function isLastChatMessageAssistant(): boolean {
     return Boolean(last && !last.is_user && !last.is_system);
 }
 
+function resolveTurnUserInput(
+    action: GenerationAction,
+    messageId: number,
+    fallbackUserName: string,
+): { userInput: string | undefined; userName: string } {
+    if (action === 'continue' || !Array.isArray(chat) || chat.length === 0) {
+        return { userInput: undefined, userName: fallbackUserName };
+    }
+    const startIdx = Math.min(chat.length - 1, messageId - 1);
+    for (let i = startIdx; i >= 0; i -= 1) {
+        const candidate = chat[i] as
+            | { is_user?: unknown; is_system?: unknown; mes?: unknown; name?: unknown }
+            | undefined;
+        if (!candidate || candidate.is_system) {
+            continue;
+        }
+        if (candidate.is_user && typeof candidate.mes === 'string') {
+            return {
+                userInput: candidate.mes,
+                userName: typeof candidate.name === 'string' ? candidate.name : fallbackUserName,
+            };
+        }
+        return { userInput: undefined, userName: fallbackUserName };
+    }
+    return { userInput: undefined, userName: fallbackUserName };
+}
+
 function isTargetBindableOrRecreateable(target: MessageTarget): boolean {
     if (
         !Array.isArray(chat)
@@ -513,20 +540,11 @@ export function createAgenticInterceptor(
             activeRenderer.setRetrievingStatus('Retrying turn');
             getAppStore?.()?.setActiveTarget(activeRenderer.target);
 
-            const prevMsg =
-                Array.isArray(chat) && activeRenderer.target.messageId > 0
-                    ? (chat[activeRenderer.target.messageId - 1] as
-                          | { is_user?: unknown; mes?: unknown; name?: unknown }
-                          | undefined)
-                    : undefined;
-            const userInput =
-                runAction === 'normal' && prevMsg?.is_user && typeof prevMsg.mes === 'string'
-                    ? prevMsg.mes
-                    : undefined;
-            const userName =
-                runAction === 'normal' && prevMsg?.is_user && typeof prevMsg.name === 'string'
-                    ? prevMsg.name
-                    : rendererDeps.identity.userName;
+            const { userInput, userName } = resolveTurnUserInput(
+                runAction,
+                activeRenderer.target.messageId,
+                rendererDeps.identity.userName,
+            );
 
             const result = await orchestrator.runTurn({
                 action: runAction,
@@ -597,20 +615,11 @@ export function createAgenticInterceptor(
             activeRenderer.setRetrievingStatus('Preparing turn context');
             getAppStore?.()?.setActiveTarget(activeRenderer.target);
 
-            const prevMsg =
-                Array.isArray(chat) && activeRenderer.target.messageId > 0
-                    ? (chat[activeRenderer.target.messageId - 1] as
-                          | { is_user?: unknown; mes?: unknown; name?: unknown }
-                          | undefined)
-                    : undefined;
-            const userInput =
-                action === 'normal' && prevMsg?.is_user && typeof prevMsg.mes === 'string'
-                    ? prevMsg.mes
-                    : undefined;
-            const userName =
-                action === 'normal' && prevMsg?.is_user && typeof prevMsg.name === 'string'
-                    ? prevMsg.name
-                    : rendererDeps.identity.userName;
+            const { userInput, userName } = resolveTurnUserInput(
+                action,
+                activeRenderer.target.messageId,
+                rendererDeps.identity.userName,
+            );
 
             const result = await orchestrator.runTurn({
                 action,

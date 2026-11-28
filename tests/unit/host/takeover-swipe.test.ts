@@ -415,6 +415,7 @@ describe('Takeover swipe lifecycle and consistency', () => {
         expect(capturedInput?.action).toBe('swipe');
         expect(capturedInput?.target).toEqual({ messageId: 1, swipeId: 3 });
         expect(capturedInput?.previousSwipeId).toBe(originalSwipeId);
+        expect(capturedInput?.userInput).toBe('Hi');
         expect(msg.swipes.length).toBe(4);
         expect(stMocks.fns.updateSwipeCounter).toHaveBeenCalledWith(1);
 
@@ -1120,11 +1121,98 @@ describe('Takeover swipe lifecycle and consistency', () => {
         expect(clearCheckpointSpy).toHaveBeenCalledWith({ messageId: 1, swipeId: 0 });
         expect(stMocks.state.chat).toHaveLength(2);
         expect(runTurnCalls[1]?.action).toBe('regenerate');
+        expect(runTurnCalls[1]?.userInput).toBe('Hello Alice');
         expect(stMocks.state.chat[1]?.mes).toBe('Retried (regenerate)');
 
         // 4. Out-of-bounds target (messageId > chat.length) still fails cleanly with toast
         await handle.resumeTakeoverTurn({ messageId: 5, swipeId: 0 });
         expect(appStore.pushToast).toHaveBeenCalledWith('无法恢复：目标消息不存在。', 'error');
+
+        handle.dispose();
+    });
+
+    it('forwards preceding userInput on regenerate across system messages while keeping continue and empty-send on assistant tail undefined', async () => {
+        stMocks.state.chat.push(
+            { name: 'Tester', is_user: true, is_system: false, mes: 'Open the tavern door' },
+            { name: 'System', is_user: false, is_system: true, mes: 'System note' },
+            {
+                name: 'Alice',
+                is_user: false,
+                is_system: false,
+                mes: 'Initial reply',
+                swipe_id: 0,
+                swipes: ['Initial reply'],
+                swipe_info: [{}],
+            },
+        );
+
+        const settings: Settings = { ...createDefaultSettings(), runMode: 'takeover' };
+        const bridge = new STHostBridge({ getSettings: () => settings });
+        const appStore = createMinimalAppStore();
+        const capturedInputs: RunTurnInput[] = [];
+
+        const orchestrator = createFakePipeline(async (input) => {
+            capturedInputs.push(input);
+            return {
+                target: input.target,
+                action: input.action,
+                content: `Reply (${input.action})`,
+                deltaContent: `Reply (${input.action})`,
+                beforeTurnResults: [],
+                mainRun: {
+                    runId: `run-${capturedInputs.length}`,
+                    target: input.target,
+                    phase: 'main_turn',
+                    agentProfileId: 'main',
+                    content: `Reply (${input.action})`,
+                    rounds: 1,
+                    toolSteps: [],
+                    usage: { inputTokens: 10, outputTokens: 5, cachedTokens: 0, totalTokens: 15 },
+                    trace: {
+                        runId: `run-${capturedInputs.length}`,
+                        target: input.target,
+                        phase: 'main_turn',
+                        agentProfileId: 'main',
+                        agentName: 'Main',
+                        connectionId: 'conn-1',
+                        model: 'gpt-test',
+                        status: 'completed',
+                        startedAt: Date.now(),
+                        durationMs: 10,
+                        usage: { inputTokens: 10, outputTokens: 5, cachedTokens: 0, totalTokens: 15 },
+                        toolSteps: [],
+                    },
+                },
+                afterTurnTasks: [],
+                maintenanceTasks: [],
+            };
+        });
+
+        const handle = createAgenticInterceptor({
+            bridge,
+            orchestrator,
+            getSettings: () => settings,
+            getAppStore: () => appStore,
+            registerGlobal: false,
+        });
+
+        // 1. Regenerate after ST pops the trailing assistant floor skips intervening is_system floor #1 and recovers userInput from floor #0
+        stMocks.state.chat.pop();
+        await handle.interceptor(stMocks.state.chat, 4096, () => {}, 'regenerate');
+        expect(capturedInputs[0]?.action).toBe('regenerate');
+        expect(capturedInputs[0]?.target).toEqual({ messageId: 2, swipeId: 0 });
+        expect(capturedInputs[0]?.userInput).toBe('Open the tavern door');
+        expect(capturedInputs[0]?.userName).toBe('Tester');
+
+        // 2. Continue preserves userInput: undefined
+        await handle.interceptor(stMocks.state.chat, 4096, () => {}, 'continue');
+        expect(capturedInputs[1]?.action).toBe('continue');
+        expect(capturedInputs[1]?.userInput).toBeUndefined();
+
+        // 3. Normal send immediately following an assistant message preserves userInput: undefined
+        await handle.interceptor(stMocks.state.chat, 4096, () => {}, 'normal');
+        expect(capturedInputs[2]?.action).toBe('normal');
+        expect(capturedInputs[2]?.userInput).toBeUndefined();
 
         handle.dispose();
     });
